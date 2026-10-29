@@ -41,7 +41,7 @@
   "benchmark_decode_steps": 128,
   "local_submit_benchmark_decode_steps": 1023,
   "official_prefill_warmup_runs": 1,
-  "baseline_reference_commit": "eaf357818976f39dcda5da49c6a7689de5d60613",
+  "baseline_reference_commit": "0d3eed36e3f32fae59345d3f9a7a1cb139d109dc",
   "tensorfold_revision": "eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab",
   "benchd_source_commit": "8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729",
   "target": {
