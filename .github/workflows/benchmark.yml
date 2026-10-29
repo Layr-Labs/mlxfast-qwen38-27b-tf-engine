@@ -1,0 +1,538 @@
+# qwen3.8-27b-tf-mlx-v1 ranked benchmark.
+#
+# benchmark.json's runner.workflow names this file. Yukon dispatches it once per
+# submission; the two jobs below are the whole ranked pipeline. A hosted
+# no-credential surface check runs first, and only if it passes does the
+# measurement reach the box.
+#
+# No secret, anywhere, by design. This file references no
+# repository secret, inherits none, and asks for no write permission, and it
+# never will: hidden material for this track (the timed-pool tapes, the
+# token-fidelity oracle, the reference baseline workspace) is staged onto the
+# box out of band by the organizer. A box receives bundles, never keys.
+# The workflow runs ./setup.sh first. Then tools/ranked-box-preflight.sh
+# re-checks every staged asset against
+# fixtures/qwen3_8_27b_tf_mlx_v1_track.json's own {sha256, bytes} pins -- byte
+# count first, then digest -- before any timing, and refuses on any miss. The
+# contract fixture is trusted-side (not an editable path), so a
+# submission cannot move the pins it is measured against.
+#
+# The ranked steps read
+# MLXFAST_QWEN38_GOLDEN_DIR out of the self-hosted runner's own process
+# environment -- the same name tools/qwen38-27b-tf-measure-and-score.sh and
+# tools/ranked-box-preflight.sh already read (docs/participant-contract.md,
+# "Run contract").
+#
+# The paired design adds two names, and only two:
+#   MLXFAST_BASELINE_WORKSPACE     the organizer-staged reference tree the
+#                                  serial-control leg runs on, at the fixture's
+#                                  baseline_reference_commit;
+#   MLXFAST_BASELINE_CALIBRATION   this box's health band for that leg.
+# Both arrive the same way everything else on this box does: staged out of band,
+# exported by the runner service, verified here. Nothing in this job fetches or
+# builds the reference tree.
+#
+# The runner label is the track ID. `runs-on: [self-hosted, macOS,
+# qwen3.8-27b-tf-mlx-v1]` -- track and label are one string (the canonical
+# decoder-neutral naming construction). The bench channel is not that string:
+# benchd is published from the bench repository's main, and the MLX and CUDA
+# tracks share it because they share one benchmarker. Branch = channel,
+# track id = platform. This label is the platform one, and so is every other
+# occurrence in this file. tools/box-runner/box-runner.env's RUNNER_LABELS must
+# carry the same label: that value is the entire coupling surface between this
+# file and the runner side, and a mismatch strands a dispatch with no runner
+# rather than failing it.
+#
+# One window per box at a time. The box lock provides this limit. The
+# measurement script takes /tmp/mtplx-gpu-exclusive.lock for the whole window
+# and boots the one resident bench-worker inside it, so two dispatches that
+# land on the same box queue on the lock. The job declares NO GitHub
+# concurrency group: a fixed group serialized every dispatch behind one
+# in-flight measurement across every box with the label, so a fleet measured
+# one submission at a time. Nothing here cancels a run: cancelling a timed
+# run mid-window destroys the measurement and leaves the GPU hot for the next
+# one.
+#
+# Fail-closed inventory. Each item aborts before a score.json can exist,
+# and none of them has a degraded path:
+#   1. benchd manifest mismatch. ./tools/fetch-benchd.sh accepts only bytes
+#      matching the channel's benchd.manifest.json; it never returns an unverified binary and
+#      never falls back to a PATH benchd or a source build.
+#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, an empty pool, or any
+#      entry whose sha256 is not 64 hex / bytes is not positive: refused,
+#      because there would be no pin to verify a staged file against. Two
+#      entries with the same sha256 or r2_path: refused.
+#   3. Missing staged asset. MLXFAST_QWEN38_GOLDEN_DIR unset or absent, a pool
+#      tape missing, a live golden not staged, or the paired leg pair
+#      unstaged: MLXFAST_BASELINE_WORKSPACE / MLXFAST_BASELINE_CALIBRATION
+#      absent, a reference tree at the wrong commit, a reference tree with no
+#      staged worker or no pinned target snapshot of its own, or a calibration
+#      file that does not name this track, this box and that commit.
+#   4. Hash mismatch on a staged asset, in either half of the pin, on any tape
+#      or on a box-named MLXFAST_CORRECTNESS_GOLDEN_PATH. An unpinned extra
+#      *.json in the staging directory is also refused: every *.json there is
+#      passed as a --golden, so one more file is one more cohort member.
+#   5. Credential or override in the job environment. R2 keys, an R2 signer, a
+#      dist token, BENCHD (which bypasses the benchd manifest check),
+#      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,
+#      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT.
+#   6. Model absent or changed. ./setup.sh verifies every target file against
+#      the fixture's byte count and SHA-256 digest. It does not download files.
+#   7. No composite. benchd iterate --mode official is the SOLE writer of the
+#      sealed score.json; it refuses to seal (and writes no score.json) rather
+#      than substitute a diagnostic for the required composite. There is no separate
+#      score-conversion step to bypass.
+# A refusal is always a non-zero exit. A failure before scoring leaves no
+# score.json. A failure during scoring can leave benchd's sealed record with
+# passed=false and score=null. The upload step runs `if: always()` with
+# `if-no-files-found: error`, so it publishes a sealed failure record when one
+# exists and makes a missing score file loud.
+#
+# Editable paths are untrusted input. The dispatched commit carries the
+# submission's editablePaths; the hosted surface-check job static-reviews them
+# before the box is reached, and the ranked box then builds and executes
+# participant Zig inside the sandboxed runtime worker -- the accepted design
+# for this track family, matching the qwen precedent.
+#
+# What must exist before a dispatch can go green:
+#   - organization Actions enabled for this repository;
+#   - a registered self-hosted runner on the box advertising the three labels
+#     below (tools/box-runner/ owns that side);
+#   - box staging: the pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
+#     goldens among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
+#     no Rust toolchain and this job holds no dist token, so the binary is
+#     placed there out of band), the reference checkpoint, and a macmon GPU
+#     temperature reader at the path this file pins into MLXFAST_MACMON and
+#     MLXFAST_MACMON_BIN (/opt/homebrew/bin/macmon) -- no reader, no ranked run:
+#     tools/ranked-box-preflight.sh hard-fails on it. The reference tree and
+#     this box's calibration file are staged too: tools/stage-baseline-workspace.sh
+#     builds the tree at the fixture's baseline_reference_commit and
+#     tools/calibrate-box.sh writes the band, and the runner service exports
+#     both paths;
+#   - the track ARMED: fixtures/qwen3_8_27b_tf_mlx_v1_track.json sets
+#     official_scoring_enabled to true, and both
+#     tools/ranked-box-preflight.sh (section 5) and the pinned benchd refuse to
+#     seal an official scoring artifact while it is false (or absent). What
+#     remains is the box-only goldens.
+#
+# Trigger: workflow_dispatch only. There is deliberately no `pull_request`,
+# `push` or `schedule` trigger -- Yukon dispatches a submission explicitly, and
+# a pull_request trigger would run every submission twice on the one box.
+
+name: Qwen3.8-27B TensorFold MLX ranked benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Real, hosted, no-GPU, no-credential checks: the same class of check
+  # ci.yml's own `lint` job already runs against this manifest on every push
+  # to main, reproduced here so a ranked-workflow dispatch also self-checks
+  # before the dispatch to the ranked box.
+  surface-check:
+    name: editable-surface + static review (hosted, no GPU, no credential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. This repository has no
+          # submodule at all, and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. The flag is kept for the next submodule --
+          # see docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: Submission static review (whole-surface, self-check)
+        run: |
+          set -euo pipefail
+          # whole-surface mode reads benchmark.json from the WORK TREE. That is
+          # safe here because the dispatched commit's benchmark.json is trusted
+          # side -- it is not an editablePath, so a submission overlay cannot
+          # widen it. See the script's own header for the self-widening hazard
+          # this mode is an explicit opt-in against.
+          CONTRACT_PATH=benchmark.json \
+          MLXFAST_SUBMISSION_REVIEW_MODE=whole-surface \
+            .github/scripts/submission-static-review-checks.sh
+
+
+  # The ranked measurement. `needs: surface-check` so a submission that fails
+  # the static review never reaches the box at all.
+  ranked:
+    name: ranked measurement (self-hosted, qwen3.8-27b-tf-mlx-v1 box)
+    needs: surface-check
+    # The third label IS the track id (= the branch name = the R2 key prefix).
+    # tools/box-runner/box-runner.env RUNNER_LABELS must advertise it.
+    runs-on: [self-hosted, macOS, qwen3.8-27b-tf-mlx-v1]
+    # Queue time is outside this cap. A healthy ranked run takes about 4-15 min;
+    # one that still holds the box at 60 min is refused as a stuck job.
+    timeout-minutes: 60
+    env:
+      # Use the configured runner Zig. An empty value falls back to PATH.
+      ZIG: ${{ vars.ZIG }}
+      # --- Host contract: the GPU temperature reader ----------------------
+      # Use one explicit reader path for preflight and benchd. The preflight
+      # proves that this file is executable before any model work starts.
+      # GPU_LOADED_UTIL stays unset, so benchd uses its documented default.
+      MLXFAST_MACMON_CANDIDATES: /opt/homebrew/bin/macmon
+      # The timed-pool tapes are not named here. They are organizer material
+      # published in R2 and staged on the box out of band, so no checkout
+      # carries them and there is nothing here to point at. The runner service
+      # exports MLXFAST_QWEN38_GOLDEN_DIR, and the step below refuses a box that
+      # does not.
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # The DISPATCHED commit, per the Yukon workflow author guide -- not
+          # the branch tip, which can move between dispatch and pickup while a
+          # run is queued behind the in-flight measurement.
+          ref: ${{ github.sha }}
+          submodules: false
+          # This job must hold no credential, and a persisted checkout token
+          # would be one.
+          persist-credentials: false
+
+      - name: Runner environment carries the box paths and the toolchain
+        run: |
+          set -euo pipefail
+          fail=0
+          # MLXFAST_BASELINE_WORKSPACE is required because the serial-control
+          # leg runs on the
+          # organizer-staged reference tree, so an absent tree is an absent
+          # denominator. The tree's identity is checked in the next step.
+          # MLXFAST_QWEN38_GOLDEN_DIR holds the staged track goldens. They are
+          # organizer material published in R2 and staged on the box out of
+          # band; they are never in the checkout, so an unset variable here has
+          # no in-repo copy to fall back on and is refused.
+          for var in BENCHD_BIN_DIR MLXFAST_REFERENCE_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_QWEN38_GOLDEN_DIR; do
+            eval "value=\${${var}:-}"
+            if [[ -z "${value}" ]]; then
+              echo "::error::${var} is not exported by the runner service environment (see the checked-in staging instructions in .github/workflows/benchmark.yml under 'WHAT MUST EXIST BEFORE A DISPATCH CAN GO GREEN')" >&2
+              fail=1
+            elif [[ ! -d "${value}" ]]; then
+              echo "::error::${var}=${value} is not a directory on this box" >&2
+              fail=1
+            fi
+          done
+          # MLXFAST_BASELINE_CALIBRATION names a FILE, not a directory -- this
+          # box's baseline-calibration.json, the health band the serial-control
+          # leg must land inside (tools/calibrate-box.sh writes it). It is
+          # required on the ranked path exactly as the workspace is, so it is
+          # checked here with the test its type actually calls for; the
+          # preflight validates its contents.
+          for var in MLXFAST_BASELINE_CALIBRATION; do
+            eval "value=\${${var}:-}"
+            if [[ -z "${value}" ]]; then
+              echo "::error::${var} is not exported by the runner service environment (run tools/calibrate-box.sh on this box and export the file it writes)" >&2
+              fail=1
+            elif [[ ! -f "${value}" ]]; then
+              echo "::error::${var}=${value} is not a file on this box" >&2
+              fail=1
+            fi
+          done
+          for tool in git jq python3 bc shasum; do
+            command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH" >&2; fail=1; }
+          done
+          [[ "${fail}" == "0" ]] || exit 1
+          zig_bin="$(tools/zig-bin.sh)" || { echo "::error::Zig 0.17.0 is missing or has the wrong version" >&2; exit 1; }
+          echo "ZIG=${zig_bin}" >> "${GITHUB_ENV}"
+          echo "runner environment ok: benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_REFERENCE_DIR} baseline_workspace=${MLXFAST_BASELINE_WORKSPACE} baseline_calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_QWEN38_GOLDEN_DIR}"
+
+      - name: Reference workspace is the pinned commit, built and staged
+        # The paired run's denominator. The
+        # serial-control leg runs on the organizer-staged reference tree, so
+        # that tree's identity IS half the score. This step asserts two things
+        # and fixes neither:
+        #
+        #   * HEAD equals the fixture's baseline_reference_commit, exactly. A
+        #     tree at any other commit is a different denominator, so a prefix
+        #     match would not do.
+        #   * the TensorFold worker is staged at the fixed relative path;
+        #   * the tree carries its own pinned target snapshot.
+        #
+        # Nothing here fetches or builds that tree. The job holds no credential.
+        # tools/stage-baseline-workspace.sh stages the tree in advance, the same
+        # way the goldens are staged. A tree that fails this step is re-staged; the
+        # job refuses and measures nothing.
+        run: |
+          set -euo pipefail
+          want="$(jq -r '.baseline_reference_commit // ""' fixtures/qwen3_8_27b_tf_mlx_v1_track.json)"
+          if [[ ! "${want}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the track contract declares no 40-hex baseline_reference_commit (got '${want}'); there is nothing to hold the reference tree to" >&2
+            exit 1
+          fi
+          have="$(git -C "${MLXFAST_BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
+          if [[ "${have}" != "${want}" ]]; then
+            echo "::error::the reference workspace at ${MLXFAST_BASELINE_WORKSPACE} is at '${have:-nothing}' but the contract pins ${want}; re-stage it on the box with tools/stage-baseline-workspace.sh" >&2
+            exit 1
+          fi
+          worker="${MLXFAST_BASELINE_WORKSPACE}/Vendor/TensorFold/zig-out/bin/bench-worker"
+          target="${MLXFAST_BASELINE_WORKSPACE}/reference_weights/Qwen3.8-27B-MLX-4bit"
+          [[ -x "${worker}" ]] || { echo "::error::the reference TensorFold worker is missing: ${worker}" >&2; exit 1; }
+          [[ -f "${target}/config.json" ]] || { echo "::error::the reference target snapshot is missing: ${target}" >&2; exit 1; }
+          echo "reference workspace ok: ${MLXFAST_BASELINE_WORKSPACE} at ${want}, TensorFold worker and target staged"
+
+      - name: Stop residents left by an earlier job (GPU lock, exact match)
+        # A cancelled job can leave its resident alive after the runner exits.
+        # The box-wide GPU lock proves whether cleanup can safely inspect all
+        # runner work trees before this job starts.
+        run: ./tools/stop-leaked-residents.sh --mode preflight --root "${GITHUB_WORKSPACE%/*/*}"
+
+      - name: Resolve the pinned benchd (sha256 + bytes, no credential)
+        # First half of benchmark.json's setupCommand. fetch-benchd.sh resolves
+        # benchd and record-correctness-golden from the public Layr-Labs/benchd
+        # repository, or uses an operator-placed offline set. It accepts only
+        # files whose SHA-256 digests and byte counts match the pinned manifest.
+        run: ./tools/fetch-benchd.sh
+
+      - name: Restore the worker build cache (content-keyed, box-owned)
+        # tools/build-cache.sh keys the build on every tracked source, the
+        # vendored engine sources, the resolved packages, the vendored Metal
+        # fingerprint and the toolchain; a hit restores bench-worker and the
+        # worker from ~/.cache/mlxfast-engine-build after a sha256 check
+        # against the manifest the save wrote. A miss (first dispatch on a box,
+        # or any source change) builds below exactly as before and saves.
+        run: |
+          set -euo pipefail
+          if tools/build-cache.sh restore; then
+            echo "MLXFAST_BUILD_CACHE_HIT=1" >> "${GITHUB_ENV}"
+          else
+            echo "MLXFAST_BUILD_CACHE_HIT=0" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Setup (toolchain, Metal kernels, pinned checkpoint)
+        # setup.sh reads the existing snapshot from MLXFAST_REFERENCE_DIR. It
+        # verifies every file against the fixture and then builds the worker.
+        # It does not download or transform the target.
+        #
+        # The compile runs sandboxed. The build compiles editable Zig, C++ and
+        # Metal files, and a compiler reads every file that a source names.
+        # setup.sh starts the compile command
+        # through tools/sandboxed-build.sh, which runs it under sandbox-exec on
+        # this runner. The compile cannot read the evaluator-only paths or the
+        # runner registration, and it cannot use the network.
+        #
+        # A build-cache hit reuses the verified TensorFold worker.
+        run: |
+          set -euo pipefail
+          MLXFAST_SKIP_WORKER_SELF_TEST=1 ./setup.sh
+
+      - name: Ranked box preflight (staged assets, contract pins, no credential)
+        run: ./tools/ranked-box-preflight.sh
+
+      - name: Candidate worker self-test (sandboxed)
+        run: ./tools/sandboxed-cli.sh self-test
+
+      - name: Save the worker build cache
+        if: env.MLXFAST_BUILD_CACHE_HIT != '1'
+        run: tools/build-cache.sh save
+
+      - name: Stage the target snapshot in the candidate tree
+        # The ranked job clones the verified target snapshot into the candidate
+        # tree. APFS clone-copy is preferred; plain copy is the safe
+        # fallback on a filesystem that does not support clones.
+        run: |
+          set -euo pipefail
+          mkdir -p reference_weights
+          [[ ! -e reference_weights/Qwen3.8-27B-MLX-4bit && ! -L reference_weights/Qwen3.8-27B-MLX-4bit ]] || { echo "::error::candidate target path already exists" >&2; exit 1; }
+          target_dir=reference_weights/Qwen3.8-27B-MLX-4bit
+          if ! cp -cRL "${MLXFAST_REFERENCE_DIR}" "${target_dir}"; then
+            cp -RL "${MLXFAST_REFERENCE_DIR}" "${target_dir}"
+          fi
+          if find "${target_dir}" -type l -print -quit | grep -q .; then
+            echo "::error::the staged target snapshot contains a symlink" >&2
+            exit 1
+          fi
+          [[ -f "${target_dir}/config.json" ]] || { echo "::error::the staged target has no config.json" >&2; exit 1; }
+          (cd "${target_dir}" && shasum -a 256 -c "${GITHUB_WORKSPACE}/fixtures/reference_qwen3_8_27b_4bit.sha256") >/dev/null \
+            || { echo "::error::the staged target differs from the intake shas" >&2; exit 1; }
+          echo "target snapshot staged from ${MLXFAST_REFERENCE_DIR}"
+
+      - name: Stage the pinned drafter for DFlash
+        run: ./tools/stage-drafter.sh
+
+      - name: Record the dispatched candidate sha (author-at-seal)
+        # benchd's official seal records the candidate SHA and fails closed
+        # without a dispatch
+        # context: it reads the recorded sha from the file named by
+        # MLXFAST_CANDIDATE_SHA_FILE, and cross-checks the untrusted proposal in
+        # MLXFAST_COMMIT_SHA. Both values must come from this trusted dispatch
+        # context so the seal identifies the measured candidate.
+        #
+        # THIS is the dispatch lane, so this is where the context exists. Both
+        # values are the FULL 40-hex sha (`github.sha`), never the short form:
+        # the seal compares them for equality and an abbreviation is not equal.
+        # Written here rather than in the stager because it is dispatch context,
+        # not a staged box path -- the stager owns paths it has verified on disk.
+        run: |
+          printf '%s\n' "${GITHUB_SHA}" > "${RUNNER_TEMP}/candidate.sha"
+          {
+            printf 'MLXFAST_CANDIDATE_SHA_FILE=%s\n' "${RUNNER_TEMP}/candidate.sha"
+            printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Sensor check before timing
+        # The quiescence gate lives in benchd beside the cool
+        # gate, with the same fixed thresholds, and runs immediately before the
+        # cool gate on every timed phase of both legs and on every calibration
+        # pass, so it holds between the legs too, which a workflow step cannot.
+        # One load/util sample is logged here for the record; the sensor sanity
+        # checks below stay, because a dead reader must not reach the gates.
+        #
+        # The workflow does not require passwordless sudo. A box left loaded by a
+        # lingering process does not get measured hot -- it fails this step at
+        # the 900 s ceiling and the run is retried on a clean box. Refuse and
+        # retry, never a hot measurement.
+        #
+        # The cool-gate contract is not re-implemented here. The fixed
+        # per-phase gate lives in the pinned benchd official iterate path. It
+        # gates every timed leg, baseline and candidate
+        # alike. This step gets the machine to the starting line; benchd holds the
+        # contract between the legs.
+        run: |
+          set -euo pipefail
+          # The runner environment names the reader (MLXFAST_MACMON_BIN, written
+          # by the box converge). The job account is not the operator, so
+          # ${HOME}/bin is not where the box keeps it; the named file comes first.
+          MLXFAST_MACMON=""
+          if [[ -n "${MLXFAST_MACMON_BIN:-}" && -x "${MLXFAST_MACMON_BIN}" ]]; then MLXFAST_MACMON="${MLXFAST_MACMON_BIN}"; fi
+          if [[ -z "${MLXFAST_MACMON}" ]] && command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
+          if [[ -z "${MLXFAST_MACMON}" ]]; then
+            IFS=: read -r -a candidates <<< "${MLXFAST_MACMON_CANDIDATES}:${HOME}/bin/macmon"
+            for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
+          fi
+          if [[ -z "${MLXFAST_MACMON}" ]]; then
+            echo "::error::macmon was not found (MLXFAST_MACMON_BIN, PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
+            exit 1
+          fi
+          export MLXFAST_MACMON MLXFAST_MACMON_BIN="${MLXFAST_MACMON}"
+          { printf 'MLXFAST_MACMON=%s\n' "${MLXFAST_MACMON}"; printf 'MLXFAST_MACMON_BIN=%s\n' "${MLXFAST_MACMON}"; } >> "${GITHUB_ENV}"
+          load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+          util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
+          # Same field the gates read (.temp.gpu_temp_avg), so this probe and
+          # benchd's gate cannot disagree about what the sensor says. The
+          # frozen-sensor and implausibility checks ran in full at preflight
+          # (tools/ranked-box-preflight.sh section 2c); this is the last look
+          # before the clock starts, and a reader that has died in the meantime
+          # must not be handed to the gates.
+          temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // empty')"
+          if [[ -z "${temp}" ]]; then
+            echo "::error::the GPU temperature reader stopped returning samples between preflight and timing; refusing to hand the cool gate a dead sensor" >&2
+            exit 1
+          fi
+          if [[ "$(jq -n --argjson t "${temp}" '$t > 5')" != "true" ]]; then
+            echo "::error::GPU temperature reads ${temp}C, at or below the 5C implausibility floor; the sensor is broken or frozen and every cool gate would pass regardless of real temperature" >&2
+            exit 1
+          fi
+          echo "ranked: starting line (load=${load} gpu_util=${util} gpu_temp=${temp}C); the fixed 50C per-phase gate inside the pinned benchd holds every timed leg"
+
+      - name: Benchmark (benchd iterate --mode official, seal)
+        # The ranked half of benchmark.json's benchmarkCommand. That command
+        # runs tools/qwen38-27b-tf-yukon-run.sh, which replaces itself with
+        # the script below when GITHUB_ACTIONS is "true". This step calls the
+        # script directly. The golden pool comes from the runner environment, which the preflight has
+        # already pin-verified; the staged runtime worker and the dispatch sha
+        # come from the two steps above (./setup.sh, GITHUB_ENV).
+        #
+        # The run is paired. The measure script passes
+        # MLXFAST_BASELINE_WORKSPACE and MLXFAST_BASELINE_CALIBRATION on to
+        # `benchd iterate --mode official` as --baseline-workspace and
+        # --baseline-calibration. benchd measures the serial-control leg on the
+        # reference tree and the candidate leg on this checkout, in this window,
+        # and seals the LIVE ratio. The calibration file is the control leg's
+        # health band, never the denominator: benchd kills the run by name when
+        # leg 1 lands outside this box's band. Both names reach the script
+        # through the runner service environment, which the runner-environment
+        # step requires and the preflight validates; they are restated on this
+        # step so the ranked invocation is legible in one place and a `run:`
+        # step that inherited neither fails here rather than deeper.
+        #
+        # THIS STEP IS THE GPU WINDOW, AND THE MEASURE SCRIPT OPENS IT. The
+        # command below is deliberately NOT wrapped here: the measure script
+        # takes the box GPU lock (/tmp/mtplx-gpu-exclusive.lock) itself and
+        # re-executes itself inside it. The lock lives in the script, not in
+        # this YAML, so that benchmark.json's benchmarkCommand -- which reaches
+        # this same script on a ranked box -- gets the same window, and so
+        # every ranked entry uses the same lock wiring.
+        #
+        # One resident runs per leg, and benchd boots it. The measure script boots
+        # NOTHING and exports NO socket. A paired job has two legs on two trees
+        # with two weight directories, so one resident cannot serve both.
+        # benchd calls
+        # tools/resident-up.sh --boot in each leg's OWN tree and --stop when
+        # that leg ends, inside the lock this step's script holds -- the boot
+        # refuses when nobody holds it.
+        #
+        # DO NOT EXPORT BENCH_WORKER_RESIDENT_SOCKET on this box. It names one
+        # already-loaded resident, so both legs would attach to it. The
+        # preflight and the measure script both refuse it by name.
+        # tools/qwen38-27b-tf-measure-and-score.sh header, section
+        # "ONE RESIDENT bench-worker PER LEG", holds the detail.
+        run: |
+          MLXFAST_SCORE_PATH=score.json \
+          MLXFAST_BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE}" \
+          MLXFAST_BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION}" \
+            ./tools/qwen38-27b-tf-measure-and-score.sh
+
+      - name: Explain a refused run
+        # Participant-facing reason for a refusal. Reads ONLY score.json, which
+        # benchd seals (a submission cannot add it: it is outside the editable
+        # paths). When it records passed=false, its error goes to the job
+        # summary and to an annotation. The error text can carry engine-reported
+        # words, so it is cut to printable ASCII, capped and escaped for workflow
+        # commands. Exit codes and score semantics do not change.
+        if: always() && hashFiles('score.json') != ''
+        run: |
+          set -euo pipefail
+          passed="$(jq -r '.passed' score.json 2>/dev/null || echo unknown)"
+          [[ "${passed}" == "false" ]] || exit 0
+          reason="$(jq -r '(.metrics.error // .error // "") | tostring' score.json 2>/dev/null || true)"
+          if [[ -z "${reason//[[:space:]]/}" ]]; then
+            gates="$(jq -r '[(.metrics // {}) | to_entries[]
+              | select((.key | startswith("passed_")) and .value == false) | .key] | join(", ")' \
+              score.json 2>/dev/null || true)"
+            reason="the sealed record has passed=false${gates:+ (failed: ${gates})}"
+          fi
+          reason="$(printf '%s' "${reason}" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C tr -d '`' | cut -c1-300)"
+          {
+            echo "### Run refused"
+            echo
+            echo "The sealed score record has \`passed: false\` and no score. Reason:"
+            echo
+            echo '```'
+            printf '%s\n' "${reason}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::error title=Run refused::${reason//%/%25}"
+
+      - name: Upload score artifact
+        # Matches benchmark.json scoreArtifact `benchmark-results-<run_id>/score.json`.
+        # `if: always()` so a failure after a written score still publishes it,
+        # and `if-no-files-found: error` so a refused run is loud and artifact-less
+        # instead of quietly uploading nothing.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: score.json
+          if-no-files-found: error
+
+      - name: Stop this job's residents (cleanup)
+        # Always try cleanup after the artifact step.
+        # Exit 3 defers cleanup to the next job's preflight.
+        if: always()
+        run: |
+          rc=0
+          ./tools/stop-leaked-residents.sh --mode cleanup --root "${GITHUB_WORKSPACE%/*/*}" || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]

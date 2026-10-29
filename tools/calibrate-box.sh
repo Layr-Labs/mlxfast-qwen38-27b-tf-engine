@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+#
+# calibrate-box.sh -- record THIS box's health band for the serial-control leg.
+#
+# WHAT A CALIBRATION IS, AND WHAT IT IS NOT. A ranked run on this track is
+# PAIRED: it measures a serial-control leg on the
+# organizer-staged reference tree and a candidate leg on the submission tree, in
+# the same job, on the same box, and the score is the LIVE ratio of the two. The
+# calibration file this script writes is NEVER that denominator. It is a HEALTH
+# BAND: it records what this box's serial-control leg costs when the box is
+# itself, so benchd can kill a run by name when leg 1 lands outside the band
+# instead of sealing a score measured on a machine that was thermally throttled,
+# shared, or otherwise not the machine that was calibrated.
+#
+# So a stale calibration file cannot move a score. It can only stop one.
+#
+# WHAT IT MEASURES. `benchd calibrate-baseline` runs the serial-control leg
+# --passes times under the FULL official methodology -- the quiescence gate and
+# the cool gate per pass,
+# one resident worker per pass, the same live goldens the ranked run scores
+# over -- and writes one file with one entry per live golden. Each entry holds
+# the mean, the coefficient of variation and the band on both axes. It REFUSES to write a file when the CV exceeds 2 % on either axis,
+# because a box that cannot repeat itself has no band worth recording. That
+# refusal is the point of the three passes, and this script does not soften it.
+#
+# THE LEG RUNS ENTIRELY INSIDE THE REFERENCE TREE. --engine is a path RELATIVE
+# to the workspace (Vendor/TensorFold/zig-out/bin/bench-worker, where
+# tools/stage-bench-worker.sh puts it) and --weights is the workspace's own
+# pinned target snapshot, not this checkout's. The control leg's engine and
+# snapshot come from the pinned commit, so
+# nothing this submission changed can move the denominator or the band.
+#
+# THIS SCRIPT RUNS ON THE RANKED BOX ONLY. It loads the checkpoint, so it takes
+# the fleet GPU lock (/tmp/mtplx-gpu-exclusive.lock) FIRST and holds it for the
+# whole calibration -- the same lock, taken the same way, as the ranked
+# measurement in tools/qwen38-27b-tf-measure-and-score.sh. A calibration
+# measured beside another GPU owner is a calibration of the wrong machine.
+#
+# IT BOOTS NO RESIDENT AND EXPORTS NO SOCKET. Each pass is a full serial-control
+# leg under the official methodology, and benchd boots that leg's resident
+# itself by calling `tools/resident-up.sh --boot` in the reference tree, then
+# `--stop` when the pass ends. A resident this script booted would be the
+# candidate tree's, and every pass would then measure the wrong engine. An inherited
+# BENCH_WORKER_RESIDENT_SOCKET is refused for the same reason.
+#
+# Usage:
+#   tools/calibrate-box.sh <box name> <output file>
+#
+#   <box name>     the runner name this box runs under (Actions RUNNER_NAME).
+#                  tools/ranked-box-preflight.sh refuses a calibration whose
+#                  `box` does not equal it, so it is an argument rather than a
+#                  guess. Defaults to RUNNER_NAME when that is exported.
+#   <output file>  where to write baseline-calibration.json. Export its path as
+#                  MLXFAST_BASELINE_CALIBRATION in the runner service
+#                  environment afterwards.
+#
+# Env (the SAME names the ranked job runs under):
+#   MLXFAST_BASELINE_WORKSPACE   the built reference tree the control leg runs
+#                                 on. Required; there is no default, because a
+#                                 guessed tree is a different denominator.
+#   MLXFAST_QWEN38_GOLDEN_DIR    the staged live and warm-up goldens. Each path
+#                                 is resolved from the fixture exactly as the
+#                                 ranked path resolves it.
+#   BENCHD_BIN_DIR               where tools/fetch-benchd.sh keeps the pinned
+#                                 binary and its benchd.manifest.json. The
+#                                 manifest's `source_commit` is recorded in the
+#                                 calibration as benchd_source_commit, so a band
+#                                 states which benchmarker measured it.
+#   MLXFAST_BENCHD_SOURCE_COMMIT an explicit benchd source commit, used when the
+#                                 manifest cannot be read (benchd reads the same
+#                                 name itself when the flag is absent).
+#   BENCHD                       an explicit benchd, NOT hash-checked (benchd
+#                                 development). Same meaning as in the measure
+#                                 script.
+#   MLXFAST_CALIBRATION_PASSES   pass count. Default 3, the contract's value.
+#   RESIDENT_UP_LOCK_PATH        the GPU lock. Default
+#                                 /tmp/mtplx-gpu-exclusive.lock.
+#   MLXFAST_GPU_LOCK_TIMEOUT_S   ceiling on the wait for it (default 1800).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${SCRIPT_DIR}"
+
+die() {
+  echo "calibrate-box.sh: $*" >&2
+  exit 1
+}
+
+BOX_NAME="${1:-${RUNNER_NAME:-}}"
+OUT_PATH="${2:-}"
+[[ -n "${BOX_NAME}" ]] \
+  || die "usage: tools/calibrate-box.sh <box name> <output file> -- the box name must equal this runner's RUNNER_NAME, because the preflight refuses a calibration that names another machine"
+[[ -n "${OUT_PATH}" ]] \
+  || die "usage: tools/calibrate-box.sh <box name> <output file> -- no output path given"
+if [[ $# -gt 2 ]]; then
+  die "unrecognized argument: $3"
+fi
+
+command -v jq >/dev/null 2>&1 || die "jq is required (it reads the fixture's live_goldens and track id)"
+
+# AN INHERITED SOCKET IS A REFUSAL. Every calibration pass is a control leg on
+# the REFERENCE tree, and benchd boots that leg's resident from that tree. A
+# socket in the environment would send every pass to an already-loaded resident
+# -- in practice the candidate tree's -- and the band would then describe the
+# wrong engine.
+if [[ -n "${BENCH_WORKER_RESIDENT_SOCKET:-}" ]]; then
+  die "BENCH_WORKER_RESIDENT_SOCKET is set (${BENCH_WORKER_RESIDENT_SOCKET}); each calibration pass is a control leg whose resident benchd boots from the reference tree, so a socket in the environment would measure an already-loaded engine that is not that tree's. Unset it."
+fi
+command -v python3 >/dev/null 2>&1 || die "python3 is required to hold the GPU lock for the calibration window"
+
+CONTRACT="${SCRIPT_DIR}/fixtures/qwen3_8_27b_tf_mlx_v1_track.json"
+[[ -f "${CONTRACT}" ]] || die "track contract fixture missing: ${CONTRACT}"
+
+# The reference tree. No default: the control leg measured on a guessed tree is
+# a band for a machine-and-tree pair nobody chose.
+BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE:-}"
+[[ -n "${BASELINE_WORKSPACE}" ]] \
+  || die "MLXFAST_BASELINE_WORKSPACE is unset; the serial-control leg runs on the organizer-staged reference tree and there is nothing to calibrate without it"
+[[ -d "${BASELINE_WORKSPACE}" ]] \
+  || die "MLXFAST_BASELINE_WORKSPACE is not a directory: ${BASELINE_WORKSPACE}"
+
+# The reference tree must be the one the contract pins: a band recorded against
+# another commit is refused by tools/ranked-box-preflight.sh anyway, so refuse
+# here rather than after the GPU window.
+REFERENCE_COMMIT="$(jq -r '.baseline_reference_commit // ""' "${CONTRACT}")"
+printf '%s' "${REFERENCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
+  || die "the track contract declares no 40-hex baseline_reference_commit (got '${REFERENCE_COMMIT}')"
+workspace_head="$(git -C "${BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
+[[ "${workspace_head}" == "${REFERENCE_COMMIT}" ]] \
+  || die "the reference workspace is at '${workspace_head:-nothing}' but the contract pins ${REFERENCE_COMMIT}; re-stage it with tools/stage-baseline-workspace.sh"
+
+# The track id. `benchd` requires it in every mode, and it is benchmark.json's
+# value, never a guess -- the same resolution the measure script performs.
+MANIFEST_TRACK_ID="$(jq -r '.trackId // empty' "${SCRIPT_DIR}/benchmark.json" 2>/dev/null || true)"
+[[ -n "${MANIFEST_TRACK_ID}" ]] || die "benchmark.json carries no trackId"
+if [[ -n "${MLXFAST_QWEN_MTP_TRACK_ID:-}" && "${MLXFAST_QWEN_MTP_TRACK_ID}" != "${MANIFEST_TRACK_ID}" ]]; then
+  die "MLXFAST_QWEN_MTP_TRACK_ID is '${MLXFAST_QWEN_MTP_TRACK_ID}' but benchmark.json trackId is '${MANIFEST_TRACK_ID}'; the track id is ONE value"
+fi
+export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
+
+# The live goldens -- the prompts both legs run, read FROM the fixture, in
+# fixture order. Each one reaches benchd as a --golden and --prompt pair, and
+# benchd matches the two flags by position.
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+[[ ${#LIVE_GOLDEN_NAMES[@]} -gt 0 ]] || die "the fixture declares no live_goldens"
+GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+[[ -n "${GOLDEN_DIR}" ]] \
+  || die "MLXFAST_QWEN38_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
+[[ -d "${GOLDEN_DIR}" ]] || die "MLXFAST_QWEN38_GOLDEN_DIR is not a directory: ${GOLDEN_DIR}"
+if [[ -z "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+  MLXFAST_PRIVATE_DIR="$(cd "${GOLDEN_DIR}" && pwd -P)"
+fi
+export MLXFAST_PRIVATE_DIR
+GOLDEN_ARGS=()
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  [[ -f "${GOLDEN_DIR}/${name}.golden.json" ]] \
+    || die "the live golden is not staged at ${GOLDEN_DIR}/${name}.golden.json"
+  GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
+done
+
+WARMUP_ARGS=()
+warmup_entry="$(jq -c '.warmup_golden // empty' "${CONTRACT}")"
+if [[ -n "${warmup_entry}" && "${warmup_entry}" != "null" ]]; then
+  warmup_r2_path="$(printf '%s' "${warmup_entry}" | jq -r '.r2_path // empty')"
+  warmup_base="${warmup_r2_path##*/}"
+  warmup_sha="$(printf '%s' "${warmup_entry}" | jq -r '.sha256 // empty')"
+  warmup_bytes="$(printf '%s' "${warmup_entry}" | jq -r '.bytes // empty')"
+  [[ -n "${warmup_r2_path}" && -n "${warmup_base}" && "${warmup_base}" == *.golden.json ]] \
+    || die "warmup_golden.r2_path is missing or malformed: '${warmup_r2_path}'"
+  printf '%s' "${warmup_sha}" | grep -Eq '^[0-9a-f]{64}$' \
+    || die "warmup_golden.sha256 is not 64 lowercase hex characters: '${warmup_sha}'"
+  printf '%s' "${warmup_bytes}" | grep -Eq '^[1-9][0-9]*$' \
+    || die "warmup_golden.bytes is not a positive integer: '${warmup_bytes}'"
+  warmup_path="${GOLDEN_DIR}/${warmup_base}"
+  [[ -f "${warmup_path}" ]] || die "the warm-up golden is not staged at ${warmup_path}"
+  private_abs="$(cd "${MLXFAST_PRIVATE_DIR}" 2>/dev/null && pwd -P)" \
+    || die "MLXFAST_PRIVATE_DIR is not a directory: ${MLXFAST_PRIVATE_DIR}"
+  warmup_abs="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${warmup_path}")" \
+    || die "cannot resolve the whole warm-up golden path: ${warmup_path}"
+  case "${warmup_abs}" in
+    "${private_abs}"|"${private_abs}"/*) : ;;
+    *) die "the warm-up golden ${warmup_abs} is outside canonical MLXFAST_PRIVATE_DIR ${private_abs}" ;;
+  esac
+  got_bytes="$(wc -c < "${warmup_path}" | tr -d '[:space:]')"
+  [[ "${got_bytes}" == "${warmup_bytes}" ]] \
+    || die "warm-up golden byte-count mismatch (staged ${got_bytes}, pinned ${warmup_bytes}): ${warmup_path}"
+  got_sha="$(shasum -a 256 "${warmup_path}" | awk '{print $1}')"
+  [[ "${got_sha}" == "${warmup_sha}" ]] \
+    || die "warm-up golden sha256 mismatch (staged ${got_sha}, pinned ${warmup_sha}): ${warmup_path}"
+fi
+
+# The PINNED benchd, resolved exactly as the ranked path resolves it.
+BENCHD="${BENCHD:-${BENCHCTL:-}}"
+if [[ -z "${BENCHD:-}" ]]; then
+  BENCHD="$("${SCRIPT_DIR}/tools/fetch-benchd.sh")"
+fi
+[[ -x "${BENCHD}" ]] || die "benchd not found at ${BENCHD}; run ./tools/fetch-benchd.sh or set BENCHD"
+if [[ -n "${warmup_entry}" && "${warmup_entry}" != "null" ]]; then
+  calibrate_help="$("${BENCHD}" calibrate-baseline --help 2>&1 || true)"
+  printf '%s' "${calibrate_help}" \
+    | grep -Eq -- '(^|[[:space:]])--warmup-golden([[:space:]]|$)' \
+    || die "the fixture declares warmup_golden but this benchd calibrate-baseline has no --warmup-golden and cannot enforce the required warm-up guard"
+  WARMUP_ARGS=(--warmup-golden "${warmup_path}")
+  if printf '%s' "${calibrate_help}" | grep -q -- '--warmup-golden-sha256' \
+    && printf '%s' "${calibrate_help}" | grep -q -- '--warmup-golden-bytes'; then
+    WARMUP_ARGS+=(--warmup-golden-sha256 "${warmup_sha}" --warmup-golden-bytes "${warmup_bytes}")
+  fi
+fi
+
+# THE REFERENCE TREE'S OWN BUILD. benchd re-roots the relative engine path
+# under the workspace, so the flag value is the workspace-relative path
+# tools/stage-bench-worker.sh writes -- never an absolute one, and never this
+# checkout's.
+REFERENCE_ENGINE_REL="Vendor/TensorFold/zig-out/bin/bench-worker"
+[[ -x "${BASELINE_WORKSPACE}/${REFERENCE_ENGINE_REL}" ]] \
+  || die "the reference workspace has no executable worker at ${BASELINE_WORKSPACE}/${REFERENCE_ENGINE_REL}; build and stage it with tools/stage-baseline-workspace.sh"
+BASELINE_WORKSPACE_ABS="$(cd "${BASELINE_WORKSPACE}" && pwd -P)"
+REFERENCE_ENGINE_ABS="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASELINE_WORKSPACE}/${REFERENCE_ENGINE_REL}")"
+case "${REFERENCE_ENGINE_ABS}" in
+  "${BASELINE_WORKSPACE_ABS}"/*) : ;;
+  *) die "the baseline worker resolves outside the baseline workspace: ${REFERENCE_ENGINE_ABS}" ;;
+esac
+
+# THE REFERENCE TREE'S OWN WEIGHTS, not this checkout's. The control leg is the
+# pinned commit end to end: its engine and the target snapshot copied from
+# MLXFAST_REFERENCE_DIR and verified against fixtures/reference_qwen3_8_27b_4bit.sha256.
+REFERENCE_WEIGHTS="${BASELINE_WORKSPACE}/reference_weights/Qwen3.8-27B-MLX-4bit"
+[[ -d "${REFERENCE_WEIGHTS}" ]] \
+  || die "the reference workspace has no verified target snapshot at ${REFERENCE_WEIGHTS}; tools/stage-baseline-workspace.sh performs no transformed weights step: it copies MLXFAST_REFERENCE_DIR, verifies it against fixtures/reference_qwen3_8_27b_4bit.sha256, and builds the worker"
+
+# The benchmarker's own identity, recorded in the band. The channel manifest
+# beside the pinned binary is the source of truth; the environment name benchd
+# itself reads is the fallback; neither present means the flag is omitted and
+# benchd resolves it however it does.
+BENCHD_MANIFEST="${BENCHD_BIN_DIR:-${SCRIPT_DIR}/benchd-bin}/benchd.manifest.json"
+BENCHD_SOURCE_COMMIT="${MLXFAST_BENCHD_SOURCE_COMMIT:-}"
+if [[ -z "${BENCHD_SOURCE_COMMIT}" && -f "${BENCHD_MANIFEST}" ]]; then
+  BENCHD_SOURCE_COMMIT="$(jq -r '.source_commit // empty' "${BENCHD_MANIFEST}" 2>/dev/null || true)"
+fi
+BENCHD_SOURCE_ARGS=()
+if [[ -n "${BENCHD_SOURCE_COMMIT}" ]]; then
+  printf '%s' "${BENCHD_SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
+    || die "the benchd source commit '${BENCHD_SOURCE_COMMIT}' is not 40 hex characters (from ${BENCHD_MANIFEST} or MLXFAST_BENCHD_SOURCE_COMMIT)"
+  BENCHD_SOURCE_ARGS=(--benchd-source-commit "${BENCHD_SOURCE_COMMIT}")
+fi
+
+PASSES="${MLXFAST_CALIBRATION_PASSES:-3}"
+printf '%s' "${PASSES}" | grep -Eq '^[1-9][0-9]*$' \
+  || die "MLXFAST_CALIBRATION_PASSES must be a positive integer (got '${PASSES}')"
+
+mkdir -p "$(dirname "${OUT_PATH}")"
+
+GPU_LOCK_PATH="${RESIDENT_UP_LOCK_PATH:-/tmp/mtplx-gpu-exclusive.lock}"
+GPU_LOCK_TIMEOUT_S="${MLXFAST_GPU_LOCK_TIMEOUT_S:-1800}"
+printf '%s' "${GPU_LOCK_TIMEOUT_S}" | grep -Eq '^[1-9][0-9]*$' \
+  || die "MLXFAST_GPU_LOCK_TIMEOUT_S must be a positive integer (got '${GPU_LOCK_TIMEOUT_S}')"
+
+# resident-up.sh reads this name to check the lock is HELD before it boots a
+# pass's resident, so the lock this script takes is the lock those boots check.
+export RESIDENT_UP_LOCK_PATH="${GPU_LOCK_PATH}"
+
+echo "calibrate-box.sh: taking the GPU lock ${GPU_LOCK_PATH}, then calibrating ${PASSES} pass(es) of the serial-control leg on ${BASELINE_WORKSPACE} over ${LIVE_GOLDEN_NAMES[*]}. benchd boots ONE resident per pass from the reference tree; this script boots none." >&2
+
+# THE LOCK HOLDER IS THE OUTERMOST PROCESS of the calibration window. It holds an
+# exclusive flock on an inheritable descriptor and then becomes benchd through
+# execv, so the lock lives exactly as long as the measurement. A bounded wait,
+# then a refusal -- never a calibration beside another GPU owner. Same shape,
+# same lock and same timeout name as the ranked measurement.
+python3 -c "
+import fcntl, os, signal, sys
+lock_path = sys.argv[1]
+timeout_s = int(sys.argv[2])
+argv = sys.argv[3:]
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+os.set_inheritable(fd, True)
+def on_timeout(*_):
+    sys.stderr.write(
+        'calibrate-box.sh: another owner has held ' + lock_path + ' for '
+        + str(timeout_s) + 's; refusing to calibrate beside another GPU owner. Nothing has been loaded.\n')
+    sys.exit(1)
+signal.signal(signal.SIGALRM, on_timeout)
+signal.alarm(timeout_s)
+fcntl.flock(fd, fcntl.LOCK_EX)
+signal.alarm(0)
+os.execv(argv[0], argv)
+" "${GPU_LOCK_PATH}" "${GPU_LOCK_TIMEOUT_S}" \
+  "${BENCHD}" calibrate-baseline \
+  --contract "${CONTRACT}" \
+  --baseline-workspace "${BASELINE_WORKSPACE}" \
+  --engine "${REFERENCE_ENGINE_REL}" \
+  --weights "${REFERENCE_WEIGHTS}" \
+  "${GOLDEN_ARGS[@]}" \
+  ${WARMUP_ARGS[@]+"${WARMUP_ARGS[@]}"} \
+  --passes "${PASSES}" \
+  --box "${BOX_NAME}" \
+  --track "${MANIFEST_TRACK_ID}" \
+  --reference-commit "${REFERENCE_COMMIT}" \
+  ${BENCHD_SOURCE_ARGS[@]+"${BENCHD_SOURCE_ARGS[@]}"} \
+  --out "${OUT_PATH}"
+
+[[ -f "${OUT_PATH}" ]] \
+  || die "benchd wrote no calibration file at ${OUT_PATH}; a CV above 2 % on either axis is a refusal, not a warning -- the box did not repeat itself"
+
+echo "calibrate-box.sh: wrote ${OUT_PATH}"
+echo "calibrate-box.sh: export it as MLXFAST_BASELINE_CALIBRATION in the runner service environment."
+cat "${OUT_PATH}"

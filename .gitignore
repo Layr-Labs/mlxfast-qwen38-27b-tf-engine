@@ -1,0 +1,19 @@
+/benchd-bin/
+/.build/
+/Vendor/TensorFold/zig-out/
+/Vendor/TensorFold/.zig-cache/
+/reference_weights/*
+!/reference_weights/.gitkeep
+/drafter_weights/
+/score.json
+/score.json.sha256
+/benchmark-integrity.json
+/benchmark-integrity.local-iterate.json
+/score.local-iterate.json
+/score.local-iterate.json.sha256
+/.resident/
+/.env
+/.DS_Store
+# Zig build caches that setup.sh and the engine build write into a stage tree.
+/.zig-cache/
+/.zig-global-cache/

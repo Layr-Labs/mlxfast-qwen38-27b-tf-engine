@@ -1,0 +1,6 @@
+{
+  "upstream_model_id": "TensorFold/Qwen3.8-27B-MLX-4bit",
+  "upstream_revision": "22d8d538154e0e5b6f8dcb1fcc74a60a0798104c",
+  "source": "fixtures/qwen3_8_27b_tf_mlx_v1_track.json",
+  "field": "target.files"
+}

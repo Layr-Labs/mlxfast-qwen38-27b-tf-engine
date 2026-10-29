@@ -1,0 +1,9 @@
+# actionlint configuration.
+#
+# actionlint validates `runs-on` against the labels GitHub itself provides and
+# rejects anything else, so a self-hosted label has to be declared here or the
+# ranked workflow fails the `lint` job on a label that is correct.
+# Keep this label equal to the track ID in the ranked workflow.
+self-hosted-runner:
+  labels:
+    - qwen3.8-27b-tf-mlx-v1

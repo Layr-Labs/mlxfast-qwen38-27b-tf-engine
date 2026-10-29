@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "track_id": "qwen3.8-27b-tf-mlx-v1",
+  "track_name": "qwen3.8-27b-tf-mlx-v1 paired composite speedup",
+  "official_scoring_enabled": true,
+  "official_pairs": 2,
+  "official_pair_combine": "mean",
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial",
+    "dflash"
+  ],
+  "benchmark_name": "mlxfast-qwen38-27b-tf",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 1,
+  "prefill_gain_exponent": 0.25,
+  "decode_gain_exponent": 0.75,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "decode_speedup_ceiling": 5.0,
+  "prefill_speedup_ceiling": 1.5,
+  "seed_window_max_ratio": 1.4,
+  "require_private_dir": true,
+  "decode_golden_offset": 1,
+  "decode_window_includes_seed": true,
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.03,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "baseline_reference_commit": "eaf357818976f39dcda5da49c6a7689de5d60613",
+  "tensorfold_revision": "eea9dc9c9c8b459c0a03de7f6fe0c6f4835d69ab",
+  "benchd_source_commit": "8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729",
+  "target": {
+    "upstream_model_id": "TensorFold/Qwen3.8-27B-MLX-4bit",
+    "upstream_revision": "22d8d538154e0e5b6f8dcb1fcc74a60a0798104c",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "model_type": "qwen3_5_text",
+    "num_hidden_layers": 64,
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "vocab_size": 248320,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 262144,
+    "quantization": {
+      "group_size": 64,
+      "bits": 4,
+      "mode": "affine"
+    },
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 7951,
+        "sha256": "c93c08d92f704889e4c18b05aef061fdf58508c626982c58b774b75dc0ba5d43"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 8952,
+        "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+      },
+      {
+        "path": "config.json",
+        "bytes": 4932,
+        "sha256": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 202,
+        "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+      },
+      {
+        "path": "model-00001-of-00003.safetensors",
+        "bytes": 5343268662,
+        "sha256": "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d"
+      },
+      {
+        "path": "model-00002-of-00003.safetensors",
+        "bytes": 5354185130,
+        "sha256": "83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670"
+      },
+      {
+        "path": "model-00003-of-00003.safetensors",
+        "bytes": 5357087557,
+        "sha256": "31b8c91ef899f79efaaa69e3d2c096f6e2ebeb2ff20e29222abbd9ebc79e560a"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 218281,
+        "sha256": "13b840162b4cb35c66fef7df072f7dbb4717908204364f5e5d9f9655a2758fa8"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 390,
+        "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+      },
+      {
+        "path": "processor_config.json",
+        "bytes": 991,
+        "sha256": "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 19989325,
+        "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 1165,
+        "sha256": "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b"
+      },
+      {
+        "path": "video_preprocessor_config.json",
+        "bytes": 385,
+        "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 6722759,
+        "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+      }
+    ],
+    "drafter": {
+      "upstream_model_id": "z-lab/Qwen3.8-27B-DFlash2",
+      "upstream_revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+    }
+  },
+  "live_goldens": [
+    "pool-01",
+    "pool-02"
+  ],
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-tf-mlx-v1/pool-01.golden.json",
+      "sha256": "b4840ad2768d3cfbe5f0e5a9fd7fbd01a2b511ccdfc86214f5170aa1c92012b6",
+      "bytes": 55945
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-tf-mlx-v1/pool-02.golden.json",
+      "sha256": "e6ba3133b874613de702cfbc05aae0532e55814d8e9c45203ff51486719748e9",
+      "bytes": 55612
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "b4840ad2768d3cfbe5f0e5a9fd7fbd01a2b511ccdfc86214f5170aa1c92012b6",
+    "bytes": 55945
+  },
+  "live_golden_speculative": {
+    "dflash1": {
+      "pool-01": {
+        "r2_path": "correctness_prompts/qwen3.8-27b-tf-mlx-v1/pool-01.dflash1.golden.json",
+        "sha256": "b4840ad2768d3cfbe5f0e5a9fd7fbd01a2b511ccdfc86214f5170aa1c92012b6",
+        "bytes": 55945
+      },
+      "pool-02": {
+        "r2_path": "correctness_prompts/qwen3.8-27b-tf-mlx-v1/pool-02.dflash1.golden.json",
+        "sha256": "e6ba3133b874613de702cfbc05aae0532e55814d8e9c45203ff51486719748e9",
+        "bytes": 55612
+      }
+    }
+  },
+  "vocab_size": 248320,
+  "num_hidden_layers": 64,
+  "golden_model_type": "qwen3_5_text",
+  "seed_tokens": 1065,
+  "warmup_golden": {
+    "r2_path": "correctness_prompts/qwen3.8-27b-tf-mlx-v1/warmup-01.golden.json",
+    "sha256": "7d88c3dbfab3a7338462415c1b7c5e8686dc02bc3afc34be896316cdf2bb8aca",
+    "bytes": 55731
+  },
+  "dflash_head": {
+    "role": "spec_decode_dflash2",
+    "source": "pinned",
+    "permitted_draft_depths": [
+      1
+    ],
+    "upstream_model_id": "z-lab/Qwen3.8-27B-DFlash2",
+    "upstream_revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+  },
+  "protocol": {
+    "max_speculative_batch": 1,
+    "spec_decoder": "dflash",
+    "verification_mode": "rectangular"
+  }
+}
