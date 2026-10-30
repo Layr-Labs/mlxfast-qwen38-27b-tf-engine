@@ -19,6 +19,15 @@ const Resident = @import("resident.zig").Resident;
 const nemo_disk = @import("nemotron_disk.zig");
 
 pub const backends: []const []const u8 = &.{"metal"};
+/// The 27B's DFlash generation module, for the bench worker's depth-1 rounds.
+pub const qwen27_generation = tf.qwen27.dflash.generation;
+/// The 27B's DFlash generation, its prompt chunk and its lane host behind an opened engine; null for any other engine or without a drafter.
+pub fn qwen27Dflash(opened: api.Opened) ?struct { generation: *qwen27_generation.Generation, chunk: usize, host: *api.LaneHost } {
+    if (opened.close != qwen27.close) return null;
+    const h: *qwen27.Host = @ptrCast(@alignCast(opened.ctx));
+    const d = h.draft orelse return null;
+    return .{ .generation = &d.generation, .chunk = h.back.chunk, .host = &h.host };
+}
 pub const serves: []const []const u8 = &.{ "--checkpoint-slots", "--spill-gib" };
 const spill = @import("metal_spill.zig");
 

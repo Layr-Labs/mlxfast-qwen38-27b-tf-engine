@@ -241,8 +241,10 @@ pub fn GenerationBinding(comptime generation: type) type {
 
         fn seed(ptr: *anyopaque, tokens: []const u32, depth: u8) anyerror!u32 {
             const binding: *@This() = @ptrCast(@alignCast(ptr));
+            if (depth != 1) return error.BadDraftDepth;
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
+            try binding.ready();
             try binding.resetNow();
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
@@ -256,6 +258,8 @@ pub fn GenerationBinding(comptime generation: type) type {
             const binding: *@This() = @ptrCast(@alignCast(ptr));
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
+            try binding.ready();
+            if (binding.depth != 1) return error.SessionNotSeeded;
             if (binding.generation.journal != null) return error.AuditAlreadyAttached;
             var journal: generation.AuditJournal = .{};
             defer journal.deinit(binding.generation.allocator);
@@ -275,6 +279,15 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
             try binding.resetNow();
+        }
+
+        /// The lane host idle, as EngineDflashBinding.ready requires, and its thread hook run.
+        fn ready(binding: *@This()) !void {
+            const h = binding.host orelse return;
+            if (h.closing) return error.Closed;
+            if (h.queued.items.len != 0 or h.admitted.items.len != 0 or h.filling.items.len != 0) return error.Busy;
+            if (h.core.activeCount() != 0) return error.Busy;
+            if (h.on_thread) |start| try start.run(start.ctx);
         }
 
         fn resetNow(binding: *@This()) !void {
