@@ -277,21 +277,32 @@ pub const Metal = struct {
 
     /// Rows [first, first + rows)'s greedy picks into `picks` at the same rows: one command buffer and one wait.
     fn argmaxRows(b: *Metal, first: usize, rows: usize) !void {
-        const logits = b.runner.model.frame.get(.logits);
-        const vocab: u32 = @intCast(b.runner.model.config.vocab);
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = b.runner.model.queue.commandBuffer();
         const e = cb.compute(.serial);
+        try b.encodeArgmax(e, first, rows);
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (q.decode_round.gpuFailed(cb, "a draw")) return error.DrawGpuFailure;
+    }
+
+    /// The argmax dispatches over rows [first, first + rows) of the frame's logits, into `picks` at the same rows.
+    fn encodeArgmax(b: *Metal, e: mtl.ComputeEncoder, first: usize, rows: usize) !void {
+        const logits = b.runner.model.frame.get(.logits);
+        const vocab: u32 = @intCast(b.runner.model.config.vocab);
         var at = first;
         while (at < first + rows) : (at += contract.max_rows) {
             const n = @min(first + rows - at, contract.max_rows);
             try b.ops.argmax(e, .{ .buf = logits.buffer, .off = logits.offset + at * vocab * 2 }, .{ .buf = b.picks, .off = at * @sizeOf(contract.Pick) }, .{ .rows = @intCast(n), .vocab = vocab, .stride = vocab });
         }
-        e.end();
-        cb.commit();
-        cb.wait();
-        if (q.decode_round.gpuFailed(cb, "a draw")) return error.DrawGpuFailure;
+    }
+
+    /// The verify's tail: every row of the round picked behind the head, in the forward's last command buffer.
+    fn encodeRoundPicks(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const b = self(ptr);
+        try b.encodeArgmax(e, 0, b.rows);
     }
 
     /// The tokens argmaxRows picked for rows [first, first + rows).
@@ -514,13 +525,14 @@ pub const Metal = struct {
         b.round = try Round.init(b.gpa, inputs[0..windows.len], @intCast(r.model.config.conv_kernel), r.slots, @intCast(r.model.config.vocab));
         b.count = windows.len;
         errdefer b.dropRound();
-        if (plain) try r.advance(&b.round.?, .all) else try r.verifyHead(&b.round.?, .all);
-        b.advanced = plain;
-        b.rows = total;
-        // every greedy window's rows from one argmax over the round; a sampled window draws on the host
+        // every greedy window's rows from one argmax over the round, encoded behind the verify's head; a sampled window draws on the host
         var greedy = false;
         for (windows) |w| greedy = greedy or (w.stream.sampling == null and w.masks.len == 0);
-        if (greedy) try b.argmaxRows(0, total);
+        b.rows = total;
+        r.tail = if (greedy) .{ .ptr = b, .encode = encodeRoundPicks } else null;
+        defer r.tail = null;
+        if (plain) try r.advance(&b.round.?, .all) else try r.verifyHead(&b.round.?, .all);
+        b.advanced = plain;
         for (windows, out, b.round.?.firsts) |w, o, first| {
             const rows = w.rows();
             if (o.rows.len != 0 and o.rows.len != rows) return error.BadWindows;
