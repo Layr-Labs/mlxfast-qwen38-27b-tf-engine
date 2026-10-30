@@ -7,7 +7,7 @@ TARGET="${MLXFAST_REFERENCE_DIR:-${ROOT}/reference_weights/Qwen3.8-27B-MLX-4bit}
 ZIG_BIN="$("${ROOT}/tools/zig-bin.sh")"
 
 fail() { printf 'setup.sh: %s\n' "$*" >&2; exit 1; }
-[[ -d "${TARGET}" ]] || fail "target snapshot is missing: ${TARGET}"
+[[ -d "${TARGET}" ]] || fail "MLXFAST_REFERENCE_DIR target snapshot is missing"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 
 while IFS=$'\t' read -r relative bytes digest; do

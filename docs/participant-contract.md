@@ -29,6 +29,10 @@
 12. Do not read or transmit files outside the permitted runtime inputs.
 13. Do not change, replace, or modify the target checkpoint.
 
+## Draft mode
+
+When a submission declares DFlash depth 1 in `mtp-head.manifest.json`, the engine must really run DFlash depth 1 with the pinned drafter in the candidate leg. It must not use another depth and must not bypass the drafter. The token stream cannot show the depth, so promoted entries are reviewed. An entry that uses another depth or bypasses the drafter is removed.
+
 ## How the score is measured
 
 - Higher scores are better.
@@ -85,9 +89,18 @@ Sources for this section:
 - The ratio is seed seconds per token divided by the same leg's prefill seconds per token.
 - A ratio above `1.4` refuses the run.
 - Speed up the seed step together with prefill.
+- A new PPID-1 process in the job coalition (`orphan-process`) refuses the run.
+- A new PPID-1 process outside the job coalition also refuses the run unless it is a trusted system agent.
+- A trusted system agent must use a root-owned system binary. An interpreter or a defence-in-depth code host on the guard's list does not pass. The list is not complete. A passing agent is logged.
+- A candidate step that commits more tokens than its declared depth allows (`dflash-depth`) refuses the run.
 
 ## Build isolation limits
 
+- The build and engine write only to non-indexed locations, and a sandboxed process cannot ask Spotlight to index.
 - xcrun lookup cache: The build reads one shared xcrun lookup cache file of the job account. The trusted wrapper refreshes it and checks the Metal tool paths before and after the build. A process of the same account outside the sandbox could still change it during the build and restore it before the check.
 - Xcode owner: The selected Xcode can be owned by an admin account instead of root. The Metal compiler can come from the selected Xcode app; it then follows the same owner and write checks, while a Metal compiler from the system Metal Toolchain must be owned by root. Before the build, the wrapper checks the macOS build tool directories, the SDK in use, and python3. It refuses with `toolchain-writable` if a path is writable by group or other. It also refuses if a path owner is neither root nor the Xcode owner. The check also covers ACLs and the Xcode app directory, Contents, Platforms, and Toolchains directories, and fails closed when a path is missing.
+- Shared account orphans: Runner jobs share one account. The guard uses the Runner.Worker resource coalition as the job coalition. A runner or official benchmark environment without a Runner.Worker ancestor fails closed. A new PPID-1 process in the job coalition makes the job red. A new PPID-1 process in another coalition also makes the job red unless it runs a trusted system binary. A child that still has a living parent is not checked. The binary and all parent directories must be root-owned, must not be writable by group or other, must not be symlinks, and must have no ACL. The only exception is a world-writable Cryptexes or Cryptexes/Incoming parent whose next child is sealed with `SF_NOUNLINK` and meets the other trust rules. The path must start with `/System/`, `/usr/libexec/`, or `/usr/sbin/`. Interpreters do not pass. The guard also blocks a defence-in-depth list of code hosts. That list is not complete. A launchd-submitted system binary that passes these rules can pass and is logged. Processes older than the job start are ignored. The operator must clear an old orphan.
+- Raw launch APIs: The build, engine and command-line profiles of this repository deny `job-creation`. The tests prove that `launchctl submit` fails inside each of them. The runtime-worker profile of the pinned benchmarker does not deny `job-creation`. A launchd helper that exits before the post-timing check is not caught. The fix needs a change to the benchmarker (organizer). launchd checks `job-creation` on its side for the spawn API (Apple launchd source, `job_mig_spawn_internal`). Coverage of every current raw launch API is not verified. Such a job is covered by the code-host list and by the coalition rule for any binary that is not a trusted system binary.
+- Page cache channel: Jobs on the box share the page cache. Where enabled, they also share file access times. A submission could leave a timing mark in which host files are cached. A later job could read it. Process cleanup and write denial do not reset it. Promoted entries are reviewed.
+- DFlash depth report: The engine reports the depth it runs; the trusted check only bounds the committed tokens per step. The complete fix needs a trusted check in benchd. The trusted depth check covers the sealed pair only. This benchd does not report the counts of the other pair, so that pair is not checked. Full coverage needs per-pair counts from benchd. Every promoted entry gets a contract review within 12 hours of promotion. An entry that drafted deeper than it declared is reported to the organizers for removal. The review also checks the entry's diff for launchd and XPC job APIs (`launch_*`, `SMJob*`, `xpc_*`, `bootstrap_*`, a spawn of `launchctl`, or `NSTask`/`Process` running `launchctl`) and for any read of benchmarker private paths. A hit is reported to the organizers for removal.
 - The account cache directory (`DARWIN_USER_CACHE_DIR`) stays shared between jobs of the account.

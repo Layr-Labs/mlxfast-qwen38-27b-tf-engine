@@ -380,7 +380,7 @@ done
 require_private_golden_path() {
   local flag="$1" path="$2" private_abs path_abs
   if [[ -z "${MLXFAST_PRIVATE_DIR}" || ! -d "${MLXFAST_PRIVATE_DIR}" ]]; then
-    echo "qwen38-27b-tf-measure-and-score.sh: REFUSING -- ${flag} path ${path} has no canonical MLXFAST_PRIVATE_DIR directory (got '${MLXFAST_PRIVATE_DIR:-unset}')." >&2
+    echo "qwen38-27b-tf-measure-and-score.sh: REFUSING -- ${flag} has no canonical MLXFAST_PRIVATE_DIR directory." >&2
     return 1
   fi
   if [[ ! -d "$(dirname "${path}")" ]]; then
@@ -615,6 +615,30 @@ case "${WEIGHTS_PATH_ABS}" in
 esac
 
 SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
+ORPHAN_REASON_PATH="${SCORE_PATH}.refusal-reason"
+ORPHAN_OFFICIAL=0
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" \
+   || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+  ORPHAN_OFFICIAL=1
+  rm -f -- "${ORPHAN_REASON_PATH}"
+fi
+
+write_orphan_reason() {
+  (umask 077; printf 'orphan-process\n' > "${ORPHAN_REASON_PATH}")
+}
+
+write_dflash_reason() {
+  (umask 077; printf '%s\n' \
+    'dflash-depth: the reported depth is not bounded by the committed tokens per step' \
+    > "${ORPHAN_REASON_PATH}")
+}
+
+remove_sealed_score() {
+  local score_dir
+  score_dir="$(dirname -- "${SCORE_PATH}")"
+  rm -f -- "${SCORE_PATH}" "${SCORE_PATH}.sha256" \
+    "${score_dir%/}/benchmark-integrity.json"
+}
 
 # ---------------------------------------------------------------------------
 # THE GPU WINDOW. Everything above resolved WITHOUT loading anything: the
@@ -692,6 +716,16 @@ os.execv(argv[0], argv)
     "${SCRIPT_DIR}/tools/qwen38-27b-tf-measure-and-score.sh" "$@"
 fi
 
+JOB_START=""
+if [[ "${ORPHAN_OFFICIAL}" == "1" ]]; then
+  if ! JOB_START="$("${SCRIPT_DIR}/tools/orphan-guard.sh" job-start)"; then
+    remove_sealed_score
+    write_orphan_reason
+    echo "qwen38-27b-tf-measure-and-score.sh: FAIL: orphan-process: no job start" >&2
+    exit 1
+  fi
+fi
+
 # THE SOLE SCORED PATH: benchd iterate --mode official over the live goldens.
 # --baseline-workspace names the reference tree benchd runs the serial-control
 # leg on, and --baseline-calibration names this box's health band for that leg.
@@ -746,7 +780,7 @@ if [[ -z "${MLXFAST_RESIDENT_LOG_ROOT:-}" ]]; then
       echo "qwen38-27b-tf-measure-and-score.sh: HOME is unset; the self-hosted resident log root cannot be resolved." >&2
       exit 1
     }
-    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs"
+    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs.noindex"
   else
     MLXFAST_RESIDENT_LOG_ROOT="${SCRIPT_DIR}/.build/resident"
   fi
@@ -757,6 +791,20 @@ chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}"
 RESIDENT_UP_LOG_DIR="$(mktemp -d "${MLXFAST_RESIDENT_LOG_ROOT%/}/job.XXXXXX")"
 chmod 700 "${RESIDENT_UP_LOG_DIR}"
 export RESIDENT_UP_LOG_DIR
+ORPHAN_GUARD_RESIDENT_RECORD_DIR="${RESIDENT_UP_LOG_DIR}/orphan-guard"
+mkdir -m 700 "${ORPHAN_GUARD_RESIDENT_RECORD_DIR}"
+export ORPHAN_GUARD_RESIDENT_RECORD_DIR
+
+# Public score.json hides engine-chosen numeric arrays. Ask benchd for its full
+# trusted audit in a fresh directory that the candidate worker cannot read.
+DEPTH_AUDIT_DIR="$(mktemp -d /tmp/qwen38-depth-audit.XXXXXX)"
+chmod 700 "${DEPTH_AUDIT_DIR}"
+export BENCHD_PRIVATE_AUDIT_PATH="${DEPTH_AUDIT_DIR}/score.json"
+cleanup_depth_audit() {
+  rm -f -- "${BENCHD_PRIVATE_AUDIT_PATH}"
+  rmdir -- "${DEPTH_AUDIT_DIR}" 2>/dev/null || true
+}
+trap cleanup_depth_audit EXIT
 
 # --box, AND THE CONDITION IS INVERTED FROM THE OBVIOUS ONE. benchd lets
 # RUNNER_NAME win over the flag, so passing --box on a runner would be dead
@@ -809,7 +857,17 @@ elif [[ "${SPEC_DESC}" != "serial" ]]; then
   echo "qwen38-27b-tf-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
   exit 1
 fi
-exec "${BENCHD}" iterate \
+if [[ "${ORPHAN_OFFICIAL}" == "1" ]]; then
+  if ! "${SCRIPT_DIR}/tools/orphan-guard.sh" check --job-start "${JOB_START}"; then
+    remove_sealed_score
+    write_orphan_reason
+    echo "qwen38-27b-tf-measure-and-score.sh: FAIL: orphan-process (before timing)" >&2
+    exit 1
+  fi
+fi
+
+set +e
+"${BENCHD}" iterate \
   --engine "${ENGINE_BIN_REL}" \
   ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --weights "${WEIGHTS_PATH}" \
@@ -823,3 +881,85 @@ exec "${BENCHD}" iterate \
   --score-path "${SCORE_PATH}" \
   "${GOLDEN_PIN_ARGS[@]}" \
   --contract "${CONTRACT}"
+benchd_rc=$?
+set -e
+
+# Benchd keeps the candidate leg's exact per-round committed-token counts in
+# the private audit. An older benchd may leave them in score.json instead.
+# Depth D can commit at most D drafts plus one target token.
+depth_limit=$((DECLARED_DEPTH + 1))
+depth_ok=0
+depth_data_path="${BENCHD_PRIVATE_AUDIT_PATH}"
+if [[ ! -s "${depth_data_path}" && -s "${SCORE_PATH}" ]]; then
+  depth_data_path="${SCORE_PATH}"
+fi
+# A run benchd already refused keeps its own sealed reason.
+if [[ "${benchd_rc}" -ne 0 ]]; then
+  depth_ok=1
+elif [[ ! -s "${depth_data_path}" && "${DECLARED_DEPTH}" == "0" ]]; then
+  depth_ok=1
+elif jq -e --argjson limit "${depth_limit}" --argjson depth "${DECLARED_DEPTH}" '
+  .metrics.acceptance_lengths as $lengths
+  | if $depth > 0 then
+      ($lengths | type) == "array" and ($lengths | length) > 0
+      and all($lengths[]; type == "number" and . >= 0 and floor == . and . <= $limit)
+    elif $lengths == null then true
+    else
+      ($lengths | type) == "array"
+      and all($lengths[]; type == "number" and . >= 0 and floor == . and . <= $limit)
+    end
+' "${depth_data_path}" >/dev/null 2>&1; then
+  depth_ok=1
+fi
+if [[ "${depth_ok}" != "1" ]]; then
+  remove_sealed_score
+  write_dflash_reason
+  echo "qwen38-27b-tf-measure-and-score.sh: FAIL: dflash-depth" >&2
+  exit 1
+fi
+cleanup_depth_audit
+trap - EXIT
+
+if [[ "${ORPHAN_OFFICIAL}" == "1" ]]; then
+  ALLOW_RESIDENT_ARGS=()
+  shopt -s nullglob
+  resident_records=("${ORPHAN_GUARD_RESIDENT_RECORD_DIR}"/resident.*)
+  shopt -u nullglob
+  # bash 3.2 (macOS /bin/bash) treats an empty "${a[@]}" as unbound under set -u.
+  for record in ${resident_records[@]+"${resident_records[@]}"}; do
+    resident_record="$(<"${record}")"
+    if [[ ! -f "${record}" || -L "${record}" \
+       || ! "${resident_record}" =~ ^[0-9]+:/ ]]; then
+      remove_sealed_score
+      write_orphan_reason
+      echo "qwen38-27b-tf-measure-and-score.sh: FAIL: orphan-process" >&2
+      exit 1
+    fi
+    ALLOW_RESIDENT_ARGS+=(--allow-pid "${resident_record}")
+  done
+  # A pinned baseline tree can carry the older resident-up.sh. Its trusted
+  # identity file has the same exact pid and executable fields. Use it as the
+  # fallback if benchd returned before that leg reached --stop.
+  if [[ -f "${RESIDENT_UP_LOG_DIR}/resident-identity.json" \
+     && ! -L "${RESIDENT_UP_LOG_DIR}/resident-identity.json" ]]; then
+    identity_record="$(jq -r '
+      if (.resident_pid | type) == "number" and (.bench_worker | type) == "string"
+      then (.resident_pid | tostring) + ":" + .bench_worker else empty end
+    ' "${RESIDENT_UP_LOG_DIR}/resident-identity.json")"
+    if [[ ! "${identity_record}" =~ ^[0-9]+:/ ]]; then
+      remove_sealed_score
+      write_orphan_reason
+      echo "qwen38-27b-tf-measure-and-score.sh: FAIL: orphan-process" >&2
+      exit 1
+    fi
+    ALLOW_RESIDENT_ARGS+=(--allow-pid "${identity_record}")
+  fi
+  if ! "${SCRIPT_DIR}/tools/orphan-guard.sh" check --job-start "${JOB_START}" \
+    ${ALLOW_RESIDENT_ARGS[@]+"${ALLOW_RESIDENT_ARGS[@]}"}; then
+    remove_sealed_score
+    write_orphan_reason
+    echo "qwen38-27b-tf-measure-and-score.sh: FAIL: orphan-process (after timing)" >&2
+    exit 1
+  fi
+fi
+exit "${benchd_rc}"

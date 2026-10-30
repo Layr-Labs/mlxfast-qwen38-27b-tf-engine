@@ -25,12 +25,12 @@ if output="$(ZIG="${WORK}/zig-wrong" "${ROOT}/tools/zig-bin.sh" 2>&1)"; then
   printf 'test-zig-bin.sh: wrong version was accepted\n' >&2
   exit 1
 fi
-[[ "${output}" == *"Zig 0.17.0 is required"* ]]
+[[ "${output}" == *"the configured Zig is not 0.17.0"* ]]
 
 if output="$(env -u ZIG PATH="${WORK}/empty" /bin/bash "${ROOT}/tools/zig-bin.sh" 2>&1)"; then
   printf 'test-zig-bin.sh: missing Zig was accepted\n' >&2
   exit 1
 fi
-[[ "${output}" == *"set ZIG or add zig to PATH"* ]]
+[[ "${output}" == *"the configured Zig is missing or not executable"* ]]
 
 printf 'test-zig-bin.sh: PASS\n'

@@ -13,7 +13,15 @@ WORK="$(cd -- "${WORK}" && pwd -P)"
 # too long for it. Cases that run self-test under RUNNER_TEMP use this short dir.
 SHORT_TMP="$(mktemp -d /tmp/tfcli.XXXXXX)"
 SHORT_TMP="$(cd -- "${SHORT_TMP}" && pwd -P)"
-trap 'rm -rf "${WORK}" "${SHORT_TMP}"' EXIT
+OFFICIAL_ROOT="/private/tmp/q38cli-$(/usr/bin/id -u).noindex"
+REMOVE_OFFICIAL_ROOT=0
+cleanup() {
+  rm -rf "${WORK}" "${SHORT_TMP}"
+  if [[ "${REMOVE_OFFICIAL_ROOT}" == 1 ]]; then
+    rm -f "${OFFICIAL_ROOT}" 2>/dev/null || rmdir "${OFFICIAL_ROOT}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 # The profile allows exec of the literal worker path only, so a #! script (which also execs its interpreter) is denied.
 cat > "${WORK}/worker.c" <<'MOCK'
 #include <stdio.h>
@@ -113,6 +121,36 @@ long_tmp="${WORK}/$(printf 'x%.0s' {1..90})"
 mkdir "${long_tmp}"
 out="$(RUNNER_TEMP="${long_tmp}" MLXFAST_ENGINE_BIN="${WORK}/worker" "${ROOT}/tools/sandboxed-cli.sh" self-test 2>&1 || true)"
 [[ "${out}" == 'sandboxed-cli.sh: FAIL: socket-path' ]] || fail "long socket path was accepted"
+if [[ ! -e "${OFFICIAL_ROOT}" && ! -L "${OFFICIAL_ROOT}" ]]; then
+  mkdir -m 755 "${OFFICIAL_ROOT}"
+  REMOVE_OFFICIAL_ROOT=1
+  out="$(RUNNER_ENVIRONMENT=self-hosted MLXFAST_ENGINE_BIN="${WORK}/worker" \
+    "${ROOT}/tools/sandboxed-cli.sh" self-test 2>&1 || true)"
+  [[ "${out}" == 'sandboxed-cli.sh: FAIL: temp' ]] || fail "mode 755 work root was accepted"
+  rmdir "${OFFICIAL_ROOT}"
+  ln -s "${WORK}" "${OFFICIAL_ROOT}"
+  out="$(RUNNER_ENVIRONMENT=self-hosted MLXFAST_ENGINE_BIN="${WORK}/worker" \
+    "${ROOT}/tools/sandboxed-cli.sh" self-test 2>&1 || true)"
+  [[ "${out}" == 'sandboxed-cli.sh: FAIL: temp' ]] || fail "symlink work root was accepted"
+  rm "${OFFICIAL_ROOT}"
+  REMOVE_OFFICIAL_ROOT=0
+else
+  printf 'test-sandboxed-cli.sh: INFO: existing official work root left unchanged\n'
+fi
+mkdir -p "${WORK}/goldens" "${WORK}/baseline" "${WORK}/benchd" "${WORK}/runner/work"
+official_env=(
+  RUNNER_ENVIRONMENT=self-hosted
+  RUNNER_TEMP="${long_tmp}"
+  MLXFAST_ENGINE_BIN="${WORK}/worker"
+  MLXFAST_QWEN38_GOLDEN_DIR="${WORK}/goldens"
+  MLXFAST_BASELINE_WORKSPACE="${WORK}/baseline"
+  MLXFAST_BASELINE_CALIBRATION="${WORK}/calibration.json"
+  BENCHD_BIN_DIR="${WORK}/benchd"
+  RUNNER_WORKSPACE="${WORK}/runner/work"
+)
+out="$(env "${official_env[@]}" "${ROOT}/tools/sandboxed-cli.sh" self-test 2>&1)"
+[[ "${out}" == 'sandboxed-cli.sh: PASS: self-test' ]] \
+  || fail "self-hosted long RUNNER_TEMP did not use the short work root: ${out}"
 out="$(TMPDIR=/tmp MLXFAST_ENGINE_BIN="${WORK}/worker" MLXFAST_OFFICIAL_BENCHMARK_RUN=1 "${ROOT}/tools/sandboxed-cli.sh" self-test 2>&1 || true)"
 [[ "${out}" == 'sandboxed-cli.sh: FAIL: profile' || "${out}" == 'sandboxed-cli.sh: FAIL: sandbox-unavailable' ]] \
   || fail "official environment refusal changed"

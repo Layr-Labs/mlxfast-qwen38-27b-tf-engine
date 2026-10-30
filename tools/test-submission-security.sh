@@ -511,6 +511,20 @@ rm "${EGRESS}/secret.yml"
 printf '%s\n' 'permissions:' '  id-token: write' > "${EGRESS}/oidc.yml"
 assert_status "egress/OIDC write permission is refused" 1 "${ROOT}/tools/ci-workflow-egress-scan.sh" "${EGRESS}"
 rm "${EGRESS}/oidc.yml"
+mkdir -p "${EGRESS}/workflows"
+cat > "${EGRESS}/workflows/benchmark.yml" <<'YAML'
+steps:
+  - uses: actions/upload-artifact@0123456789012345678901234567890123456789
+    with:
+      path: tree.noindex/score.json
+      if-no-files-found: error
+YAML
+assert_status "egress/ranked tree score upload passes" 0 "${ROOT}/tools/ci-workflow-egress-scan.sh" "${EGRESS}"
+sed 's#tree.noindex/score.json#score.json#' "${EGRESS}/workflows/benchmark.yml" \
+  > "${EGRESS}/workflows/benchmark-old.yml"
+mv "${EGRESS}/workflows/benchmark-old.yml" "${EGRESS}/workflows/benchmark.yml"
+assert_status "egress/old ranked score path is refused" 1 "${ROOT}/tools/ci-workflow-egress-scan.sh" "${EGRESS}"
+rm -rf "${EGRESS}/workflows"
 printf '%s\n' 'steps:' '  - uses: actions/upload-artifact@0123456789012345678901234567890123456789' > "${EGRESS}/upload.yml"
 assert_status "egress/artifact upload is refused" 1 "${ROOT}/tools/ci-workflow-egress-scan.sh" "${EGRESS}"
 
