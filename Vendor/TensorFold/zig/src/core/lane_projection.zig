@@ -36,11 +36,19 @@ pub const Layout = struct {
     reg: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
+    /// reg only: 16-row blocks one threadgroup runs on each unpacked weight group (1, 2 or 4); words are unchanged.
+    row_blocks: usize = 1,
+    /// reg, no tile ranges, K slices of equal group counts: column tiles per threadgroup (1, 2 or 4) sharing each step's
+    /// X rows staged in threadgroup memory (tf_lane_reg_tt); X must be 16-byte aligned. Words are unchanged.
+    tiles_per_group: usize = 1,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
         if (l.reg and (l.cooperative or l.format.bits != 4 or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
+        if ((l.row_blocks != 1 and l.row_blocks != 2 and l.row_blocks != 4) or (l.row_blocks != 1 and !l.reg)) return error.InvalidSchedule;
+        if (l.tiles_per_group != 1 and l.tiles_per_group != 2 and l.tiles_per_group != 4) return error.InvalidSchedule;
+        if (l.tiles_per_group != 1 and (!l.reg or l.ranges.len != 0 or l.tileCount() % l.tiles_per_group != 0 or l.groupCut()[1] % l.sk != 0)) return error.InvalidSchedule;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
         if (l.y_stride) |s| if (s < l.n or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
@@ -76,7 +84,9 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
-        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * 16 * 32 * @sizeOf(f32);
+        // tf_lane_reg_tt: double-buffered X rows of every slice, and each tile's split-K partials
+        if (l.tiles_per_group > 1) return 2 * l.sk * l.row_blocks * 16 * l.format.group * 2 + (l.sk - 1) * l.tiles_per_group * l.row_blocks * 16 * 32 * @sizeOf(f32);
+        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.row_blocks * 16 * 32 * @sizeOf(f32) + (if (l.tiles_per_group > 1) 2 * l.row_blocks * 16 * l.format.group * 2 else 0);
     }
 
     pub fn weightWords(l: Layout) usize {
@@ -113,7 +123,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     }
     try text.appendSlice(a, if (l.ranges.len == 0) "  return j;\n}\n" else "  return 0;\n}\n");
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
-    if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
+    if (l.reg) try text.print(a, "#define TF_REG 1\n#define TF_RB {d}\n#define TF_TT {d}\n", .{ l.row_blocks, l.tiles_per_group });
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -232,8 +242,22 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    row_blocks: usize = 1,
+    tiles_per_group: usize = 1,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
+        if (l.tiles_per_group == 1) return initLayout(a, device, l);
+        // a staged-X pipeline this chip will not compile or run at its width falls back to one tile a threadgroup
+        return initLayout(a, device, l) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            std.log.warn("lane projection {d}x{d}: {d} tiles a threadgroup unavailable ({s}); one tile", .{ l.n, l.k, l.tiles_per_group, @errorName(err) });
+            var narrow = l;
+            narrow.tiles_per_group = 1;
+            return initLayout(a, device, narrow);
+        };
+    }
+
+    fn initLayout(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
         if (!device.tensorUnits() and (l.format.bits != 6 or l.format.group != 32 or l.cooperative or l.reg or l.precompute_sums)) return error.TensorUnitsRequired;
         const text = try source(a, l);
@@ -242,9 +266,9 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        const p = try mtl.Pipeline.init(device, lib, if (l.tiles_per_group > 1) "tf_lane_reg_tt" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
-        if (p.simdWidth() != 32 or p.maxThreads() < l.sk * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < l.sk * l.tiles_per_group * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -252,7 +276,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = l.sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = l.sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32 * l.tiles_per_group, .reg = l.reg, .row_blocks = l.row_blocks, .tiles_per_group = l.tiles_per_group };
     }
 
     pub fn deinit(p: Projection) void {
@@ -298,7 +322,8 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        if (p.tiles_per_group > 1 and x.off % 16 != 0) return error.MisalignedBuffer;
+        e.dispatchGroups(mtl.Size.of(p.tile_count / p.tiles_per_group, if (p.reg) (blocks + p.row_blocks - 1) / p.row_blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };

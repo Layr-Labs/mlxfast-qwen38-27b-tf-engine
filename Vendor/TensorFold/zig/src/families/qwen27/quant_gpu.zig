@@ -10,7 +10,7 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64 };
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, row_blocks: u8 = 1, tiles_per_group: u8 = 1 };
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, ane_input, mlp_ane, add_ane };
 
 pub const Kernels = struct {
@@ -162,14 +162,18 @@ pub const Kernels = struct {
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        // prompt rows: one unpacked weight group serves several 16-row blocks (same words; decode keeps one block)
+        const row_blocks: u8 = if (reg and k.prompt and rows > 16) promptRowBlocks(sk) else 1;
+        // and column tiles share each step's X rows staged in threadgroup memory (4 tiles on one K slice, 2 on two)
+        const tiles_per_group: u8 = if (row_blocks > 1 and skip == 0 and cut[1] == 0 and x.offset % 16 == 0) promptTiles(p.n / 32, p.k / 64, sk) else 1;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group, .row_blocks = row_blocks, .tiles_per_group = tiles_per_group };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .row_blocks = row_blocks, .tiles_per_group = tiles_per_group });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -341,4 +345,20 @@ pub fn padded(rows: u32) u32 {
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+}
+
+/// 16-row blocks a prompt reg launch runs per weight read: 2 (TF_PROMPT_ROW_BLOCKS takes 1, 2 or 4), within
+/// the split's threadgroup memory.
+fn promptRowBlocks(slices: u32) u8 {
+    const v: u8 = if (std.c.getenv("TF_PROMPT_ROW_BLOCKS")) |t| std.fmt.parseInt(u8, std.mem.span(t), 10) catch 2 else 2;
+    const want: u8 = if (v == 1 or v == 2 or v == 4) v else 2;
+    return if (slices <= 4) want else 1;
+}
+
+/// Column tiles a prompt reg threadgroup takes: 4 on one K slice, 2 on two, else 1, within 32 KB of threadgroup
+/// memory at two row blocks (TF_PROMPT_TILES caps it at 1 or 2). Slices must hold equal group counts.
+fn promptTiles(tiles: u32, groups: u32, sk: u32) u8 {
+    const cap: u8 = if (std.c.getenv("TF_PROMPT_TILES")) |t| std.fmt.parseInt(u8, std.mem.span(t), 10) catch 1 else 1; // staged X off unless asked
+    const want: u8 = @min(if (cap == 1 or cap == 2) cap else 4, @as(u8, if (sk == 1) 4 else if (sk == 2) 2 else 1));
+    return if (want > 1 and tiles % want == 0 and groups % sk == 0) want else 1;
 }
