@@ -27,9 +27,9 @@ const ResidentArgs = struct { weights: []const u8, drafter: ?[]const u8, socket:
 
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.arena.allocator();
-    const raw = try init.minimal.args.toSlice(alloc);
-    const argv = try alloc.alloc([]const u8, raw.len);
-    for (argv, raw) |*to, from| to.* = from;
+    const raw_args = try init.minimal.args.toSlice(alloc);
+    const argv = try alloc.alloc([]const u8, raw_args.len);
+    for (argv, raw_args) |*to, from| to.* = from;
     if (argv.len == 2 and std.mem.eql(u8, argv[1], "self-test")) return selfTest(init);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "manifest") and std.mem.eql(u8, argv[2], "--digest")) {
         const digest = manifestDigest();
