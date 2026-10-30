@@ -10,44 +10,49 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, serial: u32 = 0,
 
-    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
-    fn serialSk2(key: Key) bool {
-        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    /// Decoded rows' reg chains a SIMD group runs in turn (lane_projection.Layout.serial); prompt keys keep 0.
+    fn serialChains(key: Key) u32 {
+        if (key.kind != .projection or key.bits != 4 or key.group != 64 or key.skip != 0 or key.cut[0] != 0 or key.cut[1] != 0) return 0;
+        for (serial_chains) |t| if (t[0] == key.n and t[1] == key.k and t[2] == key.slices) return t[3];
+        return 0;
     }
 };
 
-test "serial SK2 guard and cache keys separate every excluded projection" {
-    const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
-    try std.testing.expect(eligible.serialSk2());
-    try std.testing.expect((Key{ .kind = .projection, .n = 10240, .k = 5120, .slices = 2 }).serialSk2());
-    try std.testing.expect((Key{ .kind = .projection, .n = 12288, .k = 5120, .slices = 2 }).serialSk2());
-    inline for (.{
-        .{ "kind", Kind.mlp },
-        .{ "n", @as(u32, 17408) },
-        .{ "k", @as(u32, 2560) },
-        .{ "slices", @as(u32, 1) },
-        .{ "slices", @as(u32, 4) },
-        .{ "skip", @as(u32, 1) },
-        .{ "cut", [2]u32{ 1, 0 } },
-        .{ "cut", [2]u32{ 0, 40 } },
-        .{ "bits", @as(u8, 8) },
-        .{ "group", @as(u32, 128) },
-    }) |change| {
-        var excluded = eligible;
-        @field(excluded, change[0]) = change[1];
-        try std.testing.expect(!excluded.serialSk2());
-        var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+/// n, k, decode split, chains a SIMD group runs: MLP gate/up, GDN qkv and attention q+gate each in one group.
+const serial_chains = [_][4]u32{ .{ 34816, 5120, 2, 2 }, .{ 10240, 5120, 2, 2 }, .{ 12288, 5120, 2, 2 } };
+
+test "serial chains take only the table's decode keys, which never share a prompt key's pipeline" {
+    for (serial_chains) |t| {
+        const eligible = Key{ .kind = .projection, .n = t[0], .k = t[1], .slices = t[2] };
+        try std.testing.expect(eligible.serialChains() > 1 and t[2] % eligible.serialChains() == 0);
+        inline for (.{
+            .{ "kind", Kind.mlp },
+            .{ "n", @as(u32, 17408) },
+            .{ "k", @as(u32, 2560) },
+            .{ "slices", @as(u32, 1) },
+            .{ "slices", @as(u32, 16) },
+            .{ "skip", @as(u32, 1) },
+            .{ "cut", [2]u32{ 1, 0 } },
+            .{ "cut", [2]u32{ 0, 40 } },
+            .{ "bits", @as(u8, 8) },
+            .{ "group", @as(u32, 128) },
+        }) |change| {
+            var excluded = eligible;
+            @field(excluded, change[0]) = change[1];
+            try std.testing.expectEqual(@as(u32, 0), excluded.serialChains());
+        }
+        var decode = eligible;
+        decode.serial = eligible.serialChains();
+        var cache = std.AutoHashMap(Key, u32).init(std.testing.allocator);
         defer cache.deinit();
-        try cache.put(eligible, eligible.serialSk2());
-        try cache.put(excluded, excluded.serialSk2());
+        try cache.put(eligible, 0);
+        try cache.put(decode, decode.serial);
         try std.testing.expectEqual(@as(u32, 2), cache.count());
-        try std.testing.expect(cache.get(eligible).?);
-        try std.testing.expect(!cache.get(excluded).?);
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
+    try std.testing.expectEqual(@as(?u32, 2), projection.promptSplit(12288, 5120)); // the decode split: only `serial` parts the keys
 }
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
@@ -202,14 +207,15 @@ pub const Kernels = struct {
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        if (!k.prompt) key.serial = key.serialChains();
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial = key.serial });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;

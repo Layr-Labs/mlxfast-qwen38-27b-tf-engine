@@ -303,7 +303,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_SERIAL) // one SIMD group runs every chain in turn; C0 holds the earlier chains, added in split order
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
@@ -336,8 +336,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
     }
   }
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_SERIAL)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+#if TF_SK > 2
+    else if (split + 1 < TF_SK) for (int i = 0; i < 16; i++) C0[i] += C[i];
+#endif
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
 #else
