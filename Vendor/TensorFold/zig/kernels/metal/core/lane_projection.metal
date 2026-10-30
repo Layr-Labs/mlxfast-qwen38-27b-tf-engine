@@ -274,21 +274,36 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #endif
 
 #if TF_BITS == 4 && defined(TF_REG)
-struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
+#ifndef TF_RB
+#define TF_RB 1
+#endif
+// TF_RB 16-row blocks per threadgroup: each group's codes are fetched and unpacked once and run against every block.
+// A block's tensor op, its fma order and its split-K reduction are the one-block kernel's, so every word is unchanged.
+struct tf_reg_load { uint4 w0, w1, q0, q1; float x0[TF_RB], x1[TF_RB]; }; // a lane's codes, its two metadata quads and its blocks' row sums for one group
 
-inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
-  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride, int nblocks) {
+  tf_reg_load r;
+  r.w0 = wl[(size_t)g * 64];
+  r.w1 = wl[(size_t)g * 64 + 32];
+  r.q0 = sbv[((size_t)g * TF_N + n) / 4];
+  r.q1 = sbv[((size_t)g * TF_N + n + 16) / 4];
+  for (int b = 0; b < TF_RB; b++) {
+    r.x0[b] = b < nblocks ? XS[g * stride + 16 * b + m] : 0.0f;
+    r.x1[b] = b < nblocks ? XS[g * stride + 16 * b + m + 8] : 0.0f;
+  }
+  return r;
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
-  const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+  const int r0 = int(tg.y) * 16 * TF_RB, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
   Y += (size_t)r0 * TF_YS;
   XS += r0;
+  const int nblocks = min((rows + 15) / 16, TF_RB);
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
@@ -302,10 +317,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
-  float C[16];
-  for (int i = 0; i < 16; i++) C[i] = 0.0f;
+  float C[TF_RB][16];
+  for (int b = 0; b < TF_RB; b++)
+    for (int i = 0; i < 16; i++) C[b][i] = 0.0f;
   tf_reg_load next = {};
-  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
+  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride, nblocks);
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
     for (int w = 0; w < 8; w++) {
@@ -317,28 +333,141 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
-    if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
-    auto x = a.slice(g * GS, 0);
-    op.run(x, cb, P);
-    for (int j = 0; j < 4; j++) {
-      const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
-      const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
-      C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
-      C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
-      C[8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0, C[8 + j]));
-      C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
+    if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride, nblocks);
+    for (int b = 0; b < TF_RB; b++) if (b < nblocks) {
+      tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> ab((device bfloat*)(X + (size_t)b * 16 * TF_K), dextents<int32_t, 2>(TF_K, min(rows - 16 * b, 16)));
+      auto x = ab.slice(g * GS, 0);
+      op.run(x, cb, P);
+      for (int j = 0; j < 4; j++) {
+        const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
+        const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
+        C[b][j] = fma(s0, P[j], fma(b0, cur.x0[b], C[b][j]));
+        C[b][4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1[b], C[b][4 + j]));
+        C[b][8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0[b], C[b][8 + j]));
+        C[b][12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1[b], C[b][12 + j]));
+      }
     }
   }
-  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_RB * 16 * 32];
   if (TF_SK > 1) {
-    if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
+    if (ks > 0)
+      for (int b = 0; b < TF_RB; b++)
+        for (int i = 0; i < 16; i++) part[(((ks - 1) * TF_RB + b) * 16 + i) * 32 + lane] = C[b][i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
+    if (ks == 0)
+      for (int s2 = 1; s2 < TF_SK; s2++)
+        for (int b = 0; b < TF_RB; b++)
+          for (int i = 0; i < 16; i++) C[b][i] += part[(((s2 - 1) * TF_RB + b) * 16 + i) * 32 + lane];
   }
   if (ks == 0)
-    for (int i = 0; i < 16; i++) {
-      const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
-      if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+    for (int b = 0; b < TF_RB; b++) if (b < nblocks) {
+      const int Mb = min(rows - 16 * b, 16);
+      for (int i = 0; i < 16; i++) {
+        const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+        if (m < Mb && n < TF_N) Y[(size_t)(16 * b + m) * TF_YS + n] = static_cast<TF_OUT>(C[b][i]);
+      }
     }
 }
+
+#if defined(TF_TT) && TF_TT > 1 && (TF_GN % TF_SK) == 0
+// TF_TT column tiles x TF_SK K slices per threadgroup, one simdgroup each (tile = sgi % TF_TT, slice = sgi / TF_TT).
+// Each step's X rows (every slice's group, every block) are staged once in threadgroup memory, double buffered, and
+// read by all TF_TT tiles' tensor ops instead of each tile reading them from the device again. Codes, op, row extents,
+// sums, fma order and the split-K reduction order are tf_lane_reg's: every word is unchanged.
+constant constexpr int TT_STEPS = TF_GN / TF_SK, TT_ROWS = TF_RB * 16, TT_SLAB = TT_ROWS * GS;
+inline void tf_tt_stage(threadgroup bfloat* dst, const device bfloat* X, int step, int rows, uint tid) {
+  for (int i = int(tid); i < TF_SK * TT_ROWS * (GS / 8); i += TF_TT * TF_SK * 32) {
+    const int slice = i / (TT_ROWS * (GS / 8)), r = (i / (GS / 8)) % TT_ROWS, c = i % (GS / 8);
+    const int g = TF_G0 + slice * TT_STEPS + step;
+    ((threadgroup uint4*)(dst + slice * TT_SLAB + r * GS))[c] = r < rows ? ((const device uint4*)(X + (size_t)r * TF_K + g * GS))[c] : uint4(0);
+  }
+}
+
+[[kernel]] void tf_lane_reg_tt(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]) {
+  const int r0 = int(tg.y) * TT_ROWS, rows = mdims[0] - r0;
+  if (rows <= 0) return;
+  X += (size_t)r0 * TF_K;
+  Y += (size_t)r0 * TF_YS;
+  XS += r0;
+  const int nblocks = min((rows + 15) / 16, TF_RB);
+  const int lane = int(lanei), within = int(sgi) % TF_TT, ks = int(sgi) / TF_TT, stride = mdims[1];
+  const int tile = tf_tile(int(tg.x) * TF_TT + within), n0 = tile * NT;
+  const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+  const int first = TF_G0 + ks * TT_STEPS;
+  // uint4 storage: the staging copies are 16-byte stores, and every slab starts on a 128-byte boundary
+  threadgroup uint4 xs_words[2 * TF_SK * TT_SLAB / 8];
+  threadgroup bfloat* xs = (threadgroup bfloat*)xs_words;
+  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroup> op;
+  tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> t0(xs, dextents<int32_t, 2>(GS, min(rows, 16)));
+  auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(t0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+  thread half2* b2 = (thread half2*)&cb[0];
+  const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
+  const device uint4* sbv = (const device uint4*)SB;
+  const half2 bias = half2(1024.0h);
+  float C[TF_RB][16];
+  for (int b = 0; b < TF_RB; b++)
+    for (int i = 0; i < 16; i++) C[b][i] = 0.0f;
+  tf_reg_load next = {};
+  if (TT_STEPS > 0) {
+    tf_tt_stage(xs, X, 0, rows, tid);
+    next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride, nblocks);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int step = 0; step < TT_STEPS; step++) {
+    const int g = first + step, buf = step & 1;
+    const tf_reg_load cur = next;
+    for (int w = 0; w < 8; w++) {
+      // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
+      const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
+      const int e = 16 * (w & 1) + 2 * (w >> 1);
+      b2[e] = as_type<half2>((lo & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 1] = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+    }
+    if (step + 1 < TT_STEPS) {
+      tf_tt_stage(xs + (buf ^ 1) * TF_SK * TT_SLAB, X, step + 1, rows, tid);
+      next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride, nblocks);
+    }
+    for (int b = 0; b < TF_RB; b++) if (b < nblocks) {
+      tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> xb(xs + buf * TF_SK * TT_SLAB + ks * TT_SLAB + b * 16 * GS, dextents<int32_t, 2>(GS, min(rows - 16 * b, 16)));
+      op.run(xb, cb, P);
+      for (int j = 0; j < 4; j++) {
+        const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
+        const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
+        C[b][j] = fma(s0, P[j], fma(b0, cur.x0[b], C[b][j]));
+        C[b][4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1[b], C[b][4 + j]));
+        C[b][8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0[b], C[b][8 + j]));
+        C[b][12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1[b], C[b][12 + j]));
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+#if TF_SK > 1
+  // tf_lane_reg's reduction, per tile: slices 1.. land in threadgroup memory, slice 0 adds them in slice order
+  threadgroup float part[(TF_SK - 1) * TF_TT * TF_RB * 16 * 32];
+  if (ks > 0)
+    for (int b = 0; b < TF_RB; b++)
+      for (int i = 0; i < 16; i++) part[((((ks - 1) * TF_TT + within) * TF_RB + b) * 16 + i) * 32 + lane] = C[b][i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0)
+    for (int s2 = 1; s2 < TF_SK; s2++)
+      for (int b = 0; b < TF_RB; b++)
+        for (int i = 0; i < 16; i++) C[b][i] += part[((((s2 - 1) * TF_TT + within) * TF_RB + b) * 16 + i) * 32 + lane];
+#endif
+  if (ks == 0)
+    for (int b = 0; b < TF_RB; b++) if (b < nblocks) {
+      const int Mb = min(rows - 16 * b, 16);
+      for (int i = 0; i < 16; i++) {
+        const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+        if (m < Mb && n < TF_N) Y[(size_t)(16 * b + m) * TF_YS + n] = static_cast<TF_OUT>(C[b][i]);
+      }
+    }
+}
+#endif
 #endif
