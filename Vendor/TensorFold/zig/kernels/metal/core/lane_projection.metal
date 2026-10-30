@@ -281,7 +281,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
+#if defined(TF_SERIAL_SK2) // one SIMD group runs both chains: cap the threadgroup at it, so registers are sized for 32 threads
+[[max_total_threads_per_threadgroup(32)]]
+#else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
+#endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
@@ -313,8 +317,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
   tf_reg_load next = {};
   if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
+#if defined(TF_REG_PF2)
+  // decode rows keep two groups' loads in flight: the one after next is issued before this group's unpack
+  tf_reg_load after = {};
+  if (first + 1 < last) after = tf_reg_fetch(wl, sbv, XS, first + 1, n0 + nb, mb, stride);
+#endif
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
+#if defined(TF_REG_PF2)
+    next = after;
+    if (g + 2 < last) after = tf_reg_fetch(wl, sbv, XS, g + 2, n0 + nb, mb, stride);
+#endif
     for (int w = 0; w < 8; w++) {
       // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
@@ -324,7 +337,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
+#if !defined(TF_REG_PF2)
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
+#endif
     auto x = a.slice(g * GS, 0);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
