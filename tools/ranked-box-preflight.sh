@@ -587,7 +587,7 @@ except ValueError:
     refuse(f"baseline calibration captured_at {captured_at!r} is not an RFC 3339 timestamp")
 if captured.tzinfo is None:
     refuse(f"baseline calibration captured_at {captured_at!r} carries no timezone offset")
-reference_date = datetime.datetime.fromisoformat(os.environ["MLXFAST_CAL_REF_DATE"])
+reference_date = datetime.datetime.fromisoformat(os.environ["MLXFAST_CAL_REF_DATE"].replace("Z", "+00:00"))
 if captured <= reference_date:
     refuse(
         f"baseline calibration captured_at {captured_at} is not after the reference "
