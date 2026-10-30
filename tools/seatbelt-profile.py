@@ -10,6 +10,7 @@ This is the one source of the profile rules. Three trusted callers use it:
 The profile prints on stdout. The rules:
 
   * deny all network, except the Unix sockets that --unix-socket names;
+  * deny launchd job creation in every profile;
   * deny scheduling-priority changes in every profile;
   * deny process-fork, and deny process-exec except the paths --exec names
     (sandbox-exec itself execs the first program after it applies the
@@ -32,9 +33,9 @@ the parent is / or contains any protected root, it denies the audit file only.
 Otherwise it denies the parent directory, including a dedicated private
 directory inside /private/tmp. The protected roots are /, HOME, --tree,
 RUNNER_TEMP, TMPDIR, /tmp, /private/tmp, /var/tmp and /private/var/tmp. The
-stable resident log root is also denied
-(MLXFAST_RESIDENT_LOG_ROOT, falling back to RESIDENT_UP_LOG_DIR and then
-~/.mlxfast-resident-logs), the build
+stable resident log root is also denied (MLXFAST_RESIDENT_LOG_ROOT or
+RESIDENT_UP_LOG_DIR). The old ~/.mlxfast-resident-logs and current
+~/.mlxfast-resident-logs.noindex roots are always denied. The build
 cache root (MLXFAST_BUILD_CACHE_DIR, else
 ~/.cache/mlxfast-engine-build), the runner registration files two levels
 above RUNNER_WORKSPACE, and the registration files in every actions-runner*
@@ -103,9 +104,10 @@ def evaluator_paths(env, tree):
     paths = [env.get(name, "") for name in OFFICIAL_REQUIRED + OTHER_EVALUATOR_PATHS
              if name != "BENCHD_PRIVATE_AUDIT_PATH"]
     home = env.get("HOME") or os.path.expanduser("~")
-    paths.append(env.get("MLXFAST_RESIDENT_LOG_ROOT")
-                 or env.get("RESIDENT_UP_LOG_DIR")
-                 or os.path.join(home, ".mlxfast-resident-logs"))
+    paths += [env.get("MLXFAST_RESIDENT_LOG_ROOT")
+              or env.get("RESIDENT_UP_LOG_DIR", ""),
+              os.path.join(home, ".mlxfast-resident-logs"),
+              os.path.join(home, ".mlxfast-resident-logs.noindex")]
     paths.append(env.get("MLXFAST_BUILD_CACHE_DIR") or os.path.join(home, ".cache/mlxfast-engine-build"))
     audit = env.get("BENCHD_PRIVATE_AUDIT_PATH", "")
     if audit:
@@ -180,7 +182,12 @@ def main():
                 "the evaluator-only paths the profile denies; unset: %s\n" % ", ".join(missing))
             return 2
 
-    lines = ["(version 1)", "(allow default)", "(deny network*)"]
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        "(deny job-creation)",
+    ]
     sockets = []
     for sock in args.unix_socket:
         for path in sorted({os.path.abspath(sock), resolved(sock)}):
@@ -198,7 +205,11 @@ def main():
     ]
     if args.build:
         # A build needs to signal its compilers, but not another runner job.
-        lines += ["(deny signal)", "(allow signal (target same-sandbox))"]
+        lines += [
+            "(deny signal)",
+            "(allow signal (target same-sandbox))",
+            '(deny process-exec (literal "/usr/bin/mdimport") (literal "/usr/bin/mdutil"))',
+        ]
     if not args.build:
         # Signals: deny all, then allow the process itself (raise, abort, thread signals).
         # "(deny signal (target others))" alone is not enforced on macOS 27 (measured:
@@ -213,6 +224,7 @@ def main():
             '(allow mach-lookup (global-name "com.apple.MTLCompilerService") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd") (global-name "com.apple.diagnosticd"))',
         ]
     lines += [
+        '(deny mach-lookup (global-name-prefix "com.apple.metadata.mds"))',
         '(deny mach-lookup (global-name "com.apple.mDNSResponder"))',
         '(deny mach-lookup (global-name "com.apple.system.mDNSResponder"))',
         '(deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))',

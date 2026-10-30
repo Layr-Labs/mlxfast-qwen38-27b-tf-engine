@@ -58,7 +58,23 @@ WORKER="${MLXFAST_ENGINE_BIN:-${ROOT}/Vendor/TensorFold/zig-out/bin/bench-worker
 [[ -x "${WORKER}" ]] || refuse worker-missing
 SANDBOX_EXEC=/usr/bin/sandbox-exec
 [[ -x "${SANDBOX_EXEC}" ]] || refuse sandbox-unavailable
-work_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tf-sandboxed-cli.XXXXXX")"  # not the long macOS $TMPDIR: the self-test socket path must stay under 104 bytes
+work_root="${RUNNER_TEMP:-/tmp}"
+if [[ "${RUNNER_ENVIRONMENT:-}" == self-hosted || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == 1 ]]; then
+  work_root="/private/tmp/q38cli-$(/usr/bin/id -u).noindex"
+  # A concurrent job of the same uid may create it first (EEXIST); the strict
+  # checks below decide either way.
+  if [[ ! -e "${work_root}" && ! -L "${work_root}" ]]; then
+    mkdir -m 700 "${work_root}" 2>/dev/null || true
+  fi
+  work_root_stat="$(/usr/bin/stat -f '%u %Lp' "${work_root}" 2>/dev/null || true)"
+  work_root_acl="$(/bin/ls -led "${work_root}" 2>/dev/null || true)"
+  [[ -d "${work_root}" && ! -L "${work_root}" \
+    && "${work_root_stat}" == "$(/usr/bin/id -u) 700" \
+    && -n "${work_root_acl}" \
+    && "$(printf '%s\n' "${work_root_acl}" | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')" == 1 ]] \
+    || refuse temp
+fi
+work_dir="$(mktemp -d "${work_root%/}/tf-sandboxed-cli.XXXXXX")"  # not the long macOS $TMPDIR: the self-test socket path must stay under 104 bytes
 trap cleanup EXIT
 private_tmp="${work_dir}/tmp"
 mkdir -m 700 "${private_tmp}"

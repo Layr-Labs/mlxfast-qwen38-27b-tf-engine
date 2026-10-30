@@ -102,6 +102,9 @@
 #                                    attaching phase run ONE binary)
 #   RESIDENT_UP_LOG_DIR              pidfile, pgid file, identity file, resident
 #                                    log (default <repo>/.build/resident)
+#   ORPHAN_GUARD_RESIDENT_RECORD_DIR private 0700 directory where --boot records
+#                                    <pid>:<real executable path> for the trusted
+#                                    post-timing orphan check
 #   MLXFAST_RESIDENT_LOG_ROOT        stable parent denied to participant code;
 #                                    RESIDENT_UP_LOG_DIR must be inside it
 #   RESIDENT_UP_LOCK_PATH            the GPU lock file (default
@@ -140,6 +143,18 @@ log() { printf 'resident-up.sh: %s\n' "$*" >&2; }
 die() { printf 'resident-up.sh: %s\n' "$*" >&2; exit 1; }
 refuse() { printf 'resident-up.sh: REFUSED (%s): %s\n' "$1" "$2" >&2; exit 2; }
 RESIDENT_TMP_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  RESIDENT_TMP_ROOT="${RUNNER_TEMP:-/private/tmp}/resident.noindex"
+fi
+
+non_indexed_path() {
+  python3 -c '
+import os, sys
+p = os.path.realpath(os.path.abspath(sys.argv[1]))
+roots = ("/private/tmp", "/private/var/folders", "/var/folders")
+raise SystemExit(0 if any(x.endswith(".noindex") for x in p.split(os.sep)) or any(p == r or p.startswith(r + "/") for r in roots) else 1)
+' "$1"
+}
 
 remove_resident_tmp_tree() {
   local tree="$1"
@@ -351,17 +366,21 @@ WIRED_LIMIT_READER="${RESIDENT_UP_WIRED_LIMIT_READER:-sysctl -n iogpu.wired_limi
 if [[ -z "${MLXFAST_RESIDENT_LOG_ROOT:-}" ]]; then
   if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
     [[ -n "${HOME:-}" ]] || refuse log-root "HOME is unset; the self-hosted resident log root cannot be resolved"
-    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs"
+    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs.noindex"
   else
     MLXFAST_RESIDENT_LOG_ROOT="${SCRIPT_DIR}/.build/resident"
   fi
 fi
 export MLXFAST_RESIDENT_LOG_ROOT
 LOG_DIR="${RESIDENT_UP_LOG_DIR:-${MLXFAST_RESIDENT_LOG_ROOT}}"
-mkdir -p "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not create ${MLXFAST_RESIDENT_LOG_ROOT}"
-chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not set mode 0700 on ${MLXFAST_RESIDENT_LOG_ROOT}"
 resolved_log_root="$(python3 -c 'import os, sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "${MLXFAST_RESIDENT_LOG_ROOT}")"
 resolved_log_dir="$(python3 -c 'import os, sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "${LOG_DIR}")"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  non_indexed_path "${resolved_log_root}" || refuse log-root "the self-hosted resident log root is indexed: ${MLXFAST_RESIDENT_LOG_ROOT}"
+  non_indexed_path "${resolved_log_dir}" || refuse log-dir "the self-hosted resident log directory is indexed: ${LOG_DIR}"
+fi
+mkdir -p "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not create ${MLXFAST_RESIDENT_LOG_ROOT}"
+chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not set mode 0700 on ${MLXFAST_RESIDENT_LOG_ROOT}"
 case "${resolved_log_dir}" in
   "${resolved_log_root}"|"${resolved_log_root}"/*) : ;;
   *) refuse log-dir-outside-root "RESIDENT_UP_LOG_DIR '${LOG_DIR}' is outside MLXFAST_RESIDENT_LOG_ROOT '${MLXFAST_RESIDENT_LOG_ROOT}'" ;;
@@ -371,10 +390,16 @@ chmod 700 "${LOG_DIR}" || refuse log-dir "could not set mode 0700 on ${LOG_DIR}"
 RUN_TAG="$$-$(date -u +%Y%m%dT%H%M%SZ)"
 # A Unix socket path must be under 104 bytes on macOS. A long TMPDIR moves the
 # default socket to a short private per-user directory; a long --socket refuses.
+# On a self-hosted runner an indexed TMPDIR moves it there too, so the
+# non-indexed check below holds.
 socket_bytes() { printf '%s' "$1" | LC_ALL=C wc -c | tr -d '[:space:]'; }
 if [[ -z "${SOCKET_PATH}" ]]; then
   SOCKET_PATH="${TMPDIR:-/tmp}/bench-worker-resident.${RUN_TAG}.sock"
-  if (( $(socket_bytes "${SOCKET_PATH}") >= 104 )); then
+  socket_dir_indexed=0
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]] && ! non_indexed_path "$(dirname -- "${SOCKET_PATH}")"; then
+    socket_dir_indexed=1
+  fi
+  if (( $(socket_bytes "${SOCKET_PATH}") >= 104 )) || [[ "${socket_dir_indexed}" == 1 ]]; then
     short_socket_dir="/private/tmp/bench-worker-$(id -u)"
     if [[ ! -e "${short_socket_dir}" && ! -L "${short_socket_dir}" ]]; then
       mkdir -m 700 "${short_socket_dir}" || refuse socket-path "could not create ${short_socket_dir}"
@@ -388,6 +413,9 @@ if [[ -z "${SOCKET_PATH}" ]]; then
 fi
 (( $(socket_bytes "${SOCKET_PATH}") < 104 )) \
   || refuse socket-path "the socket path is $(socket_bytes "${SOCKET_PATH}") bytes; a Unix socket path must be under 104 bytes on macOS: ${SOCKET_PATH}"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  non_indexed_path "${SOCKET_PATH}" || refuse socket-path "the self-hosted resident socket path is indexed: ${SOCKET_PATH}"
+fi
 PIDFILE="${LOG_DIR}/resident.pid"
 PGIDFILE="${LOG_DIR}/resident.pgid"
 IDENTITY_FILE="${LOG_DIR}/resident-identity.json"
@@ -656,6 +684,10 @@ esac
 RESIDENT_LAUNCH=()
 if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
   [[ -x /usr/bin/sandbox-exec ]] || refuse sandbox-missing "/usr/bin/sandbox-exec is not available; the resident must run under it. Nothing has been loaded."
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+    mkdir -p "${RESIDENT_TMP_ROOT}" || refuse sandbox-tmp "the resident temporary root cannot be created: ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
+    chmod 700 "${RESIDENT_TMP_ROOT}" || refuse sandbox-tmp "the resident temporary root cannot be made private: ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
+  fi
   [[ -d "${RESIDENT_TMP_ROOT}" ]] || refuse sandbox-tmp "the resident temporary root is missing: ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
   if [[ "${MODE}" == "boot" ]]; then
     for stale_tmp in "${RESIDENT_TMP_ROOT%/}"/tmp.resident-up.*; do
@@ -749,6 +781,29 @@ RESIDENT_PID=$!
 RESIDENT_PGID="${RESIDENT_PID}"
 printf '%s\n' "${RESIDENT_PID}" > "${PIDFILE}"
 printf '%s\n' "${RESIDENT_PGID}" > "${PGIDFILE}"
+if [[ -n "${ORPHAN_GUARD_RESIDENT_RECORD_DIR:-}" ]]; then
+  /usr/bin/python3 -I - "${ORPHAN_GUARD_RESIDENT_RECORD_DIR}" \
+    "${RESIDENT_PID}" "${BENCH_WORKER}" <<'PY' \
+    || die "could not write the orphan-guard resident record"
+import os
+import stat
+import sys
+
+root, pid, executable = sys.argv[1:]
+info = os.lstat(root)
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    raise SystemExit(1)
+if stat.S_IMODE(info.st_mode) != 0o700:
+    raise SystemExit(1)
+executable = os.path.realpath(executable)
+if not os.path.isabs(executable):
+    raise SystemExit(1)
+path = os.path.join(root, "resident." + pid)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as handle:
+    handle.write(pid + ":" + executable + "\n")
+PY
+fi
 
 start="$(date +%s)"
 while :; do

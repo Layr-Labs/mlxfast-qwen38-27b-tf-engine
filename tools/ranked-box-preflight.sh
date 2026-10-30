@@ -77,8 +77,8 @@ ok() {
 # finish a ranked run either.
 command -v jq >/dev/null 2>&1 || fail "jq is required to read the track contract"
 command -v shasum >/dev/null 2>&1 || fail "shasum is required to verify staged assets"
-[[ -r "${CONTRACT}" ]] || fail "cannot read the track contract at ${CONTRACT}"
-jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "the track contract is not valid JSON: ${CONTRACT}"
+[[ -r "${CONTRACT}" ]] || fail "cannot read fixtures/qwen3_8_27b_tf_mlx_v1_track.json"
+jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "fixtures/qwen3_8_27b_tf_mlx_v1_track.json is not valid JSON"
 ok "track contract readable and parses: fixtures/qwen3_8_27b_tf_mlx_v1_track.json"
 
 # --- 1. the job holds no credential -----------------------------------------
@@ -143,8 +143,8 @@ ok "no measurement-weakening override in the job environment"
 # on the box checks the same file the ranked job will use.
 MLXFAST_MACMON="${MLXFAST_MACMON:-${MLXFAST_MACMON_BIN:-/opt/homebrew/bin/macmon}}"
 test -x "${MLXFAST_MACMON}" \
-  || fail "macmon missing at ${MLXFAST_MACMON}: no GPU temperature reader, so the cool-down gate would silently skip on every timed leg. Install macmon or point MLXFAST_MACMON_BIN at it; this run measures nothing without thermal control"
-ok "GPU temperature reader present and executable: ${MLXFAST_MACMON}"
+  || fail "MLXFAST_MACMON_BIN is missing or not executable: no GPU temperature reader, so the cool-down gate would silently skip on every timed leg. Install macmon or point MLXFAST_MACMON_BIN at it; this run measures nothing without thermal control"
+ok "GPU temperature reader present and executable"
 
 # --- 2c. the reader is not frozen -------------------------------------------
 # A reader that ALWAYS returns the same number passes every cool gate instantly,
@@ -163,7 +163,7 @@ read_gpu_temp() {
 
 first_temp="$(read_gpu_temp || true)"
 [[ -n "${first_temp}" ]] \
-  || fail "the temperature reader at ${MLXFAST_MACMON} produced no .temp.gpu_temp_avg sample; a reader that cannot be read is a missing reader"
+  || fail "MLXFAST_MACMON_BIN produced no .temp.gpu_temp_avg sample; a reader that cannot be read is a missing reader"
 [[ "$(jq -n --argjson t "${first_temp}" '$t > 5')" == "true" ]] \
   || fail "GPU temperature reads ${first_temp}C, at or below the 5C implausibility floor; the sensor is broken or frozen, and a broken sensor passes every cool gate"
 
@@ -182,7 +182,7 @@ if [[ "$(distinct_temp_count "${temps[@]}")" == "1" ]]; then
     temps+=("$(read_gpu_temp || true)")
   done
   if [[ "$(distinct_temp_count "${temps[@]}")" == "1" ]]; then
-    fail "the temperature reader at ${MLXFAST_MACMON} returned the identical value ${first_temp}C on ${#temps[@]} samples across ~20s; treating it as a frozen sensor, because a stuck reading passes every cool gate on an arbitrarily hot GPU"
+    fail "MLXFAST_MACMON_BIN returned the identical value ${first_temp}C on ${#temps[@]} samples across ~20s; treating it as a frozen sensor, because a stuck reading passes every cool gate on an arbitrarily hot GPU"
   fi
 fi
 ok "temperature reader is plausible and moving (samples: ${temps[*]})"
@@ -241,29 +241,29 @@ GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
   || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory"
 GOLDEN_DIR_ABS="$(cd "${GOLDEN_DIR}" && pwd -P)"
 
 require_golden_dir_path() {
   local path="$1" label="$2" path_abs
   path_abs="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${path}")" \
-    || fail "${label}: cannot resolve whole staged file path: ${path}"
+    || fail "${label}: cannot resolve its staged file path"
   case "${path_abs}" in
     "${GOLDEN_DIR_ABS}"/*) : ;;
-    *) fail "${label}: staged file ${path_abs} is outside canonical MLXFAST_QWEN38_GOLDEN_DIR ${GOLDEN_DIR_ABS}" ;;
+    *) fail "${label}: staged file is outside canonical MLXFAST_QWEN38_GOLDEN_DIR" ;;
   esac
 }
 
 verify_pin() {
   # verify_pin <path> <want_sha256> <want_bytes> <label>
   local path="$1" want_sha="$2" want_bytes="$3" label="$4" got_bytes got_sha
-  [[ -f "${path}" ]] || fail "${label}: staged file is missing: ${path}"
+  [[ -f "${path}" ]] || fail "${label}: staged file is missing"
   got_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
   [[ "${got_bytes}" == "${want_bytes}" ]] \
-    || fail "${label}: byte-count mismatch (staged ${got_bytes}, pinned ${want_bytes}): ${path}"
+    || fail "${label}: byte-count mismatch (staged ${got_bytes}, pinned ${want_bytes})"
   got_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
   [[ "${got_sha}" == "${want_sha}" ]] \
-    || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha}): ${path}"
+    || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha})"
 }
 
 verify_golden_pin() {
@@ -366,7 +366,7 @@ while IFS= read -r live_name; do
   printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
     || fail "live golden '${live_name}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
   [[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
-    || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; the ranked run scores over it"
+    || fail "the live golden ${live_golden_base} is not staged in MLXFAST_QWEN38_GOLDEN_DIR; the ranked run scores over it"
   ok "live golden ${live_golden_base} is pinned and staged"
   live_count=$((live_count + 1))
 done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
@@ -414,11 +414,11 @@ BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION:-}"
 [[ -n "${BASELINE_WORKSPACE}" ]] \
   || fail "MLXFAST_BASELINE_WORKSPACE is unset; the paired run has no reference tree for the serial-control leg, so it has no denominator"
 [[ -d "${BASELINE_WORKSPACE}" ]] \
-  || fail "MLXFAST_BASELINE_WORKSPACE does not exist or is not a directory: ${BASELINE_WORKSPACE}"
+  || fail "MLXFAST_BASELINE_WORKSPACE does not exist or is not a directory"
 [[ -n "${BASELINE_CALIBRATION}" ]] \
   || fail "MLXFAST_BASELINE_CALIBRATION is unset; the serial-control leg would have no health band and a box that was not itself would still seal a score"
 [[ -f "${BASELINE_CALIBRATION}" ]] \
-  || fail "MLXFAST_BASELINE_CALIBRATION does not name a file: ${BASELINE_CALIBRATION}"
+  || fail "MLXFAST_BASELINE_CALIBRATION does not name a file"
 
 REFERENCE_COMMIT="$(jq -r '.baseline_reference_commit // ""' "${CONTRACT}")"
 printf '%s' "${REFERENCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
@@ -426,7 +426,7 @@ printf '%s' "${REFERENCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
 
 command -v git >/dev/null 2>&1 || fail "git is required to verify the reference workspace's HEAD"
 [[ -e "${BASELINE_WORKSPACE}/.git" ]] \
-  || fail "MLXFAST_BASELINE_WORKSPACE is not a git checkout (no .git at ${BASELINE_WORKSPACE}); its commit cannot be verified, so the serial-control leg would run on an unidentified tree"
+  || fail "MLXFAST_BASELINE_WORKSPACE is not a git checkout; its commit cannot be verified, so the serial-control leg would run on an unidentified tree"
 workspace_head="$(git -C "${BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
 [[ "${workspace_head}" == "${REFERENCE_COMMIT}" ]] \
   || fail "the reference workspace is at '${workspace_head:-nothing}' but the contract pins baseline_reference_commit ${REFERENCE_COMMIT}; re-stage it with tools/stage-baseline-workspace.sh"
@@ -435,21 +435,21 @@ ok "reference workspace is a git checkout at baseline_reference_commit ${REFEREN
 # The reference tree must be built at the worker path that benchd resolves.
 REFERENCE_WORKER="${BASELINE_WORKSPACE}/Vendor/TensorFold/zig-out/bin/bench-worker"
 [[ -x "${REFERENCE_WORKER}" ]] \
-  || fail "the reference workspace has no executable worker at ${REFERENCE_WORKER}; build and stage it on the box (tools/stage-baseline-workspace.sh), because nothing in the ranked job builds it"
+  || fail "MLXFAST_BASELINE_WORKSPACE has no executable Vendor/TensorFold/zig-out/bin/bench-worker; build and stage it with tools/stage-baseline-workspace.sh, because nothing in the ranked job builds it"
 ok "reference TensorFold worker is staged"
 
 # The control leg runs on the pinned commit end to end, including the reference
 # tree's own pinned target snapshot. Sharing the candidate workspace's copy
 # would put one tree on both sides of the ratio.
 [[ -f "${BASELINE_WORKSPACE}/reference_weights/Qwen3.8-27B-MLX-4bit/config.json" ]] \
-  || fail "the reference workspace has no verified target snapshot at ${BASELINE_WORKSPACE}/reference_weights/Qwen3.8-27B-MLX-4bit (no config.json); tools/stage-baseline-workspace.sh copies MLXFAST_REFERENCE_DIR, verifies it against fixtures/reference_qwen3_8_27b_4bit.sha256, and builds the worker; the control leg must not borrow the candidate workspace's snapshot"
+  || fail "MLXFAST_BASELINE_WORKSPACE has no verified target snapshot at reference_weights/Qwen3.8-27B-MLX-4bit (no config.json); tools/stage-baseline-workspace.sh copies MLXFAST_REFERENCE_DIR, verifies it against fixtures/reference_qwen3_8_27b_4bit.sha256, and builds the worker; the control leg must not borrow the candidate workspace's snapshot"
 ok "reference workspace carries its own verified target snapshot"
 
 # The commit's own date bounds the calibration from below: a calibration
 # captured BEFORE the reference tree existed cannot have measured that tree.
 reference_commit_date="$(git -C "${BASELINE_WORKSPACE}" show -s --format=%cI "${REFERENCE_COMMIT}" 2>/dev/null || true)"
 [[ -n "${reference_commit_date}" ]] \
-  || fail "cannot read the commit date of ${REFERENCE_COMMIT} from ${BASELINE_WORKSPACE}; the calibration's captured_at cannot be bounded"
+  || fail "cannot read the commit date of ${REFERENCE_COMMIT} from MLXFAST_BASELINE_WORKSPACE; the calibration's captured_at cannot be bounded"
 
 # The calibration file. python3 parses it (the fixture's own tools already
 # require python3), checks every field the ranked path depends on, and prints
@@ -481,11 +481,16 @@ def refuse(message):
 try:
     with open(path, encoding="utf-8") as handle:
         cal = json.load(handle)
-except (OSError, json.JSONDecodeError) as exc:
-    refuse(f"the baseline calibration file does not parse as JSON ({exc}): {path}")
+except OSError:
+    refuse("MLXFAST_BASELINE_CALIBRATION could not be read")
+except json.JSONDecodeError as exc:
+    refuse(
+        "MLXFAST_BASELINE_CALIBRATION does not parse as JSON "
+        f"(line {exc.lineno}, column {exc.colno})"
+    )
 
 if not isinstance(cal, dict):
-    refuse(f"the baseline calibration file is not a JSON object: {path}")
+    refuse("MLXFAST_BASELINE_CALIBRATION is not a JSON object")
 
 # Version 3 holds one entry for each prompt in `prompts`. Versions 1 and 2 are
 # unsupported legacy shapes. The current fixture decides whether decode also
@@ -528,9 +533,8 @@ want_box = os.environ["MLXFAST_CAL_BOX"]
 if want_box:
     if cal.get("box") != want_box:
         refuse(
-            f"baseline calibration box is {cal.get('box')!r} but this runner is "
-            f"{want_box!r}; the band was measured on another machine and says nothing "
-            "about this one"
+            "baseline calibration box does not match RUNNER_NAME; the band was "
+            "measured on another machine and says nothing about this one"
         )
 
 want_commit = os.environ["MLXFAST_CAL_REF_COMMIT"]
@@ -583,7 +587,7 @@ except ValueError:
     refuse(f"baseline calibration captured_at {captured_at!r} is not an RFC 3339 timestamp")
 if captured.tzinfo is None:
     refuse(f"baseline calibration captured_at {captured_at!r} carries no timezone offset")
-reference_date = datetime.datetime.fromisoformat(os.environ["MLXFAST_CAL_REF_DATE"])
+reference_date = datetime.datetime.fromisoformat(os.environ["MLXFAST_CAL_REF_DATE"].replace("Z", "+00:00"))
 if captured <= reference_date:
     refuse(
         f"baseline calibration captured_at {captured_at} is not after the reference "
@@ -591,10 +595,10 @@ if captured <= reference_date:
         "that did not exist yet"
     )
 PYEOF
-)" || fail "the baseline calibration validator failed to run against ${BASELINE_CALIBRATION}"
-[[ -z "${calibration_error}" ]] || fail "${calibration_error} (${BASELINE_CALIBRATION})"
+)" || fail "the baseline calibration validator failed to run against MLXFAST_BASELINE_CALIBRATION"
+[[ -z "${calibration_error}" ]] || fail "${calibration_error}"
 if [[ -n "${RUNNER_NAME:-}" ]]; then
-  ok "baseline calibration parses and names this track, this box (${RUNNER_NAME}) and the reference commit"
+  ok "baseline calibration parses and names this track, this box and the reference commit"
 else
   ok "baseline calibration parses and names this track and the reference commit (RUNNER_NAME unset, so the box name is not checked)"
 fi
@@ -662,8 +666,11 @@ def refuse(message):
     sys.exit(1)
 
 
+current_label = "protected evaluator material"
+
+
 def walk_error(error):
-    refuse("cannot list %s (%s); every item under it must be checked" % (error.filename, error.strerror))
+    refuse("cannot list %s (%s); every item under it must be checked" % (current_label, error.strerror))
 
 
 entry_count = 0
@@ -674,12 +681,12 @@ def check_entry(path, label):
     global entry_count
     entry_count += 1
     if os.lstat(path).st_uid == uid:
-        refuse("the job account (uid %d) owns %s, which is part of %s. The operator account must own it. Run the box converge." % (uid, path, label))
+        refuse("the job account (uid %d) owns part of %s. The operator account must own it. Run the box converge." % (uid, label))
     if os.access(path, os.W_OK):
-        refuse("the job account can write %s, which is part of %s. Run the box converge." % (path, label))
+        refuse("the job account can write part of %s. Run the box converge." % label)
 
 
-def check_ancestors(path, label, top):
+def check_ancestors(path, label):
     child = path
     parent = os.path.dirname(child)
     while True:
@@ -687,29 +694,30 @@ def check_ancestors(path, label, top):
             checked_ancestors.add((parent, child))
             info = os.stat(parent)
             if info.st_uid == uid:
-                refuse("the job account (uid %d) owns %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (uid, parent, label, top, top))
+                refuse("the job account (uid %d) owns a directory above %s, so it can replace evaluator material. Run the box converge." % (uid, label))
             if os.access(parent, os.W_OK):
                 sticky = info.st_mode & stat.S_ISVTX
                 if not (sticky and os.lstat(child).st_uid != uid):
-                    refuse("the job account can write %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (parent, label, top, top))
+                    refuse("the job account can write a directory above %s, so it can replace evaluator material. Run the box converge." % label)
         if parent == "/":
             break
         child, parent = parent, os.path.dirname(parent)
 
 
 for label, path in pairs:
+    current_label = label
     if not os.path.lexists(path):
-        refuse("%s does not exist at %s" % (label, path))
+        refuse("%s does not exist" % label)
     check_entry(path, label)
     if os.path.isdir(path):
         for root, dirs, files in os.walk(path, onerror=walk_error):
             for name in dirs + files:
                 check_entry(os.path.join(root, name), label)
     lexical = os.path.abspath(path)
-    check_ancestors(lexical, label, path)
+    check_ancestors(lexical, label)
     resolved = os.path.realpath(path)
     if resolved != lexical:
-        check_ancestors(resolved, label, path)
+        check_ancestors(resolved, label)
 
 directories = len({parent for parent, _ in checked_ancestors})
 print("checked %d items in %d protected trees (owner, and write access by mode and ACL) and %d directories above them up to /" % (entry_count, len(pairs), directories))

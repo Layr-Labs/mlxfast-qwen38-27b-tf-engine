@@ -35,7 +35,8 @@
 # track. So the blanket ban is NARROWED rather than lifted: uploads are still a
 # hard failure everywhere else in .github/, and in that one file EXACTLY ONE
 # upload may exist and it is itself checked -- pinned actions/upload-artifact
-# action, `score.json` and nothing else, and `if-no-files-found: error` so a
+# action, `tree.noindex/score.json` and nothing else, and
+# `if-no-files-found: error` so a
 # refused run cannot publish an empty artifact. A benchmark.yml that uploads
 # anything wider, or that adds a second upload of any shape, fails this scan
 # exactly as any other file would.
@@ -104,8 +105,8 @@ if [[ -n "${other_hits}" ]]; then
 fi
 
 # Inside the ranked workflow the upload is allowed but not unexamined: it has
-# to be THE ONE pinned action step, uploading score.json only, refusing an empty
-# result. A missing benchmark.yml is fine here (nothing to upload, nothing to
+# to be THE ONE pinned action step, uploading tree.noindex/score.json only,
+# refusing an empty result. A missing benchmark.yml is fine here (nothing to upload, nothing to
 # check); an upload in it that fails any of the four checks below is not.
 #
 # WHY THE COUNT COMES FIRST, AND WHY THE REST IS PER-STEP. Three independent
@@ -116,7 +117,7 @@ fi
 #
 #   1. exactly ONE upload reference may exist in the file at all, and
 #   2. the three property checks are evaluated INSIDE that one step's own block,
-#      not file-wide, so a `path: score.json` belonging to some other step
+#      not file-wide, so an allowed `path:` belonging to some other step
 #      cannot vouch for an upload that points somewhere else.
 #
 # Comments are stripped before counting: naming the action in prose is not an
@@ -151,7 +152,7 @@ if [[ -f "${ranked_workflow}" ]] && grep -qE "${upload_expr}" "${ranked_workflow
         end = NR
         for (i = uses_line + 1; i <= NR; i++) if (marker[i]) { end = i - 1; break }
         for (i = start; i <= end; i++) {
-          if (line[i] ~ /^[[:space:]]+path:[[:space:]]*score\.json[[:space:]]*$/) has_path = 1
+          if (line[i] ~ /^[[:space:]]+path:[[:space:]]*tree\.noindex\/score\.json[[:space:]]*$/) has_path = 1
           if (line[i] ~ /^[[:space:]]+if-no-files-found:[[:space:]]*error[[:space:]]*$/) has_inff = 1
         }
         if (!has_path) { print "path"; exit }
@@ -162,7 +163,7 @@ if [[ -f "${ranked_workflow}" ]] && grep -qE "${upload_expr}" "${ranked_workflow
     case "${step_verdict}" in
       ok) : ;;
       path)
-        echo "::error::${ranked_rel}'s upload step does not have exactly 'path: score.json' in its own block; the sanctioned upload is the score file and nothing else" >&2
+        echo "::error::${ranked_rel}'s upload step does not have exactly 'path: tree.noindex/score.json' in its own block; the sanctioned upload is the score file and nothing else" >&2
         status=1
         ;;
       if-no-files-found)
@@ -177,7 +178,7 @@ if [[ -f "${ranked_workflow}" ]] && grep -qE "${upload_expr}" "${ranked_workflow
   fi
 
   if [[ ${status} -eq 0 ]]; then
-    echo "ci-workflow-egress-scan: ${ranked_rel} carries exactly one artifact upload, and it is pinned, score.json-only, and errors on no files"
+    echo "ci-workflow-egress-scan: ${ranked_rel} carries exactly one artifact upload, and it is pinned, tree.noindex/score.json-only, and errors on no files"
   fi
 fi
 

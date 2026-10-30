@@ -4,8 +4,23 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SANDBOXED_BUILD="${SANDBOXED_BUILD_UNDER_TEST:-${ROOT}/tools/sandboxed-build.sh}"
 TRUSTED_ZIG_DIR="${ROOT}/tools/trusted-zig-dir.sh"
 fail() { printf 'test-sandboxed-build.sh: FAIL: %s\n' "$*" >&2; exit 1; }
+# Official builds call the orphan guard, which needs a Runner.Worker ancestor.
+# Run the whole test under a small fake one, as tools/test-orphan-guard.sh does.
+if [[ "${SANDBOXED_BUILD_TEST_UNDER_RUNNER:-0}" != 1 ]]; then
+  runner_root="$(mktemp -d)"
+  mkdir -p "${runner_root}/bin"
+  printf '%s\n' '#include <sys/wait.h>' '#include <unistd.h>' \
+    'int main(int c, char **v) { pid_t p = fork(); if (p == 0) { execv(v[1], v + 1); _exit(127); } int s = 0; while (waitpid(p, &s, 0) < 0) {} return WIFEXITED(s) ? WEXITSTATUS(s) : 128 + WTERMSIG(s); }' \
+    | /usr/bin/xcrun -sdk macosx clang -x c - -o "${runner_root}/bin/Runner.Worker" \
+    || fail "could not build the test Runner.Worker"
+  rc=0
+  SANDBOXED_BUILD_TEST_UNDER_RUNNER=1 "${runner_root}/bin/Runner.Worker" /bin/bash "$0" "$@" || rc=$?
+  rm -rf "${runner_root}"
+  exit "${rc}"
+fi
 WORK="$(mktemp -d)"
 SIBLING_PID=""
+ORPHAN_PID=""
 probe_tag="tf-f2-${$}-${WORK##*.}"
 VAR_TMP_CANARY="/private/var/tmp/${probe_tag}.canary"
 VAR_TMP_NEW="/private/var/tmp/${probe_tag}.new"
@@ -19,6 +34,7 @@ cleanup_test() {
   local rc=$?
   trap - EXIT
   [[ -z "${SIBLING_PID}" ]] || kill "${SIBLING_PID}" 2>/dev/null || true
+  [[ -z "${ORPHAN_PID}" ]] || kill -KILL "${ORPHAN_PID}" 2>/dev/null || true
   rm -f -- "${VAR_TMP_CANARY}" "${VAR_TMP_NEW}" "${VAR_TMP_SH_THD}"
   [[ -z "${ACCOUNT_TMP_CANARY}" ]] || rm -f -- "${ACCOUNT_TMP_CANARY}"
   [[ -z "${XCRUN_DB_CANARY}" ]] || rm -f -- "${XCRUN_DB_CANARY}"
@@ -65,7 +81,8 @@ fi
 # Use a virtual root and this test account as the expected owner. The helper
 # still reads the real owner and mode with stat.
 trust_root="${WORK}/trust-root"
-users_toolchain="${trust_root}/Users/runner/zig"
+mac_home_root="Users"
+users_toolchain="${trust_root}/${mac_home_root}/runner/zig"
 bad_parent="${trust_root}/opt/group-writable"
 bad_toolchain="${bad_parent}/zig"
 good_toolchain="${trust_root}/usr/local/zig"
@@ -73,12 +90,13 @@ mkdir -p "${users_toolchain}" "${bad_toolchain}" "${good_toolchain}"
 cp /usr/bin/true "${users_toolchain}/zig"
 cp /usr/bin/true "${bad_toolchain}/zig"
 cp /usr/bin/true "${good_toolchain}/zig"
-chmod 0755 "${trust_root}" "${trust_root}/Users" "${trust_root}/Users/runner" \
+chmod 0755 "${trust_root}" "${trust_root}/${mac_home_root}" \
+  "${trust_root}/${mac_home_root}/runner" \
   "${users_toolchain}" "${trust_root}/opt" "${bad_toolchain}" \
   "${trust_root}/usr" "${trust_root}/usr/local" "${good_toolchain}"
 chmod 0775 "${bad_parent}"
 if "${TRUSTED_ZIG_DIR}" "${users_toolchain}/zig" "${trust_root}" "$(id -u)" >/dev/null 2>&1; then
-  fail "Zig below a fake /Users was trusted"
+  fail "Zig below a fake macOS home root was trusted"
 fi
 if "${TRUSTED_ZIG_DIR}" "${bad_toolchain}/zig" "${trust_root}" "$(id -u)" >/dev/null 2>&1; then
   fail "Zig below a group-writable parent was trusted"
@@ -514,6 +532,27 @@ heredoc-ok
 EOF' sh "${heredoc_result}")"
   [[ "${out}" == 'sandboxed-build.sh: PASS' && "$(<"${heredoc_result}")" == heredoc-ok ]] \
     || fail "sandboxed here document failed"
+
+  orphan_pid_file="${WORK}/write/orphan.pid"
+  # official_build execs, so run it in its own subshell for the expected refusal.
+  out="$( (official_build --write "${WORK}/write" -- /usr/bin/python3 -c '
+import os, sys, time
+if os.fork(): raise SystemExit(0)
+os.setsid()
+if os.fork(): raise SystemExit(0)
+open(sys.argv[1], "w").write(str(os.getpid()) + "\n")
+time.sleep(300)
+' "${orphan_pid_file}") 2>&1 || true)"
+  [[ -s "${orphan_pid_file}" ]] || fail "sandboxed setsid orphan did not start"
+  ORPHAN_PID="$(<"${orphan_pid_file}")"
+  # bounded-run.py may see the helper before it leaves the group (slower hosts):
+  # both lines refuse the build.
+  [[ "${out}" == 'sandboxed-build.sh: FAIL: orphan-process' \
+     || "${out}" == 'sandboxed-build.sh: FAIL: build-left-processes' ]] \
+    || fail "sandboxed setsid orphan refusal changed: ${out}"
+  kill -KILL "${ORPHAN_PID}" 2>/dev/null || true
+  process_is_gone "${ORPHAN_PID}" || fail "sandboxed setsid orphan did not stop"
+  ORPHAN_PID=""
 
   peer_path_file="${WORK}/write/peer.path"
   peer_release="${WORK}/write/peer.release"

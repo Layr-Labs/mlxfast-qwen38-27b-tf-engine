@@ -178,6 +178,9 @@ jobs:
     # Queue time is outside this cap. A healthy ranked run takes about 4-15 min;
     # one that still holds the box at 60 min is refused as a stuck job.
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: tree.noindex
     env:
       # Use the configured runner Zig. An empty value falls back to PATH.
       ZIG: ${{ vars.ZIG }}
@@ -202,6 +205,7 @@ jobs:
           # This job must hold no credential, and a persisted checkout token
           # would be one.
           persist-credentials: false
+          path: tree.noindex
 
       - name: Runner environment carries the box paths and the toolchain
         run: |
@@ -221,7 +225,7 @@ jobs:
               echo "::error::${var} is not exported by the runner service environment (see the checked-in staging instructions in .github/workflows/benchmark.yml under 'WHAT MUST EXIST BEFORE A DISPATCH CAN GO GREEN')" >&2
               fail=1
             elif [[ ! -d "${value}" ]]; then
-              echo "::error::${var}=${value} is not a directory on this box" >&2
+              echo "::error::${var} is not a directory" >&2
               fail=1
             fi
           done
@@ -237,7 +241,7 @@ jobs:
               echo "::error::${var} is not exported by the runner service environment (run tools/calibrate-box.sh on this box and export the file it writes)" >&2
               fail=1
             elif [[ ! -f "${value}" ]]; then
-              echo "::error::${var}=${value} is not a file on this box" >&2
+              echo "::error::${var} does not name a file" >&2
               fail=1
             fi
           done
@@ -245,9 +249,8 @@ jobs:
             command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH" >&2; fail=1; }
           done
           [[ "${fail}" == "0" ]] || exit 1
-          zig_bin="$(tools/zig-bin.sh)" || { echo "::error::Zig 0.17.0 is missing or has the wrong version" >&2; exit 1; }
-          echo "ZIG=${zig_bin}" >> "${GITHUB_ENV}"
-          echo "runner environment ok: benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_REFERENCE_DIR} baseline_workspace=${MLXFAST_BASELINE_WORKSPACE} baseline_calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_QWEN38_GOLDEN_DIR}"
+          tools/zig-bin.sh >/dev/null || { echo "::error::Zig 0.17.0 is missing or has the wrong version" >&2; exit 1; }
+          echo "runner environment ok: benchd, reference, baseline workspace, baseline calibration and goldens are staged"
 
       - name: Reference workspace is the pinned commit, built and staged
         # The paired run's denominator. The
@@ -274,14 +277,14 @@ jobs:
           fi
           have="$(git -C "${MLXFAST_BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
           if [[ "${have}" != "${want}" ]]; then
-            echo "::error::the reference workspace at ${MLXFAST_BASELINE_WORKSPACE} is at '${have:-nothing}' but the contract pins ${want}; re-stage it on the box with tools/stage-baseline-workspace.sh" >&2
+            echo "::error::MLXFAST_BASELINE_WORKSPACE is at '${have:-nothing}' but the contract pins ${want}; re-stage it with tools/stage-baseline-workspace.sh" >&2
             exit 1
           fi
           worker="${MLXFAST_BASELINE_WORKSPACE}/Vendor/TensorFold/zig-out/bin/bench-worker"
           target="${MLXFAST_BASELINE_WORKSPACE}/reference_weights/Qwen3.8-27B-MLX-4bit"
-          [[ -x "${worker}" ]] || { echo "::error::the reference TensorFold worker is missing: ${worker}" >&2; exit 1; }
-          [[ -f "${target}/config.json" ]] || { echo "::error::the reference target snapshot is missing: ${target}" >&2; exit 1; }
-          echo "reference workspace ok: ${MLXFAST_BASELINE_WORKSPACE} at ${want}, TensorFold worker and target staged"
+          [[ -x "${worker}" ]] || { echo "::error::MLXFAST_BASELINE_WORKSPACE is missing Vendor/TensorFold/zig-out/bin/bench-worker" >&2; exit 1; }
+          [[ -f "${target}/config.json" ]] || { echo "::error::MLXFAST_BASELINE_WORKSPACE is missing the target snapshot" >&2; exit 1; }
+          echo "reference workspace ok at ${want}: TensorFold worker and target staged"
 
       - name: Stop residents left by an earlier job (GPU lock, exact match)
         # A cancelled job can leave its resident alive after the runner exits.
@@ -294,7 +297,7 @@ jobs:
         # benchd and record-correctness-golden from the public Layr-Labs/benchd
         # repository, or uses an operator-placed offline set. It accepts only
         # files whose SHA-256 digests and byte counts match the pinned manifest.
-        run: ./tools/fetch-benchd.sh
+        run: ./tools/fetch-benchd.sh >/dev/null
 
       - name: Restore the worker build cache (content-keyed, box-owned)
         # tools/build-cache.sh keys the build on every tracked source, the
@@ -347,17 +350,24 @@ jobs:
           mkdir -p reference_weights
           [[ ! -e reference_weights/Qwen3.8-27B-MLX-4bit && ! -L reference_weights/Qwen3.8-27B-MLX-4bit ]] || { echo "::error::candidate target path already exists" >&2; exit 1; }
           target_dir=reference_weights/Qwen3.8-27B-MLX-4bit
-          if ! cp -cRL "${MLXFAST_REFERENCE_DIR}" "${target_dir}"; then
-            cp -RL "${MLXFAST_REFERENCE_DIR}" "${target_dir}"
+          # cp errors name staged paths; show them only through the public-log filter.
+          if ! cp -cRL "${MLXFAST_REFERENCE_DIR}" "${target_dir}" 2>/dev/null; then
+            cp_rc=0
+            cp_err="$(cp -RL "${MLXFAST_REFERENCE_DIR}" "${target_dir}" 2>&1 >/dev/null)" || cp_rc=$?
+            if [[ "${cp_rc}" != "0" ]]; then
+              printf '%s\n' "${cp_err}" | python3 -u tools/public-log-filter.py >&2
+              echo "::error::cannot copy the staged target into the candidate tree" >&2
+              exit "${cp_rc}"
+            fi
           fi
           if find "${target_dir}" -type l -print -quit | grep -q .; then
             echo "::error::the staged target snapshot contains a symlink" >&2
             exit 1
           fi
           [[ -f "${target_dir}/config.json" ]] || { echo "::error::the staged target has no config.json" >&2; exit 1; }
-          (cd "${target_dir}" && shasum -a 256 -c "${GITHUB_WORKSPACE}/fixtures/reference_qwen3_8_27b_4bit.sha256") >/dev/null \
+          (cd "${target_dir}" && shasum -a 256 -c "${GITHUB_WORKSPACE}/tree.noindex/fixtures/reference_qwen3_8_27b_4bit.sha256") >/dev/null 2>&1 \
             || { echo "::error::the staged target differs from the intake shas" >&2; exit 1; }
-          echo "target snapshot staged from ${MLXFAST_REFERENCE_DIR}"
+          echo "target snapshot staged from the staged reference"
 
       - name: Stage the pinned drafter for DFlash
         run: ./tools/stage-drafter.sh
@@ -376,11 +386,9 @@ jobs:
         # Written here rather than in the stager because it is dispatch context,
         # not a staged box path -- the stager owns paths it has verified on disk.
         run: |
-          printf '%s\n' "${GITHUB_SHA}" > "${RUNNER_TEMP}/candidate.sha"
-          {
-            printf 'MLXFAST_CANDIDATE_SHA_FILE=%s\n' "${RUNNER_TEMP}/candidate.sha"
-            printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}"
-          } >> "${GITHUB_ENV}"
+          candidate_sha_file="${RUNNER_TEMP}/candidate.sha"
+          printf '%s\n' "${GITHUB_SHA}" > "${candidate_sha_file}"
+          printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}" >> "${GITHUB_ENV}"
 
       - name: Sensor check before timing
         # The quiescence gate lives in benchd beside the cool
@@ -413,11 +421,12 @@ jobs:
             for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
           fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
-            echo "::error::macmon was not found (MLXFAST_MACMON_BIN, PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
+            echo "::error::macmon was not found in the configured reader locations; the cool gate needs its GPU temperature reader" >&2
             exit 1
           fi
           export MLXFAST_MACMON MLXFAST_MACMON_BIN="${MLXFAST_MACMON}"
-          { printf 'MLXFAST_MACMON=%s\n' "${MLXFAST_MACMON}"; printf 'MLXFAST_MACMON_BIN=%s\n' "${MLXFAST_MACMON}"; } >> "${GITHUB_ENV}"
+          macmon_path_file="${RUNNER_TEMP}/macmon.path"
+          printf '%s\n' "${MLXFAST_MACMON}" > "${macmon_path_file}"
           load="$(sysctl -n vm.loadavg | awk '{print $2}')"
           util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
           # Same field the gates read (.temp.gpu_temp_avg), so this probe and
@@ -480,21 +489,36 @@ jobs:
         # tools/qwen38-27b-tf-measure-and-score.sh header, section
         # "ONE RESIDENT bench-worker PER LEG", holds the detail.
         run: |
+          set -uo pipefail
+          export MLXFAST_CANDIDATE_SHA_FILE="${RUNNER_TEMP}/candidate.sha"
+          MLXFAST_MACMON="$(<"${RUNNER_TEMP}/macmon.path")"
+          export MLXFAST_MACMON MLXFAST_MACMON_BIN="${MLXFAST_MACMON}"
           MLXFAST_SCORE_PATH=score.json \
           MLXFAST_BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE}" \
           MLXFAST_BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION}" \
-            ./tools/qwen38-27b-tf-measure-and-score.sh
+            ./tools/qwen38-27b-tf-measure-and-score.sh 2>&1 \
+            | python3 -u tools/public-log-filter.py
+          benchd_rc="${PIPESTATUS[0]}"
+          exit "${benchd_rc}"
 
       - name: Explain a refused run
-        # Participant-facing reason for a refusal. Reads ONLY score.json, which
-        # benchd seals (a submission cannot add it: it is outside the editable
-        # paths). When it records passed=false, its error goes to the job
-        # summary and to an annotation. The error text can carry engine-reported
-        # words, so it is cut to printable ASCII, capped and escaped for workflow
-        # commands. Exit codes and score semantics do not change.
-        if: always() && hashFiles('score.json') != ''
+        # Participant-facing reason for a refusal. Reads the sealed score, or
+        # the fixed trusted orphan reason when the post-timing guard removed it.
+        # Text is cut to printable ASCII, capped and escaped for workflow commands.
+        if: always() && (hashFiles('tree.noindex/score.json') != '' || hashFiles('tree.noindex/score.json.refusal-reason') != '')
         run: |
           set -euo pipefail
+          if [[ ! -f score.json && -f score.json.refusal-reason ]]; then
+            reason="$(<score.json.refusal-reason)"
+            displayed_reason="$(printf '%s\n' "${reason}" | python3 -u tools/public-log-filter.py)"
+            {
+              echo "### Run refused"
+              echo
+              printf "Reason: \`%s\`\n" "${displayed_reason}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error title=Run refused::${displayed_reason}"
+            exit 0
+          fi
           passed="$(jq -r '.passed' score.json 2>/dev/null || echo unknown)"
           [[ "${passed}" == "false" ]] || exit 0
           reason="$(jq -r '(.metrics.error // .error // "") | tostring' score.json 2>/dev/null || true)"
@@ -504,17 +528,18 @@ jobs:
               score.json 2>/dev/null || true)"
             reason="the sealed record has passed=false${gates:+ (failed: ${gates})}"
           fi
-          reason="$(printf '%s' "${reason}" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C tr -d '`' | cut -c1-300)"
+          reason="$(printf '%s' "${reason}" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C tr -d '`')"
+          displayed_reason="$(printf '%s\n' "${reason}" | python3 -u tools/public-log-filter.py | cut -c1-300)"
           {
             echo "### Run refused"
             echo
             echo "The sealed score record has \`passed: false\` and no score. Reason:"
             echo
             echo '```'
-            printf '%s\n' "${reason}"
+            printf '%s\n' "${displayed_reason}"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
-          echo "::error title=Run refused::${reason//%/%25}"
+          echo "::error title=Run refused::${displayed_reason//%/%25}"
 
       - name: Upload score artifact
         # Matches benchmark.json scoreArtifact `benchmark-results-<run_id>/score.json`.
@@ -525,14 +550,70 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: benchmark-results-${{ github.run_id }}
-          path: score.json
+          path: tree.noindex/score.json
           if-no-files-found: error
 
       - name: Stop this job's residents (cleanup)
-        # Always try cleanup after the artifact step.
-        # Exit 3 defers cleanup to the next job's preflight.
+        # Always try cleanup after the artifact step. The orphan kill runs only
+        # while this step holds the same box GPU lock as measurement.
         if: always()
         run: |
+          set -u
+          cleanup_marker="${RUNNER_TEMP}/mlxfast-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.ok"
+          rm -f "${cleanup_marker}"
           rc=0
-          ./tools/stop-leaked-residents.sh --mode cleanup --root "${GITHUB_WORKSPACE%/*/*}" || rc=$?
-          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]
+          ./tools/stop-leaked-residents.sh --mode cleanup \
+            --root "${GITHUB_WORKSPACE}/tree.noindex" \
+            --root "${MLXFAST_BASELINE_WORKSPACE}" \
+            --root "${MLXFAST_REFERENCE_DIR}" || rc=$?
+          guard_rc=0
+          /usr/bin/python3 - <<'PY' || guard_rc=$?
+          import fcntl
+          import os
+          import signal
+          import subprocess
+          import sys
+
+          lock_path = os.environ.get(
+              "RESIDENT_UP_LOCK_PATH", "/tmp/mtplx-gpu-exclusive.lock")
+          timeout = 900
+          fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+
+          def deferred(*_args):
+              print("orphan-guard: cleanup deferred (GPU lock busy)")
+              raise SystemExit(3)
+
+          signal.signal(signal.SIGALRM, deferred)
+          signal.alarm(timeout)
+          fcntl.flock(fd, fcntl.LOCK_EX)
+          signal.alarm(0)
+          job = subprocess.run(
+              ["./tools/orphan-guard.sh", "job-start"],
+              check=False, capture_output=True, text=True)
+          if job.returncode != 0:
+              sys.stderr.write(job.stderr)
+              raise SystemExit(job.returncode)
+          result = subprocess.run([
+              "./tools/orphan-guard.sh", "kill", "--job-start",
+              job.stdout.strip()], check=False)
+          raise SystemExit(result.returncode)
+          PY
+          if [[ "${rc}" -ne 0 ]]; then
+            echo "orphan-guard: cleanup failed (resident rc=${rc})" >&2
+          fi
+          if [[ "${guard_rc}" -ne 0 ]]; then
+            echo "orphan-guard: cleanup failed (guard rc=${guard_rc})" >&2
+          fi
+          if [[ "${rc}" -ne 0 ]]; then exit "${rc}"; fi
+          if [[ "${guard_rc}" -ne 0 ]]; then exit "${guard_rc}"; fi
+          : > "${cleanup_marker}"
+
+      - name: Verify ranked cleanup completed
+        if: always()
+        run: |
+          cleanup_marker="${RUNNER_TEMP}/mlxfast-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.ok"
+          if [[ ! -f "${cleanup_marker}" ]]; then
+            echo "::error::ranked cleanup did not complete; the score artifact upload ran before cleanup"
+            exit 1
+          fi
+          echo "ranked cleanup complete"

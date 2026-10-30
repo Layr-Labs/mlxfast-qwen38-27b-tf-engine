@@ -86,9 +86,14 @@ jobs:
 
       - name: Real Seatbelt containment
         run: |
+          tools/test-orphan-guard.sh
+          tools/test-noindex-profiles.sh
           tools/test-sandboxed-build.sh
           tools/test-sandboxed-cli.sh
           tools/test-resident-up.sh
+
+      - name: Public ranked logs hide host paths
+        run: tools/test-public-log-paths.sh
 
       - name: All offline control-plane tests
         run: |

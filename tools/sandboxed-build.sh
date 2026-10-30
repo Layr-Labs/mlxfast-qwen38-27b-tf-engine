@@ -192,8 +192,12 @@ XCRUN_WARM_METALLIB=""
 DEVELOPER_REAL=""
 OWNER_UID=""
 run_bounded() {
-  local rc=0
+  local rc=0 build_start=""
   [[ -z "${CANCEL_SIGNAL}" ]] || finish 'sandboxed-build.sh: FAIL: cancelled' 130 1
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" \
+     || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+    build_start="$(date +%s)"
+  fi
   TMPDIR="${PRIVATE_TMP}/" SHELL="${BUILD_SHELL}" CONFIG_SHELL="${BUILD_SHELL}" \
     python3 "${REPO_ROOT}/tools/bounded-run.py" \
     --output "${OUTPUT}" --session -- "$@" 0<&0 &
@@ -207,6 +211,11 @@ run_bounded() {
     kill -0 "${BOUNDED_PID}" 2>/dev/null || break
   done
   BOUNDED_PID=""
+  if [[ -n "${build_start}" ]] \
+    && ! "${REPO_ROOT}/tools/orphan-guard.sh" check --job-start "${build_start}" \
+      >/dev/null 2>&1; then
+    finish 'sandboxed-build.sh: FAIL: orphan-process' 125 1
+  fi
   if [[ ${rc} -eq 0 && -z "${CANCEL_SIGNAL}" ]]; then
     if [[ "${XCRUN_ACTIVE}" == 1 ]]; then
       xcrun_after_sha="$(xcrun_db_sha)" \
@@ -319,7 +328,14 @@ if [[ ( "${RUNNER_ENVIRONMENT:-}" == "self-hosted" \
 fi
 
 temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
-WORK_DIR="$(mktemp -d "${temp_root%/}/tensorfold-sandboxed-build.XXXXXX")"
+build_temp_root="${temp_root}"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" \
+   || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+  build_temp_root="${RUNNER_TEMP:-/private/tmp}/build.noindex"
+  mkdir -p "${build_temp_root}" || refuse temp
+  chmod 700 "${build_temp_root}" || refuse temp
+fi
+WORK_DIR="$(mktemp -d "${build_temp_root%/}/tensorfold-sandboxed-build.XXXXXX")"
 trap cleanup EXIT
 trap 'forward_signal TERM' TERM
 trap 'forward_signal INT' INT
@@ -353,6 +369,15 @@ add_deny_read_root() {
 
 real_path() {
   python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+non_indexed_path() {
+  python3 -c '
+import os, sys
+p = os.path.realpath(os.path.abspath(sys.argv[1]))
+roots = ("/private/tmp", "/private/var/folders", "/var/folders")
+raise SystemExit(0 if any(x.endswith(".noindex") for x in p.split(os.sep)) or any(p == r or p.startswith(r + "/") for r in roots) else 1)
+' "$1"
 }
 
 # setup.sh passes the path that tools/zig-bin.sh already validated. A runner
@@ -419,6 +444,10 @@ if [[ -n "${zig_toolchain_dir}" ]]; then
   profile_args+=(--read-subpath "${zig_toolchain_dir}")
 fi
 for dir in "${writes[@]}"; do
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" \
+     || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+    non_indexed_path "${dir}" || refuse profile
+  fi
   mkdir -p "${dir}"
   profile_args+=(--read-subpath "${dir}" --write-subpath "${dir}")
 done

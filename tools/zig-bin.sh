@@ -10,12 +10,12 @@ if [[ -n "${ZIG:-}" ]]; then
   else
     zig_bin="$(command -v -- "${ZIG}" 2>/dev/null || true)"
   fi
-  [[ -n "${zig_bin}" && -x "${zig_bin}" ]] || fail "ZIG does not name an executable: ${ZIG}"
+  [[ -n "${zig_bin}" && -x "${zig_bin}" ]] || fail "the configured Zig is missing or not executable"
 else
   zig_bin="$(command -v zig 2>/dev/null || true)"
-  [[ -n "${zig_bin}" && -x "${zig_bin}" ]] || fail "Zig 0.17.0 is required; set ZIG or add zig to PATH"
+  [[ -n "${zig_bin}" && -x "${zig_bin}" ]] || fail "the configured Zig is missing or not executable"
 fi
 
-version="$("${zig_bin}" version 2>/dev/null)" || fail "cannot read Zig version: ${zig_bin}"
-[[ "${version}" == "0.17.0" ]] || fail "Zig 0.17.0 is required; ${zig_bin} reports ${version:-no version}"
+version="$("${zig_bin}" version 2>/dev/null)" || fail "cannot read the configured Zig version"
+[[ "${version}" == "0.17.0" ]] || fail "the configured Zig is not 0.17.0"
 printf '%s\n' "${zig_bin}"

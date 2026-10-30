@@ -482,14 +482,26 @@ release_lock
 
 # --- 4b. the resident sandbox cannot be switched off on a self-hosted runner --
 hold_lock
-L4B="${WORK}/case4b"; mkdir -p "${L4B}"
-out="$(run_up "${L4B}" RUNNER_ENVIRONMENT=self-hosted --weights "${WEIGHTS}" --socket "${WORK}/case4b.sock" -- echo should-not-run)"; rc=$?
+# A .noindex root makes the self-hosted log-root check pass, so the sandbox
+# check is reached.
+L4B="${WORK}/case4b.noindex"; mkdir -p "${L4B}"
+out="$(run_up "${L4B}" RUNNER_ENVIRONMENT=self-hosted --weights "${WEIGHTS}" --socket "${L4B}/c4b.sock" -- echo should-not-run)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (sandbox-required)"* && ! -f "${L4B}/stub-argv" ]]; then
   pass "RESIDENT_UP_SANDBOX=0 on a self-hosted runner refuses by name before any boot"
 else
   fail "RESIDENT_UP_SANDBOX=0 on a self-hosted runner did not refuse (rc ${rc}): ${out}"
 fi
-out="$(run_up "${L4B}" RESIDENT_UP_SANDBOX=maybe --weights "${WEIGHTS}" --socket "${WORK}/case4b.sock" -- echo should-not-run)"; rc=$?
+# The runner can set TMPDIR below an indexed home. The default socket must move
+# to the short private /private/tmp directory instead of refusing that path.
+IDX_TMP="${HOME}/.q38-resident-idx-$$"; mkdir -p "${IDX_TMP}"
+out="$(run_up "${L4B}" RUNNER_ENVIRONMENT=self-hosted TMPDIR="${IDX_TMP}/" --weights "${WEIGHTS}" -- echo should-not-run)"; rc=$?
+rm -rf "${IDX_TMP}"
+if [[ "${out}" != *"REFUSED (socket-path)"* && ! -f "${L4B}/stub-argv" ]]; then
+  pass "an indexed runner TMPDIR moves the default socket instead of refusing it"
+else
+  fail "an indexed runner TMPDIR made the default socket refuse (rc ${rc}): ${out}"
+fi
+out="$(run_up "${L4B}" RESIDENT_UP_SANDBOX=maybe --weights "${WEIGHTS}" --socket "${L4B}/c4b.sock" -- echo should-not-run)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"RESIDENT_UP_SANDBOX must be 0 or 1"* && ! -f "${L4B}/stub-argv" ]]; then
   pass "a RESIDENT_UP_SANDBOX value other than 0 or 1 refuses by name"
 else
@@ -571,7 +583,10 @@ run_leg() {
 python3 -c 'import time; time.sleep(120)' 'bench-worker resident' &
 DECOY_PID=$!
 SOCKET_OUT="${WORK}/leg1.socket"
-out="$(run_leg --boot --spec serial --draft-len 0 --socket-out "${SOCKET_OUT}")"; rc=$?
+GUARD_RECORDS="${WORK}/guard-records"
+mkdir -m 700 "${GUARD_RECORDS}"
+out="$(run_leg ORPHAN_GUARD_RESIDENT_RECORD_DIR="${GUARD_RECORDS}" \
+  --boot --spec serial --draft-len 0 --socket-out "${SOCKET_OUT}")"; rc=$?
 if kill -0 "${DECOY_PID}" 2>/dev/null; then
   pass "a decoy process with bench-worker resident text is not matched or killed"
 else
@@ -596,6 +611,16 @@ if [[ -f "${boot_socket}.ready" ]]; then
   pass "--boot writes the <socket>.ready marker"
 else
   fail "--boot wrote no ready marker beside ${boot_socket}"
+fi
+guard_record="${GUARD_RECORDS}/resident.${boot_pid}"
+expected_worker="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "${TREE}/Vendor/TensorFold/zig-out/bin/bench-worker")"
+if [[ -f "${guard_record}" \
+   && "$(<"${guard_record}")" == "${boot_pid}:${expected_worker}" \
+   && "$(stat -f '%Lp' "${guard_record}")" == 600 ]]; then
+  pass "--boot writes the exact private orphan-guard pid and executable record"
+else
+  fail "--boot wrote no exact orphan-guard resident record"
 fi
 
 # --- B2. --spec serial is authoritative over the tree's manifest -------------
