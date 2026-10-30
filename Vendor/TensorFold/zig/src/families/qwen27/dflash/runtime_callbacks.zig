@@ -12,6 +12,7 @@ fn backend(ptr: *anyopaque) *Backend {
 fn begin(ptr: *anyopaque) !u64 {
     const b = backend(ptr);
     if (b.failed) return error.DraftBackendFailed;
+    b.input_sums = null;
     return b.frame.begin();
 }
 fn release(ptr: *anyopaque, epoch: u64) void {
@@ -20,11 +21,14 @@ fn release(ptr: *anyopaque, epoch: u64) void {
 }
 fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode) !op.View {
     const b = backend(ptr);
+    errdefer b.input_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(w.shape[0]), .bf16);
     if (mode == .bf16_reference) {
+        b.input_sums = null;
         try b.primitives.linear(e, try b.frame.ref(x), try b.weight(w), try b.frame.ref(y), .{ .rows = x.rows, .n = y.width, .k = x.width, .x_stride = x.stride, .w_stride = x.width, .y_stride = y.stride });
     } else if (b.tiled.get(@intFromPtr(w.bytes.ptr))) |t| {
+        b.input_sums = null;
         if (x.stride != x.width or y.stride != y.width) return error.DraftPreparationUnqualified;
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
@@ -34,10 +38,22 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         const adapter = b.prepared.get(@intFromPtr(w.bytes.ptr)) orelse return error.DraftPreparationUnqualified;
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
-        var first: u32 = 0;
-        while (first < x.rows) : (first += 16) {
-            try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, 16));
+        const p = adapter.projection;
+        const cacheable = p.reg and p.sums_pipe != null and p.sums_buffer != null and
+            x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
+            x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
+            y.stride == p.y_stride and p.output_bytes == 2;
+        if (!cacheable or (if (b.input_sums) |s| !std.meta.eql(s.view, x) else false)) b.input_sums = null;
+        if (b.input_sums) |s| {
+            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
+        } else {
+            var first: u32 = 0;
+            while (first < x.rows) : (first += 16) {
+                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, 16));
+            }
+            if (cacheable) b.input_sums = .{ .view = x, .sums = .{ .ref = .{ .buf = p.sums_buffer.? }, .stride = 16 } };
         }
+        return y;
     }
     e.barrier();
     return y;
