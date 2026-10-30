@@ -86,8 +86,7 @@ pub const Model = struct {
         errdefer m.kernels.deinit();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
-        // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
-        m.frame = try Frame.init(m.device, c, @max(rows, promptRows(if (later) 0 else m.device.generation())));
+        m.frame = try Frame.init(m.device, c, @max(rows, promptRows()));
         errdefer m.frame.deinit();
         m.ane = null;
         m.share_pending = true;
@@ -150,10 +149,12 @@ pub const Model = struct {
     }
 };
 
-/// A prompt pass's requested rows, before the runner's frame and attention limits.
-pub fn promptRows(generation: u32) u32 {
-    const value = if (std.c.getenv("TF_PROMPT_ROWS")) |v| std.mem.span(v) else null;
-    return @import("prompt_rows.zig").requested(generation, value);
+/// A prompt pass's rows: 512 (TF_PROMPT_ROWS takes another multiple of 16 up to the frame's 2048).
+pub fn promptRows() u32 {
+    const default = 512;
+    const v = std.c.getenv("TF_PROMPT_ROWS") orelse return default;
+    const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return default;
+    return if (n >= 16 and n <= @import("gpu_frame.zig").max_rows and n % 16 == 0) n else default;
 }
 
 /// The qualified shape and layer schedule; per-module widths are admitted by widths.admit once the chip is known.
