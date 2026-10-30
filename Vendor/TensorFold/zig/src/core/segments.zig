@@ -1,7 +1,7 @@
 //! Staggered prompt segments, for any family: each segment on its own queue does what a serial chunk of its rows does, so the output equals the chunks run in order.
 const std = @import("std");
 const mtl = @import("metal");
-const Fence = @import("fence.zig").Fence;
+pub const Fence = @import("fence.zig").Fence;
 const stagger = @import("stagger.zig");
 
 /// Segments one chunk can take.
@@ -30,6 +30,11 @@ pub fn run(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: m
 
 /// `run`, committing every `every` layers (0: once), fenced in order; returns the chunk's summed GPU seconds.
 pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, every: usize) !f64 {
+    return runCommittingFrom(device, queues, layers, mode, fam, every, every);
+}
+
+/// `runCommitting` whose first commit comes after `first` layers, so the GPU starts while the CPU encodes the rest.
+pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize) !f64 {
     const n = queues.len;
     if (n == 0 or n > MAX) return error.Segments;
     var evs: [MAX - 1]mtl.Event = undefined;
@@ -55,6 +60,7 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
         queue: mtl.Queue,
         every: usize,
         layers: usize,
+        first: usize,
         done: *[16]mtl.CommandBuffer,
         n_done: *usize,
 
@@ -87,7 +93,7 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
-            if (x.every == 0 or x.lanes.len != 1 or (i + 1) % x.every != 0 or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
+            if (x.every == 0 or x.lanes.len != 1 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
             const l = &x.lanes[k];
             l.fence.update(l.enc);
             l.enc.end();
@@ -102,7 +108,7 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
             try x.fam.finish(&x.lanes[k]);
         }
     };
-    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queue = queues[0], .every = every, .layers = layers, .done = &done, .n_done = &n_done };
+    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queue = queues[0], .every = every, .layers = layers, .first = first, .done = &done, .n_done = &n_done };
     stagger.drive(n, layers, &x) catch |err| { // close the open encoders, drop the open command buffers, let committed chunks finish
         for (lanes[0..n]) |l| l.enc.end();
         for (done[0..n_done]) |cb| cb.wait();
@@ -110,6 +116,8 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
     };
     for (lanes[0..n]) |l| l.enc.end();
     for (lanes[0..n]) |l| l.cb.commit();
+    // work the family queues behind the last chunk before the host waits on it (a round's keep)
+    const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
     for (lanes[0..n]) |l| l.cb.wait(); // every segment ends before a failure returns and its buffers are reused
     var gpu: f64 = 0;
     for (done[0..n_done]) |cb| {
@@ -127,6 +135,7 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
         }
         gpu = if (n_done > 0) gpu + l.cb.gpuSeconds() else @max(gpu, l.cb.gpuSeconds());
     }
+    try queued;
     return gpu;
 }
 
