@@ -35,9 +35,8 @@ pub const Taps = struct {
         if (t.seen != 0 and rows != t.rows) return error.BadTapShape;
         const bit = @as(u8, 1) << @intCast(index);
         if (t.seen & bit != 0) return error.DuplicateTap;
-        // no barrier: the mixer that follows reads the norm's input rows, not the hidden rows or the tap planes, and its own
-        // barriers order this copy before the next write of `hidden`; the picks read the planes behind the head's barrier
         try glue.unstack(e, hidden, try t.plane(index), .{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 });
+        e.barrier();
         t.seen |= bit;
         t.rows = rows;
     }

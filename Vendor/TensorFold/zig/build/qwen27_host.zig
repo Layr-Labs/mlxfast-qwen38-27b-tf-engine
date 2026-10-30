@@ -1,6 +1,10 @@
 //! Host regressions use no shaders, model or GPU execution.
 const std = @import("std");
 pub fn tests(b: *std.Build) void {
+    const digest_metal = b.createModule(.{ .root_source_file = b.path("zig/qwen27_attention_digest_metal.zig"), .target = b.graph.host });
+    const digest_core = b.createModule(.{ .root_source_file = b.path("zig/qwen27_speed_core.zig"), .target = b.graph.host, .imports = &.{.{ .name = "metal", .module = digest_metal }} });
+    const digest = b.createModule(.{ .root_source_file = b.path("zig/qwen27_attention_digest_test.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "metal", .module = digest_metal }, .{ .name = "core", .module = digest_core } } });
+    b.step("test-qwen27-attention-digest-host", "Attention plan mutation and cache validation without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = digest, .filters = &.{ "qwen27 digest:", "plan fingerprint changes", "descriptor identity includes" } })).step);
     const attention_metal = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test_metal.zig"), .target = b.graph.host });
     const attention_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig") });
     const attention = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "metal", .module = attention_metal }, .{ .name = "kernel_sources", .module = attention_sources } } });

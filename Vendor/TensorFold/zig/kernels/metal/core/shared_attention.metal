@@ -72,12 +72,13 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 
 #define TF_G (TF_QH / TF_KVH)
 
-// Split over key chunks: one simdgroup takes a KV head's query heads for one row, reading each key once for them.
-[[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
-    const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
-    const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
-    device float* part [[buffer(5)]], uint lane [[thread_index_in_simdgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+struct tf_ring_args { uint prefix, begin, window; };
+
+// Both split entries use the same arithmetic; only the logical key's load address changes.
+template <bool ring>
+inline void tf_attention_split(const device bfloat* Q, const device bfloat* K, const device bfloat* V,
+    const device uchar* mask, constant tf_context_args& args, device float* part,
+    const device bfloat* cacheK, const device bfloat* cacheV, tf_ring_args ring_args, uint lane, uint3 tg) {
   const uint kh = tg.x, row = tg.y, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
   if (kh >= TF_KVH || row >= args.rows || chunk >= chunks) return;
   const float scale = as_type<float>(args.scale_bits);
@@ -91,9 +92,18 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
   const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
   for (uint key = chunk * TF_CHUNK; key < last; ++key) {
     if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
-    const size_t ki = ((size_t)key * TF_KVH + kh) * TF_D;
+    const device bfloat* keyK = K;
+    const device bfloat* keyV = V;
+    uint physical = key;
+    if (ring) {
+      if (key < ring_args.prefix) {
+        keyK = cacheK; keyV = cacheV;
+        physical = uint(((size_t)ring_args.begin + key) % ring_args.window);
+      } else physical = key - ring_args.prefix;
+    }
+    const size_t ki = ((size_t)physical * TF_KVH + kh) * TF_D;
     float k[TF_D / 32], v[TF_D / 32];
-    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(K[ki + lane + d * 32]); v[d] = float(V[ki + lane + d * 32]); }
+    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(keyK[ki + lane + d * 32]); v[d] = float(keyV[ki + lane + d * 32]); }
     for (uint g = 0; g < TF_G; ++g) {
       float dot = 0.0f;
       for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[g][d], k[d], dot);
@@ -113,6 +123,26 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
     if (lane == 0) { p[TF_D] = maximum[g]; p[TF_D + 1] = total[g]; }
   }
 }
+
+// Split over key chunks: one simdgroup takes a KV head's query heads for one row.
+[[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
+    const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
+    const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
+    device float* part [[buffer(5)]], uint lane [[thread_index_in_simdgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  tf_attention_split<false>(Q, K, V, mask, args, part, K, V, {0, 0, 1}, lane, tg);
+}
+
+#if TF_RING_SPLIT
+[[kernel]] void tf_shared_lane_attention_split_ring(const device bfloat* Q [[buffer(0)]],
+    const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
+    const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
+    device float* part [[buffer(5)]], const device bfloat* cacheK [[buffer(6)]],
+    const device bfloat* cacheV [[buffer(7)]], constant tf_ring_args& ring_args [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+  tf_attention_split<true>(Q, K, V, mask, args, part, cacheK, cacheV, ring_args, lane, tg);
+}
+#endif
 
 // One query head and row: its chunks' partials rescaled to the largest maximum and added in chunk order.
 [[kernel]] void tf_shared_lane_attention_merge(const device float* part [[buffer(0)]],

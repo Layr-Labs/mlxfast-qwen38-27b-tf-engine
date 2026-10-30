@@ -187,3 +187,7 @@ test {
 test {
     _ = @import("residency_qwen27_share_tests.zig");
 }
+
+test {
+    _ = @import("qwen27_ring_host.zig");
+}

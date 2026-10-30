@@ -14,6 +14,7 @@ pub const Shape = struct {
     capacity: usize,
     output: Output = .f32,
     split_chunk: usize = 256,
+    ring_split: bool = false,
 
     pub fn validate(s: Shape) !void {
         if (s.query_heads == 0 or s.kv_heads == 0 or s.query_heads % s.kv_heads != 0 or
@@ -28,12 +29,14 @@ pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 fn chunksOf(keys: usize, chunk: usize) usize {
     return (keys + chunk - 1) / chunk;
 }
+pub const Ring = struct { k: Ref, v: Ref, prefix: usize, begin: usize, window: usize };
+const RingArgs = extern struct { prefix: u32, begin: u32, window: u32 };
 const Args = extern struct { rows: u32, keys: u32 = 0, mask_stride: u32 = 0, heads: u32 = 0, scale_bits: u32 = 0 };
 
 pub fn source(a: std.mem.Allocator, s: Shape) ![]u8 {
     try s.validate();
-    return std.fmt.allocPrint(a, "#define TF_QH {d}\n#define TF_KVH {d}\n#define TF_D {d}\n#define TF_RD {d}\n#define TF_INTERLEAVED {d}\n#define TF_OUT {s}\n#define TF_CHUNK {d}\n{s}", .{
-        s.query_heads, s.kv_heads, s.head_dim, s.rotary_dim, @intFromBool(s.rope == .interleaved), if (s.output == .f32) "float" else "bfloat", s.split_chunk, sources.core_shared_attention,
+    return std.fmt.allocPrint(a, "#define TF_QH {d}\n#define TF_KVH {d}\n#define TF_D {d}\n#define TF_RD {d}\n#define TF_INTERLEAVED {d}\n#define TF_OUT {s}\n#define TF_CHUNK {d}\n#define TF_RING_SPLIT {d}\n{s}", .{
+        s.query_heads, s.kv_heads, s.head_dim, s.rotary_dim, @intFromBool(s.rope == .interleaved), if (s.output == .f32) "float" else "bfloat", s.split_chunk, @intFromBool(s.ring_split), sources.core_shared_attention,
     });
 }
 
@@ -44,6 +47,7 @@ pub const Attention = struct {
     rope: mtl.Pipeline,
     append: mtl.Pipeline,
     split: mtl.Pipeline,
+    split_ring: ?mtl.Pipeline = null,
     merge: mtl.Pipeline,
     /// encodeSplit's chunk partials: [16 rows][kv heads][chunks][query heads a kv head][head_dim + 2] fp32.
     part: mtl.Buffer,
@@ -63,11 +67,14 @@ pub const Attention = struct {
         errdefer append.deinit();
         const split = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split", false);
         errdefer split.deinit();
+        const split_ring = if (s.ring_split) try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split_ring", false) else null;
+        errdefer if (split_ring) |pipeline| pipeline.deinit();
+        if (split_ring) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 32) return error.UnsupportedAttentionPipeline;
         const merge = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge", false);
         errdefer merge.deinit();
         if (attend.simdWidth() != 32 or attend.maxThreads() < 32 or split.simdWidth() != 32 or merge.simdWidth() != 32) return error.UnsupportedAttentionPipeline;
         const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity, s.split_chunk) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .split = split, .merge = merge, .part = part };
+        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .split = split, .split_ring = split_ring, .merge = merge, .part = part };
     }
     pub fn deinit(p: Attention) void {
         p.attend.deinit();
@@ -75,28 +82,52 @@ pub const Attention = struct {
         p.rope.deinit();
         p.append.deinit();
         p.split.deinit();
+        if (p.split_ring) |pipeline| pipeline.deinit();
         p.merge.deinit();
         p.part.deinit();
     }
 
     /// Encode key chunks and merge their fp32 partials in chunk order.
     pub fn encodeSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
+        try p.encodeSplitImpl(e, rows, keys, stride, scale, q, k, v, mask, out, null);
+    }
+
+    /// Cached prefix stays in its ring; K/V contain the current rows in logical suffix order.
+    pub fn encodeSplitRing(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, ring: Ring) !void {
+        try p.encodeSplitImpl(e, rows, keys, stride, scale, q, k, v, mask, out, ring);
+    }
+
+    fn encodeSplitImpl(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, ring: ?Ring) !void {
         if (rows == 0 or rows > 16 or keys == 0 or keys > p.shape.capacity or stride < keys or stride > std.math.maxInt(u32) or
             !std.math.isFinite(scale)) return error.InvalidAttentionView;
         try check(q, rows * p.shape.query_heads * p.shape.head_dim * 2, 2);
         try check(out, rows * p.shape.query_heads * p.shape.head_dim * p.outputBytes(), p.outputBytes());
-        try check(k, keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
-        try check(v, keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
+        if (ring) |r| {
+            if (p.split_ring == null or r.window == 0 or r.window > p.shape.capacity or r.prefix >= r.window or r.begin >= r.window or r.prefix > keys or keys - r.prefix != rows) return error.InvalidAttentionView;
+            // Check each complete owned cache, including its unused capacity, before any dispatch.
+            try check(r.k, p.shape.capacity * p.shape.kv_heads * p.shape.head_dim * 2, 2);
+            try check(r.v, p.shape.capacity * p.shape.kv_heads * p.shape.head_dim * 2, 2);
+            try disjoint(out, r.k);
+            try disjoint(out, r.v);
+        }
+        const current_keys = if (ring != null) rows else keys;
+        try check(k, current_keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
+        try check(v, current_keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
         try check(mask, try std.math.mul(usize, rows, stride), 1);
         try disjoint(out, q);
         try disjoint(out, k);
         try disjoint(out, v);
         try disjoint(out, mask);
         const args = Args{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) };
-        e.setPipeline(p.split);
+        e.setPipeline(if (ring != null) p.split_ring.? else p.split);
         for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
         e.setValue(args, 4);
         e.setBuffer(p.part, 0, 5);
+        if (ring) |r| {
+            e.setBuffer(r.k.buf, r.k.off, 6);
+            e.setBuffer(r.v.buf, r.v.off, 7);
+            e.setValue(RingArgs{ .prefix = @intCast(r.prefix), .begin = @intCast(r.begin), .window = @intCast(r.window) }, 8);
+        }
         e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
         e.barrier();
         e.setPipeline(p.merge);

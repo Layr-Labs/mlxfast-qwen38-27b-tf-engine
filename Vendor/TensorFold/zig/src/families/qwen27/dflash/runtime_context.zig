@@ -106,9 +106,24 @@ pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
 
 /// Query rows [first, first + rows) against `context`'s cached keys and their own, into the same rows of `result`.
 fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, context: op.Context, caches: []const @import("runtime_backend.zig").Cache, first: u32, rows: u32, result: op.View) !void {
+    if (context.end < context.begin or context.end - context.begin >= b.config.window) return error.BadDraftContext;
     const context_rows: u32 = @intCast(context.end - context.begin);
-    const keys = context_rows + rows;
+    const keys = try std.math.add(u32, context_rows, rows);
     const at: u32 = @intCast(context.begin % b.config.window);
+    if (b.attention.split_ring != null and p.streams.len == 0 and keys > 1024 and p.keys.stride == p.keys.width and p.values.stride == p.values.width and keys > b.config.window - at) {
+        try p.keys.check(rows, b.config.kvWidth(), .bf16);
+        try p.values.check(rows, b.config.kvWidth(), .bf16);
+        const own_k = try b.frame.ref(p.keys);
+        const own_v = try b.frame.ref(p.values);
+        const mask = try b.frame.alloc(rows, keys, .u8);
+        const mask_ref = try b.frame.ref(mask);
+        try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
+        const q = try b.frame.ref(p.query);
+        const y = try b.frame.ref(result);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(b.config.head_dim)));
+        try b.attention.encodeSplitRing(e, rows, keys, keys, scale, .{ .buf = q.buf, .off = q.off }, .{ .buf = own_k.buf, .off = own_k.off }, .{ .buf = own_v.buf, .off = own_v.off }, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off }, .{ .k = .{ .buf = caches[p.layer].keys }, .v = .{ .buf = caches[p.layer].values }, .prefix = context_rows, .begin = at, .window = b.config.window });
+        return;
+    }
     var k: Ref = undefined;
     var v: Ref = undefined;
     if (at + keys <= b.config.window) {
