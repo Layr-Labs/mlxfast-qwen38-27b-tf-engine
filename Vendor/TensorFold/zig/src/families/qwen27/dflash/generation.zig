@@ -177,7 +177,8 @@ pub const Generation = struct {
             p.shape = shape;
             g.picked.?.update(e);
         }
-        /// The keep, encoded and committed behind the verify's last command buffer while the GPU still runs it.
+        /// The keep, encoded and committed behind the verify's last command buffer while the GPU still runs it,
+        /// so its replay starts on the picks' fence instead of after the host wakes, reads and encodes.
         fn keep(ptr: *anyopaque) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;

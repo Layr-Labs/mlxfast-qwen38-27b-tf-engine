@@ -122,23 +122,21 @@ kernel void q27_rope(device const uchar* X [[buffer(0)]], device const int* posi
   q27_write(Y, base + at.x, value, a.activation);
 }
 
-struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane; };
+struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane, key_stride, rows, packed_rows; };
 
-// q27_head_norm then q27_rope for bf16 prompt rows 256 wide: a row's q heads (`stride` apart) then k heads, four a group.
 // Lane l holds the norm's threads l and 32 + l (columns 4l.., 128 + 4l..) and their sums; the rope turns the rounded
-// values norm_q and norm_k held, pair d's angle from lane d.
-kernel void q27_head_norm_rope(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
-                               device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]],
-                               device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]],
-                               device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
-                               uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                               uint lane [[thread_index_in_simdgroup]]) {
+template <bool PACK>
+inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
+                                    device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
+                                    uint2 group, uint sg, uint lane) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
-  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + (row * a.kv_heads + head - a.heads) * a.width;
+  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
   device const bfloat* w = query ? QW : KW;
-  device bfloat* y = query ? QY + (row * a.heads + head) * a.width : KY + (row * a.kv_heads + head - a.heads) * a.width;
+  const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
+  device bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
+                            : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
   const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
   float sa = 0.0f, sb = 0.0f;
   for (uint j = 0; j != 4; ++j) {
@@ -184,7 +182,24 @@ kernel void q27_head_norm_rope(device const bfloat* Q [[buffer(0)]], device cons
   }
   *(device bfloat4*)(y + 4 * lane) = ya;
   *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+  if (PACK && query && row == 0 && head == kv_head * g)
+    for (uint r = a.rows * g; r < a.packed_rows; ++r) {
+      device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
+      *(device bfloat4*)(pad + 4 * lane) = ya;
+      *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+    }
 }
+
+#define Q27_HEAD_NORM_ROPE(NAME, PACK) \
+kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
+                 device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
+                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]], \
+                 uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+  q27_head_norm_rope_rows<PACK>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
+}
+Q27_HEAD_NORM_ROPE(q27_head_norm_rope, false)
+Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed, true)
+#undef Q27_HEAD_NORM_ROPE
 
 struct Element { uint width, heads, rows, activation; };
 
