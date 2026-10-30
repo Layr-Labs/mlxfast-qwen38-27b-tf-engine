@@ -33,6 +33,37 @@ const ShortSocketDir = struct {
         return std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ dir.buffer[0..dir.len], name });
     }
 };
+const ActivityProbe = struct {
+    begins: usize = 0,
+    ends: usize = 0,
+    active: bool = false,
+    bad_order: bool = false,
+
+    fn hooks(p: *ActivityProbe) resident.Activity {
+        return .{ .ctx = p, .begin = begin, .end = end };
+    }
+
+    fn begin(ctx: *anyopaque) void {
+        const p: *ActivityProbe = @ptrCast(@alignCast(ctx));
+        p.bad_order = p.bad_order or p.active;
+        p.active = true;
+        p.begins += 1;
+    }
+
+    fn end(ctx: *anyopaque) void {
+        const p: *ActivityProbe = @ptrCast(@alignCast(ctx));
+        p.bad_order = p.bad_order or !p.active;
+        p.active = false;
+        p.ends += 1;
+    }
+
+    // Read only after the server thread joins.
+    fn expectBalanced(p: *const ActivityProbe, count: usize) !void {
+        try std.testing.expectEqual(count, p.begins);
+        try std.testing.expectEqual(count, p.ends);
+        try std.testing.expect(!p.active and !p.bad_order);
+    }
+};
 const Server = struct {
     mock: *bench.MockSession,
     config: resident.Config,
@@ -296,6 +327,7 @@ test "socket round trip, stable identity, errors, and same-uid check" {
     var mock = bench.MockSession.init(std.testing.allocator);
     var failures: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer failures.deinit();
+    var activity: ActivityProbe = .{};
     const first_pair = try socketPair();
     var server: Server = .{
         .mock = &mock,
@@ -313,6 +345,7 @@ test "socket round trip, stable identity, errors, and same-uid check" {
                 .weights_revision = "revision",
             },
             .failure_writer = &failures.writer,
+            .activity = activity.hooks(),
         },
     };
     const first_thread = try std.Thread.spawn(.{}, Server.run, .{&server});
@@ -352,8 +385,11 @@ test "socket round trip, stable identity, errors, and same-uid check" {
     var failed_out: [1]u32 = undefined;
     try std.testing.expectError(error.ResidentRequestFailed, session.runFree(1, &failed_out, &failed_audit));
     try std.testing.expectEqualStrings("SessionNotSeeded", first.failureReason(error.ResidentRequestFailed));
+    session.reset();
     first.deinit();
     first_thread.join();
+    // Two connection resets plus seven dispatches (including an explicit reset), including malformed and engine-error requests.
+    try activity.expectBalanced(9);
     if (server.failure) |err| return err;
 
     const second_pair = try socketPair();
@@ -371,6 +407,8 @@ test "socket round trip, stable identity, errors, and same-uid check" {
     try audit.check(out.len);
     second.deinit();
     second_thread.join();
+    // A reconnect adds two resets and two successful dispatches.
+    try activity.expectBalanced(13);
     try std.testing.expectEqualStrings(
         "bench-worker resident: prefill failed: TooManyTokens\n" ++
             "bench-worker resident: generate failed: RequestTooLarge\n" ++
@@ -612,10 +650,12 @@ test "client refuses wrong resident_weights" {
     const asked = try tmp.dir.realPathFileAlloc(std.testing.io, "asked", std.testing.allocator);
     defer std.testing.allocator.free(asked);
     var mock = bench.MockSession.init(std.testing.allocator);
+    var activity: ActivityProbe = .{};
     const pair = try socketPair();
     var server: Server = .{ .mock = &mock, .fd = pair[0], .config = .{
         .io = std.testing.io,
         .socket_path = "unused",
+        .activity = activity.hooks(),
         .weights = held,
         .identity = .{ .backend = "mock", .device = "test", .manifest_digest = digest, .pid = 1, .load_epoch = 2, .weights_revision = "held" },
     } };
@@ -625,6 +665,8 @@ test "client refuses wrong resident_weights" {
         resident_client.Client.attach(std.testing.allocator, std.testing.io, pair[1], asked),
     );
     thread.join();
+    // Failed handshake still balances both connection resets without dispatching.
+    try activity.expectBalanced(2);
     try std.testing.expectEqual(error.MissingHandshake, server.failure.?);
 }
 

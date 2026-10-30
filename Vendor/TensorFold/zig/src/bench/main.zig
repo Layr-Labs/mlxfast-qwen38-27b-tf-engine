@@ -139,20 +139,27 @@ fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
 
     var binding = adapter_mod.EngineDflashBinding.init(init.gpa, opened.engine);
     defer binding.deinit();
-    var lone: LoneBinding = undefined;
-    const dflash = loneDflash(opened, args.drafter != null, &lone) orelse platformDflash(opened.engine, args.drafter != null, &binding);
+    const dflash = platformDflash(opened.engine, args.drafter != null, &binding);
+    // Match server.Config.keep_warm_s / the serve CLI default, independent of requests.
+    const keep_warm_s: i64 = 900;
+    const keepalive: ?*api.keepalive.Keepalive = if (opened.engine.keepaliveTarget()) |target|
+        api.keepalive.Keepalive.start(init.gpa, init.io, target, keep_warm_s * std.time.ns_per_s) catch |err| blk: {
+            std.debug.print("bench-worker: idle keepalive off: {s}\n", .{@errorName(err)});
+            break :blk null;
+        }
+    else
+        null;
+    // Join before binding cleanup and engine close: both can release resident buffers.
+    defer if (keepalive) |k| k.stop();
     var adapter = adapter_mod.Adapter.init(init.gpa, opened.engine, dflash);
     const built = engines.identity(a, .{ .model = args.weights, .drafter = args.drafter, .parallel = "1", .prompt_cache_gib = 0 });
     const digest = manifestDigest();
     const loaded_at = std.Io.Clock.awake.now(init.io).toNanoseconds();
     const epoch: u64 = @intCast(@max(0, loaded_at));
-    // macOS unwires an idle model within seconds; the server's idle keepalive holds it wired between requests
-    const keepalive: ?*api.keepalive.Keepalive = if (opened.engine.keepaliveTarget()) |target| api.keepalive.Keepalive.start(init.gpa, init.io, target, keep_warm_ns) catch null else null;
-    defer if (keepalive) |k| k.stop();
     resident.serve(init.gpa, adapter.session(), .{
         .io = init.io,
-        .keepalive = keepalive,
         .socket_path = args.socket,
+        .activity = if (keepalive) |k| .{ .ctx = k, .begin = keepaliveBegin, .end = keepaliveEnd } else null,
         .weights = args.weights,
         .identity = .{
             .backend = built.backend,
@@ -167,6 +174,16 @@ fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
         return 1;
     };
     return 0;
+}
+
+fn keepaliveBegin(ctx: *anyopaque) void {
+    const k: *api.keepalive.Keepalive = @ptrCast(@alignCast(ctx));
+    k.begin();
+}
+
+fn keepaliveEnd(ctx: *anyopaque) void {
+    const k: *api.keepalive.Keepalive = @ptrCast(@alignCast(ctx));
+    k.end();
 }
 
 fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]const u8) ![]const u8 {
@@ -195,23 +212,8 @@ pub fn manifestDigest() [64]u8 {
     return std.fmt.bytesToHex(hash, .lower);
 }
 
-/// The server's default --keep-warm window.
-const keep_warm_ns: i64 = 900 * std.time.ns_per_s;
-
 fn platformDflash(engine: api.Engine, enabled: bool, binding: *adapter_mod.EngineDflashBinding) ?adapter_mod.DflashSource {
     return adapter_mod.platformDflash(builtin.os.tag, engine, enabled, binding);
-}
-
-const backend = engines.backend;
-const LoneBinding = if (@hasDecl(backend, "qwen27Dflash")) adapter_mod.GenerationBinding(backend.qwen27_generation) else void;
-
-/// The 27B on Metal drafts its depth-1 rounds through its DFlash generation, the loop a lone greedy request takes.
-fn loneDflash(opened: api.Opened, enabled: bool, lone: *LoneBinding) ?adapter_mod.DflashSource {
-    if (comptime !@hasDecl(backend, "qwen27Dflash")) return null;
-    if (!enabled) return null;
-    const q = backend.qwen27Dflash(opened) orelse return null;
-    lone.* = .{ .generation = q.generation, .chunk = q.chunk, .host = q.host };
-    return lone.source();
 }
 
 const MockServer = struct {

@@ -2,8 +2,6 @@
 const std = @import("std");
 const api = @import("engine_api");
 const native = @import("native_engines");
-/// The native backend module, for the bench worker's family-specific bindings.
-pub const backend = native;
 const cli = @import("cli.zig");
 const build_identity = @import("identity.zig");
 const Allocator = std.mem.Allocator;

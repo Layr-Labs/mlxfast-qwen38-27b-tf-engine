@@ -1,6 +1,5 @@
 //! One loaded bench session behind a same-uid Unix socket.
 const std = @import("std");
-const api = @import("engine_api");
 const builtin = @import("builtin");
 const bench = @import("bench_session");
 const client = @import("resident_client.zig");
@@ -19,6 +18,14 @@ pub const Identity = struct {
     weights_revision: []const u8,
 };
 
+/// Optional idle-residency notification; the caller owns the context through serve's return.
+/// begin/end are paired around engine work, including failed dispatch and connection resets.
+pub const Activity = struct {
+    ctx: *anyopaque,
+    begin: *const fn (*anyopaque) void,
+    end: *const fn (*anyopaque) void,
+};
+
 pub const Config = struct {
     io: std.Io,
     socket_path: []const u8,
@@ -32,8 +39,7 @@ pub const Config = struct {
     idle_timeout_ms: u32 = default_idle_timeout_ms,
     weights_identity: ?DirectoryIdentity = null,
     failure_writer: ?*std.Io.Writer = null,
-    /// The engine's idle keepalive: it holds its commits while a request runs, as the server's does.
-    keepalive: ?*api.keepalive.Keepalive = null,
+    activity: ?Activity = null,
 };
 
 pub const default_idle_timeout_ms: u32 = 3_600_000;
@@ -59,9 +65,9 @@ pub fn serve(alloc: std.mem.Allocator, session: bench.BenchSession, config: Conf
             defer _ = std.c.close(fd);
             try client.setSocketTimeout(fd, config.timeout_ms);
             if (!try sameUid(fd)) continue;
-            session.reset();
+            resetSession(session, config.activity);
             serveClient(alloc, fd, session, resolved) catch {};
-            session.reset();
+            resetSession(session, config.activity);
         }
         served += 1;
     }
@@ -72,8 +78,8 @@ pub fn serveConnected(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: ben
     resolved.weights_identity = try directoryIdentity(std.Io.Dir.cwd(), config.io, config.weights);
     try client.setSocketTimeout(fd, config.timeout_ms);
     if (!try sameUid(fd)) return error.PeerUidMismatch;
-    session.reset();
-    defer session.reset();
+    resetSession(session, config.activity);
+    defer resetSession(session, config.activity);
     return serveClient(alloc, fd, session, resolved);
 }
 
@@ -106,9 +112,7 @@ fn serveClient(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: bench.Benc
     while (true) {
         const frame = (try client.receiveFrameWithTransferTimeout(alloc, fd, config.idle_timeout_ms, config.timeout_ms)) orelse return;
         defer alloc.free(frame);
-        if (config.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
-        defer if (config.keepalive) |k| k.end();
-        var reply = dispatch(alloc, session, frame) catch |err| {
+        var reply = dispatch(alloc, session, frame, config.activity) catch |err| {
             reportFailure(config.failure_writer, operationName(frame), @errorName(err));
             try sendFailure(alloc, fd, @errorName(err));
             continue;
@@ -193,7 +197,15 @@ fn randomBytes(bytes: []u8) !void {
     return error.EntropyUnavailable;
 }
 
-fn dispatch(alloc: std.mem.Allocator, session: bench.BenchSession, frame: []const u8) !client.Encoder {
+fn resetSession(session: bench.BenchSession, activity: ?Activity) void {
+    if (activity) |hook| hook.begin(hook.ctx);
+    defer if (activity) |hook| hook.end(hook.ctx);
+    session.reset();
+}
+
+fn dispatch(alloc: std.mem.Allocator, session: bench.BenchSession, frame: []const u8, activity: ?Activity) !client.Encoder {
+    if (activity) |hook| hook.begin(hook.ctx);
+    defer if (activity) |hook| hook.end(hook.ctx);
     var d: client.Decoder = .{ .bytes = frame };
     const op = std.enums.fromInt(client.Op, try d.byte()) orelse return error.UnknownOperation;
     if (op == .hello) return error.UnexpectedHandshake;
