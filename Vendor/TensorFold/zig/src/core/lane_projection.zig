@@ -291,14 +291,17 @@ pub const Projection = struct {
             e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
             e.barrier();
         };
+        // several 16-row blocks: blocks fastest on the grid, so a tile's blocks share one weight read (same sums, same bits)
+        const by_block = p.reg and blocks > 1;
         e.setPipeline(p.pipe);
         e.setBuffer(x.buf, x.off, 0);
         e.setBuffer(w.buf, w.off, 1);
         e.setBuffer(sb.buf, sb.off, 2);
-        e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
+        e.setValue([3]i32{ @intCast(rows), @intCast(stride), @intFromBool(by_block) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        const grid = if (by_block) mtl.Size.of(blocks, p.tile_count, 1) else mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1);
+        e.dispatchGroups(grid, mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
