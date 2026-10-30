@@ -10,7 +10,41 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64 };
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
+
+    fn serialSk2(key: Key) bool {
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and key.n == 34816 and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
+};
+
+test "serial SK2 guard and cache keys separate every excluded projection" {
+    const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
+    try std.testing.expect(eligible.serialSk2());
+    inline for (.{
+        .{ "kind", Kind.mlp },
+        .{ "n", @as(u32, 17408) },
+        .{ "k", @as(u32, 2560) },
+        .{ "slices", @as(u32, 1) },
+        .{ "slices", @as(u32, 4) },
+        .{ "skip", @as(u32, 1) },
+        .{ "cut", [2]u32{ 1, 0 } },
+        .{ "cut", [2]u32{ 0, 40 } },
+        .{ "bits", @as(u8, 8) },
+        .{ "group", @as(u32, 128) },
+    }) |change| {
+        var excluded = eligible;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!excluded.serialSk2());
+        var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+        defer cache.deinit();
+        try cache.put(eligible, eligible.serialSk2());
+        try cache.put(excluded, excluded.serialSk2());
+        try std.testing.expectEqual(@as(u32, 2), cache.count());
+        try std.testing.expect(cache.get(eligible).?);
+        try std.testing.expect(!cache.get(excluded).?);
+    }
+    try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
+}
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, ane_input, mlp_ane, add_ane };
 
 pub const Kernels = struct {
@@ -169,7 +203,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
