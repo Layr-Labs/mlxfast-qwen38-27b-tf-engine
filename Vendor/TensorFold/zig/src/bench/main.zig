@@ -126,6 +126,7 @@ fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
     const opened = (engines.open(a, init.gpa, init.io, request.dir, request.model_type, .{
         .model = request.dir,
         .drafter = request.drafter,
+        .drafter_bits = 0,
         .parallel = "1",
         .prompt_cache_gib = request.prompt_cache_gib,
     }, &problem) catch |err| {
