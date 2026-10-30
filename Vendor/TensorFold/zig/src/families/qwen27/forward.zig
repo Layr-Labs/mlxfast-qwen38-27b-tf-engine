@@ -62,7 +62,6 @@ pub const Stages = struct {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
         }
-        lane.enc.barrier();
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;

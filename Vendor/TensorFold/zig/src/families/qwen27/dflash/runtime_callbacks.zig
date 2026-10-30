@@ -38,6 +38,7 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         while (first < x.rows) : (first += 16) {
             try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, 16));
         }
+        return y;
     }
     e.barrier();
     return y;
