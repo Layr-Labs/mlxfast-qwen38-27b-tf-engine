@@ -270,6 +270,10 @@ fn dispatch(
             const out = try alloc.alloc(u32, count);
             var audit = bench.DflashAudit.init();
             defer audit.deinit(session_alloc);
+            // Organizer pre-launch test: a fixed 30 ms pause inside the timed
+            // decode run. It slows the run on purpose and leaves every token unchanged.
+            var delay: std.c.timespec = .{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+            while (std.c.nanosleep(&delay, &delay) != 0) {}
             try engineCall(void, engine_failure, session.runFree(count, out, &audit));
             try audit.check(count);
             response.tokens = out;
