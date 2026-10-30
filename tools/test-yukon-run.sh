@@ -5,7 +5,9 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 mkdir -p "${WORK}/tree/tools" "${WORK}/target"
 cp "${ROOT}/tools/qwen38-27b-tf-yukon-run.sh" "${ROOT}/tools/spec-declaration.sh" "${WORK}/tree/tools/"
-cp "${ROOT}/mtp-head.manifest.json" "${WORK}/tree/"
+# The live manifest is an editable path, and a promotion can switch it to DFlash.
+# This test covers the serial launch path, so it uses the serial declaration.
+jq '.spec = {"enabled": false, "tokens": 0}' "${ROOT}/mtp-head.manifest.json" > "${WORK}/tree/mtp-head.manifest.json"
 cat > "${WORK}/tree/tools/qwen38-27b-tf-measure-and-score.sh" <<'MOCK'
 #!/usr/bin/env bash
 printf 'ranked %s\n' "$*" > "${CAPTURE}"
