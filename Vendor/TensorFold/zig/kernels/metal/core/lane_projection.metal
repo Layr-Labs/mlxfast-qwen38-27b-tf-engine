@@ -281,7 +281,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
+#if defined(TF_PHYS)
+[[max_total_threads_per_threadgroup(32 * TF_PHYS)]]
+#else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
+#endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
@@ -306,6 +310,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2)
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
+  const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
+#elif defined(TF_PHYS)
+  // TF_PHYS SIMD groups run TF_SK / TF_PHYS consecutive logical chains each; group 0 sums its own in order and the
+  // others' after, so every word is ((C0 + C1) + C2) + ... exactly as the one-chain-a-group reduction.
+  constexpr int TF_R = TF_SK / TF_PHYS;
+  float S[16];
+  threadgroup float part[(TF_PHYS > 1 ? TF_SK - TF_R : 1) * 16 * 32];
+  for (int split = ks * TF_R; split < (ks + 1) * TF_R; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
@@ -340,6 +352,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_PHYS)
+    if (ks == 0) for (int i = 0; i < 16; i++) S[i] = split == 0 ? C[i] : S[i] + C[i];
+    else for (int i = 0; i < 16; i++) part[((split - TF_R) * 16 + i) * 32 + lane] = C[i];
+  }
+  if (TF_PHYS > 1) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = TF_R; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) S[i] += part[((s2 - TF_R) * 16 + i) * 32 + lane];
+  }
+  for (int i = 0; i < 16; i++) C[i] = S[i];
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
