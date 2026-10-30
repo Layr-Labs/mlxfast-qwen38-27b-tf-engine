@@ -46,7 +46,6 @@ fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("r
         for (slots[0..count], 0..) |*slot, i| slot.* = @intCast(positions[first + i] % b.config.window);
         const off = first * b.config.kvWidth() * 2;
         try b.attention.appendKv(e, slots[0..count], .{ .buf = k.buf, .off = k.off + off }, .{ .buf = v.buf, .off = v.off + off }, .{ .buf = cache.keys }, .{ .buf = cache.values });
-        e.barrier();
     }
 }
 fn ready(b: *Backend, transaction: u64, epoch: u64, next: op.Context) !void {
@@ -102,7 +101,6 @@ pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
         if (p.streams.len > b.batch.len or p.block == 0 or p.query.rows != p.streams.len * p.block) return error.BadDraftContext;
         for (p.streams, 0..) |context, k| try attendRows(b, e, p, context, b.batch[k], @intCast(k * p.block), p.block, result);
     }
-    e.barrier();
     return result;
 }
 
