@@ -330,7 +330,8 @@ pub const Kernels = struct {
 
         e.setPipeline(try k.get(.{ .kind = .mlp, .k = width, .n = width }));
         bind(e, .{ gate, up, dims, out, xs });
-        e.dispatchGroups(mtl.Size.of(width / 64, padded(rows), 1), mtl.Size.of(64, 1, 1));
+        // one threadgroup a 64-group and real row; row 0's also clears the padded rows' sums (mlp_xs.metal)
+        e.dispatchGroups(mtl.Size.of(width / 64, rows, 1), mtl.Size.of(64, 1, 1));
         try span.end();
     }
 };

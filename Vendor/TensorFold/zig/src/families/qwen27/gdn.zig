@@ -24,6 +24,11 @@ pub const Span = struct {
 
 pub const TreeMode = enum { auto, snapshot };
 
+/// A lazy keep's stash (tf_delta_gdn_stash): the last round's kept rows, which the slot scan steps the state by first.
+pub const Lazy = struct { stash: metal.Buffer, at: Offsets };
+/// TfDeltaLazy: one layer's stash regions as byte offsets into the stash (on = 0: no stash).
+pub const Offsets = extern struct { on: u32, keeps: u32, rows: u32, key: u32, value: u32, decay: u32, mixing: u32 };
+
 pub const Pipelines = @import("core_delta").Pipelines;
 
 pub const Buffers = struct {
@@ -107,6 +112,7 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    lazy: ?Lazy = null, // the slot scan steps a pending stash before the window's rows
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -152,6 +158,8 @@ pub const Round = struct {
             r.b.slot_steps.bind(e, 11);
             r.b.state.bind(e, 12);
             (r.b.before orelse r.b.state).bind(e, 13);
+            if (r.lazy) |l| e.setBuffer(l.stash, 0, 14) else r.b.state.bind(e, 14);
+            e.setValue(if (r.lazy) |l| l.at else std.mem.zeroes(Offsets), 15);
         }
         r.stateGrid(e);
         e.barrier();
@@ -168,13 +176,13 @@ pub const Round = struct {
         r.gate(e);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 4 value columns a simdgroup (prompt chunks, dk = 128).
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 8 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool) void {
         e.setPipeline(chain);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 4, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder) void {

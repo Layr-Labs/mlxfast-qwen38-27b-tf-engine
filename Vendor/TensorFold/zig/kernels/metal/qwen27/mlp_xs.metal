@@ -22,6 +22,8 @@ Q27_SPECIALIZE
     if (t == 0) XS[g * MP + m] = 0.0f;
     return;
   }
+  // grid rows = M: row 0's threads clear the padded rows' sums that their own threadgroups used to
+  if (m == 0 && int(t) < MP - M) XS[g * MP + M + t] = 0.0f;
   const int e = int(m) * N + int(g) * 64 + int(t);
   const int fused = int(m) * 2 * N + int(g) * 64 + int(t);  // GATE and UP point into the fused gate_up rows
   const float gf = float(GATE[fused]);

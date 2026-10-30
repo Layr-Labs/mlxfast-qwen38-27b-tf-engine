@@ -58,10 +58,35 @@ pub const Generation = struct {
     fn absorbChunk(g: *Generation, rows: usize) !void {
         var path: [128]u32 = undefined;
         var first: usize = 0;
+        var last: ?@import("metal").CommandBuffer = null;
+        defer if (last) |cb| cb.release();
         while (first < rows) : (first += path.len) {
             const n = @min(path.len, rows - first);
             for (path[0..n], 0..) |*index, i| index.* = @intCast(first + i);
-            try g.absorbRows(path[0..n]);
+            // The gather and the ring copy on the GPU, in queue order: no host wait or copy per piece.
+            std.debug.assert(g.keep == null);
+            @memcpy(g.kept.slice(u32, n), path[0..n]);
+            const cb = g.runner.model.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            try g.runner.taps.accepted(g.runner.model.glue, e, path[0..n], .{ .buffer = g.kept }, .{ .buffer = g.taps });
+            e.end();
+            const r = g.draft.ring();
+            const b = cb.blit();
+            var done: usize = 0;
+            while (done < n) {
+                const slot: usize = @intCast((r.end.* + done) % r.window);
+                const count = @min(n - done, r.window - slot);
+                b.copy(g.taps, done * r.stride, r.buf, slot * r.stride, count * r.stride);
+                done += count;
+            }
+            b.end();
+            r.end.* += n;
+            cb.commit();
+            if (last) |prev| prev.release();
+            last = cb.retain();
+            // the next piece's gather reuses `kept` and `taps`: wait for this one before rewriting them
+            cb.wait();
+            if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
         }
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
     }
@@ -125,41 +150,47 @@ pub const Generation = struct {
             return error.DraftKeepGpuFailure;
         }
     }
-    fn accept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32) !@import("core").tree_round.Decoded {
+    /// The round's picks, accepted rows' taps and head row: the verify's tail, behind its head in its last command buffer.
+    const Picks = struct {
+        g: *Generation,
+        ids: []const u32,
+        parents: []const i32,
+        budget: u32,
+        eos: []const u32,
+        shape: ?@import("core").tree_round.Match = null,
+        fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+            const p: *Picks = @ptrCast(@alignCast(ptr));
+            const g = p.g;
+            // the matcher and keep fence their own dependencies; taps and head read only the matcher's result
+            const logits = g.runner.model.frame.get(.logits);
+            const width: u32 = @intCast(g.runner.model.config.vocab);
+            const shape = try g.matcher.encode(e, .{ .buf = logits.buffer, .off = logits.offset }, p.ids, p.parents, width, p.budget, p.eos);
+            const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
+            try g.commit.taps(e, result, .{ .buf = g.runner.taps.buffer }, .{ .buf = g.taps }, .{ .rows = shape.rows, .width = g.runner.taps.width, .capacity = g.runner.taps.capacity, .planes = 5 });
+            try g.commit.head(e, result, .{ .buf = logits.buffer, .off = logits.offset }, .{ .rows = shape.rows, .width = width, .stride = width });
+            p.shape = shape;
+        }
+    };
+    /// The verify with its picks encoded behind the head: the host waits once for both, then commits the keep.
+    fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32) !@import("core").tree_round.Decoded {
         // the picks rewrite the matcher's result, which a pending keep still reads
         std.debug.assert(g.keep == null);
+        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos };
+        g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
+        defer g.runner.tail = null;
+        try g.runner.verifyHead(round, .all);
         errdefer g.runner.failed = true;
         try g.runner.taps.complete();
-        const queue = g.runner.model.queue;
-        // the picks, the accepted rows' taps and the head row: all the host waits for
-        const pick = queue.commandBuffer();
-        // the matcher and keep fence their own dependencies; taps and head read only the matcher's result
-        const e = pick.compute(.concurrent);
-        var ended = false;
-        errdefer if (!ended) e.end();
-        const logits = g.runner.model.frame.get(.logits);
-        const width: u32 = @intCast(g.runner.model.config.vocab);
-        const shape = try g.matcher.encode(e, .{ .buf = logits.buffer, .off = logits.offset }, ids, parents, width, budget, eos);
+        const shape = picks.shape orelse return error.DraftKeepGpuFailure;
+        const accepted = try g.matcher.read(shape);
         const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
-        try g.commit.taps(e, result, .{ .buf = g.runner.taps.buffer }, .{ .buf = g.taps }, .{ .rows = shape.rows, .width = g.runner.taps.width, .capacity = g.runner.taps.capacity, .planes = 5 });
-        try g.commit.head(e, result, .{ .buf = logits.buffer, .off = logits.offset }, .{ .rows = shape.rows, .width = width, .stride = width });
-        e.end();
-        ended = true;
-        pick.commit();
-        var waited = false;
-        errdefer if (!waited) pick.wait();
-        // encoded while the picks run, committed once they end
-        const keep = queue.commandBuffer();
+        const keep = g.runner.model.queue.commandBuffer();
         const k = keep.compute(.concurrent);
         var kept = false;
         errdefer if (!kept) k.end();
         try g.runner.keepDevice(round, k, g.commit, result);
         k.end();
         kept = true;
-        pick.wait();
-        waited = true;
-        if (gpuFailed(pick, "a draft round's picks")) return error.DraftKeepGpuFailure;
-        const accepted = try g.matcher.read(shape);
         // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
         keep.commit();
         g.keep = keep.retain();
@@ -224,8 +255,7 @@ pub const Generation = struct {
         defer round.deinit();
         errdefer g.finishKeep() catch {};
         try g.finishKeep();
-        try g.runner.verifyHead(&round, .all);
-        const accepted = try g.accept(&round, ids, parents, remaining, eos);
+        const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos);
         g.pending = accepted.pending;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         var landed: u32 = 0;
@@ -269,11 +299,10 @@ pub const Generation = struct {
             var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
             defer round.deinit();
             try g.finishKeep();
-            try g.runner.verifyHead(&round, .all);
+            const accepted = try g.verifyAccept(&round, ids, parents, @intCast(count - tokens.items.len), eos);
             rounds += 1;
             verified += ids.len;
             min_rows = if (min_rows == 0) @intCast(ids.len) else @min(min_rows, @as(u32, @intCast(ids.len)));
-            const accepted = try g.accept(&round, ids, parents, @intCast(count - tokens.items.len), eos);
             try tokens.appendSlice(g.allocator, accepted.tokens);
             matched += accepted.matched;
             if (accepted.path.len == 0) return error.EmptyAcceptedDraft;

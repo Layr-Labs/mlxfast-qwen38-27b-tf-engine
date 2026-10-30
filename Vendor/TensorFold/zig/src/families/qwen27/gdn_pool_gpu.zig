@@ -63,6 +63,13 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    // Lazy keeps: a device keep stashes its kept rows instead of replaying them, and the next verify's slot scan steps
+    // the state by them (one read and one write of each layer's state a round, not two reads and a write).
+    lazy: bool = true,
+    stash: ?metal.Buffer = null, // each layer's keeps, rows, key, value, decay and mixing regions (stashRegion)
+    pending: ?u32 = null, // the slot whose kept rows sit stashed: the next verify's scan or a flush steps them
+    lazy_keep: bool = false, // commitScan stashes instead of replaying (set around a device keep)
+    consume: bool = false, // this verify's slot scans step the pending stash first (set around a verify)
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -77,7 +84,7 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .lazy = lazy_keeps };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -96,6 +103,7 @@ pub const Pool = struct {
     pub fn deinit(pool: *Pool) void {
         pool.setResident(null);
         pool.releaseBefore();
+        if (pool.stash) |buffer| buffer.deinit();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
     }
@@ -104,6 +112,11 @@ pub const Pool = struct {
     pub fn prepare(pool: *Pool, device: metal.Device, plan: Plan, accepted: bool) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan);
         if (!inPlace(plan)) return error.GdnSlotMoves;
+        if (pool.stash == null and pool.lazyFits(plan)) {
+            const buffer = try device.buffer(pool.stashRegion(6, 0), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+            pool.stash = buffer;
+            if (pool.residency) |f| f.join(f.ctx, buffer);
+        }
         const slots = @import("gdn_pool.zig").beforeSlots(plan, !accepted and pool.advances(plan));
         if (slots == pool.before_slots) return;
         const bytes = try abi.countBytes(f32, pool.budget.shape.state, pool.budget.layers * slots);
@@ -181,7 +194,7 @@ pub const Pool = struct {
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
-        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 4 == 0;
+        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 8 == 0;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
@@ -236,7 +249,18 @@ pub const Pool = struct {
         const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (segment.rows > 1 or keep.rows == 0) break true;
         } else false;
-        if (replays) {
+        if (pool.lazy_keep) {
+            if (!pool.lazyFits(plan.host)) return error.GdnLazyKeep;
+            const stash = pool.stash orelse return error.GdnLazyKeep;
+            e.setPipeline(pool.kernels.stash);
+            gdn.bind(e, .{ try pool.layerSpan(.key, layer), try pool.layerSpan(.value, layer), try pool.layerSpan(.decay, layer), try pool.layerSpan(.mixing, layer) }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 4);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 5);
+            e.setValue(p, 6);
+            for (0..6) |region| e.setBuffer(stash, pool.stashRegion(region, layer), 7 + region);
+            e.setValue(@as(u32, stash_rows), 13);
+            e.dispatchThreads(.{ .width = p.nv * p.dv, .height = plan.host.parents.len, .depth = 1 }, .{ .width = 256 });
+        } else if (replays) {
             e.setPipeline(pool.kernels.pipelines.replay);
             e.setBuffer(m.segments.buffer, m.segments.offset, 9);
             ((try pool.beforeSpan(layer, plan.host, pool.advances(plan.host))) orelse state).bind(e, 10);
@@ -269,6 +293,49 @@ pub const Pool = struct {
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
+    }
+
+    /// A lazy keep's stashed rows step their slot's state with tf_delta_gdn_replay, as the keep would have; the caller fences.
+    pub fn flush(pool: *Pool, e: metal.ComputeEncoder) !void {
+        if (pool.pending == null) return;
+        const stash = pool.stash orelse return error.GdnLazyKeep;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(1, pool.budget.slots, kinds);
+        e.setPipeline(pool.kernels.pipelines.replay);
+        for (0..pool.budget.layers) |layer| {
+            const state = try pool.layerSpan(.state, layer);
+            for (0..4) |region| e.setBuffer(stash, pool.stashRegion(2 + region, layer), region);
+            state.bind(e, 4);
+            e.setBuffer(stash, pool.stashRegion(1, layer), 5);
+            e.setBuffer(stash, pool.stashRegion(0, layer), 6);
+            e.setValue(p, 7);
+            state.bind(e, 8);
+            e.setBuffer(stash, pool.stashRegion(0, layer), 9); // segments: read only by advance rounds (p.advance = 0 here)
+            state.bind(e, 10);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv }, .{ .width = 32, .height = 4 });
+        }
+        pool.pending = null;
+    }
+
+    /// A device keep may stash: one window kept in its slot by the slot scan's rule, rows within a stash segment.
+    pub fn lazyFits(pool: *const Pool, plan: Plan) bool {
+        return pool.lazy and plan.segments.len == 1 and plan.keeps.len == 1 and plan.compact and pool.budget.shape.c.dk == 128 and
+            pool.tree_mode != .snapshot and inPlace(plan) and !pool.advances(plan) and plan.parents.len <= stash_rows;
+    }
+
+    /// Whether this verify's slot scan can step the pending stash: one window, in the slot the stash belongs to.
+    pub fn consumable(pool: *const Pool, plan: Plan) bool {
+        const slot = pool.pending orelse return false;
+        return pool.lazyFits(plan) and plan.segments[0].state_slot == slot and plan.keeps[0].state_slot == slot;
+    }
+
+    /// Byte offset of stash region `region` (keeps, rows, key, value, decay, mixing; 6 is the total) for `layer`.
+    fn stashRegion(pool: *const Pool, region: usize, layer: usize) usize {
+        const c = pool.budget.shape.c;
+        const widths = [6]usize{ @sizeOf(abi.Keep), 4, c.k_heads * c.dk * 2, pool.budget.shape.value * 2, c.v_heads * 4, c.v_heads * 2 };
+        var at: usize = 0;
+        for (widths[0..region]) |w| at += std.mem.alignForward(usize, w * stash_rows * pool.budget.layers, 256);
+        return if (region == 6) at else at + layer * widths[region] * stash_rows;
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
@@ -327,6 +394,14 @@ pub const Pool = struct {
         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
         result.tree_mode = pool.tree_mode;
         result.p.advance = @intFromBool(pool.advances(plan));
+        if (pool.consume) {
+            // the verify's slot scan steps the stash first: its prologue reads these, then the window's own rows
+            if (accepted or !pool.consumable(plan) or !result.usesSlots()) return error.GdnLazyKeep;
+            const stash = pool.stash orelse return error.GdnLazyKeep;
+            var at: [6]u32 = undefined;
+            for (&at, 0..) |*offset, region| offset.* = @intCast(pool.stashRegion(region, layer));
+            result.lazy = .{ .stash = stash, .at = .{ .on = 1, .keeps = at[0], .rows = at[1], .key = at[2], .value = at[3], .decay = at[4], .mixing = at[5] } };
+        }
         return result;
     }
 
@@ -362,6 +437,12 @@ fn tensorSpan(t: Tensor) gdn.Span {
 
 /// One-row rounds take tf_delta_gdn_pre_step; off, they run the general prepare, commit and publication (checks).
 pub var step_rounds = true;
+
+/// Device keeps stash their kept rows for the next verify; off, a pool made after replays them in the keep, as before.
+pub var lazy_keeps = true;
+
+/// Rows a lazy keep's stash holds a layer: a verify window's most (core tree_round.max_rows, checked by decode_round).
+pub const stash_rows = 64;
 
 fn oneRowSegments(plan: Plan) bool {
     for (plan.segments) |segment| if (segment.rows != 1) return false;

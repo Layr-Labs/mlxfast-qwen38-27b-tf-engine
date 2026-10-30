@@ -93,17 +93,25 @@ pub const Params = extern struct {
     zba_stride: u32,
     advance: u32,
 };
+pub const Event = struct { pipeline: usize, stash: ?usize, lazy_on: u32, state: ?usize };
 pub const Recorder = struct {
     bindings: [16]?Binding = @splat(null),
     pipeline: usize = 0,
     params: Params = undefined,
     restores: usize = 0,
     segments: usize = 2,
+    events: [64]Event = undefined, // each dispatch: its pipeline, the slot scan's stash binding and lazy flag
+    event_count: usize = 0,
+    lazy_on: u32 = 0,
     fn words(r: *Recorder, at: usize) []u32 {
         const b = r.bindings[at].?;
         return @as([*]u32, @ptrCast(@alignCast(b.buffer.data.ptr + b.offset)))[0 .. (b.buffer.data.len - b.offset) / 4];
     }
     fn run(r: *Recorder) void {
+        if (r.event_count < r.events.len) {
+            r.events[r.event_count] = .{ .pipeline = r.pipeline, .stash = if (r.bindings[14]) |b| b.buffer.id else null, .lazy_on = r.lazy_on, .state = if (r.bindings[4]) |b| b.buffer.id else null };
+            r.event_count += 1;
+        }
         const p = r.params;
         const stride = p.nv * p.dv * p.dk;
         if (r.pipeline >= 10 and r.pipeline <= 14) {
@@ -149,11 +157,13 @@ pub const ComputeEncoder = struct {
     pub fn setPipeline(e: ComputeEncoder, p: Pipeline) void {
         e.record.pipeline = p.id;
         e.record.bindings = @splat(null);
+        e.record.lazy_on = 0;
     }
     pub fn setBuffer(e: ComputeEncoder, b: Buffer, offset: usize, at: usize) void {
         e.record.bindings[at] = .{ .buffer = b, .offset = offset };
     }
     pub fn setValue(e: ComputeEncoder, value: anytype, _: usize) void {
+        if (comptime @typeInfo(@TypeOf(value)) == .@"struct" and @hasField(@TypeOf(value), "on")) e.record.lazy_on = value.on;
         if (@sizeOf(@TypeOf(value)) == @sizeOf(Params)) @memcpy(std.mem.asBytes(&e.record.params), std.mem.asBytes(&value));
     }
     pub fn dispatchThreads(e: ComputeEncoder, _: Size, _: Size) void {
