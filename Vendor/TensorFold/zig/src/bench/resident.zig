@@ -1,6 +1,5 @@
 //! One loaded bench session behind a same-uid Unix socket.
 const std = @import("std");
-const api = @import("engine_api");
 const builtin = @import("builtin");
 const bench = @import("bench_session");
 const client = @import("resident_client.zig");
@@ -19,6 +18,12 @@ pub const Identity = struct {
     weights_revision: []const u8,
 };
 
+/// Held while a request runs (the engine's idle keepalive); the resident only brackets each request with it.
+pub const Hold = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque) void,
+    end: *const fn (ctx: *anyopaque) void,
+};
 pub const Config = struct {
     io: std.Io,
     socket_path: []const u8,
@@ -33,7 +38,7 @@ pub const Config = struct {
     weights_identity: ?DirectoryIdentity = null,
     failure_writer: ?*std.Io.Writer = null,
     /// The engine's idle keepalive: it holds its commits while a request runs, as the server's does.
-    keepalive: ?*api.keepalive.Keepalive = null,
+    keepalive: ?Hold = null,
 };
 
 pub const default_idle_timeout_ms: u32 = 3_600_000;
@@ -106,8 +111,8 @@ fn serveClient(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: bench.Benc
     while (true) {
         const frame = (try client.receiveFrameWithTransferTimeout(alloc, fd, config.idle_timeout_ms, config.timeout_ms)) orelse return;
         defer alloc.free(frame);
-        if (config.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
-        defer if (config.keepalive) |k| k.end();
+        if (config.keepalive) |k| k.begin(k.ctx); // the GPU is busy: the idle ticker holds its commits
+        defer if (config.keepalive) |k| k.end(k.ctx);
         var reply = dispatch(alloc, session, frame) catch |err| {
             reportFailure(config.failure_writer, operationName(frame), @errorName(err));
             try sendFailure(alloc, fd, @errorName(err));

@@ -118,6 +118,16 @@ fn residentFailureReason(ptr: *anyopaque, err: anyerror) []const u8 {
     return client_.failureReason(err);
 }
 
+fn holdBegin(ctx: *anyopaque) void {
+    const k: *api.keepalive.Keepalive = @ptrCast(@alignCast(ctx));
+    k.begin();
+}
+
+fn holdEnd(ctx: *anyopaque) void {
+    const k: *api.keepalive.Keepalive = @ptrCast(@alignCast(ctx));
+    k.end();
+}
+
 fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
     const a = init.arena.allocator();
     var problem: []const u8 = "";
@@ -151,7 +161,7 @@ fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
     defer if (keepalive) |k| k.stop();
     resident.serve(init.gpa, adapter.session(), .{
         .io = init.io,
-        .keepalive = keepalive,
+        .keepalive = if (keepalive) |k| resident.Hold{ .ctx = k, .begin = holdBegin, .end = holdEnd } else null,
         .socket_path = args.socket,
         .weights = args.weights,
         .identity = .{
