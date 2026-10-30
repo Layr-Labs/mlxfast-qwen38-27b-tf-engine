@@ -78,11 +78,6 @@ inline void tf_delta_gdn_pre_body(device const bfloat* projection,
     activated[part] = float(bfloat(rounded * sigmoid));
     if (STEP) {
       for (uint tap = 0; tap < keep; ++tap) next_history[(row_slot[row] * keep + tap) * channels + channel] = bfloat(inputs[tap + 1]);
-    } else {
-      for (uint tap = 0; tap < keep; ++tap) {
-        const uint source = windows[row * p.taps + tap + 1];
-        tails[(row * keep + tap) * channels + channel] = source < keep ? history[(row_slot[row] * keep + source) * channels + channel] : projection[(source - keep) * channels + channel];
-      }
     }
   }
   if (head < 2 * p.nk) {
@@ -131,6 +126,84 @@ kernel void tf_delta_gdn_pre(device const bfloat* projection [[buffer(0)]],
                         uint lane [[thread_index_in_simdgroup]]) {
   if (p.dk == 128 && p.dv == 128) tf_delta_gdn_pre_body<4, false>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, tails, group, lane);
   else tf_delta_gdn_pre_body<0, false>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, tails, group, lane);
+}
+
+// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps 4 rows of a head on conv weights read once;
+// bfloat4 rows, and the gates a lane a row.
+inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
+    device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
+    device const uint* windows, device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query,
+    device bfloat* key, device bfloat* value, device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
+  const uint head = group.y, first = (group.z * 4 + sg) * 4;
+  if (first >= p.rows) return;
+  const uint count = metal::min(4u, p.rows - first);
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const uint keep = p.taps - 1;
+  const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
+  const uint channel = channel0 + lane * 4;
+  float weight[4][4];
+  for (uint part = 0; part < 4; ++part)
+    for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
+  for (uint i = 0; i < count; ++i) {
+    const uint row = first + i;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint tap = 0; tap < 4; ++tap) {
+      const uint source = windows[row * p.taps + tap];
+      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (row_slot[row] * keep + source) * channels + channel)
+                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
+      for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
+    }
+    float activated[4];
+    for (uint part = 0; part < 4; ++part) {
+      const float rounded = float(bfloat(result[part]));
+      const float sigmoid = float(bfloat(1.0f / (1.0f + metal::exp(-rounded))));
+      activated[part] = float(bfloat(rounded * sigmoid));
+    }
+    if (head < 2 * p.nk) {
+      float square = 0.0f;
+      for (uint part = 0; part < 4; ++part) square += activated[part] * activated[part];
+      square = simd_sum(square);
+      const float inverse = metal::rsqrt(square / float(p.dk) + 1e-6f);
+      const float scale = head < p.nk ? float(bfloat(1.0f / float(p.dk))) : float(bfloat(metal::rsqrt(float(p.dk))));
+      bfloat4 normalized;
+      for (uint part = 0; part < 4; ++part) normalized[part] = bfloat(scale * float(bfloat(activated[part] * inverse)));
+      *(device bfloat4*)((head < p.nk ? query : key) + (row * p.nk + head % p.nk) * p.dk + lane * 4) = normalized;
+    } else {
+      bfloat4 activation;
+      for (uint part = 0; part < 4; ++part) activation[part] = bfloat(activated[part]);
+      *(device bfloat4*)(value + (row * p.nv + head - 2 * p.nk) * p.dv + lane * 4) = activation;
+    }
+  }
+  if (head >= 2 * p.nk && lane < count) {
+    const uint output_head = head - 2 * p.nk, row = first + lane;
+    const uint at = row * p.nv + output_head, gate_at = p.zba_stride ? row * p.zba_stride + output_head : at;
+    const float shifted = float(bfloat(float(a[gate_at]) + tf_delta_weight(time_bias, output_head, p.weight_flags, 2)));
+    const float softplus = float(bfloat(metal::max(shifted, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(shifted)))));
+    decay[at] = metal::exp(-metal::exp(tf_delta_weight(decay_weight, output_head, p.weight_flags, 1)) * softplus);
+    mixing[at] = bfloat(1.0f / (1.0f + metal::exp(-float(b[gate_at]))));
+  }
+}
+
+// tf_delta_gdn_pre past 16 rows of 128-wide heads: 4 simdgroups a group, 16 rows.
+kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
+                        device const bfloat* a [[buffer(1)]],
+                        device const bfloat* b [[buffer(2)]],
+                        device const bfloat* history [[buffer(3)]],
+                        device const void* weights [[buffer(4)]],
+                        device const void* decay_weight [[buffer(5)]],
+                        device const void* time_bias [[buffer(6)]],
+                        device const uint* windows [[buffer(7)]],
+                        device const uint* row_slot [[buffer(8)]],
+                        constant TfDeltaParams& p [[buffer(9)]],
+                        device bfloat* query [[buffer(10)]],
+                        device bfloat* key [[buffer(11)]],
+                        device bfloat* value [[buffer(12)]],
+                        device float* decay [[buffer(13)]],
+                        device bfloat* mixing [[buffer(14)]],
+                        uint3 group [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
 // tf_delta_gdn_pre_body<4, true> over 4 simdgroups a head; each lane's 4 squares summed in order before simd_sum.

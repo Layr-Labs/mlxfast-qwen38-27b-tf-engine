@@ -128,6 +128,18 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// prepare for 128-wide heads and 4 taps by `rows` (tf_delta_gdn_pre_rows): 16 rows a group of 128.
+    pub fn prepareRows(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        e.setPipeline(rows);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.
     pub fn prepareStep(r: Round, e: metal.ComputeEncoder, step: metal.Pipeline) void {
         e.setPipeline(step);

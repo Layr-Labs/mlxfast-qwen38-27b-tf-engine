@@ -122,6 +122,70 @@ kernel void q27_rope(device const uchar* X [[buffer(0)]], device const int* posi
   q27_write(Y, base + at.x, value, a.activation);
 }
 
+struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane; };
+
+// q27_head_norm then q27_rope for bf16 prompt rows 256 wide: a row's q heads (`stride` apart) then k heads, four a group.
+// Lane l holds the norm's threads l and 32 + l (columns 4l.., 128 + 4l..) and their sums; the rope turns the rounded
+// values norm_q and norm_k held, pair d's angle from lane d.
+kernel void q27_head_norm_rope(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                               device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]],
+                               device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]],
+                               device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
+                               uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  const uint head = group.x * 4 + sg, row = group.y;
+  if (head >= a.heads + a.kv_heads) return;
+  const bool query = head < a.heads;
+  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + (row * a.kv_heads + head - a.heads) * a.width;
+  device const bfloat* w = query ? QW : KW;
+  device bfloat* y = query ? QY + (row * a.heads + head) * a.width : KY + (row * a.kv_heads + head - a.heads) * a.width;
+  const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
+  float sa = 0.0f, sb = 0.0f;
+  for (uint j = 0; j != 4; ++j) {
+    const float value = float(xa[j]);
+    sa += value * value;
+  }
+  for (uint j = 0; j != 4; ++j) {
+    const float value = float(xb[j]);
+    sb += value * value;
+  }
+  const float s0 = simd_sum(sa), s1 = simd_sum(sb);
+  const float total = simd_sum(lane == 0 ? s0 : (lane == 1 ? s1 : 0.0f));
+  const float inverse = precise::rsqrt(total / float(a.width) + a.eps);
+  float na[4], nb[4];
+  for (uint j = 0; j != 4; ++j) {
+    const float normal = float(bfloat(float(xa[j]) * inverse));
+    na[j] = float(bfloat(float(w[4 * lane + j]) * normal));
+  }
+  for (uint j = 0; j != 4; ++j) {
+    const float normal = float(bfloat(float(xb[j]) * inverse));
+    nb[j] = float(bfloat(float(w[128 + 4 * lane + j]) * normal));
+  }
+  const uint pairs = a.rotary / 2;
+  float c = 0.0f, s = 0.0f;
+  if (lane < pairs) {
+    const uint d = lane;
+    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
+    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
+    c = cos(angle);
+    s = sin(angle);
+  }
+  bfloat4 ya, yb;
+  for (uint j = 0; j != 4; ++j) {
+    const uint at = 4 * lane + j;
+    const bool second = at >= pairs;
+    const uint d = second ? at - pairs : at;
+    const float partner = simd_shuffle(na[j], ushort(((second ? d : d + pairs) / 4) % 32));
+    const float cosine = simd_shuffle(c, ushort(d % 32)), sine = simd_shuffle(s, ushort(d % 32));
+    float value = na[j];
+    if (at < a.rotary) value = second ? value * cosine + partner * sine : value * cosine - partner * sine;
+    ya[j] = bfloat(value);
+    yb[j] = bfloat(nb[j]);
+  }
+  *(device bfloat4*)(y + 4 * lane) = ya;
+  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+}
+
 struct Element { uint width, heads, rows, activation; };
 
 // SiLU(gate) times up reads stacked [gate|up] rows with one final native activation rounding.

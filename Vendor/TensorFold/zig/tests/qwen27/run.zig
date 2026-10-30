@@ -34,10 +34,10 @@ fn emit(a: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     try write(a, io, dir, "attention.metal", sources.glue ++ sources.attention_mpp ++ sources.attention_io);
     try write(a, io, dir, "gdn.metal", gdn_source.text);
     try write(a, io, dir, "prompt.metal", sources.prompt_glue ++ sources.prompt_state);
-    for ([_][]const u8{ "norm_input", "norm_xs", "mlp_xs", "xsum" }) |name| {
-        const template = if (std.mem.eql(u8, name, "norm_input")) sources.norm_input else if (std.mem.eql(u8, name, "norm_xs")) sources.norm_xs else if (std.mem.eql(u8, name, "mlp_xs")) sources.mlp_xs else sources.xsum;
+    for ([_][]const u8{ "norm_input", "norm_xs", "mlp_xs", "mlp_xs_wide", "xsum" }) |name| {
+        const template = if (std.mem.eql(u8, name, "norm_input")) sources.norm_input else if (std.mem.eql(u8, name, "norm_xs")) sources.norm_xs else if (std.mem.eql(u8, name, "mlp_xs")) sources.mlp_xs else if (std.mem.eql(u8, name, "mlp_xs_wide")) sources.mlp_xs_wide else sources.xsum;
         const mark = std.mem.indexOf(u8, template, "Q27_SPECIALIZE") orelse return error.BadKernelSource;
-        const defines = if (std.mem.eql(u8, name, "mlp_xs")) "constexpr int N=17408;" else "constexpr int K=5120, GS=64;";
+        const defines = if (std.mem.startsWith(u8, name, "mlp_xs")) "constexpr int N=17408;" else "constexpr int K=5120, GS=64;";
         const text = try std.mem.concat(a, u8, &.{ template[0..mark], defines, template[mark + "Q27_SPECIALIZE".len ..] });
         try write(a, io, dir, try std.fmt.allocPrint(a, "{s}.metal", .{name}), text);
     }

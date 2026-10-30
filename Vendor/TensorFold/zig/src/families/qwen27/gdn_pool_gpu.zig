@@ -154,7 +154,7 @@ pub const Pool = struct {
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        prepared.prepare(pre.encoder);
+        prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         prepared.forward(scan.encoder);
@@ -177,7 +177,7 @@ pub const Pool = struct {
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepare(pre.encoder);
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();

@@ -70,10 +70,9 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
     tf_context_row<true>(Q, K, V, mask, O, tg.y, tg.x, args.keys, args.mask_stride, as_type<float>(args.scale_bits), lane);
 }
 
-#define TF_CHUNK 256
 #define TF_G (TF_QH / TF_KVH)
 
-// Split over 256-key chunks: one simdgroup takes a KV head's query heads for one row, reading each key once for them.
+// Split over key chunks: one simdgroup takes a KV head's query heads for one row, reading each key once for them.
 [[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
     const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
     const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],

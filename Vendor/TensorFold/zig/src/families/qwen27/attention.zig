@@ -196,7 +196,7 @@ pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, nor
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [10]mtl.Pipeline,
+    io: [11]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
@@ -208,10 +208,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [10]mtl.Pipeline = undefined;
+        var io: [11]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -260,6 +260,20 @@ pub const Attention = struct {
         for (outputs, 0..) |dst, i| {
             for (inputs) |src| try disjoint(dst.ref, dst.bytes, src.ref, src.bytes);
             for (outputs[0..i]) |prior| try disjoint(dst.ref, dst.bytes, prior.ref, prior.bytes);
+        }
+        // prompt rows: one pass, the rope turning the norm's rounded values in registers (norm_q and norm_k have no other reader)
+        const rows4 = for ([_]Ref{ p.qg, p.key, p.query, p.rotated_key }) |r| {
+            if (r.offset % 8 != 0) break false;
+        } else true; // bfloat4 rows
+        if (rows4) {
+            e.setPipeline(a.io[10]);
+            bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
+            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane }, 5);
+            e.setBuffer(p.query.buffer, p.query.offset, 6);
+            e.setBuffer(p.rotated_key.buffer, p.rotated_key.offset, 7);
+            e.dispatchGroups(mtl.Size.of((g.heads + g.kv_heads + 3) / 4, p.rows, 1), mtl.Size.of(128, 1, 1));
+            e.barrier();
+            return timing.end();
         }
         e.setPipeline(a.io[7]);
         bind(e, .{ p.qg, p.q_gain });
