@@ -229,6 +229,11 @@ pub const Runner = struct {
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
         try r.gdn.prepare(r.model.device, recurrent, accepted);
+        // a lazy keep's stashed rows: this verify's slot scans step them first, or they are replayed now
+        const consume = !accepted and r.gdn.consumable(recurrent);
+        if (!consume) try r.flushGdn();
+        r.gdn.consume = consume;
+        defer r.gdn.consume = false;
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
         try r.scratch.upload(attention_plan);
@@ -248,8 +253,10 @@ pub const Runner = struct {
         var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .images = placed.images };
         r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, commit_every) catch |err| {
             r.failed = true;
+            r.gdn.pending = null; // a failed runner's slots are reset by their next prompt
             return err;
         };
+        if (consume) r.gdn.pending = null;
         if (r.model.ane) |share| share.drain() catch |err| {
             r.failed = true;
             return err;
@@ -267,6 +274,7 @@ pub const Runner = struct {
         defer recurrent.deinit();
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
+        try r.flushGdn();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
@@ -313,10 +321,17 @@ pub const Runner = struct {
         try ops.metadata(e, result, keep_ref, rows, null, p);
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
+        // lazy: the kept rows go to the stash, and the next verify's slot scan (or a flush) steps the state by them
+        comptime std.debug.assert(@import("gdn_pool_gpu.zig").stash_rows == @import("core").tree_round.max_rows);
+        try r.flushGdn();
+        const lazy = r.gdn.lazyFits(recurrent) and r.gdn.stash != null;
+        r.gdn.lazy_keep = lazy;
+        defer r.gdn.lazy_keep = false;
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
         e.barrier();
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
         e.barrier();
+        if (lazy) r.gdn.pending = round.slots[0];
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
@@ -344,6 +359,26 @@ pub const Runner = struct {
     pub fn recover(r: *Runner) void {
         r.failed = false;
         r.active = null;
+        r.gdn.pending = null;
+    }
+
+    /// A lazy keep's stashed rows step their slot's state now, as the next verify's slot scan would have: before anything
+    /// else reads or writes GDN state (prompt chunks, host keeps, resets, snapshots, fingerprints).
+    pub fn flushGdn(r: *Runner) !void {
+        const slot = r.gdn.pending orelse return;
+        r.settleSlot(slot);
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = r.model.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        try r.gdn.flush(e);
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (gpuFailed(cb, "a lazy keep's replay")) {
+            r.failed = true;
+            return error.RoundGpuFailure;
+        }
     }
 
     /// An idle or newly lone host may drop scratch only after the previous verify has been kept.
@@ -368,6 +403,8 @@ pub const Runner = struct {
     pub fn reset(r: *Runner, slot: u32) !void {
         r.settleSlot(slot);
         if (r.failed or r.active != null or slot >= r.ready) return error.RoundNotReady;
+        // the slot's own stash is dropped (its state is cleared below); another slot's steps that slot first
+        if (r.gdn.pending == slot) r.gdn.pending = null else try r.flushGdn();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();

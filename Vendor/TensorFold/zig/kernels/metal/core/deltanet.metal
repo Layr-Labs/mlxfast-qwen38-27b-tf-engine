@@ -450,7 +450,8 @@ kernel void tf_delta_gdn_chain(device const bfloat* query [[buffer(0)]],
   if (p.dk == 128) tf_delta_gdn_chain_body<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
   else tf_delta_gdn_chain_body<0>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
-// Prompt chains (may differ in bits from decode): 8 lanes a value column, 16 key channels each; dk = 128.
+// Prompt chains (may differ in bits from decode): 8 lanes a pair of value columns, 16 key channels each; dk = 128.
+// Each column keeps its own sum order (16 channels in turn, then xor 1, 2, 4); the pair shares a lane's k and q loads.
 template <bool M>
 inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     device const bfloat* key,
@@ -467,41 +468,56 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     uint3 position,
     uint lane) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
-  const uint sub = lane & 7, dimension = position.y * 4 + (lane >> 3), key_head = head / (p.nv / p.nk);
+  const uint sub = lane & 7, dimension = (position.y * 4 + (lane >> 3)) * 2, key_head = head / (p.nv / p.nk);
   const TfDeltaSegment span = segments[segment_index];
   const uint state_stride = p.nv * p.dv * p.dk;
   const uint column = (head * p.dv + dimension) * p.dk + sub * 16;
-  float state[16];
-  for (uint i = 0; i < 16; ++i) state[i] = committed[span.state_slot * state_stride + column + i];
+  float state[2][16];
+  for (uint c = 0; c < 2; ++c)
+    for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + c * p.dk + i];
   for (uint node = 0; node < span.rows; ++node) {
     const uint row = span.first + node, at = row * p.nv + head;
     device const bfloat* k = key + (row * p.nk + key_head) * p.dk + sub * 16;
     device const bfloat* q = query + (row * p.nk + key_head) * p.dk + sub * 16;
     const float forget = decay[at];
-    float remembered = 0.0f;
-    for (uint i = 0; i < 16; ++i) {
-      state[i] = state[i] * forget;
-      remembered += state[i] * float(k[i]);
+    float remembered[2];
+    for (uint c = 0; c < 2; ++c) {
+      remembered[c] = 0.0f;
+      for (uint i = 0; i < 16; ++i) {
+        state[c][i] = state[c][i] * forget;
+        remembered[c] += state[c][i] * float(k[i]);
+      }
     }
-    remembered += simd_shuffle_xor(remembered, 1);
-    remembered += simd_shuffle_xor(remembered, 2);
-    remembered += simd_shuffle_xor(remembered, 4);
-    const float correction = (float(value[at * p.dv + dimension]) - remembered) * float(mixing[at]);
-    float result = 0.0f;
-    for (uint i = 0; i < 16; ++i) {
-      state[i] = state[i] + float(k[i]) * correction;
-      result += state[i] * float(q[i]);
+    for (uint c = 0; c < 2; ++c) {
+      remembered[c] += simd_shuffle_xor(remembered[c], 1);
+      remembered[c] += simd_shuffle_xor(remembered[c], 2);
+      remembered[c] += simd_shuffle_xor(remembered[c], 4);
     }
-    result += simd_shuffle_xor(result, 1);
-    result += simd_shuffle_xor(result, 2);
-    result += simd_shuffle_xor(result, 4);
-    if (sub == 0) output[at * p.dv + dimension] = bfloat(result);
+    const float mix = float(mixing[at]);
+    float result[2];
+    for (uint c = 0; c < 2; ++c) {
+      const float correction = (float(value[at * p.dv + dimension + c]) - remembered[c]) * mix;
+      result[c] = 0.0f;
+      for (uint i = 0; i < 16; ++i) {
+        state[c][i] = state[c][i] + float(k[i]) * correction;
+        result[c] += state[c][i] * float(q[i]);
+      }
+    }
+    for (uint c = 0; c < 2; ++c) {
+      result[c] += simd_shuffle_xor(result[c], 1);
+      result[c] += simd_shuffle_xor(result[c], 2);
+      result[c] += simd_shuffle_xor(result[c], 4);
+    }
+    if (sub == 0)
+      for (uint c = 0; c < 2; ++c) output[at * p.dv + dimension + c] = bfloat(result[c]);
     if (M)
       for (uint m = 0; m < 4; ++m)
         if (marks[m] == node + 1)
-          for (uint i = 0; i < 16; ++i) mark_state[(segment_index * 4 + m) * state_stride + column + i] = state[i];
+          for (uint c = 0; c < 2; ++c)
+            for (uint i = 0; i < 16; ++i) mark_state[(segment_index * 4 + m) * state_stride + column + c * p.dk + i] = state[c][i];
   }
-  for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + i] = state[i];
+  for (uint c = 0; c < 2; ++c)
+    for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
 }
 
 kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
@@ -569,10 +585,13 @@ inline void tf_delta_gdn_post_body(device const bfloat* recurrence,
     device const void* norm,
     constant TfDeltaParams& p,
     device bfloat* output,
+    device float* sums,
+    uint sums_stride,
     uint3 group,
     uint lane) {
   const uint row = group.z, head = group.y, elements = C ? C : p.dv / 32;
   float values[C ? C : 8];
+  bfloat stored[C ? C : 8];
   float square = 0.0f;
   const uint at = (row * p.nv + head) * p.dv + lane * elements, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * elements : at;
   for (uint part = 0; part < elements; ++part) {
@@ -585,7 +604,21 @@ inline void tf_delta_gdn_post_body(device const bfloat* recurrence,
     const uint channel = lane * elements + part;
     const float normalized = float(bfloat(tf_delta_weight(norm, channel, p.weight_flags, 3) * (values[part] * inverse)));
     const float z = float(gate[z_at + part]);
-    output[at + part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    stored[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    output[at + part] = stored[part];
+  }
+  // sums_stride (C = 4): the out projection's 64-channel group sums as tf_lane_xsum adds them, 16 lanes in turn;
+  // row 0 also clears the padded rows' sums
+  if (C == 4 && sums_stride != 0) {
+    float acc = 0.0f;
+    for (uint turn = 0; turn < 16; ++turn) {
+      if ((lane & 15) == turn)
+        for (uint part = 0; part < 4; ++part) acc += float(stored[part]);
+      acc = simd_shuffle(acc, ushort((lane & 16) | turn));
+    }
+    const uint g = head * 2 + (lane >> 4);
+    if ((lane & 15) == 0) sums[g * sums_stride + row] = acc;
+    if (row == 0 && (lane & 15) < sums_stride - p.rows) sums[g * sums_stride + p.rows + (lane & 15)] = 0.0f;
   }
 }
 
@@ -594,10 +627,12 @@ kernel void tf_delta_gdn_post(device const bfloat* recurrence [[buffer(0)]],
                          device const void* norm [[buffer(2)]],
                          constant TfDeltaParams& p [[buffer(3)]],
                          device bfloat* output [[buffer(4)]],
+                         device float* sums [[buffer(5)]],
+                         constant uint& sums_stride [[buffer(6)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, group, lane);
-  else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, group, lane);
+  if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, sums, sums_stride, group, lane);
+  else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, sums, 0, group, lane);
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
@@ -620,6 +655,37 @@ kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]
   const uint row = kept_rows[keep.first + keep.rows - 1];
   const uint source = windows[row * p.taps + item / channels + 1];
   next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
+}
+// A device keep's kept rows' inputs, renumbered from 0 a segment, for the next verify's scan (or a replay) to apply.
+kernel void tf_delta_gdn_stash(device const bfloat* key [[buffer(0)]],
+                          device const bfloat* value [[buffer(1)]],
+                          device const float* decay [[buffer(2)]],
+                          device const bfloat* mixing [[buffer(3)]],
+                          device const uint* kept_rows [[buffer(4)]],
+                          device const TfDeltaKeep* keeps [[buffer(5)]],
+                          constant TfDeltaParams& p [[buffer(6)]],
+                          device bfloat* stash_key [[buffer(7)]],
+                          device bfloat* stash_value [[buffer(8)]],
+                          device float* stash_decay [[buffer(9)]],
+                          device bfloat* stash_mixing [[buffer(10)]],
+                          device uint* stash_rows [[buffer(11)]],
+                          device TfDeltaKeep* stash_keeps [[buffer(12)]],
+                          constant uint& segment_rows [[buffer(13)]],
+                          uint3 position [[thread_position_in_grid]]) {
+  const uint item = position.x, step = position.y, segment = position.z;
+  const TfDeltaKeep keep = keeps[segment];
+  const uint first = segment * segment_rows;
+  if (item == 0 && step == 0) stash_keeps[segment] = TfDeltaKeep{first, keep.rows, keep.state_slot, keep.next_slot};
+  if (step >= keep.rows) return;
+  const uint from = kept_rows[keep.first + step], to = first + step;
+  const uint key_width = p.nk * p.dk, value_width = p.nv * p.dv;
+  if (item == 0) stash_rows[to] = to;
+  if (item < key_width) stash_key[to * key_width + item] = key[from * key_width + item];
+  if (item < value_width) stash_value[to * value_width + item] = value[from * value_width + item];
+  if (item < p.nv) {
+    stash_decay[to * p.nv + item] = decay[from * p.nv + item];
+    stash_mixing[to * p.nv + item] = mixing[from * p.nv + item];
+  }
 }
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 

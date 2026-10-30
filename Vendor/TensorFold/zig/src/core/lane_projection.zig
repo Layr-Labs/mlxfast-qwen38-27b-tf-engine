@@ -34,6 +34,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
+    /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
+    serial_sk2: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -46,6 +48,7 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -114,6 +117,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.appendSlice(a, if (l.ranges.len == 0) "  return j;\n}\n" else "  return 0;\n}\n");
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
+    if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -232,6 +236,7 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    lut_pipe: ?mtl.Pipeline = null, // tf_lane_reg reading (scale, bias) words through a matrix's table (TF_LUT)
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -244,7 +249,8 @@ pub const Projection = struct {
         defer lib.deinit();
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
-        if (p.simdWidth() != 32 or p.maxThreads() < l.sk * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
+        const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
+        if (p.simdWidth() != 32 or p.maxThreads() < physical_sk * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -252,18 +258,55 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = l.sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg };
+        errdefer if (sums_pipe) |pipe| pipe.deinit();
+        errdefer if (sums_buffer) |buffer| buffer.deinit();
+        // a chip that will not build the table variant keeps the pairs: decode then reads them, as without an index
+        const lut_pipe: ?mtl.Pipeline = if (l.reg and l.format.bits == 4 and l.format.group == 64) lutPipeline(a, device, l) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            std.log.warn("lane projection {d}x{d}: no (scale, bias) table pipeline ({s}); decode reads the pairs", .{ l.n, l.k, @errorName(err) });
+            break :blk null;
+        } else null;
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .lut_pipe = lut_pipe };
+    }
+
+    fn lutPipeline(a: std.mem.Allocator, device: mtl.Device, l: Layout) !mtl.Pipeline {
+        const body = try source(a, l);
+        defer a.free(body);
+        const text = try std.mem.concat(a, u8, &.{ "#define TF_LUT 1\n", body });
+        defer a.free(text);
+        const adapted = try frags.source(device, a, text);
+        defer a.free(adapted);
+        const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
+        defer lib.deinit();
+        const pipe = try mtl.Pipeline.init(device, lib, "tf_lane_reg", false);
+        if (pipe.simdWidth() != 32 or pipe.maxThreads() < (if (l.serial_sk2) 1 else l.sk) * 32) {
+            pipe.deinit();
+            return error.UnsupportedPipelineShape;
+        }
+        return pipe;
     }
 
     pub fn deinit(p: Projection) void {
         p.pipe.deinit();
+        if (p.lut_pipe) |pipe| pipe.deinit();
         if (p.sums_pipe) |pipe| pipe.deinit();
         if (p.sums_buffer) |buffer| buffer.deinit();
     }
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
     pub fn encode(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32) !void {
-        return p.encodeImpl(e, x, w, sb, null, y, rows);
+        return p.encodeImpl(e, x, w, sb, null, null, y, rows);
+    }
+
+    /// encode or encodeSums with a matrix's (scale, bias) table: windows of lut_rows or fewer read the index and table,
+    /// larger ones the pairs (sb), so every row gets the same metadata words either way.
+    pub fn encodeLut(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: ?Sums, lut: ?Lut, y: Ref, rows: u32) !void {
+        if (sums) |s| {
+            if (!p.reg) return error.SumsNeedReg;
+            if (rows == 0 or rows > reg_rows or s.stride < rows) return error.InvalidRows;
+            try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
+        }
+        return p.encodeImpl(e, x, w, sb, sums, lut, y, rows);
     }
 
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
@@ -271,10 +314,10 @@ pub const Projection = struct {
         if (!p.reg) return error.SumsNeedReg;
         if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows);
+        return p.encodeImpl(e, x, w, sb, sums, null, y, rows);
     }
 
-    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
+    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, lut: ?Lut, y: Ref, rows: u32) !void {
         if (rows == 0 or rows > @as(u32, if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
@@ -291,10 +334,18 @@ pub const Projection = struct {
             e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
             e.barrier();
         };
-        e.setPipeline(p.pipe);
+        const table: ?Lut = if (lut != null and rows <= lut_rows and p.lut_pipe != null) lut else null;
+        if (table) |t| {
+            try checkRef(t.index, p.metadata_bytes / 2, 8);
+            try checkRef(t.table, 4, 4);
+        }
+        e.setPipeline(if (table != null) p.lut_pipe.? else p.pipe);
         e.setBuffer(x.buf, x.off, 0);
         e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        if (table) |t| {
+            e.setBuffer(t.index.buf, t.index.off, 2);
+            e.setBuffer(t.table.buf, t.table.off, 6);
+        } else e.setBuffer(sb.buf, sb.off, 2);
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
@@ -306,8 +357,34 @@ pub const Projection = struct {
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
 
+/// Windows of this many rows or fewer (decode and verify) read a matrix's (scale, bias) table; prompts read the pairs.
+pub const lut_rows = 16;
+
+/// A reg matrix's metadata as a u16 index a (group, column), in the pairs' order, into its table of distinct u32
+/// (scale, bias) words: the same words the pairs hold.
+pub const Lut = struct { index: Ref, table: Ref };
+
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
+
+test "serial SK2 keeps logical split and is off by default" {
+    var l = Layout{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true };
+    try std.testing.expect(!l.serial_sk2);
+    const plain = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_SERIAL_SK2") == null);
+    l.serial_sk2 = true;
+    const serial = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(serial);
+    try std.testing.expect(std.mem.startsWith(u8, serial, "#define TF_N 34816\n#define TF_K 5120\n"));
+    try std.testing.expect(std.mem.indexOf(u8, serial, "#define TF_SK 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "#define TF_SERIAL_SK2 1\n") != null);
+    l.sk = 1;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.sk = 2;
+    l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
 
 fn checkRef(r: Ref, need: usize, alignment: usize) !void {
     if (r.off % alignment != 0) return error.MisalignedBuffer;

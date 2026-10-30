@@ -40,6 +40,8 @@ pub const Kernels = struct {
     pre_step: metal.Pipeline,
     /// tf_delta_gdn_pre past 16 rows (128-wide heads, 4 taps): 4 simdgroups a head, 4 rows each, conv weights read once.
     pre_rows: metal.Pipeline,
+    /// A device keep's kept rows into the lazy stash, for the next verify's slot scan (or a replay) to step.
+    stash: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -64,6 +66,7 @@ pub const Kernels = struct {
             "tree_slots_4",
             "tree_slots_8",
             "tree_slots_16",
+            "stash",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -92,6 +95,7 @@ pub const Kernels = struct {
             .mark_conv = pipelines[11],
             .pre_step = pipelines[12],
             .pre_rows = pipelines[13],
+            .stash = pipelines[19],
         };
     }
 
@@ -111,6 +115,7 @@ pub const Kernels = struct {
             k.mark_conv,
             k.pre_step,
             k.pre_rows,
+            k.stash,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

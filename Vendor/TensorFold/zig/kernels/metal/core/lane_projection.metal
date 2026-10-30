@@ -279,10 +279,23 @@ struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, i
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
   return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
 }
+#if defined(TF_LUT)
+// The same metadata words through the matrix's table of distinct (scale, bias) words: a u16 index a (group, column).
+inline tf_reg_load tf_reg_fetch_lut(const device uint4* wl, const device ushort4* ix, const device uint* lut, const device float* XS, int g, int n, int m, int stride) {
+  const ushort4 i0 = ix[((size_t)g * TF_N + n) / 4], i1 = ix[((size_t)g * TF_N + n + 16) / 4];
+  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], uint4(lut[i0.x], lut[i0.y], lut[i0.z], lut[i0.w]), uint4(lut[i1.x], lut[i1.y], lut[i1.z], lut[i1.w]), XS[g * stride + m], XS[g * stride + m + 8]};
+}
+#define TF_REG_FETCH(g) tf_reg_fetch_lut(wl, (const device ushort4*)SB, LUT, XS, g, n0 + nb, mb, stride)
+#else
+#define TF_REG_FETCH(g) tf_reg_fetch(wl, sbv, XS, g, n0 + nb, mb, stride)
+#endif
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+#if defined(TF_LUT)
+    const device uint* LUT [[buffer(6)]], // SB holds the u16 indexes into it
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
@@ -291,7 +304,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   XS += r0;
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
@@ -300,12 +312,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
   const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
+#if !defined(TF_LUT)
   const device uint4* sbv = (const device uint4*)SB;
+#endif
   const half2 bias = half2(1024.0h);
   float C[16];
+#if defined(TF_SERIAL_SK2)
+  float C0[16];
+  for (int split = 0; split < TF_SK; split++) {
+  const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
+#else
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+#endif
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
   tf_reg_load next = {};
-  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
+  if (first < last) next = TF_REG_FETCH(first);
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
     for (int w = 0; w < 8; w++) {
@@ -317,7 +338,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
-    if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
+    if (g + 1 < last) next = TF_REG_FETCH(g + 1);
     auto x = a.slice(g * GS, 0);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
@@ -329,12 +350,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
     }
   }
+#if defined(TF_SERIAL_SK2)
+    if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+  }
+  for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
+#endif
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);

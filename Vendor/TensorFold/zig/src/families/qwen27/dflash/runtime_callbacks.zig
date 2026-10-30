@@ -47,9 +47,11 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         if (b.input_sums) |s| {
             try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
         } else {
+            // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
+            const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
             var first: u32 = 0;
-            while (first < x.rows) : (first += 16) {
-                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, 16));
+            while (first < x.rows) : (first += step) {
+                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));
             }
             if (cacheable) b.input_sums = .{ .view = x, .sums = .{ .ref = .{ .buf = p.sums_buffer.? }, .stride = 16 } };
         }

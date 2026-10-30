@@ -206,6 +206,7 @@ pub fn saveSlot(a: std.mem.Allocator, r: *Runner, slot: u32, ring: ?Ring, at: u3
     if (at == 0 or r.failed or r.active != null or slot >= r.ready) return error.NotAtMark;
     const marked = if (r.gdn.marks) |m| m.index(slot, at, r.offsets[slot]) != null else false;
     if ((r.offsets[slot] != at and !marked) or (ring != null and (marked or ring.?.end.* != at))) return error.NotAtMark;
+    try r.flushGdn(); // a lazy keep's rows step the live state before it is copied
     const n = slotBytes(r, ring, at);
     const st = try a.create(State);
     errdefer a.destroy(st);
@@ -253,6 +254,7 @@ pub fn moveSlot(a: std.mem.Allocator, r: *Runner, from: u32, from_ring: ?Ring, t
     const at = r.offsets[from];
     r.settleSlot(from);
     if (from == to or r.failed or r.active != null or from >= r.slots or to >= r.slots or (from_ring == null) != (to_ring == null)) return error.BadSlotMove;
+    try r.flushGdn();
     if (from_ring) |g| if (g.end.* != at) return error.NotAtMark;
     try r.reset(to);
     var src: std.ArrayList(Part) = .empty;

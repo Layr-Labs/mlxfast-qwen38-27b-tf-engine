@@ -7,7 +7,30 @@ const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix; `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{} };
+/// index and table: the pairs as a u16 index a (group, column) into the matrix's distinct (scale, bias) words (decode).
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, index: ?Ref = null, table: ?Ref = null };
+
+/// Reg matrices also get a (scale, bias) table at load; off, decode reads the pairs as prompts do.
+pub var pair_index = true;
+
+const pair_index_core = @import("pair_index.zig");
+pub const table_limit = pair_index_core.table_limit;
+pub const indexPairs = pair_index_core.indexPairs;
+
+/// A reg matrix's index and table beside its pairs, or none (more than table_limit distinct words, or switched off).
+fn indexTable(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pairs: []const u32) !?struct { index: Ref, table: Ref } {
+    if (!pair_index) return null;
+    const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+    const table = try allocator.alloc(u32, table_limit);
+    defer allocator.free(table);
+    const slots = try allocator.alloc(u32, 2 * table_limit);
+    defer allocator.free(slots);
+    const index = try own(device, allocator, owned, pairs.len * 2, options);
+    const count = indexPairs(pairs, index.slice(u16, pairs.len), table, slots) orelse return null; // index stays owned, unused
+    const words = try own(device, allocator, owned, @max(count, 4) * 4, options);
+    @memcpy(words.slice(u32, count), table[0..count]);
+    return .{ .index = .{ .buffer = index }, .table = .{ .buffer = words } };
+}
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -78,7 +101,8 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         };
         base += rows;
     }
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices };
+    const lut = try indexTable(device, allocator, owned, sb.slice(u32, n * (k / 64)));
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .index = if (lut) |l| l.index else null, .table = if (lut) |l| l.table else null };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {

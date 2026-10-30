@@ -30,6 +30,9 @@ pub const Head = struct {
         }
         head.linear.n = width;
         head.linear.words = .{ .buffer = words };
+        // the span copy's pairs are its own: the target head's (scale, bias) index does not address them
+        head.linear.index = null;
+        head.linear.table = null;
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
             const biases = try head.allocate(device, width * groups * 2);
