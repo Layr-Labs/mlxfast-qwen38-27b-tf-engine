@@ -51,6 +51,8 @@ pub const Runner = struct {
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     current_placed: image_rows.Placed = .{},
+    /// Encoded after the head in the next verify's last command buffer, then cleared by its caller.
+    tail: ?forward.Tail = null,
     /// Each slot's rows' M-RoPE layout from its stream's images (empty: text, plain rope at the cache row).
     rope: [attn.planning.max_streams]mrope.Layout = @splat(.{}),
     /// A prompt pass's image rows, while it runs.
@@ -243,7 +245,7 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .images = placed.images };
+        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .images = placed.images, .gdn_sums = true, .tail = r.tail };
         r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, commit_every) catch |err| {
             r.failed = true;
             return err;

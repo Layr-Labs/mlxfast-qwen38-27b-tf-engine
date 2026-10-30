@@ -526,6 +526,45 @@ kernel void tf_delta_gdn_post(device const bfloat* recurrence [[buffer(0)]],
   if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, group, lane);
   else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, group, lane);
 }
+
+// tf_delta_gdn_post for 128-wide heads that also writes the output's 64-wide group sums for the out projection:
+// sums[g * stride + row] is float(bf16 output) added in channel order from zero, the lane projection's tf_lane_sums
+// order, so the projection reads the same words as from its own sums dispatch. The output words are post's.
+kernel void tf_delta_gdn_post_xs(device const bfloat* recurrence [[buffer(0)]],
+                         device const bfloat* gate [[buffer(1)]],
+                         device const void* norm [[buffer(2)]],
+                         constant TfDeltaParams& p [[buffer(3)]],
+                         device bfloat* output [[buffer(4)]],
+                         device float* sums [[buffer(5)]],
+                         constant uint& stride [[buffer(6)]],
+                         uint3 group [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  const uint row = group.z, head = group.y;
+  float values[4];
+  float square = 0.0f;
+  const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+  for (uint part = 0; part < 4; ++part) {
+    values[part] = float(recurrence[at + part]);
+    square += values[part] * values[part];
+  }
+  square = simd_sum(square);
+  const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+  float written[4];
+  for (uint part = 0; part < 4; ++part) {
+    const uint channel = lane * 4 + part;
+    const float normalized = float(bfloat(tf_delta_weight(norm, channel, p.weight_flags, 3) * (values[part] * inverse)));
+    const float z = float(gate[z_at + part]);
+    const bfloat o = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    output[at + part] = o;
+    written[part] = float(o);
+  }
+  // lanes 0-15 hold the head's first 64 channels, 16-31 its second; each half's leader adds them in channel order
+  const ushort half_base = ushort(lane & 16u);
+  float acc = 0.0f;
+  for (ushort source = 0; source < 16; ++source)
+    for (uint part = 0; part < 4; ++part) acc += simd_shuffle(written[part], ushort(half_base + source));
+  if ((lane & 15u) == 0) sums[(head * 2 + (lane >> 4)) * stride + row] = acc;
+}
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
 kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]],

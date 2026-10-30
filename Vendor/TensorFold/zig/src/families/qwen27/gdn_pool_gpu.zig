@@ -51,7 +51,8 @@ pub const Scalars = struct {
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0 };
+/// `sums`: where post writes the output's group sums for the out projection, `sums_stride` rows a group (null: none).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?Ref = null, sums_stride: u32 = 0 };
 
 pub const Pool = struct {
     budget: Budget,
@@ -325,6 +326,8 @@ pub const Pool = struct {
             .keeps = try refSpan(m.keeps, plan.keeps.len * @sizeOf(abi.Keep)),
             .kept_rows = try refSpan(m.kept_rows, plan.kept_rows.len * 4),
             .slot_steps = try refSpan(m.slot_steps, plan.slot_steps.len * @sizeOf(@import("core").tree_slots.Step)),
+            .sums = if (refs.sums) |s| if (refs.sums_stride >= p.rows) try refSpan(s, (@as(usize, p.nv) * p.dv / 64 - 1) * refs.sums_stride * 4 + @as(usize, p.rows) * 4) else null else null,
+            .sums_stride = refs.sums_stride,
         };
         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
         result.tree_mode = pool.tree_mode;
