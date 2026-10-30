@@ -33,6 +33,27 @@
 
 When a submission declares DFlash depth 1 in `mtp-head.manifest.json`, the engine must really run DFlash depth 1 with the pinned drafter in the candidate leg. It must not use another depth and must not bypass the drafter. The token stream cannot show the depth, so promoted entries are reviewed. An entry that uses another depth or bypasses the drafter is removed.
 
+## Engine state
+
+The resident clears model state at each phase boundary. A phase starts with a
+`prefill`, `decode_begin`, `correctness`, `correctness_begin` or
+`free_decode_begin` request. The step and run requests that follow continue
+that phase.
+
+It must not keep prompt or decode work from an earlier phase. For example, it
+must not reuse the KV cache or drafter state of a prefill pass, measured or not,
+in a later prefill pass or in the decode run.
+
+Setup that holds no prompt or decode content, such as buffers, workspaces,
+kernel loads and compiled pipelines, may be done at engine open or on first use,
+and may be kept across phases.
+
+The engine must not carry state from one job to a later job through any side
+channel, such as the page cache or file access times of shared host files. The
+sandbox cleanup does not clear those, so promoted entries are reviewed. An
+entry that keeps prompt or decode state across phases, or any state across
+jobs, is removed.
+
 ## How the score is measured
 
 - Higher scores are better.
