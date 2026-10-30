@@ -157,7 +157,7 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        prepared.forward(scan.encoder);
+        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
         try scan.end();
     }
 
@@ -189,13 +189,20 @@ pub const Pool = struct {
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
-        prepared.gate(gate.encoder);
+        prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
         errdefer publication.cancel();
         const e = publication.encoder;
         if (pool.marks) |m| try m.convolution(layer, prepared, e, pool.kernels.mark_conv);
+        if (in_place and projectedWindows(plan.host, prepared.p.taps)) {
+            // no kept window reads its history: each lands there directly and nothing is left to publish
+            var direct = prepared;
+            direct.b.next_history = prepared.b.history;
+            direct.commitConv(e);
+            return publication.end();
+        }
         prepared.commitConv(e);
         e.setPipeline(pool.kernels.publish_conv);
         gdn.bind(e, .{prepared.b.next_history}, 0);
@@ -365,6 +372,16 @@ pub var step_rounds = true;
 
 fn oneRowSegments(plan: Plan) bool {
     for (plan.segments) |segment| if (segment.rows != 1) return false;
+    return true;
+}
+
+/// Whether every kept window (a keep's last row's next conv window) reads projected rows alone.
+fn projectedWindows(plan: Plan, taps: u32) bool {
+    for (plan.keeps) |keep| {
+        if (keep.rows == 0) continue;
+        const row: usize = plan.kept_rows[keep.first + keep.rows - 1];
+        for (plan.windows[row * taps + 1 ..][0 .. taps - 1]) |source| if (source < taps - 1) return false;
+    }
     return true;
 }
 

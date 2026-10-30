@@ -1,6 +1,7 @@
 //! Only completed committed-tap transactions advance the drafter's absolute rolling context.
 const std = @import("std");
 const op = @import("operators.zig");
+const append_plan = @import("append_plan.zig");
 const Backend = @import("runtime_backend.zig").Backend;
 const Ref = @import("runtime_backend.zig").Ref;
 fn cast(ptr: *anyopaque) *Backend {
@@ -39,11 +40,34 @@ pub fn streamAppend(ptr: *anyopaque, epoch: u64, stream: u32, layer: u32, keys: 
 fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("runtime_backend.zig").Cache, keys: op.View, values: op.View, positions: []const u64) !void {
     const k = try b.frame.ref(keys);
     const v = try b.frame.ref(values);
+    // Long sequential prompt appends occupy one or two disjoint runs of the ring.
+    // Keep the scatter path for short, repeated, non-contiguous or oversized inputs.
+    if (append_plan.contiguous(positions, b.config.window)) |plan| {
+        if (k.buf.id != cache.keys.id and k.buf.id != cache.values.id and
+            v.buf.id != cache.keys.id and v.buf.id != cache.values.id and cache.keys.id != cache.values.id)
+        {
+            const width = b.config.kvWidth();
+            const bytes_per_row = @as(usize, width) * 2;
+            try b.copy(e, k, .{ .buf = cache.keys, .off = @as(usize, plan.slot) * bytes_per_row }, plan.first, width, keys.stride);
+            try b.copy(e, v, .{ .buf = cache.values, .off = @as(usize, plan.slot) * bytes_per_row }, plan.first, width, values.stride);
+            if (plan.second != 0) {
+                try b.copy(e, .{ .buf = k.buf, .off = k.off + @as(usize, plan.first) * keys.stride * 2 }, .{ .buf = cache.keys }, plan.second, width, keys.stride);
+                try b.copy(e, .{ .buf = v.buf, .off = v.off + @as(usize, plan.first) * values.stride * 2 }, .{ .buf = cache.values }, plan.second, width, values.stride);
+            }
+            e.barrier();
+            return;
+        }
+    }
     var first: usize = 0;
     while (first < positions.len) : (first += 16) {
         const count = @min(positions.len - first, 16);
         var slots: [16]u32 = undefined;
         for (slots[0..count], 0..) |*slot, i| slot.* = @intCast(positions[first + i] % b.config.window);
+        if (values.stride != b.config.kvWidth() or keys.stride != b.config.kvWidth()) {
+            try b.attention.appendKvStrided(e, slots[0..count], .{ .buf = k.buf, .off = k.off + first * keys.stride * 2 }, .{ .buf = v.buf, .off = v.off + first * values.stride * 2 }, .{ .buf = cache.keys }, .{ .buf = cache.values }, keys.stride, values.stride);
+            e.barrier();
+            continue;
+        }
         const off = first * b.config.kvWidth() * 2;
         try b.attention.appendKv(e, slots[0..count], .{ .buf = k.buf, .off = k.off + off }, .{ .buf = v.buf, .off = v.off + off }, .{ .buf = cache.keys }, .{ .buf = cache.values });
     }
@@ -86,8 +110,8 @@ fn gather(b: *Backend, e: @import("metal").ComputeEncoder, context: op.Context, 
     const at: u32 = @intCast(context.begin % b.config.window);
     const first = @min(rows, b.config.window - at);
     const width = b.config.kvWidth();
-    try b.copy(e, .{ .buf = cache, .off = @as(usize, at) * width * 2 }, out, first, width);
-    if (first < rows) try b.copy(e, .{ .buf = cache }, .{ .buf = out.buf, .off = out.off + @as(usize, first) * width * 2 }, rows - first, width);
+    try b.copy(e, .{ .buf = cache, .off = @as(usize, at) * width * 2 }, out, first, width, width);
+    if (first < rows) try b.copy(e, .{ .buf = cache }, .{ .buf = out.buf, .off = out.off + @as(usize, first) * width * 2 }, rows - first, width, width);
 }
 pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
     const b = cast(ptr);
@@ -108,6 +132,12 @@ pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
 fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, context: op.Context, caches: []const @import("runtime_backend.zig").Cache, first: u32, rows: u32, result: op.View) !void {
     const context_rows: u32 = @intCast(context.end - context.begin);
     const keys = context_rows + rows;
+    const R = @import("core").shared_attention.Ref;
+    const q = try b.frame.ref(p.query);
+    const y = try b.frame.ref(result);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(b.config.head_dim)));
+    const own_k = try b.frame.ref(p.keys);
+    const own_v = try b.frame.ref(p.values);
     const at: u32 = @intCast(context.begin % b.config.window);
     var k: Ref = undefined;
     var v: Ref = undefined;
@@ -125,19 +155,15 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
         try gather(b, e, context, caches[p.layer].values, v);
     }
     const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
-    const own_k = try b.frame.ref(p.keys);
-    const own_v = try b.frame.ref(p.values);
-    try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width);
-    try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width);
+    try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
+    try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
+    const k_ref: R = .{ .buf = k.buf, .off = k.off };
+    const v_ref: R = .{ .buf = v.buf, .off = v.off };
     const mask = try b.frame.alloc(rows, keys, .u8);
     const mask_ref = try b.frame.ref(mask);
     try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
-    const q = try b.frame.ref(p.query);
-    const y = try b.frame.ref(result);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(b.config.head_dim)));
-    const R = @import("core").shared_attention.Ref;
-    const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, .{ .buf = k.buf, .off = k.off }, .{ .buf = v.buf, .off = v.off }, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
-    // Long contexts share each key chunk across the query heads of one KV head.
+    const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
+    // Long contexts share each 256-key chunk across the query heads of one KV head.
     if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
 }
 

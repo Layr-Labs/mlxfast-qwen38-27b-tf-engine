@@ -12,10 +12,8 @@ pub const Sums = struct { ref: Ref, stride: u32 };
 
 const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
 
-    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
-        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and (key.n == 34816 or key.n == 10240 or key.n == 12288) and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
 };
 
