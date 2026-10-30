@@ -13,6 +13,7 @@ fn failed(cb: mtl.CommandBuffer) bool {
     return true;
 }
 
+pub const AfterCommit = struct { ptr: *anyopaque, call: *const fn (*anyopaque) void };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     device: mtl.Device,
@@ -28,6 +29,8 @@ pub const Frame = struct {
     external: ?Entry = null,
     external_id: u64 = 0,
     external_epoch: u64 = 0,
+    /// Run once right after the frame's command buffer commits, before its wait (the round's keep queues behind it).
+    after_commit: ?AfterCommit = null,
     fence: ?mtl.objc.Id = null,
     parts: [8]mtl.CommandBuffer = undefined,
     part_count: usize = 0,
@@ -97,6 +100,10 @@ pub const Frame = struct {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
         f.encoder.end();
         f.cb.commit();
+        if (f.after_commit) |h| {
+            f.after_commit = null;
+            h.call(h.ptr);
+        }
         f.cb.wait();
         f.completed = true;
         for (f.parts[0..f.part_count]) |cb| {

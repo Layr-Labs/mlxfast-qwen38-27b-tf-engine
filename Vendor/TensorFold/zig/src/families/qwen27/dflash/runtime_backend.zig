@@ -179,6 +179,5 @@ pub const Backend = struct {
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = width, .offset = 0 });
-        e.barrier();
     }
 };

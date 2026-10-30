@@ -180,7 +180,7 @@ const Data = struct {
                     e.setBuffer(x.d.marks, 0, 10);
                     e.setBuffer(x.d.mark_state, 0, 11);
                 }
-                e.dispatchThreads(.{ .width = 32, .height = dv / 4, .depth = nv * x.n }, .{ .width = 32, .height = 4 });
+                e.dispatchThreads(.{ .width = 32, .height = dv / 8, .depth = nv * x.n }, .{ .width = 32, .height = 4 });
                 if (!x.marked) return;
                 e.barrier();
                 e.setPipeline(x.k.mark_conv);

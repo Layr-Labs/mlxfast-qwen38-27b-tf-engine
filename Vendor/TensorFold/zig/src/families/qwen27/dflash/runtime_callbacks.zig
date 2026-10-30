@@ -53,6 +53,7 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
             }
             if (cacheable) b.input_sums = .{ .view = x, .sums = .{ .ref = .{ .buf = p.sums_buffer.? }, .stride = 16 } };
         }
+        return y;
     }
     e.barrier();
     return y;
