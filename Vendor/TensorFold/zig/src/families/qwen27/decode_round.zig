@@ -8,6 +8,8 @@ const forward = @import("forward.zig");
 const commit_every = 4;
 /// Layers a verify encodes before its first commit: the idle GPU starts after two layers' encode.
 const first_commit = 2;
+/// Rows up to which a forward encodes its dispatches serially (decode rounds): every dispatch already waits on the one before it.
+const serial_rows = 16;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -252,7 +254,7 @@ pub const Runner = struct {
         var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
-        r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
+        r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, if (round.ids.len <= serial_rows) .serial else .concurrent, &stages, first_commit, commit_every) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -440,12 +442,15 @@ pub const Runner = struct {
         try r.model.kernels.quant(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.q_gate), rows);
         try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
         e.barrier();
+        // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
-        try r.model.glue.unstack(e, f.get(.mixed), f.get(.key), .{ .rows = rows, .width = kv, .stride = 2 * kv, .offset = 0 });
-        try r.model.glue.unstack(e, f.get(.mixed), f.get(.value), .{ .rows = rows, .width = kv, .stride = 2 * kv, .offset = kv });
-        e.barrier();
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = f.get(.key), .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = f.get(.query), .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), f.get(.value), f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt);
+        const mixed = f.get(.mixed);
+        var value = mixed;
+        value.offset += @as(usize, kv) * 2;
+        // a prompt plan's query goes straight to the prompt kernel's packed rows
+        const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
