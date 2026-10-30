@@ -22,7 +22,7 @@ pub const Bank = struct {
     residency: ?metal.ResidencySet.Follow,
 
     pub fn init(device: metal.Device, budget: Budget, kernels: delta.Kernels, slot: u32, start: u32, end: u32, rows: [marks.limit]u32, resident: ?metal.ResidencySet.Follow) !Bank {
-        if (slot >= budget.slots or budget.shape.c.dk != 128 or budget.shape.c.dv % 4 != 0 or end <= start or end - start > budget.rows) return error.BadPromptMarks;
+        if (slot >= budget.slots or budget.shape.c.dk != 128 or budget.shape.c.dv % 8 != 0 or end <= start or end - start > budget.rows) return error.BadPromptMarks;
         if (kernels.chain_wide_marks.simdWidth() != 32 or kernels.chain_wide_marks.maxThreads() < 128 or kernels.mark_conv.maxThreads() < 32) return error.UnsupportedGdnPipeline;
         const position = try marks.Position.init(slot, start, end, rows);
         const size = try marks.layout(budget.layers, budget.shape.state, budget.shape.conv);
@@ -61,7 +61,7 @@ pub const Bank = struct {
         gdn.bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
         e.setBuffer(b.list, 0, 10);
         e.setBuffer(b.state, layer * marks.limit * b.state_bytes, 11);
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 4, .depth = r.p.nv }, .{ .width = 32, .height = 4 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv }, .{ .width = 32, .height = 4 });
         e.barrier();
     }
 
