@@ -22,6 +22,11 @@ pub const Tail = struct {
     ptr: *anyopaque,
     encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void,
 };
+/// Work committed right after the forward's last command buffer, before the host waits on it (a round's keep).
+pub const Hook = struct {
+    ptr: *anyopaque,
+    run: *const fn (*anyopaque) anyerror!void,
+};
 pub const Stages = struct {
     model: *Model,
     rows: u32,
@@ -31,6 +36,7 @@ pub const Stages = struct {
     residual: Ref = undefined,
     head: Head = .all,
     tail: ?Tail = null,
+    after: ?Hook = null,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
@@ -68,7 +74,6 @@ pub const Stages = struct {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
         }
-        lane.enc.barrier();
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
@@ -141,6 +146,9 @@ pub const Stages = struct {
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
+    }
+    pub fn committed(s: *Stages) !void {
+        if (s.after) |h| try h.run(h.ptr);
     }
 };
 
