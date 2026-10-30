@@ -1,6 +1,10 @@
 //! Host regressions use no shaders, model or GPU execution.
 const std = @import("std");
 pub fn tests(b: *std.Build) void {
+    const attention_metal = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test_metal.zig"), .target = b.graph.host });
+    const attention_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig") });
+    const attention = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "metal", .module = attention_metal }, .{ .name = "kernel_sources", .module = attention_sources } } });
+    b.step("test-shared-attention-host", "Shared attention source, allocation and dispatch without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = attention })).step);
     const rows = b.createModule(.{ .root_source_file = b.path("zig/src/qwen27_rows_test.zig"), .target = b.graph.host });
     b.step("test-qwen27-prompt-rows-host", "Device-aware prompt rows beside owned decoding streams without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = rows, .filters = &.{"qwen27 rows:"} })).step);
     const ane_policy = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen27/ane_policy.zig"), .target = b.graph.host });

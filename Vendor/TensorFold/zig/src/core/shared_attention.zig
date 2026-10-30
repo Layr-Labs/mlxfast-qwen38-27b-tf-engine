@@ -13,25 +13,27 @@ pub const Shape = struct {
     rope: Rope = .split_half,
     capacity: usize,
     output: Output = .f32,
+    split_chunk: usize = 256,
 
     pub fn validate(s: Shape) !void {
         if (s.query_heads == 0 or s.kv_heads == 0 or s.query_heads % s.kv_heads != 0 or
             s.query_heads > 128 or s.head_dim == 0 or s.head_dim > 256 or s.head_dim % 32 != 0 or
-            s.rotary_dim > s.head_dim or s.rotary_dim % 2 != 0 or s.capacity == 0 or s.capacity > std.math.maxInt(u32)) return error.InvalidAttentionShape;
+            s.rotary_dim > s.head_dim or s.rotary_dim % 2 != 0 or s.capacity == 0 or s.capacity > std.math.maxInt(u32) or
+            (s.split_chunk != 64 and s.split_chunk != 256)) return error.InvalidAttentionShape;
         _ = try std.math.mul(usize, s.capacity, try std.math.mul(usize, s.kv_heads, s.head_dim));
     }
 };
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
-/// 256-key chunks covering `keys` (tf_shared_lane_attention_split's TF_CHUNK).
-fn chunksOf(keys: usize) usize {
-    return (keys + 255) / 256;
+/// Chunks covering `keys` (tf_shared_lane_attention_split's TF_CHUNK).
+fn chunksOf(keys: usize, chunk: usize) usize {
+    return (keys + chunk - 1) / chunk;
 }
 const Args = extern struct { rows: u32, keys: u32 = 0, mask_stride: u32 = 0, heads: u32 = 0, scale_bits: u32 = 0 };
 
 pub fn source(a: std.mem.Allocator, s: Shape) ![]u8 {
     try s.validate();
-    return std.fmt.allocPrint(a, "#define TF_QH {d}\n#define TF_KVH {d}\n#define TF_D {d}\n#define TF_RD {d}\n#define TF_INTERLEAVED {d}\n#define TF_OUT {s}\n{s}", .{
-        s.query_heads, s.kv_heads, s.head_dim, s.rotary_dim, @intFromBool(s.rope == .interleaved), if (s.output == .f32) "float" else "bfloat", sources.core_shared_attention,
+    return std.fmt.allocPrint(a, "#define TF_QH {d}\n#define TF_KVH {d}\n#define TF_D {d}\n#define TF_RD {d}\n#define TF_INTERLEAVED {d}\n#define TF_OUT {s}\n#define TF_CHUNK {d}\n{s}", .{
+        s.query_heads, s.kv_heads, s.head_dim, s.rotary_dim, @intFromBool(s.rope == .interleaved), if (s.output == .f32) "float" else "bfloat", s.split_chunk, sources.core_shared_attention,
     });
 }
 
@@ -64,7 +66,7 @@ pub const Attention = struct {
         const merge = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge", false);
         errdefer merge.deinit();
         if (attend.simdWidth() != 32 or attend.maxThreads() < 32 or split.simdWidth() != 32 or merge.simdWidth() != 32) return error.UnsupportedAttentionPipeline;
-        const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity, s.split_chunk) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .split = split, .merge = merge, .part = part };
     }
     pub fn deinit(p: Attention) void {
@@ -77,7 +79,7 @@ pub const Attention = struct {
         p.part.deinit();
     }
 
-    /// Encode 256-key chunks and merge their fp32 partials in chunk order.
+    /// Encode key chunks and merge their fp32 partials in chunk order.
     pub fn encodeSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
         if (rows == 0 or rows > 16 or keys == 0 or keys > p.shape.capacity or stride < keys or stride > std.math.maxInt(u32) or
             !std.math.isFinite(scale)) return error.InvalidAttentionView;
@@ -95,7 +97,7 @@ pub const Attention = struct {
         for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
         e.setValue(args, 4);
         e.setBuffer(p.part, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, rows, chunksOf(keys)), mtl.Size.of(32, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
         e.barrier();
         e.setPipeline(p.merge);
         e.setBuffer(p.part, 0, 0);
