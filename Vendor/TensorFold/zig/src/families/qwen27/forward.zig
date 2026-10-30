@@ -17,6 +17,11 @@ pub const Mixer = struct {
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
 pub const Head = enum { all, last, none };
+/// Work a round encodes behind the head in the forward's last command buffer (its greedy picks): no buffer of its own.
+pub const Tail = struct {
+    ptr: *anyopaque,
+    encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void,
+};
 pub const Stages = struct {
     model: *Model,
     rows: u32,
@@ -25,8 +30,11 @@ pub const Stages = struct {
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
+    tail: ?Tail = null,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
+    /// The GDN mixer hook's post writes mixer_out's group sums into act_sums (tf_delta_gdn_post_xs, 128-wide heads).
+    gdn_sums: bool = false,
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
         const m = s.model;
         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
@@ -62,7 +70,6 @@ pub const Stages = struct {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
         }
-        lane.enc.barrier();
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
@@ -74,7 +81,8 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
-        try m.kernels.quant(e, out, f.get(.mixer_out), null, f.get(.dims), f.get(.output), s.rows);
+        const out_sums: ?@import("quant_gpu.zig").Sums = if (s.gdn_sums and layer.mixer == .linear and m.config.dv == 128) sums(f, .act_sums, s.rows) else null;
+        try m.kernels.quant(e, out, f.get(.mixer_out), out_sums, f.get(.dims), f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
@@ -134,6 +142,10 @@ pub const Stages = struct {
             try m.kernels.quant(e, m.weights.head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
         }
         e.barrier();
+        if (s.tail) |t| {
+            try t.encode(t.ptr, e);
+            e.barrier();
+        }
     }
 };
 

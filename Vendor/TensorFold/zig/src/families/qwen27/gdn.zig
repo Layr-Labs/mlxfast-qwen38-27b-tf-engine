@@ -56,6 +56,9 @@ pub const Buffers = struct {
     keeps: Span,
     kept_rows: Span,
     slot_steps: Span,
+    /// The output's 64-wide group sums for the out projection (tf_delta_gdn_post_xs), at `sums_stride` rows a group.
+    sums: ?Span = null,
+    sums_stride: u32 = 0,
 
     pub fn check(b: Buffers, sizes: abi.Bytes, kinds: abi.WeightKinds, p: abi.Params, plan: Plan) !void {
         try b.qkv.check(sizes.qkv);
@@ -155,12 +158,27 @@ pub const Round = struct {
         }
         r.stateGrid(e);
         e.barrier();
-        e.setPipeline(r.pipelines.post);
+        r.post(e);
+    }
+
+    /// The gate and head norm into the output; with sums bound, the output's group sums beside it (one dispatch).
+    fn post(r: Round, e: metal.ComputeEncoder) void {
+        const xs = r.writesSums();
+        e.setPipeline(if (xs) r.pipelines.post_xs.? else r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
+        if (xs) {
+            r.b.sums.?.bind(e, 5);
+            e.setValue(r.b.sums_stride, 6);
+        }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32, .height = 1, .depth = 1 });
         e.barrier();
+    }
+
+    /// Whether post writes the output's group sums: 128-wide heads, a bound sums span and the pipeline.
+    pub fn writesSums(r: Round) bool {
+        return r.b.sums != null and r.pipelines.post_xs != null and r.p.dv == 128 and r.b.sums_stride >= r.p.rows;
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
@@ -178,12 +196,7 @@ pub const Round = struct {
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder) void {
-        e.setPipeline(r.pipelines.post);
-        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
-        e.setValue(r.p, 3);
-        r.b.output.bind(e, 4);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32 });
-        e.barrier();
+        r.post(e);
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.conv_commit);

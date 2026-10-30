@@ -71,6 +71,7 @@ pub const Backend = struct {
     appended_rows: u32 = 0,
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
+    input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
