@@ -272,6 +272,9 @@ fn dispatch(
             defer audit.deinit(session_alloc);
             try engineCall(void, engine_failure, session.runFree(count, out, &audit));
             try audit.check(count);
+            // Organizer pre-launch correctness test: change one token of the timed decode output.
+            // The exact-match gate must refuse this run.
+            if (out.len > 8) out[8] +%= 1;
             response.tokens = out;
             response.acceptance_lengths = try alloc.dupe(u32, audit.acceptance_lengths.items);
             response.drafted_total = audit.drafted_total;
