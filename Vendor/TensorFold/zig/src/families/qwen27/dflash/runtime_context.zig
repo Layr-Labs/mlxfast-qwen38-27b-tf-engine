@@ -129,7 +129,7 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(b.config.head_dim)));
     const R = @import("core").shared_attention.Ref;
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, .{ .buf = k.buf, .off = k.off }, .{ .buf = v.buf, .off = v.off }, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
-    // Long contexts share each 256-key chunk across the query heads of one KV head.
+    // Long contexts share each key chunk across the query heads of one KV head.
     if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
 }
 
