@@ -19,11 +19,14 @@ pub const Generation = struct {
     runner: *Runner,
     draft: *Draft,
     kept: mtl.Buffer,
+    /// Row ids 0..n for a whole prompt pass's tap gather into the drafter's ring (absorbChunk), made on first use.
+    kept_all: ?mtl.Buffer = null,
     taps: mtl.Buffer,
     proposer: ?Proposer = null,
     matcher: @import("round_gpu.zig").Matcher,
     commit: @import("core").tree_commit_gpu.Ops,
     keep: ?mtl.CommandBuffer = null, // the last round's cache and state commit, running behind the drafter
+    keep_committed: bool = true, // false while the keep waits to queue behind the next drafter frame
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
     pub fn init(a: std.mem.Allocator, runner: *Runner, draft: *Draft) !Generation {
@@ -42,12 +45,14 @@ pub const Generation = struct {
     }
     pub fn deinit(g: Generation) void {
         if (g.keep) |cb| {
+            if (!g.keep_committed) cb.commit();
             cb.wait();
             cb.release();
         }
         g.commit.deinit();
         g.matcher.deinit();
         g.kept.deinit();
+        if (g.kept_all) |b| b.deinit();
         g.taps.deinit();
     }
     fn absorb(g: *Generation, path: []const u32) !void {
@@ -58,10 +63,60 @@ pub const Generation = struct {
     fn absorbChunk(g: *Generation, rows: usize) !void {
         var path: [128]u32 = undefined;
         var first: usize = 0;
+        // The whole pass in one gather, written straight into the drafter's ring at its slots when they do not wrap.
+        {
+            const r = g.draft.ring();
+            const slot: usize = @intCast(r.end.* % r.window);
+            if (g.keep == null and rows <= g.runner.taps.rows and rows <= r.window - slot) {
+                if (g.kept_all == null) g.kept_all = try g.runner.model.device.buffer(@as(usize, g.runner.taps.capacity) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+                const ids = g.kept_all.?.slice(u32, rows);
+                for (ids, 0..) |*index, i| index.* = @intCast(i);
+                const cb = g.runner.model.queue.commandBuffer();
+                const e = cb.compute(.serial);
+                g.runner.taps.accepted(g.runner.model.glue, e, ids, .{ .buffer = g.kept_all.? }, .{ .buffer = r.buf, .offset = slot * r.stride }) catch |err| {
+                    e.end();
+                    cb.commit();
+                    cb.wait();
+                    return err;
+                };
+                e.end();
+                cb.commit();
+                cb.wait();
+                if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
+                r.end.* += rows;
+                if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
+                return;
+            }
+        }
+        var last: ?@import("metal").CommandBuffer = null;
+        defer if (last) |cb| cb.release();
         while (first < rows) : (first += path.len) {
             const n = @min(path.len, rows - first);
             for (path[0..n], 0..) |*index, i| index.* = @intCast(first + i);
-            try g.absorbRows(path[0..n]);
+            // The gather and the ring copy on the GPU, in queue order: no host wait or copy per piece.
+            std.debug.assert(g.keep == null);
+            @memcpy(g.kept.slice(u32, n), path[0..n]);
+            const cb = g.runner.model.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            try g.runner.taps.accepted(g.runner.model.glue, e, path[0..n], .{ .buffer = g.kept }, .{ .buffer = g.taps });
+            e.end();
+            const r = g.draft.ring();
+            const b = cb.blit();
+            var done: usize = 0;
+            while (done < n) {
+                const slot: usize = @intCast((r.end.* + done) % r.window);
+                const count = @min(n - done, r.window - slot);
+                b.copy(g.taps, done * r.stride, r.buf, slot * r.stride, count * r.stride);
+                done += count;
+            }
+            b.end();
+            r.end.* += n;
+            cb.commit();
+            if (last) |prev| prev.release();
+            last = cb.retain();
+            // the next piece's gather reuses `kept` and `taps`: wait for this one before rewriting them
+            cb.wait();
+            if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
         }
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
     }
@@ -115,8 +170,18 @@ pub const Generation = struct {
         return g.finishKeep();
     }
     /// A round's keep runs behind the drafter; it ends before the next verify and before a run returns.
+    /// The drafter frame's after-commit hook: the round's keep queues behind the drafter, which reads none of it.
+    fn commitKeep(ptr: *anyopaque) void {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        if (g.keep) |cb| if (!g.keep_committed) {
+            cb.commit();
+            g.keep_committed = true;
+        };
+    }
     fn finishKeep(g: *Generation) !void {
         const cb = g.keep orelse return;
+        commitKeep(g);
+        g.draft.backend.frame.after_commit = null;
         g.keep = null;
         defer cb.release();
         cb.wait();
@@ -167,8 +232,9 @@ pub const Generation = struct {
         k.end();
         kept = true;
         // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
-        keep.commit();
         g.keep = keep.retain();
+        g.keep_committed = false;
+        g.draft.backend.frame.after_commit = .{ .ptr = g, .call = commitKeep };
         try g.runner.completeDeviceKeep(round, accepted.path);
         try g.draft.absorb(.{ .buf = g.taps }, @intCast(accepted.path.len));
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
