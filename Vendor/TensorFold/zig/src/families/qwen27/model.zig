@@ -149,9 +149,10 @@ pub const Model = struct {
     }
 };
 
-/// A prompt pass's rows: 512 (TF_PROMPT_ROWS takes another multiple of 16 up to the frame's 2048).
+/// A prompt pass's rows: the frame's 2048, so a prompt up to 2048 tokens is one pass over the weights
+/// (TF_PROMPT_ROWS takes another multiple of 16 down to 16).
 pub fn promptRows() u32 {
-    const default = 512;
+    const default = @import("gpu_frame.zig").max_rows;
     const v = std.c.getenv("TF_PROMPT_ROWS") orelse return default;
     const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return default;
     return if (n >= 16 and n <= @import("gpu_frame.zig").max_rows and n % 16 == 0) n else default;
