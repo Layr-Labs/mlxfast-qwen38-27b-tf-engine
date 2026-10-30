@@ -168,13 +168,13 @@ pub const Round = struct {
         r.gate(e);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 4 value columns a simdgroup (prompt chunks, dk = 128).
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 8 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool) void {
         e.setPipeline(chain);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 4, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder) void {

@@ -303,8 +303,9 @@ pub const Projection = struct {
     }
 };
 
-/// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
-pub const reg_rows = 128;
+/// Rows one reg encode takes, as 16-row blocks on the grid's y: a whole prompt pass (the qwen27 frame's 2048 rows) is
+/// one dispatch, not one per 128 rows with a barrier between them. Every threadgroup's words are unchanged.
+pub const reg_rows = 2048;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
