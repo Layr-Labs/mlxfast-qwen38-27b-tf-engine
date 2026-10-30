@@ -58,10 +58,35 @@ pub const Generation = struct {
     fn absorbChunk(g: *Generation, rows: usize) !void {
         var path: [128]u32 = undefined;
         var first: usize = 0;
+        var last: ?@import("metal").CommandBuffer = null;
+        defer if (last) |cb| cb.release();
         while (first < rows) : (first += path.len) {
             const n = @min(path.len, rows - first);
             for (path[0..n], 0..) |*index, i| index.* = @intCast(first + i);
-            try g.absorbRows(path[0..n]);
+            // The gather and the ring copy on the GPU, in queue order: no host wait or copy per piece.
+            std.debug.assert(g.keep == null);
+            @memcpy(g.kept.slice(u32, n), path[0..n]);
+            const cb = g.runner.model.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            try g.runner.taps.accepted(g.runner.model.glue, e, path[0..n], .{ .buffer = g.kept }, .{ .buffer = g.taps });
+            e.end();
+            const r = g.draft.ring();
+            const b = cb.blit();
+            var done: usize = 0;
+            while (done < n) {
+                const slot: usize = @intCast((r.end.* + done) % r.window);
+                const count = @min(n - done, r.window - slot);
+                b.copy(g.taps, done * r.stride, r.buf, slot * r.stride, count * r.stride);
+                done += count;
+            }
+            b.end();
+            r.end.* += n;
+            cb.commit();
+            if (last) |prev| prev.release();
+            last = cb.retain();
+            // the next piece's gather reuses `kept` and `taps`: wait for this one before rewriting them
+            cb.wait();
+            if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
         }
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
     }
