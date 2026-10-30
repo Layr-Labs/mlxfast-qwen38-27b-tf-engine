@@ -35,8 +35,9 @@ pub const Taps = struct {
         if (t.seen != 0 and rows != t.rows) return error.BadTapShape;
         const bit = @as(u8, 1) << @intCast(index);
         if (t.seen & bit != 0) return error.DuplicateTap;
+        // unfenced: the copy runs beside the mixer's projections, whose barrier orders it before any reader of the plane
+        // and before the next write of `hidden` (two norms on)
         try glue.unstack(e, hidden, try t.plane(index), .{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 });
-        e.barrier();
         t.seen |= bit;
         t.rows = rows;
     }

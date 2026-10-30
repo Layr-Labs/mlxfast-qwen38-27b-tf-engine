@@ -96,7 +96,7 @@ pub fn chunk(b: *Metal, s: *lanes.Stream, f: *Fill) !bool {
         }
     }
     const shape = b.runner.gdn.budget.shape;
-    if (s.reuse.hook != null and d == null and !decoded and !b.runner.capture_taps and b.runner.images == null and shape.c.dk == 128 and shape.c.dv % 4 == 0) {
+    if (s.reuse.hook != null and d == null and !decoded and !b.runner.capture_taps and b.runner.images == null and shape.c.dk == 128 and shape.c.dv % 8 == 0) {
         const picked = try q.prompt_marks.select(@intCast(at), @intCast(end), s.reuse.marks);
         if (picked.count > 0) if (b.grow) |g| {
             const budget = b.runner.gdn.budget;

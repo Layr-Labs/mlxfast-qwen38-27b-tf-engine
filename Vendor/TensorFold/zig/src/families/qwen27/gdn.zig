@@ -155,7 +155,23 @@ pub const Round = struct {
         return r.p.dk == 128 and r.compact and r.tree_mode != .snapshot;
     }
 
-    pub fn forward(r: Round, e: metal.ComputeEncoder) void {
+    /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
+    pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
+        if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
+        e.setPipeline(pair);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+        e.setValue(r.p, 8);
+        bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
+        r.b.slot_steps.bind(e, 11);
+        r.b.state.bind(e, 12);
+        (r.b.before orelse r.b.state).bind(e, 13);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.barrier();
+        r.gate(e, post_rows);
+    }
+
+    /// `post_rows`: tf_delta_gdn_post_rows, as `gate` takes it.
+    pub fn forward(r: Round, e: metal.ComputeEncoder, post_rows: metal.Pipeline) void {
         e.setPipeline(if (r.usesSlots()) r.pipelines.tree_slots[r.slot_kernel] else r.pipelines.tree);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
         e.setValue(r.p, 8);
@@ -167,34 +183,33 @@ pub const Round = struct {
         }
         r.stateGrid(e);
         e.barrier();
-        e.setPipeline(r.pipelines.post);
-        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
-        e.setValue(r.p, 3);
-        r.b.output.bind(e, 4);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32, .height = 1, .depth = 1 });
-        e.barrier();
+        r.gate(e, post_rows);
     }
 
-    pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
+    pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) void {
         r.scanChain(e, chain, false);
-        r.gate(e);
+        r.gate(e, post_rows);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 4 value columns a simdgroup (prompt chunks, dk = 128).
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 8 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool) void {
         e.setPipeline(chain);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 4, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         e.barrier();
     }
-    pub fn gate(r: Round, e: metal.ComputeEncoder) void {
-        e.setPipeline(r.pipelines.post);
+    /// tf_delta_gdn_post a simdgroup a (row, head); 128-wide heads on bfloat4 rows take `rows` (tf_delta_gdn_post_rows),
+    /// 4 rows a group of 128.
+    pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+        var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
+        inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // bfloat4 rows
+        e.setPipeline(if (wide) rows else r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32 });
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {

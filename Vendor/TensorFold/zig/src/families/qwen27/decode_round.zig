@@ -6,6 +6,8 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 4;
+/// Layers a verify encodes before its first commit: the idle GPU starts after two layers' encode.
+const first_commit = 2;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -50,6 +52,8 @@ pub const Runner = struct {
     current_round: ?*const Round = null,
     /// Encoded after the head of the next verify, in its last command buffer.
     tail: ?forward.Tail = null,
+    /// Committed right after the next verify's last command buffer, then cleared by its caller.
+    after: ?forward.Hook = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     current_placed: image_rows.Placed = .{},
@@ -245,9 +249,12 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .images = placed.images };
-        r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, commit_every) catch |err| {
+        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .after = r.after, .images = placed.images };
+        // a keep committed behind the forward's last command buffer (stages.after) keeps this round
+        if (!accepted and r.after != null) r.active = fingerprint(round);
+        r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
             r.failed = true;
+            r.active = null;
             return err;
         };
         if (r.model.ane) |share| share.drain() catch |err| {
@@ -317,6 +324,9 @@ pub const Runner = struct {
         e.barrier();
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
         e.barrier();
+        // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
+        // copy every kept row onto itself
+        if (chainWindow(round.windows[0].parents)) return;
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
@@ -331,6 +341,12 @@ pub const Runner = struct {
                 ai += 1;
             },
         };
+    }
+
+    /// Whether every row's parent is the row before it (a chain), so any kept path is a prefix of the rows.
+    fn chainWindow(parents: []const i32) bool {
+        for (parents, 0..) |parent, row| if (parent != @as(i32, @intCast(row)) - 1) return false;
+        return true;
     }
 
     pub fn completeDeviceKeep(r: *Runner, round: *const Round, path: []const u32) !void {
@@ -424,12 +440,15 @@ pub const Runner = struct {
         try r.model.kernels.quant(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.q_gate), rows);
         try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
         e.barrier();
+        // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
-        try r.model.glue.unstack(e, f.get(.mixed), f.get(.key), .{ .rows = rows, .width = kv, .stride = 2 * kv, .offset = 0 });
-        try r.model.glue.unstack(e, f.get(.mixed), f.get(.value), .{ .rows = rows, .width = kv, .stride = 2 * kv, .offset = kv });
-        e.barrier();
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = f.get(.key), .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = f.get(.query), .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), f.get(.value), f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt);
+        const mixed = f.get(.mixed);
+        var value = mixed;
+        value.offset += @as(usize, kv) * 2;
+        // a prompt plan's query goes straight to the prompt kernel's packed rows
+        const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
