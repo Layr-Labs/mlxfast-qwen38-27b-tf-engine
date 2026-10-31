@@ -37,6 +37,9 @@ pub const Stages = struct {
     head: Head = .all,
     tail: ?Tail = null,
     after: ?Hook = null,
+    /// No consumer needs the final block's other rows after its cache updates.
+    terminal_rows: bool = false,
+    compact: bool = false,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
@@ -85,9 +88,18 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
-        try m.kernels.quant(e, out, f.get(.mixer_out), null, f.get(.dims), f.get(.output), s.rows);
+        var mixer_out = f.get(.mixer_out);
+        if (s.terminal_rows and index + 1 == m.config.layers) {
+            if (s.head == .none) return;
+            mixer_out.offset += @as(usize, s.rows - 1) * out.k * 2;
+            s.hidden.offset += @as(usize, s.rows - 1) * h * 2;
+            s.rows = 1;
+            s.compact = true;
+        }
+        const dims = f.get(if (s.compact) .last_dims else .dims);
+        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
         e.barrier();
-        try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);
@@ -117,20 +129,22 @@ pub const Stages = struct {
             s.pending = f.get(.output);
             return;
         } else {
-            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.dims), f.get(.mixed), s.rows);
+            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
             e.barrier();
-            try m.kernels.mlp(e, f.get(.mixed), up, f.get(.dims), f.get(.activated), f.get(.act_sums), width, s.rows);
+            try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
         }
         lane.enc.barrier();
-        try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.dims), f.get(.output), s.rows);
+        try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), dims, f.get(.output), s.rows);
         lane.enc.barrier();
         s.pending = f.get(.output);
     }
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
+        if (s.terminal_rows and s.head == .none) return;
         const m = s.model;
         const f = &m.frame;
         const e = lane.enc;
-        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+        const dims = f.get(if (s.compact) .last_dims else .dims);
+        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
