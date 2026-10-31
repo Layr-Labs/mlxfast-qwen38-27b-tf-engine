@@ -233,7 +233,7 @@ pub const Kernels = struct {
             entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean });
             k.joined(entry.value_ptr);
         }
-        const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+        const step: u32 = if (entry.value_ptr.reg) (if (k.prompt) lane.prompt_rows else lane.reg_rows) else 16;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
