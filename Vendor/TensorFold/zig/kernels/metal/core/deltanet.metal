@@ -672,6 +672,25 @@ kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]
   const uint source = windows[row * p.taps + item / channels + 1];
   next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
 }
+kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
+                              device const ushort* projection [[buffer(1)]],
+                              device const uint* kept_rows [[buffer(2)]],
+                              device const TfDeltaKeep* keeps [[buffer(3)]],
+                              device const uint* windows [[buffer(4)]],
+                              constant TfDeltaParams& p [[buffer(5)]],
+                              uint2 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const TfDeltaKeep keep = keeps[position.y];
+  if (item >= channels || keep.rows == 0) return;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
 kernel void tf_delta_gdn_publish(device const uint* next_state [[buffer(0)]],

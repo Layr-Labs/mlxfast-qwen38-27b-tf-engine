@@ -348,10 +348,9 @@ pub const Runner = struct {
         }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
-        e.barrier();
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
-        // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
+        // Each layer replays its state and copies all conv taps before overwriting that channel's history.
+        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+        // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;
         const lane = @as(usize, r.scratch.limits.rows) * g.kv_heads * g.dim * 2;
@@ -500,8 +499,8 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        // decoded rows: the merge writes the out projection's group sums into `.sums` (read and cleared by forward.post)
-        const out_sums = !prepacked and !r.attention.promptPath(plan, r.model.kernels.prompt);
+        // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
+        const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
         try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
         f.mixer_sums = out_sums;
