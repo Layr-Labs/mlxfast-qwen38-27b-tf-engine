@@ -4,19 +4,31 @@ const mtl = @import("metal");
 pub const contract = @import("tree_round");
 const source = @import("tree_round_sources").text;
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
+/// Spans a row's picks take in `argmaxSpans`: enough threadgroups to spread a 248320-wide row over the GPU.
+pub const argmax_spans = 64;
+/// One span's best score, its token (invalid_token when the span held none) and its nonfinite mask.
+pub const ArgmaxPart = extern struct { value: f32, token: u32, nonfinite: u32 };
 pub const Ops = struct {
     argmax_pipe: mtl.Pipeline,
     match_pipe: mtl.Pipeline,
+    span_pipe: mtl.Pipeline,
+    merge_pipe: mtl.Pipeline,
     pub fn init(device: mtl.Device) !Ops {
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
         const argmax_pipe = try mtl.Pipeline.init(device, lib, "tf_round_bf16_argmax", false);
         errdefer argmax_pipe.deinit();
-        return .{ .argmax_pipe = argmax_pipe, .match_pipe = try mtl.Pipeline.init(device, lib, "tf_tree_round_match", false) };
+        const match_pipe = try mtl.Pipeline.init(device, lib, "tf_tree_round_match", false);
+        errdefer match_pipe.deinit();
+        const span_pipe = try mtl.Pipeline.init(device, lib, "tf_round_bf16_argmax_span", false);
+        errdefer span_pipe.deinit();
+        return .{ .argmax_pipe = argmax_pipe, .match_pipe = match_pipe, .span_pipe = span_pipe, .merge_pipe = try mtl.Pipeline.init(device, lib, "tf_round_bf16_argmax_merge", false) };
     }
     pub fn deinit(ops: Ops) void {
         ops.argmax_pipe.deinit();
         ops.match_pipe.deinit();
+        ops.span_pipe.deinit();
+        ops.merge_pipe.deinit();
     }
     pub fn argmax(ops: Ops, e: mtl.ComputeEncoder, logits: Ref, picks: Ref, p: contract.Argmax) !void {
         try contract.checkArgmax(p);
@@ -30,6 +42,31 @@ pub const Ops = struct {
         e.setBuffer(picks.buf, picks.off, 1);
         e.setValue(p, 2);
         e.dispatchGroups(mtl.Size.of(p.rows, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+    /// `argmax` in two passes through `parts` (rows * argmax_spans ArgmaxPart): every row's spans run in their own
+    /// threadgroups, then one threadgroup a row merges them. The picks equal `argmax`'s; `parts` is the caller's scratch.
+    pub fn argmaxSpans(ops: Ops, e: mtl.ComputeEncoder, logits: Ref, parts: Ref, picks: Ref, p: contract.Argmax) !void {
+        try contract.checkArgmax(p);
+        const cells = try std.math.add(usize, try std.math.mul(usize, p.rows - 1, p.stride), p.vocab);
+        const bytes = try std.math.mul(usize, cells, 2);
+        const part_bytes = @as(usize, p.rows) * argmax_spans * @sizeOf(ArgmaxPart);
+        try check(logits, bytes, 2);
+        try check(parts, part_bytes, 4);
+        try check(picks, @as(usize, p.rows) * @sizeOf(contract.Pick), 4);
+        try distinct(parts, part_bytes, logits, bytes);
+        try distinct(picks, @as(usize, p.rows) * @sizeOf(contract.Pick), parts, part_bytes);
+        try distinct(picks, @as(usize, p.rows) * @sizeOf(contract.Pick), logits, bytes);
+        e.setPipeline(ops.span_pipe);
+        e.setBuffer(logits.buf, logits.off, 0);
+        e.setBuffer(parts.buf, parts.off, 1);
+        e.setValue(p, 2);
+        e.dispatchGroups(mtl.Size.of(argmax_spans, p.rows, 1), mtl.Size.of(256, 1, 1));
+        e.barrier();
+        e.setPipeline(ops.merge_pipe);
+        e.setBuffer(parts.buf, parts.off, 0);
+        e.setBuffer(picks.buf, picks.off, 1);
+        e.setValue(@as(u32, argmax_spans), 2);
+        e.dispatchGroups(mtl.Size.of(p.rows, 1, 1), mtl.Size.of(64, 1, 1));
     }
     pub fn match(ops: Ops, e: mtl.ComputeEncoder, tokens: Ref, parents: Ref, picks: Ref, eos: ?Ref, result: Ref, p: contract.Match) !void {
         try contract.checkMatch(p);
