@@ -152,6 +152,8 @@ pub const packed_metallib = @import("nemotron_packed_metallib").bytes;
 /// The core lane projection (tensor units): every window row's sums in one weight read, and its row order.
 pub const core_lane_projection = @embedFile("core/lane_projection.metal");
 pub const core_lane_order = @embedFile("core/lane_order.metal");
+/// Decoded rows' gate/up, activation and down projection in one dispatch (qwen27 quant_gpu.mlpFlow).
+pub const core_mlp_flow = @embedFile("core/mlp_flow.metal");
 /// Lane rows attending a shared context through an explicit mask (core/shared_attention.zig).
 pub const core_shared_attention = @embedFile("core/shared_attention.metal");
 /// The core DeltaNet kernels (core/deltanet_kernels.zig).

@@ -135,6 +135,11 @@ pub const Stages = struct {
             lane.enc.barrier();
             s.pending = f.get(.output);
             return;
+        } else if (try m.kernels.mlpFlow(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), f.get(.output), s.rows)) {
+            // decoded rows: gate/up, activation and down in one dispatch
+            lane.enc.barrier();
+            s.pending = f.get(.output);
+            return;
         } else if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
             try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
             e.barrier();

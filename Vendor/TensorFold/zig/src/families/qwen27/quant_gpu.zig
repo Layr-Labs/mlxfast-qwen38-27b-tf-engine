@@ -71,12 +71,21 @@ pub const Kernels = struct {
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
+    /// mlpFlow's pipelines by metadata form (gate/up 12-bit * 2 + down 12-bit), its counters and flags, and the epoch of
+    /// its last encoded dispatch (each dispatch publishes its groups under a new one).
+    flow: [4]?mtl.Pipeline = .{ null, null, null, null },
+    flow_sync: ?mtl.Buffer = null,
+    flow_epoch: u32 = 0,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
         while (it.next()) |p| {
             if (k.residency) |f| mtl.resident.fields.apply(p, f, false);
             if (hook) |f| mtl.resident.fields.apply(p, f, true);
+        }
+        if (k.flow_sync) |b| {
+            if (k.residency) |f| f.leave(f.ctx, b);
+            if (hook) |f| f.join(f.ctx, b);
         }
         k.residency = hook;
     }
@@ -99,6 +108,8 @@ pub const Kernels = struct {
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+        for (k.flow) |p| if (p) |pipe| pipe.deinit();
+        if (k.flow_sync) |b| b.deinit();
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -164,6 +175,56 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
+        try span.end();
+        return true;
+    }
+
+    /// Decoded rows' MLP block in one dispatch (mlp_flow.metal): what `gateUpActivated` writes to `out` and `out_sums`,
+    /// and the down `quant` of them to `y`, without the barrier between the two. Down tiles start while gate/up
+    /// threadgroups finish and wait for each group of activations they read. False (nothing encoded) where the shapes do
+    /// not take it; the caller then encodes the two projections.
+    pub fn mlpFlow(k: *Kernels, input_encoder: mtl.ComputeEncoder, gu: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, y: Ref, rows: u32) !bool {
+        if (k.prompt or rows == 0 or rows > 8 or xs.stride < rows) return false;
+        if (!flowShape(gu, 34816, 5120, 2) or !flowShape(down, 5120, 17408, 4)) return false;
+        const which: usize = @as(usize, @intFromBool(gu.index12)) * 2 + @intFromBool(down.index12);
+        if (k.flow[which] == null) {
+            const text = try std.fmt.allocPrint(k.allocator, "#define MF_GU12 {d}\n#define MF_DN12 {d}\n{s}", .{ @intFromBool(gu.index12), @intFromBool(down.index12), @import("kernel_sources").core_mlp_flow });
+            defer k.allocator.free(text);
+            const lib = try mtl.Library.fromSource(k.device, text, mtl.CompileOptions.mlx());
+            defer lib.deinit();
+            const p = try mtl.Pipeline.init(k.device, lib, "tf_mlp_flow", false);
+            errdefer p.deinit();
+            if (p.simdWidth() != 32 or p.maxThreads() < 128) return error.UnsupportedPipelineShape;
+            k.flow[which] = p;
+        }
+        if (k.flow_sync == null) {
+            const b = try k.device.buffer(flow_words * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.slice(u32, flow_words), 0);
+            k.flow_sync = b;
+            if (k.residency) |f| f.join(f.ctx, b);
+        }
+        k.flow_epoch +%= 1;
+        if (k.flow_epoch == 0) k.flow_epoch = 1; // a cleared flag never matches
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = gu.n, .k = gu.k, .sk = gu.slices, .bits = gu.bits };
+        errdefer span.cancel();
+        const e = span.encoder;
+        const gm = metadata(gu, true);
+        const dm = metadata(down, true);
+        e.setPipeline(k.flow[which].?);
+        e.setBuffer(x.buffer, x.offset, 0);
+        e.setBuffer(gu.words.buffer, gu.words.offset, 1);
+        e.setBuffer(gm.buf, gm.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(xs.stride) }, 3);
+        e.setBuffer(out.buffer, out.offset, 4);
+        e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
+        e.setBuffer(out_sums.buffer, out_sums.offset, 6);
+        e.setBuffer(down.words.buffer, down.words.offset, 7);
+        e.setBuffer(dm.buf, dm.off, 8);
+        e.setBuffer(y.buffer, y.offset, 9);
+        e.setBuffer(k.flow_sync.?, 0, 10);
+        e.setValue(k.flow_epoch, 11);
+        e.dispatchGroups(mtl.Size.of(34816 / 128 + 5120 / 32, 1, 1), mtl.Size.of(128, 1, 1));
         try span.end();
         return true;
     }
@@ -518,6 +579,15 @@ pub const Kernels = struct {
 };
 
 /// The metadata a reg launch binds: decoded rows' indexed copy where its key takes it, else the pairs.
+/// mlpFlow's sync words: the ticket counter and the finished count in their own 128 bytes, then a flag per down tile and
+/// gate/up group (mlp_flow.metal's MF_FLAGS).
+const flow_words = 32 + (5120 / 32) * (34816 / 128);
+
+/// A decoded rows' projection mlp_flow.metal takes: its 4-bit g64 indexed reg path at `sk` K splits, tiles batched by 8.
+fn flowShape(p: projection.Linear, n: u32, kk: u32, sk: u32) bool {
+    return p.runs.len == 0 and p.raw == null and p.tile == 32 and p.bits == 4 and p.group == 64 and p.n == n and p.k == kk and p.slices == sk and p.batch == 8 and p.index != null;
+}
+
 fn metadata(p: projection.Linear, indexed: bool) lane.Ref {
     if (indexed) if (p.index) |i| return .{ .buf = i.buffer, .off = i.offset };
     return .{ .buf = p.pairs.buffer, .off = p.pairs.offset };
