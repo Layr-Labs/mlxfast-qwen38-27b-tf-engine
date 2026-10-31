@@ -535,5 +535,7 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 /// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
-    return if (key.k == 17408 or key.k == 6144) 2 else 1;
+    if (key.k != 17408 and key.k != 6144) return 1;
+    const four = key.batch > 0 and (key.batch % 4 == 0 or 4 % key.batch == 0);
+    return if (four) 4 else 2;
 }

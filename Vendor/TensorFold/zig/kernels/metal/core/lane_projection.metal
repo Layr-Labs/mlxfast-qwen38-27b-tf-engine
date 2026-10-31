@@ -569,7 +569,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #ifndef TF_TB
 #define TF_TB 1
 #endif
-// Prompt rows, TF_PROMPT_TN (2) adjacent 32-column tiles a SIMD group: a group's 16x64 activation slice loads once into
+// Prompt rows, TF_PROMPT_TN (2 or 4) adjacent 32-column tiles a SIMD group: a group's 16x64 activation slice loads once into
 // cooperative registers and feeds both tiles' products, instead of each tile's tensor op reading it from device memory.
 // Each tile unpacks its own codes into the same register words as tf_lane_reg, and applies the same scale/bias FMA chain,
 // K split reduction and store as tf_lane_reg's prompt rows. Both operands in registers need K = 32 tensor ops, so each
@@ -581,6 +581,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 // Uint4s between a tile's codes and the next tile's: adjacent tiles of a batch sit one 64-uint4 block apart per group.
 #define TF_TN_CODES (TF_TB > 1 ? 64 : KG * 64)
+#if TF_PROMPT_TN == 4
+// Four tiles may cross a two-tile interleave block. tile0 is aligned to four tiles.
+#define TF_TN_OFFSET(t) ((((t) / TF_TB) * KG * TF_TB + (t) % TF_TB) * 64)
+#else
+#define TF_TN_OFFSET(t) ((t) * TF_TN_CODES)
+#endif
 // One tile of a group: unpack its codes (1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting
 // 1024 is exact), prefetch its next codes, run, then FMAs.
 #define TF_TN_TILE(t, CB, PP) { \
@@ -597,8 +603,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
         b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
       } \
-      nw0[t] = cp[(t) * TF_TN_CODES]; \
-      nw1[t] = cp[(t) * TF_TN_CODES + 32]; \
+      nw0[t] = cp[TF_TN_OFFSET(t)]; \
+      nw1[t] = cp[TF_TN_OFFSET(t) + 32]; \
       opm.run(xl0, CB##l, PP); \
       opa.run(xl1, CB##h, PP); \
       TF_UNROLL \
@@ -651,7 +657,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     nw0[t] = 0; nw1[t] = 0;
-    if (first < last) { nw0[t] = cp[t * TF_TN_CODES]; nw1[t] = cp[t * TF_TN_CODES + 32]; }
+    if (first < last) { nw0[t] = cp[TF_TN_OFFSET(t)]; nw1[t] = cp[TF_TN_OFFSET(t) + 32]; }
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
@@ -668,6 +674,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
     TF_TN_TILE(0, cb0, P0)
     TF_TN_TILE(1, cb1, P1)
+#if TF_PROMPT_TN == 4
+    TF_TN_TILE(2, cb0, P0)
+    TF_TN_TILE(3, cb1, P1)
+#endif
     sp += TF_N / 4;
   }
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
