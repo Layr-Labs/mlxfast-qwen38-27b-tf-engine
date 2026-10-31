@@ -3,19 +3,32 @@ const std = @import("std");
 const weights = @import("weights.zig");
 const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
-/// `floor`: a node offers a child whose drafter probability (the head's softmax over its row's top-k) is below it only
-/// when that child is the node's best.
-pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
+pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null };
 /// Candidate count and maximum draft-parent path length are independent.
 pub const Policy = struct {
     nodes: usize,
     max_depth: ?u32 = null,
     /// Siblings a node may offer (Options.children): a depth-one tree of `nodes` drafts needs as many.
     children: u32 = 4,
-    /// Options.floor: the least drafter probability of a sibling that is not its node's best.
-    floor: f64 = 0,
+    /// Opt-in mass of the best scored head candidate; narrowing is valid only for a depth-one tree.
+    confidence_mass: ?f64 = null,
+
+    fn confidenceCutoff(p: Policy) !?f64 {
+        const mass = p.confidence_mass orelse return null;
+        if (p.max_depth != 1 or !std.math.isFinite(mass) or mass <= 0 or mass > 1) return error.BadDraftConfidence;
+        return @log(mass);
+    }
+
+    pub fn offerCount(p: Policy, count: usize, scores: []const f64) !usize {
+        const cutoff = (try p.confidenceCutoff()) orelse return count;
+        if (scores.len != count) return error.BadDraftConfidence;
+        if (count == 0) return 0;
+        if (!std.math.isFinite(scores[0]) or scores[0] > 0) return error.BadDraftConfidence;
+        return if (scores[0] >= cutoff) 1 else count;
+    }
 
     pub fn block(p: Policy, cap: u32) !u32 {
+        _ = try p.confidenceCutoff();
         if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
         if (p.max_depth) |depth| if (depth == 0 or depth > 15) return error.BadDraftDepth;
         return @min(cap, @min(@as(u32, @intCast(p.nodes)) + 1, (p.max_depth orelse 15) + 1));
@@ -48,9 +61,14 @@ pub const Tree = struct {
         t.* = undefined;
     }
     pub fn verifyParents(t: Tree, gpa: std.mem.Allocator) ![]i32 {
-        const parents = try gpa.alloc(i32, t.parents.len + 1);
+        return t.verifyPrefixParents(gpa, t.parents.len);
+    }
+    /// Allocate verifier parents for a prefix without changing ownership of the full proposal.
+    pub fn verifyPrefixParents(t: Tree, gpa: std.mem.Allocator, count: usize) ![]i32 {
+        if (count > t.parents.len) return error.BadDraftPrefix;
+        const parents = try gpa.alloc(i32, count + 1);
         parents[0] = -1;
-        for (t.parents, 0..) |p, i| {
+        for (t.parents[0..count], 0..) |p, i| {
             if (p < -1 or p >= i) {
                 gpa.free(parents);
                 return error.BadDraftParents;
@@ -109,31 +127,13 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
         }
     };
     std.mem.sort(u32, order[0..lattice.topk], Rank{ .scores = scores[0..lattice.topk] }, Rank.less);
-    var drafter: [16]f64 = undefined;
-    if (options.floor > 0) {
-        var top: f64 = -std.math.inf(f64);
-        for (lattice.unary[row..][0..lattice.topk]) |u| top = @max(top, @as(f64, u));
-        var total: f64 = 0;
-        for (drafter[0..lattice.topk], lattice.unary[row..][0..lattice.topk]) |*q, u| {
-            q.* = @exp(@as(f64, u) - top);
-            total += q.*;
-        }
-        for (drafter[0..lattice.topk]) |*q| q.* /= total;
-    }
-    const children = @min(options.children, lattice.topk);
-    var offered: u32 = 0;
-    for (order[0..lattice.topk]) |i| {
-        if (offered == children) break;
-        if (offered > 0 and options.floor > 0 and drafter[i] < options.floor) continue;
-        try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
-        offered += 1;
-    }
+    for (order[0..@min(options.children, lattice.topk)]) |i| try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
 }
 pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {
     try g.config.check();
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
-    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0 or !(options.floor >= 0 and options.floor < 1)) return error.BadDraftSelector;
+    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0) return error.BadDraftSelector;
     var frontier: std.ArrayList(Node) = .empty;
     defer frontier.deinit(lattice.gpa);
     const tokens = try gpa.alloc(u32, options.nodes);
@@ -185,4 +185,58 @@ test "proposal width and parent depth have separate bounds" {
     try std.testing.expectError(error.BadDraftDepth, (Policy{ .nodes = 2, .max_depth = 0 }).block(16));
     try std.testing.expectEqual(@as(u32, 2), p.budget(128));
     try std.testing.expectEqual(@as(u32, 1), p.budget(1));
+}
+
+test "depth one confidence preserves the default and validates normalized head mass" {
+    const a = std.testing.allocator;
+    _ = a;
+    const legacy = Policy{ .nodes = 7, .max_depth = 1, .children = 7 };
+    const adaptive = Policy{ .nodes = 7, .max_depth = 1, .children = 7, .confidence_mass = 0.95 };
+    var scores = [_]f64{ @log(0.95), @log(0.02), @log(0.01), @log(0.005), @log(0.003), @log(0.002), @log(0.001) };
+    try std.testing.expectEqual(@as(usize, 7), try legacy.offerCount(7, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), try adaptive.offerCount(7, &scores));
+    scores[0] -= 1e-9;
+    try std.testing.expectEqual(@as(usize, 7), try adaptive.offerCount(7, &scores));
+    scores[0] = @log(0.99);
+    try std.testing.expectEqual(@as(usize, 1), try adaptive.offerCount(7, &scores));
+    try std.testing.expectEqual(@as(u32, 2), try adaptive.block(16));
+    try std.testing.expectEqual(@as(u32, 2), adaptive.budget(128));
+    try std.testing.expectEqual(@as(u32, 1), adaptive.budget(1));
+    try std.testing.expectError(error.BadDraftConfidence, adaptive.offerCount(7, scores[0..6]));
+    scores[0] = std.math.nan(f64);
+    try std.testing.expectError(error.BadDraftConfidence, adaptive.offerCount(7, &scores));
+    for ([_]f64{ 0, -1, 1.01, std.math.inf(f64) }) |mass| try std.testing.expectError(error.BadDraftConfidence, (Policy{ .nodes = 7, .max_depth = 1, .confidence_mass = mass }).block(16));
+    try std.testing.expectError(error.BadDraftConfidence, (Policy{ .nodes = 7, .max_depth = 2, .confidence_mass = 0.95 }).block(16));
+    try std.testing.expectError(error.BadDraftConfidence, (Policy{ .nodes = 7, .confidence_mass = 0.95 }).block(16));
+}
+
+test "offered parent prefixes keep full proposal ownership and fall back on an unoffered target" {
+    const a = std.testing.allocator;
+    var tree = Tree{ .gpa = a, .tokens = try a.dupe(u32, &.{ 2, 3, 4, 5, 6, 7, 8 }), .parents = try a.dupe(i32, &.{ -1, -1, -1, -1, -1, -1, -1 }), .scores = try a.dupe(f64, &.{ -0.01, -6, -7, -8, -9, -10, -11 }) };
+    defer tree.deinit();
+    const matcher = @import("core").tree_round;
+    const audit = @import("audit.zig");
+    for ([_]usize{ 1, 7 }) |offered| for ([_]u32{ 2, 8 }) |pick| {
+        const parents = try tree.verifyPrefixParents(a, offered);
+        defer a.free(parents);
+        var ids = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        var picks: [8]matcher.Pick = undefined;
+        for (&picks) |*v| v.* = .{ .token = 9 };
+        picks[0].token = pick;
+        const shape = matcher.Match{ .rows = @intCast(offered + 1), .vocab = 16, .budget = 2 };
+        const raw = try matcher.oracle(shape, ids[0 .. offered + 1], parents, picks[0 .. offered + 1], &.{});
+        const accepted = try matcher.decode(&raw, shape);
+        const expected: usize = if (pick == 2 or offered == 7) 2 else 1;
+        try std.testing.expectEqual(expected, accepted.tokens.len);
+        try std.testing.expectEqual(pick, accepted.tokens[0]);
+        if (expected == 2) try std.testing.expectEqual(@as(u32, 9), accepted.tokens[1]);
+        var journal: audit.Journal = .{};
+        defer journal.deinit(a);
+        try journal.record(a, .{ .committed = @intCast(accepted.tokens.len), .drafted = @intCast(offered), .accepted = accepted.matched });
+        try std.testing.expectEqual(@as(u64, @intCast(offered)), journal.drafted_total);
+        try std.testing.expectEqual(@as(u64, @intCast(expected)), journal.committed_total);
+        try std.testing.expectEqual(@as(usize, 7), tree.tokens.len);
+        try std.testing.expectEqual(@as(usize, 7), tree.parents.len);
+    };
+    try std.testing.expectError(error.BadDraftPrefix, tree.verifyPrefixParents(a, 8));
 }

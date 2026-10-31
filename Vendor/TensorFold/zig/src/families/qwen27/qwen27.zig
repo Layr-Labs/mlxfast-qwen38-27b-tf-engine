@@ -52,7 +52,7 @@ test {
     _ = @import("simd_attention.zig");
     _ = glue;
     _ = image_rows;
-    _ = @import("rope_test.zig");
+    // Host unit suites must not import the Metal ROPE diagnostic.
     _ = state;
     _ = projection;
     _ = model;
