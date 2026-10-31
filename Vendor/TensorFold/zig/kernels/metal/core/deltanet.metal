@@ -615,8 +615,6 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device const void* norm [[buffer(2)]],
                          constant TfDeltaParams& p [[buffer(3)]],
                          device bfloat* output [[buffer(4)]],
-                         device float* sums [[buffer(5)]],
-                         constant uint& sums_stride [[buffer(6)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
@@ -639,15 +637,6 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
   }
   *(device bfloat4*)(output + at) = y;
-  if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
-    if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
-      sums[g * int(sums_stride) + int(row)] = acc;
-    }
-  }
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 

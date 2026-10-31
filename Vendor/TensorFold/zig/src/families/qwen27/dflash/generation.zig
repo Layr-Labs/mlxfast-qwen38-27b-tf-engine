@@ -282,8 +282,6 @@ pub const Generation = struct {
         errdefer g.finishKeep() catch {};
         try g.finishKeep();
         const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos);
-        // a depth-bounded round that takes its whole budget stops at its length with the bonus emitted: that pick is the
-        // next round's pending token, as a bonus stop's is, so the next round need not take it from the logits again
         g.pending = accepted.pending orelse accepted.bonus;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         var landed: u32 = 0;
