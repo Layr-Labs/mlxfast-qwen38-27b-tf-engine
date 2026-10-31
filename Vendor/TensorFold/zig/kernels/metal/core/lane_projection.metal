@@ -348,6 +348,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+#if defined(TF_REG_D2) || defined(TF_REG_D3)
+  // codes two (three) groups ahead: groups g + 1 (and g + 2) sit in mw (and ow) while group g's codes are consumed from nw
+  uint4 mw0 = 0, mw1 = 0;
+  { const size_t g1 = (size_t)min(first + 1, last - 1) * TF_TB * 64; if (first < last) { mw0 = wl[g1]; mw1 = wl[g1 + 32]; } }
+#endif
+#if defined(TF_REG_D3)
+  uint4 ow0 = 0, ow1 = 0;
+  { const size_t g2 = (size_t)min(first + 2, last - 1) * TF_TB * 64; if (first < last) { ow0 = wl[g2]; ow1 = wl[g2 + 32]; } }
+#endif
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
@@ -371,7 +380,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
+#if defined(TF_REG_D3)
+    { const size_t gn = (size_t)min(g + 3, last - 1) * TF_TB * 64; nw0 = mw0; nw1 = mw1; mw0 = ow0; mw1 = ow1; ow0 = wl[gn]; ow1 = wl[gn + 32]; }
+#elif defined(TF_REG_D2)
+    { const size_t gn = (size_t)min(g + 2, last - 1) * TF_TB * 64; nw0 = mw0; nw1 = mw1; mw0 = wl[gn]; mw1 = wl[gn + 32]; }
+#else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+#endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif

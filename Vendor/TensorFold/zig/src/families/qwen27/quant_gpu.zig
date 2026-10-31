@@ -10,7 +10,7 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, batch: u32 = 1, swiglu: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, batch: u32 = 1, swiglu: bool = false, depth: u8 = 1, parallel: bool = false,
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -51,6 +51,11 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
 }
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
+/// A decoded-row reg schedule: groups of codes the lean loop keeps ahead, and whether a two-chain projection runs its
+/// chains in two SIMD groups (chain 1 handed to chain 0) instead of one after the other. Every choice computes C0 + C1
+/// from the same words in the same order.
+pub const Choice = struct { depth: u8 = 1, parallel: bool = false };
+
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -70,6 +75,8 @@ pub const Kernels = struct {
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
+    /// Per decoded-row reg shape [n, k, slices, batch, swiglu]: its schedule, chosen once on this chip by `gateDepth`.
+    deep: std.AutoHashMapUnmanaged([5]u32, Choice) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
@@ -93,6 +100,7 @@ pub const Kernels = struct {
         k.twins.deinit(k.allocator);
         k.bit_twins.deinit(k.allocator);
         k.pair_twins.deinit(k.allocator);
+        k.deep.deinit(k.allocator);
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
@@ -150,7 +158,7 @@ pub const Kernels = struct {
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
         if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64) return false;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .depth = (k.deep.get(.{ p.n, p.k, p.slices, p.batch, 1 }) orelse Choice{}).depth };
         if (!key.serialSk2() or p.n != 34816) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
@@ -158,7 +166,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .reg_depth = key.depth, .swiglu = true });
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, .{ .buf = p.pairs.buffer, .off = p.pairs.offset }, .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
@@ -223,14 +231,17 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1 };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1 };
+        const choice: Choice = if (reg and !k.prompt and rows <= 8 and skip == 0 and cut[1] == 0) k.deep.get(.{ p.n, p.k, sk, p.batch, 0 }) orelse .{} else .{};
+        key.depth = choice.depth;
+        key.parallel = choice.parallel and key.serialSk2();
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and !key.parallel, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .reg_depth = key.depth });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -324,6 +335,93 @@ pub const Kernels = struct {
         if (!ok and row.simd.pairs(m.n, 2, row.simd.splits(m.n))) std.log.info("qwen27: {d}x{d} rows keep simd_qmm's plain tiles (chunk pairs' bits differ on this chip)", .{ m.n, m.k });
         try k.pair_twins.put(k.allocator, .{ m.n, m.k }, ok);
         return ok;
+    }
+
+    /// Decoded-row reg projections take their lean loop with codes one, two or three groups ahead; every depth reads the
+    /// same words and runs the same arithmetic. On this chip, each distinct shape of `linears` keeps the depth whose 8-row
+    /// launches finish first on its own weights (zero input rows, rotating timed command buffers).
+    pub fn gateDepth(k: *Kernels, queue: mtl.Queue, linears: []const projection.Linear) !void {
+        if (k.prompt) return error.GateNeedsDecodeRows;
+        for (linears) |p| {
+            if (p.runs.len > 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64 or p.n % 32 != 0) continue;
+            const swiglu = p.n == 34816 and (Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group }).serialSk2();
+            const passes: []const bool = if (swiglu) &.{ false, true } else &.{false};
+            for (passes) |fused| {
+                const id = [5]u32{ p.n, p.k, p.slices, p.batch, @intFromBool(fused) };
+                if (!k.deep.contains(id)) {
+                    const pick = k.timeShape(queue, p, fused) catch |err| blk: {
+                        std.log.info("qwen27: {d}x{d} keeps its default decode schedule ({s})", .{ p.n, p.k, @errorName(err) });
+                        break :blk Choice{};
+                    };
+                    try k.deep.put(k.allocator, id, pick);
+                }
+            }
+        }
+    }
+
+    fn timeShape(k: *Kernels, queue: mtl.Queue, p: projection.Linear, fused: bool) !Choice {
+        const rows: u32 = 8;
+        const stride: u32 = 16;
+        const groups: usize = p.k / 64;
+        const serial = (Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group }).serialSk2();
+        if (fused and !serial) return error.InvalidSchedule;
+        var choices: [6]Choice = undefined;
+        var count: usize = 0;
+        for ([_]bool{ false, true }) |parallel| {
+            if (parallel and (!serial or fused)) continue;
+            for (1..4) |depth| {
+                choices[count] = .{ .depth = @intCast(depth), .parallel = parallel };
+                count += 1;
+            }
+        }
+        var variants: [6]lane.Projection = undefined;
+        var built: usize = 0;
+        defer for (variants[0..built]) |v| v.deinit();
+        for (choices[0..count], 0..) |c, i| {
+            variants[i] = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = 4, .group = 64 }, .sk = p.slices, .precompute_sums = true, .reg = true, .serial_sk2 = serial and !c.parallel, .tile_batch = p.batch, .rows8 = true, .reg_lean = true, .reg_depth = c.depth, .swiglu = fused });
+            built += 1;
+        }
+        const opts = mtl.ResourceOptions.shared;
+        const x = try k.device.buffer(@as(usize, rows) * p.k * 2, opts);
+        defer x.deinit();
+        const xs = try k.device.buffer(groups * stride * 4, opts);
+        defer xs.deinit();
+        const y = try k.device.buffer(@as(usize, rows) * p.n * 2, opts);
+        defer y.deinit();
+        const hs = try k.device.buffer((p.n / 128) * @as(usize, stride) * 4, opts);
+        defer hs.deinit();
+        @memset(x.contents()[0..x.length()], 0);
+        @memset(xs.contents()[0..xs.length()], 0);
+        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+        const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
+        const sums = lane.Sums{ .ref = .{ .buf = xs }, .stride = stride };
+        const trials = 6;
+        const launches = 8;
+        var seconds: [6][trials]f64 = undefined;
+        for (0..trials + 1) |t| for (0..count) |i| {
+            const v = (i + t) % count;
+            const pool = mtl.objc.Pool.push();
+            defer pool.pop();
+            const cb = queue.commandBuffer();
+            const e = cb.compute(.serial);
+            for (0..launches) |_| {
+                if (fused) try variants[v].encodeSwiglu(e, .{ .buf = x }, w, sb, sums, .{ .buf = y }, .{ .buf = hs }, rows) else try variants[v].encodeSums(e, .{ .buf = x }, w, sb, sums, .{ .buf = y }, rows);
+            }
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure() != null) return error.GpuFailed;
+            if (t > 0) seconds[v][t - 1] = cb.gpuSeconds(); // the first round only loads the pipelines
+        };
+        var best: usize = 0;
+        var median: [6]f64 = undefined;
+        for (0..count) |i| {
+            std.mem.sort(f64, seconds[i][0..], {}, std.sort.asc(f64));
+            median[i] = (seconds[i][trials / 2 - 1] + seconds[i][trials / 2]) / 2;
+            if (median[i] < median[best]) best = i;
+        }
+        // choices[0] is the default schedule: one group ahead, chains as the shape already runs them
+        return if (median[best] < median[0] * 0.98) choices[best] else choices[0];
     }
 
     pub fn sum(k: *Kernels, input_encoder: mtl.ComputeEncoder, x: Ref, dims: Ref, xs: Ref, width: u32, rows: u32) !void {
