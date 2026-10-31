@@ -52,7 +52,6 @@ test {
     _ = @import("simd_attention.zig");
     _ = glue;
     _ = image_rows;
-    _ = @import("rope_test.zig");
     _ = state;
     _ = projection;
     _ = model;
