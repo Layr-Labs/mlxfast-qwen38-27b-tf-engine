@@ -312,6 +312,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
 #endif
+#if defined(TF_DICT)
+    const device uint* LUT [[buffer(7)]], // SB holds a u16 index a (group, column) into this (scale, bias) table
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
@@ -372,7 +375,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
   for (int g = first; g < last; g++) {
-#if defined(TF_ROWS8)
+#if defined(TF_ROWS8) && defined(TF_DICT)
+    // the same (scale, bias) words through the matrix's table: a u16 index a column instead of the u32 word
+    const ushort4 i0 = ((const device ushort4*)SB)[((size_t)g * TF_N + n0 + nb) / 4];
+    const ushort4 i1 = ((const device ushort4*)SB)[((size_t)g * TF_N + n0 + nb + 16) / 4];
+    const uint4 q0 = uint4(LUT[i0.x], LUT[i0.y], LUT[i0.z], LUT[i0.w]);
+    const uint4 q1 = uint4(LUT[i1.x], LUT[i1.y], LUT[i1.z], LUT[i1.w]);
+    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], 0.0f};
+#elif defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
 #else
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
