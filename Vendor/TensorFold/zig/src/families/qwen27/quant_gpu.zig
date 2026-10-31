@@ -17,7 +17,36 @@ const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 
         const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
         return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
+    /// The decode projections whose K split is 4: GDN z+b+a (6240 x 5120), GDN and attention out (5120 x 6144), MLP down (5120 x 17408).
+    fn serialPairs(key: Key) bool {
+        const shape = (key.n == 6240 and key.k == 5120) or (key.n == 5120 and key.k == 6144) or (key.n == 5120 and key.k == 17408);
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.slices == 4 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
 };
+
+test "serial pairs guard admits exactly the three four-chain decode shapes" {
+    try std.testing.expect((Key{ .kind = .projection, .n = 6240, .k = 5120, .slices = 4 }).serialPairs());
+    try std.testing.expect((Key{ .kind = .projection, .n = 5120, .k = 6144, .slices = 4 }).serialPairs());
+    try std.testing.expect((Key{ .kind = .projection, .n = 5120, .k = 17408, .slices = 4 }).serialPairs());
+    const eligible = Key{ .kind = .projection, .n = 5120, .k = 17408, .slices = 4 };
+    try std.testing.expect(!eligible.serialSk2());
+    inline for (.{
+        .{ "kind", Kind.mlp },
+        .{ "n", @as(u32, 2048) },
+        .{ "k", @as(u32, 5120) },
+        .{ "slices", @as(u32, 2) },
+        .{ "slices", @as(u32, 8) },
+        .{ "skip", @as(u32, 1) },
+        .{ "cut", [2]u32{ 1, 0 } },
+        .{ "bits", @as(u8, 8) },
+        .{ "group", @as(u32, 128) },
+    }) |change| {
+        var excluded = eligible;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!excluded.serialPairs());
+    }
+    try std.testing.expect(!(Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 }).serialPairs());
+}
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
     const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
@@ -209,7 +238,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .serial_pairs = key.serialPairs() });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;

@@ -36,6 +36,8 @@ pub const Layout = struct {
     reg: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
+    /// Run the sk logical reg chains two to a SIMD group (sk / 2 groups), then add them to chain 0 in chain order.
+    serial_pairs: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -49,6 +51,7 @@ pub const Layout = struct {
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
+        if (l.serial_pairs and (!l.reg or l.serial_sk2 or l.sk < 4 or l.sk % 2 != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -118,6 +121,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
+    if (l.serial_pairs) try text.appendSlice(a, "#define TF_SERIAL_PAIRS 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -248,7 +252,7 @@ pub const Projection = struct {
         defer lib.deinit();
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
-        const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
+        const physical_sk: usize = if (l.serial_sk2) 1 else if (l.serial_pairs) l.sk / 2 else l.sk;
         if (p.simdWidth() != 32 or p.maxThreads() < physical_sk * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
@@ -337,6 +341,30 @@ fn checkRef(r: Ref, need: usize, alignment: usize) !void {
     if (r.off % alignment != 0) return error.MisalignedBuffer;
     const len = r.buf.length();
     if (r.off > len or need > len - r.off) return error.BufferTooSmall;
+}
+
+test "serial pairs keep the logical split, need an even split of at least four and are off by default" {
+    var l = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4, .reg = true, .precompute_sums = true };
+    try std.testing.expect(!l.serial_pairs);
+    const plain = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_SERIAL_PAIRS") == null);
+    l.serial_pairs = true;
+    const pairs = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(pairs);
+    try std.testing.expect(std.mem.indexOf(u8, pairs, "#define TF_SK 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pairs, "#define TF_SERIAL_PAIRS 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pairs, "#define TF_SERIAL_SK2") == null);
+    l.sk = 2;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.sk = 6;
+    try l.validate();
+    l.sk = 4;
+    l.serial_sk2 = true;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.serial_sk2 = false;
+    l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 
 test "layouts reject unsupported formats, schedules, cuts and overlapping tile reads" {

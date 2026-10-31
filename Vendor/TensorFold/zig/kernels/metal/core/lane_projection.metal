@@ -283,6 +283,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
 #if defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
+#elif defined(TF_SERIAL_PAIRS)
+[[max_total_threads_per_threadgroup(16 * TF_SK)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
@@ -310,6 +312,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2)
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
+  const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
+#elif defined(TF_SERIAL_PAIRS)
+  // TF_SK / 2 SIMD groups, SIMD group ks walking logical chains 2 ks and 2 ks + 1 in order
+  float C0[16];
+  for (int pc = 0; pc < 2; pc++) {
+  const int split = 2 * ks + pc;
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
@@ -344,6 +352,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_SERIAL_PAIRS)
+    if (pc == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+  }
+  // chain c > 0 in part slot c - 1, as when every chain had its own SIMD group; chains 2 ks and 2 ks + 1 stored apart
+  threadgroup float part[(TF_SK - 1) * 16 * 32];
+  if (ks > 0) {
+    for (int i = 0; i < 16; i++) part[((2 * ks - 1) * 16 + i) * 32 + lane] = C0[i];
+    for (int i = 0; i < 16; i++) part[(2 * ks * 16 + i) * 32 + lane] = C[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) {
+    for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+    for (int s2 = 2; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
+  }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
