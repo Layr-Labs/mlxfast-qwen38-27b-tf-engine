@@ -61,7 +61,10 @@ pub const Layout = struct {
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
-        if (l.swiglu and (!l.rows8 or !l.serial_sk2 or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
+        // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
+        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
+        if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
+            l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -304,13 +307,15 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
         try checkRef(sb, p.metadata_bytes, 16);
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
-        try checkRef(hs, (p.n / 128) * @as(usize, sums.stride) * 4, 4);
+        const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
+        try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
         e.setPipeline(p.pipe);
         e.setBuffer(x.buf, x.off, 0);
         e.setBuffer(w.buf, w.off, 1);
@@ -319,7 +324,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
-        e.dispatchGroups(mtl.Size.of(p.n / 128, 1, 1), mtl.Size.of(128, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the

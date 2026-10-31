@@ -98,9 +98,6 @@ pub const Buffers = struct {
     }
 };
 
-/// Group sums a gate writes for the projection that reads its rows; `written` is set once a dispatch writes them.
-pub const Sums = struct { span: Span, stride: u32, written: *bool };
-
 pub const Round = struct {
     p: abi.Params,
     b: Buffers,
@@ -108,8 +105,6 @@ pub const Round = struct {
     segments: usize,
     conv_width: usize,
     tree_mode: TreeMode = .auto,
-    /// The out projection's group sums `gate` writes beside its rows (tf_lane_sums' layout, `stride` rows a group).
-    sums: ?Sums = null,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
 
@@ -214,14 +209,6 @@ pub const Round = struct {
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
-        if (wide) if (r.sums) |w| {
-            w.span.bind(e, 5);
-            e.setValue(w.stride, 6);
-            w.written.* = true;
-        } else {
-            r.b.output.bind(e, 5); // never read: a zero stride writes no sums
-            e.setValue(@as(u32, 0), 6);
-        };
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
     }

@@ -365,23 +365,19 @@ pub const Runner = struct {
             break :made buffer;
         };
         e.useResource(lanes, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        // every layer gathers into its own lanes in one launch under one barrier, then every layer scatters in one more
+        // every layer gathers into its own lanes under one barrier, then every layer scatters under one more
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
             .attention => {
                 var views: [attn.planning.max_streams]attn.Cache = undefined;
                 const caches = r.layerCaches(ai, round, &views);
-                try attn.Attention.keepUse(e, &r.bindings[ai], p.rows, caches);
+                try r.attention.keepGather(e, &r.bindings[ai], p.rows, caches, .{ .buffer = lanes, .offset = 2 * ai * lane }, .{ .buffer = lanes, .offset = (2 * ai + 1) * lane });
                 ai += 1;
             },
         };
-        var table: [attn.max_keep_layers]attn.KeepLayer = undefined;
-        if (ai > table.len) return error.AttentionKeep;
-        const words: u32 = @intCast(lane / 2);
-        try r.attention.keepGatherLayers(e, r.bindings[0..ai], p.rows, table[0..ai], lanes, words);
         e.barrier();
-        r.attention.keepScatterLayers(e, g, p.rows, table[0..ai], lanes, words);
+        for (r.bindings[0..ai], 0..) |*binding, i| r.attention.keepScatter(e, binding, p.rows, .{ .buffer = lanes, .offset = 2 * i * lane }, .{ .buffer = lanes, .offset = (2 * i + 1) * lane });
         e.barrier();
     }
 

@@ -149,7 +149,9 @@ pub const Kernels = struct {
     /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
-        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64) return false;
+        if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
+        if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64) return false;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true };
         if (!key.serialSk2() or p.n != 34816) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -162,6 +164,67 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, .{ .buf = p.pairs.buffer, .off = p.pairs.offset }, .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
+        try span.end();
+        return true;
+    }
+
+    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch.
+    fn gateUpActivatedPrompt(
+        k: *Kernels,
+        input_encoder: mtl.ComputeEncoder,
+        p: projection.Linear,
+        x: Ref,
+        xs: Sums,
+        out: Ref,
+        out_sums: Ref,
+        rows: u32,
+    ) !bool {
+        if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
+        if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
+        const key = Key{
+            .kind = .projection,
+            .n = p.n,
+            .k = p.k,
+            .slices = 1,
+            .bits = p.bits,
+            .group = p.group,
+            .lean = true,
+            .batch = p.batch,
+            .swiglu = true,
+        };
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
+        errdefer span.cancel();
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = 1,
+                .precompute_sums = true,
+                .reg = true,
+                .tile_batch = key.batch,
+                .reg_lean = true,
+                .swiglu = true,
+            });
+            k.joined(entry.value_ptr);
+        }
+        const half = p.n / 2;
+        var first: u32 = 0;
+        while (first < rows) : (first += lane.reg_rows) {
+            const n = @min(rows - first, lane.reg_rows);
+            const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
+            const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+            const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
+            const xs_off = xs.ref.offset + @as(usize, first) * 4;
+            const xsr = lane.Sums{ .ref = .{ .buf = xs.ref.buffer, .off = xs_off }, .stride = xs.stride };
+            const hr = lane.Ref{ .buf = out.buffer, .off = out.offset + @as(usize, first) * half * 2 };
+            const hsr = lane.Ref{ .buf = out_sums.buffer, .off = out_sums.offset + @as(usize, first) * 4 };
+            try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
+        }
         try span.end();
         return true;
     }
@@ -243,6 +306,40 @@ pub const Kernels = struct {
             if (sums) |s| try entry.value_ptr.encodeSums(e, xr, w, sb, .{ .ref = .{ .buf = s.ref.buffer, .off = s.ref.offset + @as(usize, first) * 4 }, .stride = s.stride }, yr, @min(rows - first, step)) else try entry.value_ptr.encode(e, xr, w, sb, yr, @min(rows - first, step));
         }
         try span.end();
+    }
+
+    /// Compiles at load the pipeline a decode-row `quant` of `p` over `rows` takes (for shapes no target layer uses).
+    pub fn prepareDecode(k: *Kernels, p: projection.Linear, rows: u32) !void {
+        if (k.prompt or rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return;
+        const reg = p.bits == 4 and p.group == 64;
+        const key = Key{
+            .kind = .projection,
+            .n = p.n,
+            .k = p.k,
+            .slices = p.slices,
+            .bits = p.bits,
+            .group = p.group,
+            .rows8 = reg and rows <= 8,
+            .lean = reg,
+            .batch = if (reg) p.batch else 1,
+        };
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (entry.found_existing) return;
+        errdefer _ = k.lanes.remove(key);
+        entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+            .n = p.n,
+            .k = p.k,
+            .format = .{ .bits = p.bits, .group = p.group },
+            .sk = key.slices,
+            .output = .bf16,
+            .precompute_sums = reg,
+            .reg = reg,
+            .serial_sk2 = key.serialSk2(),
+            .tile_batch = key.batch,
+            .rows8 = key.rows8,
+            .reg_lean = key.lean,
+        });
+        k.joined(entry.value_ptr);
     }
 
     /// A mixed stack: each member its own product into its columns; row kernels write the fused rows at a stride.

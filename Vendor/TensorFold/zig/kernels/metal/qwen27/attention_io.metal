@@ -44,29 +44,3 @@ kernel void q27_attn_scatter(device const bfloat* K [[buffer(0)]], device const 
   caches[r.stream].keys[ulong(at.y) * uint(meta[base + 7]) + destination * 256 + at.x] = K[source];
   caches[r.stream].values[ulong(at.y) * uint(meta[base + 8]) + destination * 256 + at.x] = V[source];
 }
-struct Q27KeepLayer { device Q27CachePtrs* caches; device const int* meta; device const Q27KeepRow* map; };
-struct Q27KeepLayers { uint kept, lane; };
-kernel void q27_attn_gather_layers(constant Q27KeepLayer* layers [[buffer(0)]], device bfloat* lanes [[buffer(1)]],
-    constant Q27KeepLayers& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
-  const uint layer = at.z / a.kept, z = at.z - layer * a.kept;
-  if (at.x >= 256 || at.y >= 4) return;
-  const Q27KeepLayer l = layers[layer];
-  const Q27KeepRow r = l.map[z]; if (r.stream == 0xffffffffu) return; const uint base = 8 + r.stream * 12, source = uint(l.meta[base + 4]) + r.source;
-  const ulong destination = (ulong(r.row) * 4 + at.y) * 256 + at.x;
-  device bfloat* K = lanes + ulong(2 * layer) * a.lane;
-  device bfloat* V = lanes + ulong(2 * layer + 1) * a.lane;
-  K[destination] = l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + source * 256 + at.x];
-  V[destination] = l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + source * 256 + at.x];
-}
-kernel void q27_attn_scatter_layers(constant Q27KeepLayer* layers [[buffer(0)]], device const bfloat* lanes [[buffer(1)]],
-    constant Q27KeepLayers& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
-  const uint layer = at.z / a.kept, z = at.z - layer * a.kept;
-  if (at.x >= 256 || at.y >= 4) return;
-  const Q27KeepLayer l = layers[layer];
-  const Q27KeepRow r = l.map[z]; if (r.stream == 0xffffffffu) return; const uint base = 8 + r.stream * 12, destination = uint(l.meta[base + 4]) + r.destination;
-  const ulong source = (ulong(r.row) * 4 + at.y) * 256 + at.x;
-  device const bfloat* K = lanes + ulong(2 * layer) * a.lane;
-  device const bfloat* V = lanes + ulong(2 * layer + 1) * a.lane;
-  l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + destination * 256 + at.x] = K[source];
-  l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + destination * 256 + at.x] = V[source];
-}
