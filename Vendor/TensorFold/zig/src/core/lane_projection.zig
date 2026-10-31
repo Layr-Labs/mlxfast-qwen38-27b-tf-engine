@@ -40,7 +40,7 @@ pub const Layout = struct {
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
     reg_lean: bool = false,
-    /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
+    /// Adjacent reg tiles interleave their code blocks by group. Metadata stays column-major.
     tile_batch: usize = 1,
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
     /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
@@ -60,7 +60,7 @@ pub const Layout = struct {
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
-        if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
+        if (l.tile_batch == 0 or l.tile_batch > 32 or !std.math.isPowerOfTwo(l.tile_batch) or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         if (l.swiglu and (!l.rows8 or !l.serial_sk2 or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
@@ -96,7 +96,13 @@ pub const Layout = struct {
     }
 
     pub fn weightWords(l: Layout) usize {
-        return l.tileCount() * 32 * (l.k / 32) * l.format.bits;
+        return std.mem.alignForward(usize, l.tileCount(), l.tile_batch) * 32 * (l.k / 32) * l.format.bits;
+    }
+
+    /// Start of a column's words within a physical group block, before the reg-layout rewrite.
+    pub fn codeWordOffset(l: Layout, tile: usize, group: usize, column: usize) usize {
+        const block = (tile / l.tile_batch * (l.k / l.format.group) + group) * l.tile_batch + tile % l.tile_batch;
+        return (block * 32 + column) * (l.format.group * l.format.bits / 32);
     }
 
     /// MLX's packed W for this layout: N rows of K*bits/32 words.
@@ -155,9 +161,10 @@ pub fn pack(l: Layout, w: []const u32, scales: []const u16, biases: []const u16,
         overlap(std.mem.sliceAsBytes(scales), std.mem.sliceAsBytes(out_sb)) or
         overlap(std.mem.sliceAsBytes(biases), std.mem.sliceAsBytes(out_sb)) or
         overlap(std.mem.sliceAsBytes(out_w), std.mem.sliceAsBytes(out_sb))) return error.OverlappingStorage;
+    if (l.tile_batch != 1) @memset(out_w, 0);
     for (0..l.tileCount()) |tile| for (0..ng) |g| for (0..32) |col| {
         const n = tile * 32 + col;
-        const dst = ((tile * ng + g) * 32 + col) * wp;
+        const dst = l.codeWordOffset(tile, g, col);
         if (n >= l.n) {
             @memset(out_w[dst..][0..wp], 0);
             continue;

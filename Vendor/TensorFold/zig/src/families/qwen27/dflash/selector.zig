@@ -3,17 +3,13 @@ const std = @import("std");
 const weights = @import("weights.zig");
 const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
-/// `floor`: a node offers a child whose drafter probability (the head's softmax over its row's top-k) is below it only
-/// when that child is the node's best.
-pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
+pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null };
 /// Candidate count and maximum draft-parent path length are independent.
 pub const Policy = struct {
     nodes: usize,
     max_depth: ?u32 = null,
     /// Siblings a node may offer (Options.children): a depth-one tree of `nodes` drafts needs as many.
     children: u32 = 4,
-    /// Options.floor: the least drafter probability of a sibling that is not its node's best.
-    floor: f64 = 0,
 
     pub fn block(p: Policy, cap: u32) !u32 {
         if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
@@ -109,31 +105,13 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
         }
     };
     std.mem.sort(u32, order[0..lattice.topk], Rank{ .scores = scores[0..lattice.topk] }, Rank.less);
-    var drafter: [16]f64 = undefined;
-    if (options.floor > 0) {
-        var top: f64 = -std.math.inf(f64);
-        for (lattice.unary[row..][0..lattice.topk]) |u| top = @max(top, @as(f64, u));
-        var total: f64 = 0;
-        for (drafter[0..lattice.topk], lattice.unary[row..][0..lattice.topk]) |*q, u| {
-            q.* = @exp(@as(f64, u) - top);
-            total += q.*;
-        }
-        for (drafter[0..lattice.topk]) |*q| q.* /= total;
-    }
-    const children = @min(options.children, lattice.topk);
-    var offered: u32 = 0;
-    for (order[0..lattice.topk]) |i| {
-        if (offered == children) break;
-        if (offered > 0 and options.floor > 0 and drafter[i] < options.floor) continue;
-        try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
-        offered += 1;
-    }
+    for (order[0..@min(options.children, lattice.topk)]) |i| try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
 }
 pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {
     try g.config.check();
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
-    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0 or !(options.floor >= 0 and options.floor < 1)) return error.BadDraftSelector;
+    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0) return error.BadDraftSelector;
     var frontier: std.ArrayList(Node) = .empty;
     defer frontier.deinit(lattice.gpa);
     const tokens = try gpa.alloc(u32, options.nodes);

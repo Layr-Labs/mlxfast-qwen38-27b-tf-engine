@@ -26,14 +26,12 @@ fn m5Split(n: usize, k: usize) ?u32 {
     return null;
 }
 
-/// Adjacent tiles whose code blocks interleave by group: tiles running together read neighbouring lines (the weight stream's GB/s).
+/// Group-interleaved blocks for the largest target matrices, prepared once without prompt content.
 pub fn tileBatch(n: usize, k: usize) u32 {
-    const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 } };
-    for (table) |t| if (t[0] == n and t[1] == k) return 8;
+    for ([_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 } }) |shape| if (shape[0] == n and shape[1] == k) return 8;
     return 1;
 }
 
-/// Tiles a batched matrix stores, padding blocks included.
 pub fn storedColumns(n: usize, batch: u32) usize {
     return std.mem.alignForward(usize, n, 32 * @as(usize, batch));
 }
@@ -63,9 +61,9 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
     if (!device.tensorUnits() or n % tile != 0) return prepareRows(device, allocator, owned, parts, n, k, tile, slices);
     if (bits != 4 or group != 64) return prepareLanes(device, allocator, owned, parts, n, k, tile, slices);
     slices = m5Split(n, k) orelse slices;
-    const batch: usize = tileBatch(n, k);
-    const stored = storedColumns(n, @intCast(batch));
-    const w = try device.buffer(stored * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    const batch = tileBatch(n, k);
+    const packing = lane.Layout{ .n = n, .k = k, .format = .{ .bits = 4, .group = 64 }, .reg = true, .precompute_sums = true, .tile_batch = batch };
+    const w = try device.buffer(packing.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     owned.append(allocator, w) catch |err| {
         w.deinit();
         return err;
@@ -75,7 +73,7 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         sb.deinit();
         return err;
     };
-    const dst = w.slice(u32, stored * k / 8);
+    const dst = w.slice(u32, packing.weightWords());
     @memset(dst, 0);
     const pair = sb.slice(u16, n * (k / 64) * 2);
     var base: usize = 0;
@@ -86,15 +84,14 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         const biases = p.biases.host(u16);
         for (0..rows) |r| for (0..k / 64) |g| {
             const src = r * (k / 8) + g * 8;
-            const at = (base + r) / tile;
-            const to = ((at / batch * (k / 64) + g) * batch + at % batch) * tile * 8 + ((base + r) % tile) * 8;
+            const to = packing.codeWordOffset((base + r) / tile, g, (base + r) % tile);
             @memcpy(dst[to..][0..8], words[src..][0..8]);
             pair[(g * n + base + r) * 2] = scales[r * (k / 64) + g];
             pair[(g * n + base + r) * 2 + 1] = biases[r * (k / 64) + g];
         };
         base += rows;
     }
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch) };
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = batch };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {
@@ -103,6 +100,48 @@ test "stacked gate-up keeps the member K split rather than recomputing it from s
     try std.testing.expectEqual(@as(u32, 8), try split(48, 5120));
     try std.testing.expectEqual(@as(u32, 8), try split(6144, 5120));
     try std.testing.expectEqual(@as(u32, 8), try split(5120, 17408));
+}
+
+test "interleaved code blocks preserve every word and zero partial batches" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 32, 96, 160, 288 }) |n| for ([_]usize{ 64, 192, 256 }) |k| for ([_]usize{ 1, 2, 8 }) |batch| {
+        const l = lane.Layout{ .n = n, .k = k, .format = .{ .bits = 4, .group = 64 }, .reg = true, .precompute_sums = true, .tile_batch = batch };
+        try l.validate();
+        const w = try a.alloc(u32, l.sourceWords());
+        defer a.free(w);
+        const scales = try a.alloc(u16, n * (k / 64));
+        defer a.free(scales);
+        const biases = try a.alloc(u16, scales.len);
+        defer a.free(biases);
+        for (w, 0..) |*v, i| v.* = @as(u32, @intCast(i)) *% 0x9e3779b9;
+        for (scales, biases, 0..) |*scale, *bias, i| {
+            scale.* = @truncate(i * 17);
+            bias.* = @truncate(i * 31 + 1);
+        }
+        const ordered_words = try a.alloc(u32, l.weightWords());
+        defer a.free(ordered_words);
+        const pairs = try a.alloc(u16, l.metadataElements());
+        defer a.free(pairs);
+        @memset(ordered_words, 0xffffffff);
+        try lane.pack(l, w, scales, biases, ordered_words, pairs);
+        var at: usize = 0;
+        for (0..storedColumns(n, @intCast(batch)) / (32 * batch)) |block| for (0..k / 64) |g| for (0..batch) |tile| for (0..32) |col| for (0..8) |word| {
+            const column = (block * batch + tile) * 32 + col;
+            const expected: u32 = if (column < n) w[column * (k / 8) + g * 8 + word] else 0;
+            try std.testing.expectEqual(expected, ordered_words[at]);
+            at += 1;
+        };
+        try std.testing.expectEqual(ordered_words.len, at);
+        for (0..k / 64) |g| for (0..n) |column| {
+            try std.testing.expectEqual(scales[column * (k / 64) + g], pairs[(g * n + column) * 2]);
+            try std.testing.expectEqual(biases[column * (k / 64) + g], pairs[(g * n + column) * 2 + 1]);
+        };
+    };
+    for ([_]usize{ 0, 3, 64 }) |batch| try std.testing.expectError(error.InvalidSchedule, (lane.Layout{ .n = 96, .k = 192, .format = .{ .bits = 4, .group = 64 }, .reg = true, .precompute_sums = true, .tile_batch = batch }).validate());
+    try std.testing.expectEqual(@as(u32, 8), tileBatch(34816, 5120));
+    try std.testing.expectEqual(@as(u32, 8), tileBatch(5120, 17408));
+    try std.testing.expectEqual(@as(u32, 8), tileBatch(5120, 6144));
+    try std.testing.expectEqual(@as(u32, 1), tileBatch(10240, 5120));
 }
 
 fn prepareRows(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, n: usize, k: usize, tile: u32, slices: u32) !Linear {

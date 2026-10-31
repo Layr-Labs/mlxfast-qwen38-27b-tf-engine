@@ -10,7 +10,27 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, batch: u32 = 1, swiglu: bool = false,
+const Key = struct {
+    kind: Kind,
+    n: u32 = 0,
+    k: u32,
+    slices: u32 = 0,
+    tile: u32 = 0,
+    tmr: u32 = 0,
+    edge: bool = false,
+    skip: u32 = 0,
+    cut: [2]u32 = .{ 0, 0 },
+    bits: u8 = 4,
+    group: u32 = 64,
+    rows8: bool = false,
+    lean: bool = false,
+    swiglu: bool = false,
+    batch: u32 = 1,
+
+    /// One layout description serves the ordinary and fused projections, including every physical-code attribute.
+    fn layout(key: Key, reg: bool) lane.Layout {
+        return .{ .n = key.n, .k = key.k, .format = .{ .bits = key.bits, .group = key.group }, .sk = key.slices, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .rows8 = key.rows8, .reg_lean = key.lean, .swiglu = key.swiglu, .tile_batch = key.batch };
+    }
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -48,6 +68,32 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
         try std.testing.expect(!cache.get(excluded).?);
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
+}
+
+test "ordinary and fused layouts share code batches without cache aliasing" {
+    const a = std.testing.allocator;
+    const base = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2, .rows8 = true, .lean = true, .batch = 8 };
+    var fused = base;
+    fused.swiglu = true;
+    const ordinary_layout = base.layout(true);
+    const fused_layout = fused.layout(true);
+    try ordinary_layout.validate();
+    try fused_layout.validate();
+    try std.testing.expectEqual(@as(usize, 8), ordinary_layout.tile_batch);
+    try std.testing.expectEqual(ordinary_layout.tile_batch, fused_layout.tile_batch);
+    try std.testing.expect(!ordinary_layout.swiglu and fused_layout.swiglu);
+    var canonical = base;
+    canonical.batch = 1;
+    var cache = std.AutoHashMap(Key, u8).init(a);
+    defer cache.deinit();
+    try cache.put(base, 1);
+    try cache.put(fused, 2);
+    try cache.put(canonical, 3);
+    try std.testing.expectEqual(@as(u32, 3), cache.count());
+    const text = try lane.source(a, fused_layout);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_TB 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SWIGLU 1") != null);
 }
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
@@ -150,7 +196,7 @@ pub const Kernels = struct {
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
         if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64) return false;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .swiglu = true, .batch = p.batch };
         if (!key.serialSk2() or p.n != 34816) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
@@ -158,7 +204,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, key.layout(true));
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, .{ .buf = p.pairs.buffer, .off = p.pairs.offset }, .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
@@ -230,7 +276,11 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean });
+            var layout = key.layout(reg);
+            layout.ranges = if (skip > 0) &ranges else &.{};
+            layout.groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null;
+            layout.output = if (cut[1] > 0) .f32 else .bf16;
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, layout);
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
