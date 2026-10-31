@@ -149,7 +149,9 @@ pub const Kernels = struct {
     /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
-        if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
+        // prompt rows: the gate/up projection on two tiles a SIMD group (promptTiles), then the activation pass, measured
+        // faster than the fused one-tile SwiGLU epilogue (gateUpActivatedPrompt) on an M5 Max
+        if (k.prompt) return false;
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
@@ -532,8 +534,12 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+/// 5120-deep inputs (attention query+gate, GDN qkv, MLP gate/up) and the split-K MLP down and attention output, one elsewhere.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
-    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
+    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2()) return 1;
+    // the 5120-deep inputs (attention query+gate, GDN qkv, MLP gate/up): two tiles a SIMD group share each activation load
+    if (key.k == 5120 and (n == 12288 or n == 10240 or n == 34816) and key.batch % 2 == 0) return 2;
+    if (key.slices != 2 or n != 5120) return 1;
+    if (key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
     return if (key.k == 17408 or key.k == 6144) 2 else 1;
 }
