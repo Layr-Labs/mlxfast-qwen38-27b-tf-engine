@@ -91,6 +91,11 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
+        // read and cleared before any return: a stale flag must never reach the next layer's output projection
+        const own_sums = f.out_sums;
+        f.out_sums = false;
+        const gate_sums = f.mixer_sums;
+        f.mixer_sums = false;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -100,7 +105,13 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
+        // the mixer wrote mixer_out's group sums: an attention merge over decoded rows into act_sums (Frame.out_sums), a
+        // GDN gate into .sums (Frame.mixer_sums); either spares the projection its own sums pass (never a compacted row)
+        const given: ?@import("quant_gpu.zig").Sums = if (s.compact) null else switch (layer.mixer) {
+            .attention => if (own_sums) sums(f, .act_sums, s.rows) else null,
+            .linear => if (gate_sums) sums(f, .sums, s.rows) else null,
+        };
+        try m.kernels.quant(e, out, mixer_out, given, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();

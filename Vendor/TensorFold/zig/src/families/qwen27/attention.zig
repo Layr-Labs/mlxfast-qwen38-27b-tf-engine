@@ -199,7 +199,7 @@ pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, nor
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [12]mtl.Pipeline,
+    io: [13]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
@@ -211,10 +211,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [12]mtl.Pipeline = undefined;
+        var io: [13]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_merge_sums" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -311,7 +311,8 @@ pub const Attention = struct {
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool) !void {
+    /// `sums`: on the decoded-row path the merge also writes `out`'s 64-column group sums there (rows padded to 16).
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Ref) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -365,7 +366,7 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -396,7 +397,7 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Ref) !void {
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
@@ -432,9 +433,13 @@ pub const Attention = struct {
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
             e.barrier();
         }
-        e.setPipeline(a.io[4]);
+        e.setPipeline(if (sums != null) a.io[12] else a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 10);
+        if (sums) |s| {
+            e.setBuffer(s.buffer, s.offset, 11);
+            e.setValue(@as(u32, 16 * ((plan.rows + 15) / 16)), 12);
+        }
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
