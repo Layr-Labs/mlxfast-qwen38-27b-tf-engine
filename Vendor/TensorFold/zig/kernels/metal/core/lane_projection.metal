@@ -369,34 +369,51 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
   // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
-  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
-  const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
-  const device float* xp = XS + first * stride + mb;
+  const device uint4* cp = wl;
+  const device uint4* sp = sbv;
+  const device float* xp = XS;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+  if (first < last) {
+    cp += (size_t)first * TF_TB * 64;
+    sp += ((size_t)first * TF_N + n0 + nb) / 4;
+    xp += (size_t)first * stride + mb;
+    nw0 = cp[0]; nw1 = cp[32];
+  }
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
-    sp += TF_N / 4;
-    xp += stride;
 #else
+  // The plain and indexed decode routes advance the same group strides.
+  const device uint4* cp = wl;
+  const device float* xp = XS;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
 #if defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
-  const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
+  const device uint2* ip = (const device uint2*)(tab + TF_SBI);
   uint2 ni0 = 0, ni1 = 0;
-  if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+#else
+  const device uint4* sp = sbv;
 #endif
+  if (first < last) {
+    cp += (size_t)first * TF_TB * 64;
+    xp += (size_t)first * stride + mb;
+    nw0 = cp[0]; nw1 = cp[32];
+#if defined(TF_SBI)
+    ip += ((size_t)first * TF_N + n0 + nb) / 4;
+    ni0 = ip[0]; ni1 = ip[4];
+#else
+    sp += ((size_t)first * TF_N + n0 + nb) / 4;
+#endif
+  }
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI)
     const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
-    const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
+    const uint4 q0 = sp[0], q1 = sp[4];
 #endif
 #if defined(TF_ROWS8)
-    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], 0.0f};
+    const tf_reg_load cur = {nw0, nw1, q0, q1, xp[0], 0.0f};
 #else
-    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], XS[g * stride + mb + 8]};
+    const tf_reg_load cur = {nw0, nw1, q0, q1, xp[0], xp[8]};
 #endif
 #endif
 #else
@@ -417,13 +434,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
-    cp += g + 1 < last ? TF_TB * 64 : 0;
+    const size_t advance = g + 1 < last ? 1 : 0;
+    cp += advance * TF_TB * 64;
+    sp += advance * (TF_N / 4);
+    xp += advance * stride;
     nw0 = cp[0];
     nw1 = cp[32];
 #else
-    { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+    const size_t advance = g + 1 < last ? 1 : 0;
+    cp += advance * TF_TB * 64;
+    xp += advance * stride;
+    nw0 = cp[0]; nw1 = cp[32];
 #if defined(TF_SBI)
-    { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+    ip += advance * (TF_N / 4);
+    ni0 = ip[0]; ni1 = ip[4];
+#else
+    sp += advance * (TF_N / 4);
 #endif
 #endif
 #else
@@ -511,12 +537,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb[at] = h;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int m = t; m < stride; m += 128) {
+  // Keep the original left-to-right sum order while relaying four values per lane.
+  {
+    const int m = 2 * ks + (lane >> 4), l = lane & 15;
     float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
-    HS[int(tg.x) * stride + m] = acc;
+    for (int turn = 0; turn < 16; turn++) {
+      if (l == turn && m < M)
+        for (int part = 0; part < 4; part++) acc += float(hb[m * 64 + 4 * l + part]);
+      acc = simd_shuffle(acc, ushort((lane & 16) | turn));
+    }
+    if (l == 0 && m < stride) HS[int(tg.x) * stride + m] = m < M ? acc : 0.0f;
   }
+  for (int m = 8 + t; m < stride; m += 128) HS[int(tg.x) * stride + m] = 0.0f;
 #elif defined(TF_ROWS8)
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
