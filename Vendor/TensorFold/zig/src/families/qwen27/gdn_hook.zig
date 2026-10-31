@@ -38,6 +38,34 @@ pub const Hook = struct {
         if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), gated, e, beside);
     }
 
+    /// The layer's prompt chain split at row `first` (forward.Stages.split_first), its gate writing the out projection's
+    /// group sums as `forward`'s does; null where the layer takes `forward` whole.
+    pub fn halves(hook: *Hook, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32, first: u32) !?pool_gpu.Halves {
+        if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
+        if (!hook.accepted_chain or !hook.quant.prompt) return null;
+        var gated = try refs(weight, frame);
+        if (weight.zba.n != gated.zba_stride) return null;
+        const xs = frame.get(.sums);
+        frame.mixer_sums = false;
+        gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = @import("forward.zig").sums(frame, .sums, rows).stride, .written = &frame.mixer_sums };
+        return hook.pool.chainHalves(hook.linear_index[block], devicePlan(hook.plan.*, frame), gated, first);
+    }
+
+    /// `forward`'s qkv and zba projections over rows [first, first + count) alone, without a barrier.
+    pub fn project(hook: *Hook, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32, first: u32, count: u32) !void {
+        if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or first + count > rows) return error.BadGdnHook;
+        var sums = @import("forward.zig").sums(frame, .sums, rows);
+        sums.ref.offset += @as(usize, first) * 4;
+        var input = frame.get(.input);
+        input.offset += @as(usize, first) * weight.qkv.k * 2;
+        var qkv = try hook.pool.projected(hook.linear_index[block]);
+        qkv.offset += @as(usize, first) * weight.qkv.n * 2;
+        var zba = frame.get(.mixed);
+        zba.offset += @as(usize, first) * weight.zba.n * 2;
+        try hook.quant.quant(e, weight.qkv, input, sums, frame.get(.dims), qkv, count);
+        try hook.quant.quant(e, weight.zba, input, sums, frame.get(.dims), zba, count);
+    }
+
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers) return error.BadGdnHook;
         try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e);

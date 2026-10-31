@@ -10,7 +10,7 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, period: u32 = 0, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false,
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -168,6 +168,13 @@ pub const Kernels = struct {
         return true;
     }
 
+    /// Whether prompt rows of `p` take the fused gate/up and activation launch (gateUpActivatedPrompt).
+    pub fn fusesPromptGateUp(p: projection.Linear) bool {
+        if (p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
+        return (projection.promptSplit(p.n, p.k) orelse p.slices) == 1;
+    }
+
     /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch.
     fn gateUpActivatedPrompt(
         k: *Kernels,
@@ -179,9 +186,7 @@ pub const Kernels = struct {
         out_sums: Ref,
         rows: u32,
     ) !bool {
-        if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
-        if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
+        if (rows == 0 or !fusesPromptGateUp(p)) return false;
         const key = Key{
             .kind = .projection,
             .n = p.n,
@@ -233,14 +238,21 @@ pub const Kernels = struct {
 
     /// `quant` over input groups [cut[0], cut[0] + cut[1]) only, into fp32 partial sums.
     pub fn quantCut(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, dims: Ref, y: Ref, rows: u32, cut: [2]u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut, .{ 0, 0 });
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut, .{ 0, 0 }, 0);
     }
 
     /// `quant` over output tiles [range[0], range[0] + range[1]) only (32 columns a tile), each written at its own
     /// columns with the full launch's code: the same words there, nothing elsewhere.
     pub fn quantRange(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, range: [2]u32) !void {
         if (range[1] == 0) return error.BadCoreProjectionRows;
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, .{ 0, 0 }, range);
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, .{ 0, 0 }, range, 0);
+    }
+
+    /// `quantRange` over the same run of tiles in every `period` tiles: [r * period + range[0], ... + range[1]) for each r,
+    /// one launch (a head-interleaved projection's per-head columns).
+    pub fn quantPeriodic(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, range: [2]u32, period: u32) !void {
+        if (range[1] == 0 or period == 0) return error.BadCoreProjectionRows;
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, .{ 0, 0 }, range, period);
     }
 
     /// Whether `quantRange` takes `p`: the 4-bit g64 reg path of a plain matrix.
@@ -250,20 +262,21 @@ pub const Kernels = struct {
 
     /// `quant` over a fused two-half projection (the MLP's gate_up) without the first `skip` tiles of each half.
     pub fn quantSkip(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 }, .{ 0, 0 });
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 }, .{ 0, 0 }, 0);
     }
 
-    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
+    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32, period: u32) !void {
         if (p.runs.len > 0) {
-            if (range[1] > 0) return error.BadCoreProjectionRows;
+            if (range[1] > 0 or period > 0) return error.BadCoreProjectionRows;
             return k.quantRuns(input_encoder, p, x, xs, dims, y, rows, skip, cut);
         }
-        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut, range);
+        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut, range, period);
     }
 
-    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
+    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32, period: u32) !void {
         if ((skip > 0 or cut[1] > 0 or range[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
         if (range[1] > 0 and (skip > 0 or cut[1] > 0 or range[0] + range[1] > (p.n + 31) / 32)) return error.BadCoreProjectionRows;
+        if (period > 0 and (range[1] == 0 or range[0] + range[1] > period or ((p.n + 31) / 32) % period != 0 or (p.n + 31) / 32 / period > max_runs)) return error.BadCoreProjectionRows;
         if (skip > 0 and (p.raw != null or skip >= p.n / 64)) return error.BadCoreProjectionRows;
         if (p.raw) |raw| if (raw.bits != 4 and k.tiled(raw)) {
             if (rows == 0 or rows > 128 or p.tile != 32) return error.BadCoreProjectionRows;
@@ -304,15 +317,16 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .period = period, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
-        const tiles = [_][2]usize{.{ range[0], range[1] }};
+        var runs: [max_runs][2]usize = undefined;
+        const tiles: []const [2]usize = if (period > 0) periodic(&runs, range, period, (p.n + 31) / 32) else &.{.{ range[0], range[1] }};
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -375,7 +389,7 @@ pub const Kernels = struct {
                 const xr = Ref{ .buffer = x.buffer, .offset = x.offset + r * p.k * 2 };
                 const sr: ?Sums = if (xs) |s| .{ .ref = .{ .buffer = s.ref.buffer, .offset = s.ref.offset + r * 4 }, .stride = s.stride } else null;
                 const yr = Ref{ .buffer = y.buffer, .offset = y.offset + (r * p.n + run.first) * 2 };
-                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 }, .{ 0, 0 });
+                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 }, .{ 0, 0 }, 0);
             }
         }
     }
@@ -532,6 +546,26 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
 /// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+/// Tile runs a periodic launch takes at most (quantPeriodic).
+const max_runs = 64;
+
+/// The runs of a periodic launch: [r * period + range[0], ... + range[1]) for each of the `tiles / period` periods.
+fn periodic(runs: *[max_runs][2]usize, range: [2]u32, period: u32, tiles: usize) []const [2]usize {
+    const count = tiles / period;
+    for (runs[0..count], 0..) |*run, r| run.* = .{ r * period + range[0], range[1] };
+    return runs[0..count];
+}
+
+test "a periodic launch takes one run a period, in order" {
+    var runs: [max_runs][2]usize = undefined;
+    const gate = periodic(&runs, .{ 8, 8 }, 16, 384);
+    try std.testing.expectEqual(@as(usize, 24), gate.len);
+    try std.testing.expectEqual([2]usize{ 8, 8 }, gate[0]);
+    try std.testing.expectEqual([2]usize{ 376, 8 }, gate[23]);
+    const query = periodic(&runs, .{ 0, 8 }, 16, 384);
+    for (query, 0..) |run, r| try std.testing.expectEqual([2]usize{ 16 * r, 8 }, run);
+}
+
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
     return if (key.k == 17408 or key.k == 6144) 2 else 1;

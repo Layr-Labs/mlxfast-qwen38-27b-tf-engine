@@ -50,6 +50,40 @@ pub const Scalars = struct {
 };
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
+
+/// A prompt chain's layer as two row halves, A [0, first) and B [first, rows) (Pool.chainHalves): forwardChain's
+/// dispatches, each over one half and without a barrier, so the caller interleaves them with other work. B's scan
+/// continues the state A's leaves in place, so the rows see the same recurrence as one scan of the whole chain.
+pub const Halves = struct {
+    round: gdn.Round,
+    first: u32,
+    kernels: *const Kernels,
+    segments: gdn.Span, // A's chain then B's, each the round's segment cut at `first`
+
+    pub fn half(h: Halves, which: u1) gdn.Round {
+        return if (which == 0) h.round.rowRange(0, h.first) else h.round.rowRange(h.first, h.round.p.rows - h.first);
+    }
+
+    pub fn prepare(h: Halves, e: metal.ComputeEncoder, which: u1) void {
+        h.half(which).dispatchPrepareRows(e, h.kernels.pre_rows);
+    }
+
+    pub fn scan(h: Halves, e: metal.ComputeEncoder, which: u1) void {
+        const size = @sizeOf(abi.Segment);
+        h.round.dispatchScan(e, h.kernels.chain_wide, true, .{ .buffer = h.segments.buffer, .offset = h.segments.offset + @as(usize, which) * size, .bytes = size });
+    }
+
+    pub fn gate(h: Halves, e: metal.ComputeEncoder, which: u1) void {
+        h.half(which).dispatchGate(e, h.kernels.post_rows);
+    }
+
+    /// forwardChain's publication of a chain whose kept window reads projected rows alone: straight into history.
+    pub fn publish(h: Halves, e: metal.ComputeEncoder) void {
+        var direct = h.round;
+        direct.b.next_history = h.round.b.history;
+        direct.dispatchCommitConv(e);
+    }
+};
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
@@ -218,6 +252,39 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
         e.barrier();
         try publication.end();
+    }
+
+    /// forwardChain's round for a prompt chain split at row `first` (forward.Stages.split_first), its metadata uploaded
+    /// and its halves' scan segments written; null where the layer takes forwardChain whole.
+    pub fn chainHalves(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, first: u32) !?Halves {
+        const host = plan.host;
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, host);
+        if (pool.marks != null or host.segments.len != 1 or host.keeps.len != 1 or !inPlace(host)) return null;
+        const segment = host.segments[0];
+        if (segment.first != 0 or segment.rows != host.parents.len or host.keeps[0].rows != segment.rows) return null;
+        for (host.parents, 0..) |parent, row| if (parent != @as(i32, @intCast(row)) - 1) return null;
+        if (first == 0 or first >= segment.rows or first % 16 != 0) return null;
+        if (pool.budget.shape.c.dk != 128 or pool.budget.shape.c.dv % 8 != 0) return null; // the wide scan
+        const whole = try pool.round(layer, plan, refs, true);
+        if (whole.sums == null or !projectedWindows(host, whole.p.taps)) return null;
+        const halves = Halves{ .round = whole, .first = first, .kernels = &pool.kernels, .segments = undefined };
+        for ([_]u1{ 0, 1 }) |which| {
+            const half = halves.half(which);
+            if (!half.takesPrepareRows() or !half.wideGate()) return null;
+        }
+        // the halves' chains after the round's own segment: A from the slot's state, B from where A left it
+        const m = plan.metadata.segments;
+        const size = @sizeOf(abi.Segment);
+        if (m.offset > m.buffer.length() or 3 * size > m.buffer.length() - m.offset) return null;
+        try plan.metadata.upload(host);
+        const chains = [2]abi.Segment{
+            .{ .first = 0, .rows = first, .state_slot = segment.state_slot, .next_slot = segment.next_slot },
+            .{ .first = first, .rows = segment.rows - first, .state_slot = segment.next_slot, .next_slot = segment.next_slot },
+        };
+        @memcpy(m.buffer.contents()[m.offset + size ..][0 .. 2 * size], std.mem.sliceAsBytes(&chains));
+        var out = halves;
+        out.segments = .{ .buffer = m.buffer, .offset = m.offset + size, .bytes = 2 * size };
+        return out;
     }
 
     pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {

@@ -137,14 +137,55 @@ pub const Round = struct {
 
     /// prepare for 128-wide heads and 4 taps by `rows` (tf_delta_gdn_pre_rows): 16 rows a group of 128.
     pub fn prepareRows(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
-        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
-        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        if (!r.takesPrepareRows()) return r.prepare(e);
+        r.dispatchPrepareRows(e, rows);
+        e.barrier();
+    }
+
+    pub fn takesPrepareRows(r: Round) bool {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return false;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return false; // bfloat4 rows
+        return true;
+    }
+
+    /// prepareRows' dispatch alone: the caller places the barrier (takesPrepareRows must hold).
+    pub fn dispatchPrepareRows(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
         e.setPipeline(rows);
         bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
         e.setValue(r.p, 9);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
-        e.barrier();
+    }
+
+    /// Rows [first, first + rows) of this round as a round of their own: every span a kernel indexes by its local row
+    /// starts at row `first`, so the kernels' row i is this round's row first + i. The projection rows, history and
+    /// state stay whole (windows name rows of the whole round; a chain's scan names its rows by its segment).
+    pub fn rowRange(r: Round, first: u32, rows: u32) Round {
+        var s = r;
+        s.p.rows = rows;
+        const f: usize = first;
+        const nk: usize = r.p.nk;
+        const nv: usize = r.p.nv;
+        const zs: usize = r.p.zba_stride;
+        advance(&s.b.windows, f * r.p.taps * 4);
+        advance(&s.b.row_slots, f * 4);
+        advance(&s.b.query, f * nk * r.p.dk * 2);
+        advance(&s.b.key, f * nk * r.p.dk * 2);
+        advance(&s.b.value, f * nv * r.p.dv * 2);
+        advance(&s.b.recurrent, f * nv * r.p.dv * 2);
+        advance(&s.b.output, f * nv * r.p.dv * 2);
+        advance(&s.b.decay, f * nv * 4);
+        advance(&s.b.mixing, f * nv * 2);
+        advance(&s.b.a, f * (if (zs == 0) nv else zs) * 2);
+        advance(&s.b.b, f * (if (zs == 0) nv else zs) * 2);
+        advance(&s.b.z, f * (if (zs == 0) nv * r.p.dv else zs) * 2);
+        if (s.sums) |*w| w.span = .{ .buffer = w.span.buffer, .offset = w.span.offset + f * 4, .bytes = w.span.bytes -| f * 4 };
+        return s;
+    }
+
+    fn advance(s: *Span, bytes: usize) void {
+        s.offset += bytes;
+        s.bytes -|= bytes;
     }
 
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.
@@ -202,19 +243,35 @@ pub const Round = struct {
     }
     /// `wide`: tf_delta_gdn_chain_wide's grid, 8 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, beside: ?Beside) !void {
+        r.dispatchScan(e, chain, wide, r.b.segments);
+        if (beside) |b| try b.encode(b.ptr, e);
+        e.barrier();
+    }
+    /// scanChain's dispatch alone over the chains `segments` names (one entry a segment of this round).
+    pub fn dispatchScan(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, segments: Span) void {
         e.setPipeline(chain);
-        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
         if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
-        if (beside) |b| try b.encode(b.ptr, e);
-        e.barrier();
     }
     /// tf_delta_gdn_post a simdgroup a (row, head); 128-wide heads on bfloat4 rows take `rows` (tf_delta_gdn_post_rows),
     /// 4 rows a group of 128.
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+        r.dispatchGate(e, rows);
+        e.barrier();
+    }
+
+    /// Whether the gate takes tf_delta_gdn_post_rows (bfloat4 rows), the kernel that can write the group sums.
+    pub fn wideGate(r: Round) bool {
         var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
         inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // bfloat4 rows
+        return wide;
+    }
+
+    /// gate's dispatch alone: the caller places the barrier.
+    pub fn dispatchGate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+        const wide = r.wideGate();
         e.setPipeline(if (wide) rows else r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
@@ -228,15 +285,18 @@ pub const Round = struct {
             e.setValue(@as(u32, 0), 6);
         };
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
-        e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
+        r.dispatchCommitConv(e);
+        e.barrier();
+    }
+    /// commitConv's dispatch alone: the caller places the barrier.
+    pub fn dispatchCommitConv(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.conv_commit);
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
         e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 256 }); // a word a thread
-        e.barrier();
     }
 
     pub fn commit(r: Round, e: metal.ComputeEncoder) void {
