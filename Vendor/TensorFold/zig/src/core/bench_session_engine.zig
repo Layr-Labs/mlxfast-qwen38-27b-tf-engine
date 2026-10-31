@@ -226,13 +226,11 @@ pub const EngineDflashBinding = struct {
     }
 };
 
-/// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
-/// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
-pub const dflash_width = 7;
-/// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
-/// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-/// Siblings at 0.7-1% land about 2% of the time, a full round each, against about 0.13 ms a row; below 0.7% they
-/// almost never land.
+/// Depth-one siblings a DFlash round verifies: up to15 genuine drafts use the supported16-row path;
+/// smaller proposals retain the ROWS8 specialization when the pending row plus drafts fit eight rows.
+pub const dflash_width = 15;
+/// Keep the inherited probability floor and the selector's unconditional best-child exception.
+/// Every offered sibling is actually drafted and target-verified.
 pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
