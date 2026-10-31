@@ -91,9 +91,12 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
-        // read and cleared before any return, and used only by the block whose GDN gate wrote it
+        // read and cleared before any return, each used only by the block whose mixer wrote it: a GDN gate's sums in
+        // .sums (mixer_sums), an attention merge's in act_sums (out_sums)
         const gated = f.mixer_sums and layer.mixer == .linear;
         f.mixer_sums = false;
+        const own_sums = f.out_sums and layer.mixer == .attention;
+        f.out_sums = false;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -103,8 +106,9 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        // a GDN gate's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
-        try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
+        // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
+        const given: ?@import("quant_gpu.zig").Sums = if (s.compact) null else if (gated) sums(f, .sums, s.rows) else if (own_sums) sums(f, .act_sums, s.rows) else null;
+        try m.kernels.quant(e, out, mixer_out, given, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
