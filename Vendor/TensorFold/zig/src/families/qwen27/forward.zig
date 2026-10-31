@@ -76,6 +76,7 @@ pub const Stages = struct {
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
+        m.frame.gdn_sums_ready = false;
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
@@ -86,6 +87,8 @@ pub const Stages = struct {
         const f = &m.frame;
         const e = lane.enc;
         const layer = m.weights.layers[index];
+        const gdn_sums_ready = f.gdn_sums_ready;
+        f.gdn_sums_ready = false; // clear before terminal-row early returns
         const h: u32 = @intCast(m.config.hidden);
         const out = switch (layer.mixer) {
             .linear => |g| g.out,
@@ -100,7 +103,9 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
+        // a DeltaNet gate over decode rows wrote the out projection's group sums; other rows sum their input first
+        const out_sums: ?@import("quant_gpu.zig").Sums = if (layer.mixer == .linear and useOutSums(gdn_sums_ready, s.rows, m.kernels.prompt, s.compact, m.config.dv)) sums(f, .sums, s.rows) else null;
+        try m.kernels.quant(e, out, mixer_out, out_sums, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
@@ -188,4 +193,27 @@ pub fn encode(m: *Model, e: mtl.ComputeEncoder, rows: u32, mixer: Mixer) !void {
 /// A norm's or the MLP gate's group sums for the frame's padded rows.
 pub fn sums(f: *Frame, field: @import("gpu_frame.zig").Field, rows: u32) @import("quant_gpu.zig").Sums {
     return .{ .ref = f.get(field), .stride = @import("quant_gpu.zig").padded(rows) };
+}
+
+/// Rows whose DeltaNet gate writes its out projection's group sums: a decoded verify's or step's rows (up to the 8 of a
+/// width-7 depth-1 verify; each row's 16-lane chain runs in its own gate group); prompt chunks sum apart.
+pub fn outSums(rows: u32, prompt: bool, compact: bool, dv: usize) bool {
+    return !prompt and !compact and rows > 0 and rows <= 8 and dv == 128;
+}
+
+pub fn useOutSums(ready: bool, rows: u32, prompt: bool, compact: bool, dv: usize) bool {
+    return ready and outSums(rows, prompt, compact, dv);
+}
+
+test "gdn output sums require decoded noncompact rows" {
+    try std.testing.expect(!outSums(0, false, false, 128));
+    try std.testing.expect(outSums(1, false, false, 128));
+    try std.testing.expect(outSums(8, false, false, 128));
+    try std.testing.expect(!outSums(9, false, false, 128));
+    try std.testing.expect(!outSums(8, true, false, 128));
+    try std.testing.expect(!outSums(1, false, true, 128));
+    try std.testing.expect(!outSums(8, false, false, 64));
+    try std.testing.expect(!outSums(8, false, false, 256));
+    try std.testing.expect(!useOutSums(false, 8, false, false, 128));
+    try std.testing.expect(useOutSums(true, 8, false, false, 128));
 }

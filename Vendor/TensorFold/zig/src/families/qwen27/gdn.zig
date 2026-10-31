@@ -107,6 +107,7 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    out_sums: ?Span = null, // the gate also writes the out projection's group sums here, rows padded to 16 (decode)
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -209,6 +210,8 @@ pub const Round = struct {
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
+        (r.out_sums orelse r.b.output).bind(e, 5);
+        e.setValue(@as(u32, if (r.out_sums != null) 16 * ((r.p.rows + 15) / 16) else 0), 6);
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
     }

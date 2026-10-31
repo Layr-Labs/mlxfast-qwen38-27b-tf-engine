@@ -18,13 +18,18 @@ pub const Hook = struct {
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
+        frame.gdn_sums_ready = false;
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
         try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e);
+        var r = try refs(weight, frame);
+        // decode rows: the gate writes the out projection's group sums into .sums (read by forward.post)
+        if (@import("forward.zig").outSums(rows, hook.quant.prompt, false, frame.config.dv)) r.sums = frame.get(.sums);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), r, e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), r, e);
+        frame.gdn_sums_ready = r.sums != null;
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

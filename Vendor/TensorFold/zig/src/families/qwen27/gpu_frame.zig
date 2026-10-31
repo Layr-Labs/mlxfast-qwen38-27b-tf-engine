@@ -44,6 +44,8 @@ pub const Frame = struct {
     config: Config,
     standby: ?[scratch_fields.len]mtl.Buffer = null,
     small: bool = false,
+    /// The immediately preceding GDN hook encoded group sums for mixer_out.
+    gdn_sums_ready: bool = false,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;
