@@ -21,13 +21,38 @@ pub const Head = struct {
         const input_words = if (source.raw) |raw| raw.w else source.words.buffer;
         const input_offset = if (source.raw) |raw| raw.w_off else source.words.offset;
         const groups = k / source.group;
-        const words = try head.allocate(device, width * row);
+        // A round reads this head for one row, so it takes the tensor unit's eight-tile interleave every other decoded
+        // shape is packed in (projection.tileBatch): the whole-tile spans copy into that layout a 256-word (tile,
+        // group) block at a time, the block order unchanged by the lane rewrite, and the matrix encodes with batch 8.
+        const interleave = source.raw == null and source.batch == 1 and source.tile == 32 and source.bits == 4 and source.group == 64;
+        const tile: usize = source.tile;
+        const stored = if (interleave) std.mem.alignForward(usize, width, 8 * tile) else width;
+        const words = try head.allocate(device, stored * row);
         var destination: usize = 0;
-        for (spans) |span| {
-            const rows = span[1] - span[0];
-            const first = input_offset + @as(usize, span[0]) * row;
-            @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
-            destination += rows;
+        if (interleave) {
+            @memset(words.contents()[0 .. stored * row], 0);
+            const blocks = tile * 8; // u32 words of one (tile, group) block
+            const input_base = input_offset / 4;
+            const source_words: [*]const u32 = @ptrCast(@alignCast(input_words.contents()));
+            const destination_words: [*]u32 = @ptrCast(@alignCast(words.contents()));
+            var slot: usize = 0;
+            for (spans) |span| {
+                for (@as(usize, span[0]) / tile..@as(usize, span[1]) / tile) |at| {
+                    for (0..groups) |g| {
+                        const to = ((slot / 8) * groups + g) * 8 + slot % 8;
+                        @memcpy(destination_words[to * blocks ..][0..blocks], source_words[input_base + (at * groups + g) * blocks ..][0..blocks]);
+                    }
+                    slot += 1;
+                }
+            }
+            head.linear.batch = 8;
+        } else {
+            for (spans) |span| {
+                const rows = span[1] - span[0];
+                const first = input_offset + @as(usize, span[0]) * row;
+                @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
+                destination += rows;
+            }
         }
         head.linear.n = width;
         head.linear.index = null;

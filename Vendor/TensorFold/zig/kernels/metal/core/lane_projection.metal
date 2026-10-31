@@ -379,12 +379,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
   // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
-  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+  // prompt rows prefetch codes two groups ahead: cp points at group min(g + 2, last - 1) once the loop runs
+  const device uint4* cp = wl + (size_t)min(first + 1, last - 1) * TF_TB * 64;
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
-  uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+  uint4 nw0 = 0, nw1 = 0, mw0 = 0, mw1 = 0;
+  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; mw0 = cp[0]; mw1 = cp[32]; }
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
     sp += TF_N / 4;
@@ -437,9 +438,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
-    cp += g + 1 < last ? TF_TB * 64 : 0;
-    nw0 = cp[0];
-    nw1 = cp[32];
+    nw0 = mw0;
+    nw1 = mw1;
+    cp += g + 2 < last ? TF_TB * 64 : 0;
+    mw0 = cp[0];
+    mw1 = cp[32];
 #else
     { const int stay = int(g + 1 >= last); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
 #if defined(TF_SBI12)
