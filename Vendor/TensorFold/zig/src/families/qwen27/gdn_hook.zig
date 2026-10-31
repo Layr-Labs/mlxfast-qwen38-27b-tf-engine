@@ -1,6 +1,6 @@
 //! QKV projects straight into the pool's log and ZBA into the frame's mixed buffer, side by side from the same input.
-//! A prompt pass on the reg path runs only b and a (the prepare's) beside QKV: z, which only the gate reads, runs beside
-//! the scan, whose sequential rows leave the GPU's tensor units idle.
+//! A pass on the reg path runs only b and a (the prepare's) beside QKV: z, which only the gate reads, runs beside the
+//! scan, whose sequential rows leave the GPU's tensor units idle (prompt rows) and its memory stream idle (decoded rows).
 const metal = @import("metal");
 const Pool = @import("gdn_pool_gpu.zig").Pool;
 const pool_gpu = @import("gdn_pool_gpu.zig");
@@ -59,11 +59,13 @@ const Late = struct {
     }
 };
 
-/// z's 32-column tiles for a prompt pass whose zba takes ranged launches, z ending on a tile boundary before b and a; 0
-/// keeps one launch (decoded rows: their short scan already keeps the GPU busy).
+/// z's 32-column tiles for a pass whose zba takes ranged launches, z ending on a tile boundary before b and a; 0 keeps
+/// one launch. Decoded rows take it too: their tree scan streams almost nothing, so z's weights stream beside it instead of
+/// ahead of the barrier with QKV's.
 fn zTiles(zba: Linear, frame: *Frame, prompt: bool) u32 {
+    _ = prompt;
     const width: u32 = @intCast(frame.config.gdnValueDim());
-    if (!prompt or !Quant.ranged(zba) or width % 32 != 0 or zba.n % 32 != 0 or zba.n <= width) return 0;
+    if (!Quant.ranged(zba) or width % 32 != 0 or zba.n % 32 != 0 or zba.n <= width) return 0;
     return width / 32;
 }
 

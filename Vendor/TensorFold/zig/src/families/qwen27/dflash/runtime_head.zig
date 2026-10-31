@@ -31,6 +31,7 @@ pub const Head = struct {
         }
         head.linear.n = width;
         head.linear.index = null;
+        head.linear.index12 = false;
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
@@ -67,7 +68,9 @@ pub const Head = struct {
             }
             head.linear.pairs = .{ .buffer = pairs };
             // the source's indexed copy, trimmed to the spans' columns: the same table, each group's indices in span order
-            if (source.index) |index| {
+            // the u16 form only: a 12-bit index is not sliced this way (the pinned head's 5,873 pairs keep the u16 form)
+            if (source.index != null and !source.index12) {
+                const index = source.index.?;
                 const table = lane.sb_table * 4;
                 const trimmed = try head.allocate(device, lane.indexedBytes(width, k, source.group));
                 @memcpy(trimmed.contents()[0..table], index.buffer.contents()[index.offset..][0..table]);
