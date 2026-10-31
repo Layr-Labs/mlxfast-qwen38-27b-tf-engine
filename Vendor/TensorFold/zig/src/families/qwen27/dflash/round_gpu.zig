@@ -33,11 +33,12 @@ pub const Matcher = struct {
         @memcpy(m.buffers[3].slice(u32, eos.len), eos);
         const shape = contract.Match{ .rows = @intCast(ids.len), .vocab = vocab, .budget = budget, .eos_count = @intCast(eos.len) };
         if (span_picks)
-            try m.ops.argmaxSpans(e, logits, .{ .buf = m.buffers[5] }, .{ .buf = m.buffers[2] }, .{ .rows = shape.rows, .vocab = vocab, .stride = vocab })
-        else
+            try m.ops.argmaxSpansMatch(e, logits, .{ .buf = m.buffers[5] }, .{ .buf = m.buffers[0] }, .{ .buf = m.buffers[1] }, if (eos.len == 0) null else .{ .buf = m.buffers[3] }, .{ .buf = m.buffers[4] }, shape)
+        else {
             try m.ops.argmax(e, logits, .{ .buf = m.buffers[2] }, .{ .rows = shape.rows, .vocab = vocab, .stride = vocab });
-        e.barrier();
-        try m.ops.match(e, .{ .buf = m.buffers[0] }, .{ .buf = m.buffers[1] }, .{ .buf = m.buffers[2] }, if (eos.len == 0) null else .{ .buf = m.buffers[3] }, .{ .buf = m.buffers[4] }, shape);
+            e.barrier();
+            try m.ops.match(e, .{ .buf = m.buffers[0] }, .{ .buf = m.buffers[1] }, .{ .buf = m.buffers[2] }, if (eos.len == 0) null else .{ .buf = m.buffers[3] }, .{ .buf = m.buffers[4] }, shape);
+        }
         e.barrier();
         return shape;
     }

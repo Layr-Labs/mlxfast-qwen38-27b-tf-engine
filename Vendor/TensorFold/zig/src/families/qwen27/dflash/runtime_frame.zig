@@ -13,7 +13,8 @@ fn failed(cb: mtl.CommandBuffer) bool {
     return true;
 }
 
-/// Keeps the GPU busy from a proposal's last command buffer until the verify behind it starts. The host reads the
+/// Keeps the GPU busy from a proposal's last command buffer until the verify behind it starts, and from a round's keep
+/// until the next frame starts (`bridgeAfter`/`launchBridge`, ended by `Frame.begin`). The host reads the
 /// proposal before it encodes the verify, and a GPU left idle meanwhile starts the verify's first command buffer a few
 /// hundred microseconds after its commit; a busy one starts it within a few tens. One 32-thread group spins behind the
 /// proposal until the verify's first encoder stores the spin's epoch (`end`), or for `bound` iterations (a few
@@ -60,7 +61,7 @@ pub const Bridge = struct {
         b.flag.deinit();
     }
     /// A spin in its own command buffer, started when `fence` (updated by the proposal's last encoder) is reached.
-    fn launch(b: *Bridge, queue: mtl.Queue, fence: mtl.objc.Id) void {
+    pub fn launch(b: *Bridge, queue: mtl.Queue, fence: mtl.objc.Id) void {
         b.epoch +%= 1;
         const cb = queue.commandBuffer();
         const e = cb.compute(.serial);
@@ -106,6 +107,8 @@ pub const Frame = struct {
     residency: ?mtl.ResidencySet.Follow = null,
     /// Bridges a proposal's frame to the verify behind it (finishBridged, endBridge); none if it failed to build.
     bridge: ?Bridge = null,
+    /// Updated by a round's keep encoder; the spin bridging the keep to the next frame waits on it.
+    keep_fence: ?mtl.objc.Id = null,
     /// Signalled behind a frame's last command: finish returns once the GPU reaches it, and the frame's command buffers
     /// are waited for and checked when the next frame begins (checkUnchecked).
     poll_event: ?mtl.SharedEvent = null,
@@ -125,6 +128,7 @@ pub const Frame = struct {
         if (f.poll_event) |ev| ev.deinit();
         f.setResident(null);
         if (f.fence) |fence| mtl.objc.release(fence);
+        if (f.keep_fence) |fence| mtl.objc.release(fence);
         if (f.bridge) |*b| b.deinit();
         for (f.pool.items) |buffer| buffer.deinit();
         f.pool.deinit(f.allocator);
@@ -168,6 +172,8 @@ pub const Frame = struct {
         f.entries.clearRetainingCapacity();
         f.cb = f.queue.commandBuffer();
         f.encoder = f.cb.compute(.concurrent);
+        // a spin left behind the last round's keep ends once this frame's first buffer runs
+        if (f.bridge) |*b| b.end(f.encoder);
         f.active = true;
         f.completed = false;
         f.part_count = 0;
@@ -193,6 +199,18 @@ pub const Frame = struct {
     /// finish, leaving the bridge's spin running behind the frame for the verify that follows a proposal.
     pub fn finishBridged(f: *Frame) !void {
         return f.finishWith(f.bridge != null);
+    }
+    /// A spin behind encoder `e` (a round's keep, which `e` ends): the host reads the verify's picks and encodes the next
+    /// frame meanwhile, and that frame's first buffer then starts on a busy GPU. Nothing when the frame has no bridge.
+    pub fn bridgeAfter(f: *Frame, e: mtl.ComputeEncoder) !?mtl.objc.Id {
+        if (f.bridge == null) return null;
+        if (f.keep_fence == null) f.keep_fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
+        mtl.objc.msg(void, e.id, "updateFence:", .{f.keep_fence.?});
+        return f.keep_fence;
+    }
+    /// Starts the spin `bridgeAfter` fenced, once its encoder's command buffer is committed.
+    pub fn launchBridge(f: *Frame, fence: mtl.objc.Id) void {
+        if (f.bridge) |*b| b.launch(f.queue, fence);
     }
     /// Ends a bridge's open spin from the verify's first encoder (a forward.Tail on the frame).
     pub fn endBridge(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {

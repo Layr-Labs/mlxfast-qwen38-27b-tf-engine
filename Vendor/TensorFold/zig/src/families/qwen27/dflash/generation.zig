@@ -189,11 +189,15 @@ pub const Generation = struct {
             var kept = false;
             errdefer if (!kept) k.end();
             try g.runner.keepDevice(p.round, k, g.commit, result);
+            const frame = &g.draft.backend.frame;
+            const bridge = try frame.bridgeAfter(k);
             k.end();
             kept = true;
             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
             keep_cb.commit();
             g.keep = keep_cb.retain();
+            // the GPU keeps busy from the keep's end until the next frame's first buffer, while the host reads and encodes
+            if (bridge) |fence| frame.launchBridge(fence);
         }
     };
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once.
