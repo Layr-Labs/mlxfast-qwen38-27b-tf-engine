@@ -449,3 +449,83 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 }
 #endif
+
+#if TF_BITS == 4 && defined(TF_REG) && defined(TF_M8)
+// Decoded launches of at most 8 rows on an 8 x NT tensor-op destination (8 floats a lane instead of 16): half the
+// tensor-op rows. Each lane reads its 8 destination words' (column, row) from the cooperative tensor itself, so no layout
+// is assumed, and folds each word as fma(scale, P, fma(bias, sum, C)) over the K groups in order, exactly as the 16-row
+// kernel does for its live rows.
+[[max_total_threads_per_threadgroup(32 * TF_SK)]]
+[[kernel]] void tf_lane_reg8(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const int rows = mdims[0];
+  if (rows <= 0 || tg.y != 0) return;
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 8), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
+  constexpr auto desc = matmul2d_descriptor(8, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroup> op;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
+  auto a0 = a.slice(0, 0);
+  auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+  short colv[8], rowv[8];
+  for (int i = 0; i < 8; i++) {
+    const auto ix = P.get_multidimensional_index(i);
+    colv[i] = short(ix[0]);
+    rowv[i] = short(ix[1]);
+  }
+  thread half2* b2 = (thread half2*)&cb[0];
+  const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
+  const device uint* sbw = (const device uint*)SB; // a column's (scale, bias) bf16 pair: scale in the low half
+  const half2 bias = half2(1024.0h);
+  float C[8];
+#if defined(TF_SERIAL_SK2)
+  float C0[8];
+  for (int split = 0; split < TF_SK; split++) {
+  const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
+#else
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+#endif
+  for (int i = 0; i < 8; i++) C[i] = 0.0f;
+  uint4 nw0 = 0, nw1 = 0;
+  if (first < last) { nw0 = wl[(size_t)first * 64]; nw1 = wl[(size_t)first * 64 + 32]; }
+  for (int g = first; g < last; g++) {
+    const uint4 w0 = nw0, w1 = nw1;
+    for (int w = 0; w < 8; w++) {
+      // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
+      const uint word = w < 4 ? w0[w] : w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
+      const int e = 16 * (w & 1) + 2 * (w >> 1);
+      b2[e] = as_type<half2>((lo & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 1] = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+    }
+    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * 64]; nw1 = wl[(size_t)(g + 1) * 64 + 32]; }
+    auto xs = a.slice(g * GS, 0);
+    op.run(xs, cb, P);
+    for (int i = 0; i < 8; i++) {
+      const uint q = sbw[(size_t)g * TF_N + n0 + colv[i]];
+      const float sc = as_type<float>(q << 16), bi = as_type<float>(q & 0xFFFF0000u);
+      C[i] = fma(sc, P[i], fma(bi, XS[g * stride + rowv[i]], C[i]));
+    }
+  }
+#if defined(TF_SERIAL_SK2)
+    if (split == 0) for (int i = 0; i < 8; i++) C0[i] = C[i];
+  }
+  for (int i = 0; i < 8; i++) C[i] = C0[i] + C[i];
+#else
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 8 * 32];
+  if (TF_SK > 1) {
+    if (ks > 0) for (int i = 0; i < 8; i++) part[((ks - 1) * 8 + i) * 32 + lane] = C[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 8; i++) C[i] += part[((s2 - 1) * 8 + i) * 32 + lane];
+  }
+#endif
+  if (ks == 0)
+    for (int i = 0; i < 8; i++) {
+      const int m = rowv[i], n = n0 + colv[i];
+      if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+    }
+}
+#endif
+
