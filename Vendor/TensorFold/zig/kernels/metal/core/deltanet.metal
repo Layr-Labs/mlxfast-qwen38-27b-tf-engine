@@ -639,6 +639,8 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
   }
   *(device bfloat4*)(output + at) = y;
+  // sums_stride > 0: the out projection's group sums of these stored words, added one word at a time in tf_lane_xsum's
+  // order, so the projection skips its own tf_lane_sums dispatch and the barrier before it
   if (sums_stride != 0) {
     simdgroup_barrier(mem_flags::mem_device);
     if ((lane & 15) == 0) {
