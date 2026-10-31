@@ -371,6 +371,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+#if defined(TF_REG_D2)
+  // codes two groups ahead: group g + 1 sits in mw while group g's codes are consumed from nw
+  uint4 mw0 = 0, mw1 = 0;
+  { const size_t g1 = (size_t)min(first + 1, last - 1) * TF_TB * 64; if (first < last) { mw0 = wl[g1]; mw1 = wl[g1 + 32]; } }
+#endif
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
@@ -399,6 +404,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     cp += g + 1 < last ? TF_TB * 64 : 0;
     nw0 = cp[0];
     nw1 = cp[32];
+#elif defined(TF_REG_D2)
+    { const size_t gn = (size_t)min(g + 2, last - 1) * TF_TB * 64; nw0 = mw0; nw1 = mw1; mw0 = wl[gn]; mw1 = wl[gn + 32]; }
 #else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
 #endif

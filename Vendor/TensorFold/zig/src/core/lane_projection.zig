@@ -43,6 +43,8 @@ pub const Layout = struct {
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
     reg_lean: bool = false,
+    /// Lean decoded-row loops keep codes two groups ahead instead of one; every group consumes the same words.
+    reg_d2: bool = false,
     /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
     tile_batch: usize = 1,
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
@@ -64,6 +66,7 @@ pub const Layout = struct {
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
+        if (l.reg_d2 and (!l.reg_lean or !l.rows8 or l.prompt_sr)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
@@ -141,6 +144,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
+    if (l.reg_d2) try text.appendSlice(a, "#define TF_REG_D2 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
