@@ -5,7 +5,7 @@ const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
 /// `floor`: a node offers a child whose drafter probability (the head's softmax over its row's top-k) is below it only
 /// when that child is the node's best.
-pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
+pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0, tile_floor: f64 = 0 };
 /// Candidate count and maximum draft-parent path length are independent.
 pub const Policy = struct {
     nodes: usize,
@@ -14,9 +14,14 @@ pub const Policy = struct {
     children: u32 = 4,
     /// Options.floor: the least drafter probability of a sibling that is not its node's best.
     floor: f64 = 0,
+    /// Optional higher floor when a depth-one sibling adds an attention query tile (G=6, tile=16).
+    /// Limited to the existing seven-sibling/ROWS8 path; zero retains the original selector.
+    tile_floor: f64 = 0,
 
     pub fn block(p: Policy, cap: u32) !u32 {
         if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
+        if (!(p.tile_floor >= 0 and p.tile_floor < 1) or (p.tile_floor > 0 and p.tile_floor < p.floor)) return error.BadDraftOptions;
+        if (p.tile_floor > 0 and (p.max_depth == null or p.max_depth.? != 1 or p.nodes > 7 or p.children > 7)) return error.BadDraftOptions;
         if (p.max_depth) |depth| if (depth == 0 or depth > 15) return error.BadDraftDepth;
         return @min(cap, @min(@as(u32, @intCast(p.nodes)) + 1, (p.max_depth orelse 15) + 1));
     }
@@ -110,7 +115,7 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     };
     std.mem.sort(u32, order[0..lattice.topk], Rank{ .scores = scores[0..lattice.topk] }, Rank.less);
     var drafter: [16]f64 = undefined;
-    if (options.floor > 0) {
+    if (options.floor > 0 or options.tile_floor > 0) {
         var top: f64 = -std.math.inf(f64);
         for (lattice.unary[row..][0..lattice.topk]) |u| top = @max(top, @as(f64, u));
         var total: f64 = 0;
@@ -124,7 +129,11 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     var offered: u32 = 0;
     for (order[0..lattice.topk]) |i| {
         if (offered == children) break;
-        if (offered > 0 and options.floor > 0 and drafter[i] < options.floor) continue;
+        // `offered` siblings share one already pending target row. Qwen27 packs six query heads per row
+        // into 16-row query tiles, so adding siblings2 and5 crosses a tile boundary.
+        const extra_tile = (6 * (offered + 2) + 15) / 16 > (6 * (offered + 1) + 15) / 16;
+        const minimum = if (options.tile_floor > 0 and extra_tile) options.tile_floor else options.floor;
+        if (offered > 0 and minimum > 0 and drafter[i] < minimum) continue;
         try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
         offered += 1;
     }
@@ -134,6 +143,8 @@ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Latt
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
     if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0 or !(options.floor >= 0 and options.floor < 1)) return error.BadDraftSelector;
+    if (!(options.tile_floor >= 0 and options.tile_floor < 1) or
+        (options.tile_floor > 0 and (options.tile_floor < options.floor or lattice.depth != 1 or options.nodes > 7 or options.children > 7))) return error.BadDraftSelector;
     var frontier: std.ArrayList(Node) = .empty;
     defer frontier.deinit(lattice.gpa);
     const tokens = try gpa.alloc(u32, options.nodes);

@@ -449,3 +449,43 @@ test "a probability floor drops unlikely siblings but always offers the best one
     try std.testing.expectEqualSlices(u32, &.{0}, lone.tokens);
     try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .floor = 1 }));
 }
+
+
+test "query-tile sibling policy retains cheap children and gates the next tile" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    graph.config.topk = 16;
+    var fake = Fake{};
+    var lattice = try Fake.lattice(&fake, 1, undefined, .{ .handle = 1, .rows = 1, .width = graph.config.rank, .stride = graph.config.rank, .dtype = .bf16 }, graph.config);
+    defer lattice.deinit();
+    for (lattice.candidates, lattice.unary, 0..) |*id, *u, i| {
+        id.* = @intCast(i);
+        u.* = -@as(f32, @floatFromInt(i));
+    }
+    var cheap = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .edge = 0, .floor = 0.007 });
+    defer cheap.deinit();
+    var flat = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .edge = 0, .floor = 0.05 });
+    defer flat.deinit();
+    var tiled = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .edge = 0, .floor = 0.007, .tile_floor = 0.05 });
+    defer tiled.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, cheap.tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, flat.tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, tiled.tokens);
+    const policy = selector.Policy{ .nodes = 7, .children = 7, .max_depth = 1, .floor = 0.007, .tile_floor = 0.05 };
+    try policy.checkTree(tiled.parents);
+    try std.testing.expectEqual(@as(u32, 2), try policy.block(16));
+    // No second sibling has enough probability to pay for another query tile.
+    for (lattice.unary[1..]) |*u| u.* = -3;
+    var narrow = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .edge = 0, .floor = 0.007, .tile_floor = 0.05 });
+    defer narrow.deinit();
+    try std.testing.expectEqualSlices(u32, &.{0}, narrow.tokens);
+    // Even a floor above every candidate probability must retain the best child.
+    var best = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .edge = 0, .floor = 0.99, .tile_floor = 0.99 });
+    defer best.deinit();
+    try std.testing.expectEqualSlices(u32, &.{0}, best.tokens);
+    try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .floor = 0.007, .tile_floor = 1 }));
+    try std.testing.expectError(error.BadDraftOptions, (selector.Policy{ .nodes = 7, .children = 7, .max_depth = 2, .floor = 0.007, .tile_floor = 0.05 }).block(16));
+}
