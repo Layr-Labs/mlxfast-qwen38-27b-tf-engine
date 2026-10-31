@@ -420,3 +420,32 @@ test "width seven depth one offers the seven best siblings of one future head ro
     try std.testing.expectEqual(@as(usize, 4), four.tokens.len);
     try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width, .children = 17 }));
 }
+
+test "a probability floor drops unlikely siblings but always offers the best one" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    graph.config.topk = 16;
+    var fake = Fake{};
+    var lattice = try Fake.lattice(&fake, 1, undefined, .{ .handle = 1, .rows = 1, .width = graph.config.rank, .stride = graph.config.rank, .dtype = .bf16 }, graph.config);
+    defer lattice.deinit();
+    for (lattice.candidates, lattice.unary, 0..) |*id, *u, i| {
+        id.* = @intCast(i);
+        u.* = -@as(f32, @floatFromInt(i)); // softmax mass 0.632, 0.233, 0.086, 0.032, 0.012, 0.004, ...
+    }
+    const policy = selector.Policy{ .nodes = 7, .children = 7, .max_depth = 1, .floor = 0.01 };
+    var tree = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = policy.children, .floor = policy.floor });
+    defer tree.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, tree.tokens);
+    try policy.checkTree(tree.parents);
+    var open = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7 });
+    defer open.deinit();
+    try std.testing.expectEqual(@as(usize, 7), open.tokens.len);
+    for (lattice.unary[1..]) |*u| u.* = -40;
+    var lone = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 7, .floor = 0.01 });
+    defer lone.deinit();
+    try std.testing.expectEqualSlices(u32, &.{0}, lone.tokens);
+    try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .floor = 1 }));
+}
