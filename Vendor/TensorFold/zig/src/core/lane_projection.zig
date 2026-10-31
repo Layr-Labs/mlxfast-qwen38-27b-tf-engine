@@ -48,6 +48,8 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
     /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// Decoded rows read (scale, bias) through a u16 index (in the pairs' slot) into a table of distinct words.
+    dict: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -64,6 +66,7 @@ pub const Layout = struct {
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
+        if (l.dict and (!l.reg or !l.rows8 or !l.reg_lean)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
@@ -143,6 +146,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
+    if (l.dict) try text.appendSlice(a, "#define TF_DICT 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -265,6 +269,8 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
+    /// Built with Layout.dict: `sb` is the u16 index and every launch binds the table.
+    dict: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -286,7 +292,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .dict = l.dict };
     }
 
     pub fn deinit(p: Projection) void {
@@ -297,7 +303,27 @@ pub const Projection = struct {
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
     pub fn encode(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32) !void {
-        return p.encodeImpl(e, x, w, sb, null, y, rows);
+        return p.encodeImpl(e, x, w, sb, null, y, rows, null);
+    }
+
+    /// encode or encodeSums for a dict layout: `index` in the pairs' slot, `table` its distinct (scale, bias) words.
+    pub fn encodeDict(
+        p: Projection,
+        e: mtl.ComputeEncoder,
+        x: Ref,
+        w: Ref,
+        index: Ref,
+        sums: ?Sums,
+        y: Ref,
+        rows: u32,
+        table: Ref,
+    ) !void {
+        if (!p.dict) return error.InvalidSchedule;
+        if (sums) |s| {
+            if (rows == 0 or rows > reg_rows or s.stride < rows) return error.InvalidRows;
+            try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
+        }
+        return p.encodeImpl(e, x, w, index, sums, y, rows, table);
     }
 
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
@@ -305,18 +331,30 @@ pub const Projection = struct {
         if (!p.reg) return error.SumsNeedReg;
         if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null);
     }
 
     /// A swiglu projection: `h` gets silu(gate) * up of the rows' bf16 gate/up words (N / 2 columns a row) and `hs` its
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
-    pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
+    pub fn encodeSwiglu(
+        p: Projection,
+        e: mtl.ComputeEncoder,
+        x: Ref,
+        w: Ref,
+        sb: Ref,
+        sums: Sums,
+        h: Ref,
+        hs: Ref,
+        rows: u32,
+        table: ?Ref,
+    ) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
-        try checkRef(sb, p.metadata_bytes, 16);
+        if (p.dict != (table != null)) return error.InvalidSchedule;
+        try checkRef(sb, if (p.dict) p.metadata_bytes / 2 else p.metadata_bytes, if (p.dict) 8 else 16);
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
         const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
@@ -329,6 +367,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
+        if (table) |t| e.setBuffer(t.buf, t.off, 7);
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
     }
 
@@ -350,13 +389,24 @@ pub const Projection = struct {
         return .{ .ref = .{ .buf = buffer }, .stride = stride };
     }
 
-    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
+    fn encodeImpl(
+        p: Projection,
+        e: mtl.ComputeEncoder,
+        x: Ref,
+        w: Ref,
+        sb: Ref,
+        given: ?Sums,
+        y: Ref,
+        rows: u32,
+        table: ?Ref,
+    ) !void {
+        if (p.dict != (table != null)) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
-        try checkRef(sb, p.metadata_bytes, 16);
+        try checkRef(sb, if (p.dict) p.metadata_bytes / 2 else p.metadata_bytes, if (p.dict) 8 else 16);
         try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
         if (given == null) if (p.sums_pipe) |pipe| {
             e.setPipeline(pipe);
@@ -374,6 +424,7 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
+        if (table) |t| e.setBuffer(t.buf, t.off, 7);
         e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }

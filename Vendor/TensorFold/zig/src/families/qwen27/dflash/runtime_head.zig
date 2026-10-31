@@ -12,6 +12,9 @@ pub const Head = struct {
     owned: std.ArrayList(mtl.Buffer) = .empty,
     pub fn init(a: std.mem.Allocator, device: mtl.Device, source: projection.Linear) !Head {
         var head = Head{ .allocator = a, .linear = source };
+        // the head's own pairs (a vocabulary span copy) have no index: decode reads them
+        head.linear.index = null;
+        head.linear.table = null;
         errdefer head.deinit();
         if (source.n != 248320) return head;
         if (source.tile != 32 or source.k % source.group != 0 or source.runs.len > 0) return error.BadDraftHead;
