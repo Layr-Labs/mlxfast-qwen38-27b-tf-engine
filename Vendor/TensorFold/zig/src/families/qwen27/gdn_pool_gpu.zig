@@ -159,7 +159,11 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.usesSlots() and prepared.depth_one) {
+            try prepared.forwardStar(scan.encoder, pool.kernels.star, pool.kernels.post_rows, beside);
+        } else {
+            try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        }
         try scan.end();
     }
 
