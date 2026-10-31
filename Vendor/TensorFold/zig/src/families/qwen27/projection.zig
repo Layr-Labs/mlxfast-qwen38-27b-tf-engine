@@ -6,8 +6,8 @@ const row = @import("core").row_projection;
 const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
-/// A device matrix; `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1 };
+/// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -95,7 +95,36 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         };
         base += rows;
     }
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch) };
+    const index: ?Ref = if (try indexPairs(device, allocator, owned, pair, n, k)) |b| .{ .buffer = b } else null;
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index };
+}
+
+/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
+/// first-seen order, then each group's u16 index. Null (nothing kept) past lane_projection.sb_table distinct pairs.
+fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+    const cap = lane.sb_table;
+    var seen = std.AutoHashMap(u32, u16).init(allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(2 * cap);
+    const sb = try device.buffer(lane.indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    var keep = false;
+    defer if (!keep) sb.deinit();
+    const table = sb.slice(u32, cap);
+    @memset(table, 0);
+    const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
+    for (index, 0..) |*at, i| {
+        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
+        const got = seen.getOrPutAssumeCapacity(word);
+        if (!got.found_existing) {
+            if (seen.count() > cap) return null;
+            got.value_ptr.* = @intCast(seen.count() - 1);
+            table[got.value_ptr.*] = word;
+        }
+        at.* = got.value_ptr.*;
+    }
+    try owned.append(allocator, sb);
+    keep = true;
+    return sb;
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {
