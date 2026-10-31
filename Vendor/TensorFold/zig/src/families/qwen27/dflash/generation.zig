@@ -194,6 +194,7 @@ pub const Generation = struct {
             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
             keep_cb.commit();
             g.keep = keep_cb.retain();
+            g.draft.backend.frame.bridgeKeep();
         }
     };
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once.
