@@ -3,7 +3,6 @@ const std = @import("std");
 const op = @import("operators.zig");
 const Backend = @import("runtime_backend.zig").Backend;
 const Ref = @import("runtime_backend.zig").Ref;
-const Span = @import("runtime_backend.zig").Span;
 fn cast(ptr: *anyopaque) *Backend {
     return @ptrCast(@alignCast(ptr));
 }
@@ -40,7 +39,6 @@ pub fn streamAppend(ptr: *anyopaque, epoch: u64, stream: u32, layer: u32, keys: 
 fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("runtime_backend.zig").Cache, keys: op.View, values: op.View, positions: []const u64) !void {
     const k = try b.frame.ref(keys);
     const v = try b.frame.ref(values);
-    b.access(e, &.{ try b.span(keys), try b.span(values) }, &.{ Span.whole(cache.keys), Span.whole(cache.values) });
     var first: usize = 0;
     while (first < positions.len) : (first += 16) {
         const count = @min(positions.len - first, 16);
@@ -134,13 +132,10 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
         const merged_v = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
         k = try b.frame.ref(merged_k);
         v = try b.frame.ref(merged_v);
-        b.access(e, &.{ Span.whole(caches[p.layer].keys), Span.whole(caches[p.layer].values) }, &.{ try b.span(merged_k), try b.span(merged_v) });
         try gather(b, e, context, caches[p.layer].keys, k);
         try gather(b, e, context, caches[p.layer].values, v);
     }
     const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
-    // the gathers and these copies write disjoint rows; the attention below reads them all
-    b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
     try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
     try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
@@ -148,10 +143,6 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const mask = try b.frame.alloc(rows, keys, .u8);
     const mask_ref = try b.frame.ref(mask);
     try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
-    b.barrier(e);
-    if (keys > 1024) b.access(e, &.{}, &.{Span.whole(b.attention.part)}); // encodeSplit's partials: one attention at a time
-    const kv_bytes = @as(usize, keys) * b.config.kvWidth() * 2;
-    b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask) }, &.{try b.span(result)});
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
     // Long contexts share each 256-key chunk across the query heads of one KV head.
     if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);

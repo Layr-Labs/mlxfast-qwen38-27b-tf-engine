@@ -206,8 +206,6 @@ pub const Generation = struct {
         defer g.runner.tail = null;
         g.runner.after = .{ .ptr = &picks, .run = Picks.keep };
         defer g.runner.after = null;
-        g.runner.lead = .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge };
-        defer g.runner.lead = null;
         try g.runner.verifyHead(round, .all);
         errdefer g.runner.failed = true;
         try g.runner.taps.complete();
@@ -227,7 +225,10 @@ pub const Generation = struct {
         return g.runImpl(count, false, nodes, eos, already_delivered);
     }
     /// `extend`: a copy from the context shares the tree's agreeing nodes and adds up to `extra` rows past them.
-    pub fn runRound(g: *Generation, remaining: u32, nodes: usize, eos: []const u32, already_delivered: bool, extend: ?Extender, extra: u32) !Result {
+    pub fn runRound(g: *Generation, remaining: u32, policy: @import("selector.zig").Policy, eos: []const u32, already_delivered: bool, extend: ?Extender, extra: u32) !Result {
+        const nodes = policy.nodes;
+        _ = try policy.block(g.draft.tree_block);
+        if (policy.max_depth != null and (g.proposer != null or extend != null or extra != 0)) return error.BadDraftOptions;
         if (g.runner.failed or g.runner.active != null or g.runner.offsets[0] == 0 or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != g.runner.offsets[0] or g.draft.committed_end == 0 or nodes == 0 or nodes > 15 or eos.len > 16) return error.BadDraftOptions;
         for (eos) |token| if (token >= g.runner.model.config.vocab) return error.BadDraftOptions;
         if (remaining == 0) return .{ .tokens = try g.allocator.alloc(u32, 0), .rounds = 0, .verified = 0, .matched = 0 };
@@ -243,9 +244,12 @@ pub const Generation = struct {
         const available = g.runner.capacity - g.runner.offsets[0];
         if (available == 0) return error.ContextFull;
         const offered: u32 = @intCast(@min(nodes, available - 1));
+        var offered_policy = policy;
+        offered_policy.nodes = offered;
         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
-        var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.propose(pending, offered);
+        var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.proposePolicy(pending, offered_policy);
         defer tree.deinit();
+        try offered_policy.checkTree(tree.parents);
         const drafted = try tree.verifyParents(g.allocator);
         defer g.allocator.free(drafted);
         // a copy from the root shares the tree's nodes while they agree, and its rest hangs below the last shared one
@@ -275,7 +279,7 @@ pub const Generation = struct {
         defer round.deinit();
         errdefer g.finishKeep() catch {};
         try g.finishKeep();
-        const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos);
+        const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos);
         g.pending = accepted.pending;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         var landed: u32 = 0;
