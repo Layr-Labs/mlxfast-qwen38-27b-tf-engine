@@ -570,7 +570,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #ifndef TF_TB
 #define TF_TB 1
 #endif
-// Prompt rows, TF_PROMPT_TN (2) adjacent 32-column tiles a SIMD group: a group's 16x64 activation slice loads once into
+// Prompt rows, TF_PROMPT_TN (2 or 4) adjacent 32-column tiles a SIMD group: a group's 16x64 activation slice loads once into
 // cooperative registers and feeds both tiles' products, instead of each tile's tensor op reading it from device memory.
 // Each tile unpacks its own codes into the same register words as tf_lane_reg, and applies the same scale/bias FMA chain,
 // K split reduction and store as tf_lane_reg's prompt rows. Both operands in registers need K = 32 tensor ops, so each
@@ -580,17 +580,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #ifndef TF_UNROLL
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
 #endif
-// Uint4s between a tile's codes and the next tile's: adjacent tiles of a batch sit one 64-uint4 block apart per group.
-#define TF_TN_CODES (TF_TB > 1 ? 64 : KG * 64)
-// One tile of a group: unpack its codes (1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting
-// 1024 is exact), prefetch its next codes, run, then FMAs.
-#define TF_TN_TILE(t, CB, PP) { \
-      const uint4 q0 = sp[(t) * (NT / 4)], q1 = sp[(t) * (NT / 4) + 4]; \
-      thread half2* b2l = (thread half2*)&CB##l[0]; \
-      thread half2* b2h = (thread half2*)&CB##h[0]; \
+// One tile of a group: unpack the codes held in nw0, nw1 (as fp16 subnormals, codes (0,4) (1,5) (2,6) (3,7) of a word, as
+// tf_lane_reg does; the scales carry the 2^24 back), load the next tile's (the next group's first tile after the last; a
+// chain's last tile reloads its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
+// pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
+#define TF_TN_TILE(t) { \
+      const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      thread half2* b2l = (thread half2*)&cbl[0]; \
+      thread half2* b2h = (thread half2*)&cbh[0]; \
       TF_UNROLL \
       for (int w = 0; w < 8; w++) { \
-        const uint word = w < 4 ? nw0[t][w] : nw1[t][w - 4]; \
+        const uint word = w < 4 ? nw0[w] : nw1[w - 4]; \
         thread half2* b2 = (w & 1) ? b2h : b2l; \
         const int e = 2 * (w >> 1); \
         b2[e] = as_type<half2>(word & 0x000F000Fu); \
@@ -598,18 +599,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu); \
         b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu); \
       } \
-      nw0[t] = cp[(t) * TF_TN_CODES]; \
-      nw1[t] = cp[(t) * TF_TN_CODES + 32]; \
-      opm.run(xl0, CB##l, PP); \
-      opa.run(xl1, CB##h, PP); \
+      cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0); \
+      nw0 = cp[0]; \
+      nw1 = cp[32]; \
+      opm.run(xl0, cbl, P); \
+      opa.run(xl1, cbh, P); \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
         const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y); \
-        C[t][j] = fma(s0, PP[j], fma(b0, x0, C[t][j])); \
-        C[t][4 + j] = fma(s0, PP[4 + j], fma(b0, x1, C[t][4 + j])); \
-        C[t][8 + j] = fma(s1, PP[8 + j], fma(b1, x0, C[t][8 + j])); \
-        C[t][12 + j] = fma(s1, PP[12 + j], fma(b1, x1, C[t][12 + j])); \
+        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
 }
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
@@ -636,23 +638,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
-#define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cb0l)>, float>()
-  auto cb0l = TF_TN_RIGHT; auto cb0h = TF_TN_RIGHT;
-  auto cb1l = TF_TN_RIGHT; auto cb1h = TF_TN_RIGHT;
-  auto P0 = TF_TN_DEST;
-  auto P1 = TF_TN_DEST;
+#define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>()
+  auto cbl = TF_TN_RIGHT; auto cbh = TF_TN_RIGHT;
+  auto P = TF_TN_DEST;
   const half2 bias = half2(1024.0h);
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
-  const device uint4* sbv = (const device uint4*)SB;
-  // one pointer each for codes and metadata: the tiles' words lie fixed distances apart
   const device uint4* cp = W + ((size_t)(tile0 / TF_TB) * KG * TF_TB + tile0 % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
-  const device uint4* sp = sbv + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
-  uint4 nw0[TN], nw1[TN];
+  const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
+  uint4 nw0 = 0, nw1 = 0;
+  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   float C[TN][16];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
-    nw0[t] = 0; nw1[t] = 0;
-    if (first < last) { nw0[t] = cp[t * TF_TN_CODES]; nw1[t] = cp[t * TF_TN_CODES + 32]; }
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
@@ -664,24 +661,44 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     xp += stride;
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
-    cp += g + 1 < last ? TF_TB * 64 : 0; // a chain's last group reloads its own codes, which nothing reads
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
-    TF_TN_TILE(0, cb0, P0)
-    TF_TN_TILE(1, cb1, P1)
-    sp += TF_N / 4;
+    TF_TN_TILE(0)
+    TF_TN_TILE(1)
+#if TF_PROMPT_TN == 4
+    TF_TN_TILE(2)
+    TF_TN_TILE(3)
+#endif
   }
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
   if (TF_SK > 1) {
-    if (ks > 0) for (int t = 0; t < TN; t++) for (int i = 0; i < 16; i++) part[(((ks - 1) * TN + t) * 16 + i) * 32 + lane] = C[t][i];
+    if (ks > 0) {
+      TF_UNROLL
+      for (int t = 0; t < TN; t++) {
+        TF_UNROLL
+        for (int i = 0; i < 16; i++) part[(((ks - 1) * TN + t) * 16 + i) * 32 + lane] = C[t][i];
+      }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int t = 0; t < TN; t++) for (int i = 0; i < 16; i++) C[t][i] += part[(((s2 - 1) * TN + t) * 16 + i) * 32 + lane];
+    if (ks == 0) {
+      for (int s2 = 1; s2 < TF_SK; s2++) {
+        TF_UNROLL
+        for (int t = 0; t < TN; t++) {
+          TF_UNROLL
+          for (int i = 0; i < 16; i++) C[t][i] += part[(((s2 - 1) * TN + t) * 16 + i) * 32 + lane];
+        }
+      }
+    }
   }
-  if (ks == 0)
-    for (int t = 0; t < TN; t++)
+  if (ks == 0) {
+    TF_UNROLL
+    for (int t = 0; t < TN; t++) {
+      TF_UNROLL
       for (int i = 0; i < 16; i++) {
         const int m = mb + 8 * ((i >> 2) & 1), n = (tile0 + t) * NT + nb + 16 * (i >> 3) + (i & 3);
         if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[t][i]);
       }
+    }
+  }
 }
 #endif
