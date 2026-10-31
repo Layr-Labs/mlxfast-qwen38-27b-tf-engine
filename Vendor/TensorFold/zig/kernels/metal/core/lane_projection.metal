@@ -274,6 +274,9 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #endif
 
 #if TF_BITS == 4 && defined(TF_REG)
+#ifndef TF_TB
+#define TF_TB 1
+#endif
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
 // TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
@@ -290,27 +293,36 @@ struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, i
 
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
 #if defined(TF_ROWS8)
-  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
+  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
 #else
-  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
 #endif
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_SWIGLU)
+[[max_total_threads_per_threadgroup(128)]]
+#elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+#if defined(TF_SWIGLU)
+    device float* HS [[buffer(6)]],
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
   Y += (size_t)r0 * TF_YS;
   XS += r0;
+#if defined(TF_SWIGLU)
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
+#else
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
+#endif
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
@@ -319,7 +331,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
-  const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
+  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane;
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
@@ -335,7 +347,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * 64]; nw1 = wl[(size_t)first * 64 + 32]; }
+  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
@@ -358,7 +370,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
 #if defined(TF_REG_LEAN)
-    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * 64]; nw1 = wl[(size_t)(g + 1) * 64 + 32]; }
+    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * TF_TB * 64]; nw1 = wl[(size_t)(g + 1) * TF_TB * 64 + 32]; }
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
@@ -400,7 +412,31 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
-#if defined(TF_ROWS8)
+#if defined(TF_SWIGLU)
+  threadgroup bfloat gu[4 * 8 * 32];
+  threadgroup bfloat hb[8 * 64];
+  for (int i = 0; i < 16; i++) {
+    if (!TF_LIVE(i)) continue;
+    gu[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t = ks * 32 + lane;
+  for (int at = t; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gf = float(gu[((c >> 5) * 8 + m) * 32 + (c & 31)]);
+    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb[at] = h;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int m = t; m < stride; m += 128) {
+    float acc = 0.0f;
+    if (m < M)
+      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
+    HS[int(tg.x) * stride + m] = acc;
+  }
+#elif defined(TF_ROWS8)
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       if (!TF_LIVE(i)) continue;
