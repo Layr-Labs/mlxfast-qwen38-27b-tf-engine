@@ -24,7 +24,10 @@ pub const Hook = struct {
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
         try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e);
+        var r = try refs(weight, frame);
+        // decode rows: the gate writes the out projection's group sums into .sums (read by forward.post)
+        if (@import("forward.zig").outSums(rows)) r.sums = frame.get(.sums);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), r, e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), r, e);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

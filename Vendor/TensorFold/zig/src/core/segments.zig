@@ -93,7 +93,10 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
-            if (x.every == 0 or x.lanes.len != 1 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
+            // an early first commit (first < every) is followed by a second at 2 * first + 1, so the GPU starts after `first`
+            // layers' encode and the host stays ahead of it until the regular cadence takes over
+            const early = x.first < x.every and (i + 1 == x.first or i + 1 == 2 * x.first + 1);
+            if (x.every == 0 or x.lanes.len != 1 or (!early and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
             const l = &x.lanes[k];
             l.fence.update(l.enc);
             l.enc.end();

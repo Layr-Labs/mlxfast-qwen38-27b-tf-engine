@@ -344,6 +344,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_REG_TG1)
+  // decoded rows reduce through one 2 KiB plane in TF_SK - 1 turns (chain s writes, chain 0 adds), so a threadgroup holds
+  // 2 KiB of threadgroup memory instead of (TF_SK - 1) * 2 KiB; chain 0 still adds C1, C2, ... in order
+  threadgroup float part[16 * 32];
+  for (int s2 = 1; s2 < TF_SK; s2++) {
+    if (ks == s2) for (int i = 0; i < 16; i++) part[i * 32 + lane] = C[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int i = 0; i < 16; i++) C[i] += part[i * 32 + lane];
+    if (s2 + 1 < TF_SK) threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
