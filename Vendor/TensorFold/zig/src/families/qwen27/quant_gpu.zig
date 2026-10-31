@@ -170,7 +170,7 @@ pub const Kernels = struct {
         return true;
     }
 
-    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch.
+    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `promptStep` rows a launch.
     fn gateUpActivatedPrompt(
         k: *Kernels,
         input_encoder: mtl.ComputeEncoder,
@@ -218,8 +218,9 @@ pub const Kernels = struct {
         }
         const half = p.n / 2;
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        const step = promptStep(p.k);
+        while (first < rows) : (first += step) {
+            const n = @min(rows - first, step);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
@@ -317,7 +318,7 @@ pub const Kernels = struct {
             entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi, .indexed12 = key.sbi12 });
             k.joined(entry.value_ptr);
         }
-        const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+        const step: u32 = if (!entry.value_ptr.reg) 16 else if (k.prompt) promptStep(p.k) else lane.reg_rows;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
@@ -531,6 +532,12 @@ pub fn padded(rows: u32) u32 {
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+}
+
+/// Prompt rows a reg launch takes: 5120-deep projections stream each tile's codes once for lane.prompt_rows rows (their
+/// activation panel stays cache-resident); the deeper FFN down and attention output keep lane.reg_rows.
+fn promptStep(k: usize) u32 {
+    return if (k == 5120) lane.prompt_rows else lane.reg_rows;
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
