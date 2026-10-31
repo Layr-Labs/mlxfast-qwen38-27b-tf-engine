@@ -4,6 +4,32 @@ const weights = @import("weights.zig");
 const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
 pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null };
+/// Candidate count and maximum draft-parent path length are independent.
+pub const Policy = struct {
+    nodes: usize,
+    max_depth: ?u32 = null,
+
+    pub fn block(p: Policy, cap: u32) !u32 {
+        if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
+        if (p.max_depth) |depth| if (depth == 0 or depth > 15) return error.BadDraftDepth;
+        return @min(cap, @min(@as(u32, @intCast(p.nodes)) + 1, (p.max_depth orelse 15) + 1));
+    }
+
+    pub fn checkTree(p: Policy, parents: []const i32) !void {
+        const limit = p.max_depth orelse return;
+        if (parents.len > p.nodes or parents.len > 15) return error.BadDraftWidth;
+        var depths: [15]u32 = undefined;
+        for (parents, 0..) |parent, row| {
+            if (parent < -1 or parent >= row) return error.BadDraftParents;
+            depths[row] = if (parent < 0) 1 else depths[@intCast(parent)] + 1;
+            if (depths[row] > limit) return error.BadDraftDepth;
+        }
+    }
+
+    pub fn budget(p: Policy, remaining: u32) u32 {
+        return if (p.max_depth) |depth| @min(remaining, depth + 1) else remaining;
+    }
+};
 pub const Tree = struct {
     gpa: std.mem.Allocator,
     tokens: []u32,
@@ -120,4 +146,19 @@ test "draft roots shift to pending row while descendants retain topology" {
     const parents = try t.verifyParents(a);
     defer a.free(parents);
     try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0, 1, 3 }, parents);
+}
+
+test "proposal width and parent depth have separate bounds" {
+    const p = Policy{ .nodes = 2, .max_depth = 1 };
+    try std.testing.expectEqual(@as(u32, 2), try p.block(16));
+    try std.testing.expectEqual(@as(u32, 3), try (Policy{ .nodes = 2 }).block(16));
+    try std.testing.expectEqual(@as(u32, 1), try (Policy{ .nodes = 0, .max_depth = 1 }).block(16));
+    try p.checkTree(&.{ -1, -1 });
+    try p.checkTree(&.{});
+    try std.testing.expectError(error.BadDraftDepth, p.checkTree(&.{ -1, 0 }));
+    try std.testing.expectError(error.BadDraftWidth, p.checkTree(&.{ -1, -1, -1 }));
+    try std.testing.expectError(error.BadDraftParents, p.checkTree(&.{ -1, 1 }));
+    try std.testing.expectError(error.BadDraftDepth, (Policy{ .nodes = 2, .max_depth = 0 }).block(16));
+    try std.testing.expectEqual(@as(u32, 2), p.budget(128));
+    try std.testing.expectEqual(@as(u32, 1), p.budget(1));
 }
