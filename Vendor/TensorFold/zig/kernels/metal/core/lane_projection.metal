@@ -385,6 +385,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const tf_reg_load cur = next;
 #endif
     for (int w = 0; w < 8; w++) {
+#if defined(TF_PROMPT_SR)
+      // prompt rows: code c as the fp16 subnormal c * 2^-24 (its bits are c), the same codes (0,4) (1,5) (2,6) (3,7) of a
+      // word in the same registers, with no OR and no subtraction. Every product and partial sum of the tensor op is then
+      // the base's times 2^-24 exactly (a power of two moves no rounding point), and the scale below carries the 2^24
+      const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
+      const int e = 16 * (w & 1) + 2 * (w >> 1);
+      b2[e] = as_type<half2>(word & 0x000F000Fu);
+      b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
+      b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
+      b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
+#else
       // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
       const int e = 16 * (w & 1) + 2 * (w >> 1);
@@ -392,6 +403,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 1] = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+#endif
     }
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
@@ -408,8 +420,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     auto x = a.slice(g * GS, 0);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
+#if defined(TF_PROMPT_SR)
+      // the scale times 2^24 (exact): s0 * P[j] is the base's product of the scale and the 2^-24-scaled codes' sum
+      const float s0 = as_type<float>(cur.q0[j] << 16) * 16777216.0f, b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
+      const float s1 = as_type<float>(cur.q1[j] << 16) * 16777216.0f, b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
+#else
       const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
       const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
+#endif
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
