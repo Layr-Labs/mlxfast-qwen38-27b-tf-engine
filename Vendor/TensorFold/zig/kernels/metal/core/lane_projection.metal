@@ -344,6 +344,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_LIVE_PARTIALS8)
+  threadgroup float part[(TF_SK - 1) * 8 * 32];
+  if (ks > 0 && mb < M) for (int q = 0; q < 8; q++) {
+    const int i = (q & 3) + 8 * (q >> 2);
+    part[((ks - 1) * 8 + q) * 32 + lane] = C[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0 && mb < M) for (int s2 = 1; s2 < TF_SK; s2++) for (int q = 0; q < 8; q++) {
+    const int i = (q & 3) + 8 * (q >> 2);
+    C[i] += part[((s2 - 1) * 8 + q) * 32 + lane];
+  }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
