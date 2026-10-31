@@ -4,6 +4,13 @@ const abi = @import("gdn_contract.zig");
 const tree_slots = @import("core").tree_slots;
 const Window = @import("state.zig").Window;
 
+/// The first projected row is the root; every other row is its direct child.
+pub fn depthOneStar(parents: []const i32) bool {
+    if (parents.len == 0 or parents[0] != -1) return false;
+    for (parents[1..]) |parent| if (parent != 0) return false;
+    return true;
+}
+
 pub const Input = struct { window: Window, state_slot: u32, next_slot: u32, path: []const u32 };
 
 pub const Plan = struct {
@@ -75,6 +82,23 @@ pub const Plan = struct {
             keep_first += @intCast(input.path.len);
         }
         return .{ .gpa = gpa, .parents = parents, .windows = windows, .row_slots = slots, .segments = segments, .keeps = keeps, .kept_rows = kept_rows, .slot_steps = slot_steps, .compact = compact, .slot_peak = slot_peak };
+    }
+
+    pub fn depthOneStars(plan: Plan) bool {
+        if (plan.segments.len == 0) return false;
+        for (plan.segments) |segment| {
+            const first: usize = segment.first;
+            const rows: usize = segment.rows;
+            if (first > plan.parents.len or rows > plan.parents.len - first) return false;
+            if (!depthOneStar(plan.parents[first..][0..rows])) return false;
+        }
+        return true;
+    }
+
+    pub fn depthOneStarsWithin(plan: Plan, rows: u32) bool {
+        if (!plan.depthOneStars()) return false;
+        for (plan.segments) |segment| if (segment.rows > rows) return false;
+        return true;
     }
 
     pub fn deinit(plan: *Plan) void {

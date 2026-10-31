@@ -44,6 +44,10 @@ pub const Kernels = struct {
     post_rows: metal.Pipeline,
     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
     tree_pair: metal.Pipeline,
+    /// Native32-lane direct siblings retain only the anchor state.
+    star: metal.Pipeline,
+    /// Complete128-value-head scan and gate in one512-thread group.
+    star_gate: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -70,6 +74,8 @@ pub const Kernels = struct {
             "tree_slots_8",
             "tree_slots_16",
             "tree_pair",
+            "packed_star_32",
+            "star_gate_fused_4",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -78,7 +84,8 @@ pub const Kernels = struct {
             pipelines[index] = try metal.Pipeline.init(device, library, "tf_delta_gdn_" ++ name, false);
             done += 1;
         }
-        inline for (.{ 7, 13, 14 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        inline for (.{ 7, 13, 14, 21 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        if (pipelines[22].simdWidth() != 32 or pipelines[22].maxThreads() < 512) return error.UnsupportedGdnPipeline;
         return .{
             .library = library,
             .pipelines = .{
@@ -100,6 +107,8 @@ pub const Kernels = struct {
             .pre_rows = pipelines[13],
             .post_rows = pipelines[14],
             .tree_pair = pipelines[20],
+            .star = pipelines[21],
+            .star_gate = pipelines[22],
         };
     }
 
@@ -121,6 +130,8 @@ pub const Kernels = struct {
             k.pre_rows,
             k.post_rows,
             k.tree_pair,
+            k.star,
+            k.star_gate,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

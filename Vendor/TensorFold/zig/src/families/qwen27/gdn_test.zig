@@ -264,3 +264,46 @@ test "depth one sibling terminal and remaining-one commits retain only the root 
         try std.testing.expectEqual(@as(u32, 11), (try window.keep(accepted.path)).length);
     };
 }
+
+test "depth-one packed admission rejects chains, forests and non-root siblings" {
+    try std.testing.expect(plan_mod.depthOneStar(&.{-1}));
+    try std.testing.expect(plan_mod.depthOneStar(&.{ -1, 0 }));
+    try std.testing.expect(plan_mod.depthOneStar(&.{ -1, 0, 0, 0, 0, 0, 0, 0 }));
+    for ([_][]const i32{ &.{}, &.{0}, &.{ -1, -1 }, &.{ -1, 0, 1 }, &.{ -1, 0, 0, 2 } }) |parents| {
+        try std.testing.expect(!plan_mod.depthOneStar(parents));
+    }
+    const a = std.testing.allocator;
+    var w0 = try Window.init(a, 20, &.{ -1, 0, 0 }, 4, 128);
+    defer w0.deinit();
+    var w1 = try Window.init(a, 40, &.{ -1, 0 }, 4, 128);
+    defer w1.deinit();
+    const shape = try abi.Shape.init(config());
+    var plan = try plan_mod.Plan.init(a, try shape.params(5, 4, native), &.{ .{ .window = w0, .state_slot = 2, .next_slot = 0, .path = &.{ 0, 2 } }, .{ .window = w1, .state_slot = 3, .next_slot = 1, .path = &.{0} } });
+    defer plan.deinit();
+    try std.testing.expect(plan.depthOneStars());
+    plan.parents[2] = 1;
+    try std.testing.expect(!plan.depthOneStars());
+    plan.parents[2] = 0;
+    plan.segments[1].rows = 3;
+    try std.testing.expect(!plan.depthOneStars());
+}
+
+test "fused GDN capacity is per segment and never discards a ninth sibling row" {
+    const a = std.testing.allocator;
+    var w0 = try Window.init(a, 20, &.{ -1, 0, 0, 0, 0, 0, 0, 0 }, 4, 128);
+    defer w0.deinit();
+    var w1 = try Window.init(a, 40, &.{ -1, 0, 0 }, 4, 128);
+    defer w1.deinit();
+    const shape = try abi.Shape.init(config());
+    var plan = try plan_mod.Plan.init(a, try shape.params(11, 4, native), &.{ .{ .window = w0, .state_slot = 2, .next_slot = 0, .path = &.{ 0, 7 } }, .{ .window = w1, .state_slot = 3, .next_slot = 1, .path = &.{0} } });
+    defer plan.deinit();
+    try std.testing.expect(plan.depthOneStarsWithin(8));
+    try std.testing.expect(!plan.depthOneStarsWithin(7));
+    var w2 = try Window.init(a, 60, &.{ -1, 0, 0, 0, 0, 0, 0, 0, 0 }, 4, 128);
+    defer w2.deinit();
+    var nine = try plan_mod.Plan.init(a, try shape.params(9, 4, native), &.{.{ .window = w2, .state_slot = 0, .next_slot = 1, .path = &.{ 0, 8 } }});
+    defer nine.deinit();
+    try std.testing.expect(nine.depthOneStars());
+    try std.testing.expect(!nine.depthOneStarsWithin(8));
+    try std.testing.expect(nine.depthOneStarsWithin(9));
+}

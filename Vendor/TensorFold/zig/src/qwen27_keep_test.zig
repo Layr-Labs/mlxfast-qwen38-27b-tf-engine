@@ -28,6 +28,7 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
     var window = try Window.init(a, 9, &.{-1}, 2, 64);
     defer window.deinit();
     for ([_]bool{ false, true }) |empty_second| {
+      for ([_]bool{ false, true }) |late_gate| {
         var pool: gpu.Pool = undefined;
         pool.budget = try @import("families/qwen27/gdn_pool.zig").Budget.init(shape, 1, 2, 2);
         pool.before = null;
@@ -40,6 +41,10 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         }
         defer for (pool.buffers) |b| a.free(b.data);
         pool.kernels = undefined;
+        pool.kernels.tree_pair = .{ .id = 10 };
+        pool.kernels.post_rows = .{ .id = 3 };
+        pool.kernels.star = .{ .id = 12 };
+        pool.kernels.star_gate = .{ .id = 15 };
         pool.kernels.pipelines = .{ .pre = .{ .id = 0 }, .tree = .{ .id = 1 }, .replay = .{ .id = 2 }, .post = .{ .id = 3 }, .conv_commit = .{ .id = 4 }, .tree_slots = .{ .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 }, .{ .id = 13 }, .{ .id = 14 } } };
         pool.kernels.publish_conv = .{ .id = 8 };
         const bytes = 2 * shape.state * 4;
@@ -79,7 +84,19 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         var allocations: metal.Allocations = .{};
         defer pool.releaseBefore();
         try pool.prepare(.{ .allocations = &allocations }, plan, false);
-        try pool.forward(0, .{ .host = plan, .metadata = metadata }, refs, e, null);
+        var late_calls: usize = 0;
+        const callback = struct {
+            fn encode(ptr: *anyopaque, _: metal.ComputeEncoder) !void {
+                const calls: *usize = @ptrCast(@alignCast(ptr));
+                calls.* += 1;
+            }
+        };
+        const beside: ?gdn.Beside = if (late_gate) .{ .ptr = &late_calls, .encode = callback.encode } else null;
+        try pool.forward(0, .{ .host = plan, .metadata = metadata }, refs, e, beside);
+        try std.testing.expectEqual(@as(usize, if (late_gate) 1 else 0), late_calls);
+        try std.testing.expectEqual(@as(usize, if (late_gate) 0 else 1), record.fused_dispatches);
+        try std.testing.expectEqual(@as(usize, if (late_gate) 1 else 0), record.post_dispatches);
+        try std.testing.expectEqual(@as(usize, if (late_gate) 3 else 2), record.barriers);
         try std.testing.expect(!std.mem.eql(u8, original, state));
         var keep = try Plan.init(a, try shape.params(2, 2, kinds), &.{
             .{ .window = window, .state_slot = 0, .next_slot = 0, .path = &.{} },
@@ -94,5 +111,6 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         try std.testing.expectEqual(@as(u32, 9), (try window.keep(&.{})).length);
         try std.testing.expectEqual(@as(u32, 10), (try window.keep(&.{0})).length);
         try std.testing.expectEqual(@as(usize, if (empty_second) 2 else 1), record.restores);
+      }
     }
 }

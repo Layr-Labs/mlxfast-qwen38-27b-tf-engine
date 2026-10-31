@@ -41,6 +41,10 @@ pub const Size = struct { width: usize = 1, height: usize = 1, depth: usize = 1 
 pub const Pipeline = struct {
     id: usize,
     pub fn init(_: Device, _: Library, name: []const u8, _: bool) !Pipeline {
+        if (std.mem.endsWith(u8, name, "tree_pair")) return .{ .id = 10 };
+        if (std.mem.endsWith(u8, name, "post_rows")) return .{ .id = 3 };
+        if (std.mem.endsWith(u8, name, "packed_star_32")) return .{ .id = 12 };
+        if (std.mem.endsWith(u8, name, "star_gate_fused_4")) return .{ .id = 15 };
         const names = [_][]const u8{ "pre", "tree", "replay", "post", "conv_commit", "unused5", "unused6", "unused7", "publish_conv", "unused9", "tree_slots_1", "tree_slots_2", "tree_slots_4", "tree_slots_8", "tree_slots_16" };
         for (names, 0..) |suffix, i| if (std.mem.endsWith(u8, name, suffix)) return .{ .id = i };
         return .{ .id = 20 };
@@ -94,19 +98,24 @@ pub const Params = extern struct {
     advance: u32,
 };
 pub const Recorder = struct {
-    bindings: [16]?Binding = @splat(null),
+    bindings: [20]?Binding = @splat(null),
     pipeline: usize = 0,
     params: Params = undefined,
     restores: usize = 0,
+    fused_dispatches: usize = 0,
+    post_dispatches: usize = 0,
+    barriers: usize = 0,
     segments: usize = 2,
     fn words(r: *Recorder, at: usize) []u32 {
         const b = r.bindings[at].?;
         return @as([*]u32, @ptrCast(@alignCast(b.buffer.data.ptr + b.offset)))[0 .. (b.buffer.data.len - b.offset) / 4];
     }
     fn run(r: *Recorder) void {
+        if (r.pipeline == 15) r.fused_dispatches += 1;
+        if (r.pipeline == 3) r.post_dispatches += 1;
         const p = r.params;
         const stride = p.nv * p.dv * p.dk;
-        if (r.pipeline >= 10 and r.pipeline <= 14) {
+        if (r.pipeline >= 10 and r.pipeline <= 15) {
             const segments = r.words(7);
             for (0..r.segments) |i| {
                 const slot = segments[i * 4 + 2];
@@ -162,7 +171,9 @@ pub const ComputeEncoder = struct {
     pub fn dispatchGroups(e: ComputeEncoder, _: Size, _: Size) void {
         e.record.run();
     }
-    pub fn barrier(_: ComputeEncoder) void {}
+    pub fn barrier(e: ComputeEncoder) void {
+        e.record.barriers += 1;
+    }
     pub fn end(_: ComputeEncoder) void {}
 };
 pub const CommandBuffer = struct {
