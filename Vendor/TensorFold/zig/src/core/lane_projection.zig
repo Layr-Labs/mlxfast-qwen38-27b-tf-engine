@@ -313,7 +313,7 @@ pub const Projection = struct {
         if (l.precompute_sums) {
             sums_pipe = try mtl.Pipeline.init(device, lib, "tf_lane_sums", false);
             errdefer sums_pipe.?.deinit();
-            sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            sums_buffer = try device.buffer(@as(usize, if (l.reg) prompt_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
         return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
     }
@@ -332,7 +332,7 @@ pub const Projection = struct {
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
     pub fn encodeSums(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32) !void {
         if (!p.reg) return error.SumsNeedReg;
-        if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > prompt_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         return p.encodeImpl(e, x, w, sb, sums, y, rows);
     }
@@ -341,7 +341,7 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else prompt_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
@@ -365,7 +365,7 @@ pub const Projection = struct {
     /// caller orders it before the encodeSums dispatches that read the returned sums.
     pub fn encodeSumsOf(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32) !Sums {
         if (!p.reg) return error.SumsNeedReg;
-        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (rows == 0 or rows > prompt_rows) return error.InvalidRows;
         const pipe = p.sums_pipe orelse return error.SumsNeedReg;
         const buffer = p.sums_buffer orelse return error.SumsNeedReg;
         try checkRef(x, rows * p.k * 2, 2);
@@ -380,7 +380,7 @@ pub const Projection = struct {
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) prompt_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
@@ -410,6 +410,10 @@ pub const Projection = struct {
 
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
+
+/// The most rows one reg encode takes: a prompt launch of a 5120-deep projection (promptStep), whose 256-row activation
+/// panel still sits in an M5 Max's cache while each tile's codes stream once for twice reg_rows' rows.
+pub const prompt_rows = 256;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
