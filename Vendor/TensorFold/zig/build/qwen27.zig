@@ -138,6 +138,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const qwen_tests = b.addRunArtifact(b.addTest(.{ .root_module = qwen27 }));
     test_step.dependOn(&qwen_tests.step);
     const qwen_test_step = b.step("test-qwen27", "CPU Qwen config, affine and complete tensor graph contracts");
+    const rg4_host=b.step("test-prompt-rg4-host","Prompt RG4 eligibility and exhaustive row/HS coverage, CPU only");
+    rg4_host.dependOn(&b.addRunArtifact(b.addTest(.{.root_module=core_lane,.filters=&.{"prompt RG4"}})).step);
+    rg4_host.dependOn(&b.addRunArtifact(b.addTest(.{.root_module=qwen27,.filters=&.{"prompt RG4"}})).step);
+
     qwen_test_step.dependOn(&qwen_tests.step);
     const width_tests = b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{ "proposal width and parent depth", "width two depth one uses", "depth one siblings keep", "depth one sibling terminal", "width seven depth one", "a probability floor drops" } }));
     b.step("test-qwen27-width2-host", "Depth-one sibling topology and keep maps without a GPU").dependOn(&width_tests.step);

@@ -10,7 +10,14 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, prompt_rg4: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
+
+    fn promptRg4Eligible(key:Key,prompt:bool,rows:u32)bool{
+        return prompt and rows >= lane.reg_rows and key.kind == .projection and key.n == 34816 and key.k == 5120 and
+            key.slices == 1 and key.bits == 4 and key.group == 64 and key.lean and key.prompt_sr and key.swiglu and
+            key.batch == 8 and !key.rows8 and !key.sbi and !key.sbi12 and
+            key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+    }
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -70,6 +77,7 @@ pub const Kernels = struct {
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
+    prompt_rg4_available: std.AutoHashMapUnmanaged(Key,bool) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
@@ -96,10 +104,25 @@ pub const Kernels = struct {
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
+        k.prompt_rg4_available.deinit(k.allocator);
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
     }
+
+    fn promptKey(k:*Kernels,base:Key,rows:u32)!Key{
+        if(!base.promptRg4Eligible(k.prompt,rows))return base;
+        var selected=base;selected.prompt_rg4=true;
+        if(k.prompt_rg4_available.get(selected))|available|return if(available)selected else base;
+        var made=lane.Projection.init(k.allocator,k.device,.{.n=selected.n,.k=selected.k,.format=.{.bits=selected.bits,.group=selected.group},.sk=1,.precompute_sums=true,.reg=true,.prompt_sr=true,.tile_batch=selected.batch,.reg_lean=true,.swiglu=true,.prompt_rg4=true}) catch |err| {
+            std.log.info("qwen27: prompt RG4 unavailable ({t}); retaining original prompt GU",.{err});
+            try k.prompt_rg4_available.put(k.allocator,selected,false);return base;
+        };
+        const entry=k.lanes.getOrPut(k.allocator,selected) catch |err|{made.deinit();return err;};
+        if(entry.found_existing)made.deinit() else {entry.value_ptr.*=made;k.joined(entry.value_ptr);}
+        try k.prompt_rg4_available.put(k.allocator,selected,true);return selected;
+    }
+
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
         if (k.cache.get(key)) |p| return p;
@@ -182,7 +205,7 @@ pub const Kernels = struct {
         if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
         if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
-        const key = Key{
+        const base_key = Key{
             .kind = .projection,
             .n = p.n,
             .k = p.k,
@@ -194,6 +217,7 @@ pub const Kernels = struct {
             .batch = p.batch,
             .swiglu = true,
         };
+        const key=try k.promptKey(base_key,rows);
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
         errdefer span.cancel();
@@ -211,6 +235,7 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
+                .prompt_rg4 = key.prompt_rg4,
             });
             k.joined(entry.value_ptr);
         }
@@ -536,4 +561,11 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
     return if (key.k == 17408 or key.k == 6144) 2 else 1;
+}
+
+test "prompt RG4 private key excludes decode shortrows indexed and partial matrices" {
+ const good=Key{.kind=.projection,.n=34816,.k=5120,.slices=1,.lean=true,.prompt_sr=true,.batch=8,.swiglu=true};
+ try std.testing.expect(good.promptRg4Eligible(true,128));try std.testing.expect(good.promptRg4Eligible(true,2048));try std.testing.expect(!good.promptRg4Eligible(false,128));try std.testing.expect(!good.promptRg4Eligible(true,127));
+ inline for(.{.{"n",@as(u32,5120)},.{"k",@as(u32,17408)},.{"slices",@as(u32,2)},.{"batch",@as(u32,1)},.{"rows8",true},.{"sbi",true},.{"sbi12",true},.{"skip",@as(u32,1)},.{"cut",[2]u32{0,40}},.{"range",[2]u32{0,1}}})|change|{var bad=good;@field(bad,change[0])=change[1];try std.testing.expect(!bad.promptRg4Eligible(true,128));}
+ var selected=good;selected.prompt_rg4=true;var map=std.AutoHashMap(Key,bool).init(std.testing.allocator);defer map.deinit();try map.put(good,false);try map.put(selected,true);try std.testing.expectEqual(@as(u32,2),map.count());
 }

@@ -177,6 +177,8 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
     /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// PromptGU only: four independent M16 rowgroups in one512-thread group.
+    prompt_rg4: bool = false,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
     /// `indexed` as lane_projection.indexed12_layout.
@@ -202,6 +204,9 @@ pub const Layout = struct {
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
+        if (l.prompt_rg4 and (!l.reg or !l.swiglu or !l.prompt_sr or !l.reg_lean or l.rows8 or
+            l.serial_sk2 or l.sk != 1 or l.indexed or l.indexed12 or l.ranges.len != 0 or l.groups != null or
+            l.prompt_tn != 1)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
@@ -238,6 +243,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
+        if (l.prompt_rg4) return 32768;
         return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
     }
 
@@ -286,7 +292,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
-    try text.appendSlice(a, ks.core_lane_projection);
+    try text.appendSlice(a, if (l.prompt_rg4) ks.core_lane_prompt_rowgroups4 else ks.core_lane_projection);
     return text.toOwnedSlice(a);
 }
 
@@ -407,6 +413,8 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
+    /// PromptGU only: four independent M16 rowgroups in one512-thread group.
+    prompt_rg4: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -420,7 +428,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.prompt_rg4) @as(usize, 512) else if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -428,7 +436,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .prompt_rg4 = l.prompt_rg4 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -454,12 +462,13 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows)) return error.InvalidRows;
+        const xs_rows = try swigluSumsRows(rows, sums.stride, p.prompt_rg4);
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
         try checkRef(sb, p.metadata_bytes, 16);
-        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + xs_rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
         const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
         try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
@@ -471,7 +480,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
-        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.prompt_rg4) (rows + 63) / 64 else if (p.rows8) 1 else blocks, 1), mtl.Size.of(if (p.prompt_rg4) 512 else 128, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
@@ -696,4 +705,32 @@ test "reg order puts every code in the tensor op's right-input register for its 
     try bad.validate();
     bad.format.group = 128;
     try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
+test "prompt RG4 requires independent nonindexed prompt GU and reports full shared allocation" {
+ const valid=Layout{.n=34816,.k=5120,.format=.{.bits=4,.group=64},.sk=1,.precompute_sums=true,.reg=true,.prompt_sr=true,.reg_lean=true,.tile_batch=8,.swiglu=true,.prompt_rg4=true};
+ try valid.validate();try std.testing.expectEqual(@as(usize,32768),valid.threadgroupBytes());
+ inline for(.{.{"swiglu",false},.{"prompt_sr",false},.{"reg_lean",false},.{"rows8",true},.{"serial_sk2",true},.{"sk",@as(usize,2)},.{"indexed",true},.{"groups",@as(?[2]usize,[2]usize{0,40})}})|change|{var bad=valid;@field(bad,change[0])=change[1];try std.testing.expectError(error.InvalidSchedule,bad.validate());}
+ var ordinary=valid;ordinary.prompt_rg4=false;const a=std.testing.allocator;const original=try source(a,ordinary);defer a.free(original);const grouped=try source(a,valid);defer a.free(grouped);try std.testing.expect(!std.mem.eql(u8,original,grouped));
+}
+test "prompt RG4 row and padded-HS coverage agrees with128-row slices" {
+ for(1..2049)|total|{var first:usize=0;var seen:usize=0;while(first<total):(first+=reg_rows){const local=@min(total-first,reg_rows);const padded=std.mem.alignForward(usize,local,16);var hs_count:usize=0;for(0..(local+63)/64)|block|{const r0=block*64;const live=@min(local-r0,64);for(0..4)|rg|{const m=@min((local - r0) -| (@as(usize,16) * rg),16);for(0..m)|row|{const abs=first+r0+rg*16+row;try std.testing.expect(abs<total);seen+=1;}}const writes=@min(64,padded-r0);try std.testing.expect(writes>=live and r0+writes<=padded);hs_count+=writes;}try std.testing.expectEqual(padded,hs_count);}try std.testing.expectEqual(total,seen);}
+}
+
+/// New prompt RG4 reads both row halves of each live M16 block; default paths retain their old public bounds.
+fn swigluSumsRows(rows:u32,stride:u32,padded:bool)!u32{
+    if(rows==0 or rows>reg_rows)return error.InvalidRows;
+    const required=if(padded)16*((rows+15)/16) else rows;
+    if(stride<required)return error.InvalidRows;
+    return required;
+}
+test "prompt RG4 supplied sums cover padded rows while default bounds remain unchanged" {
+    try std.testing.expectError(error.InvalidRows,swigluSumsRows(17,17,true));
+    try std.testing.expectEqual(@as(u32,32),try swigluSumsRows(17,32,true));
+    try std.testing.expectEqual(@as(u32,17),try swigluSumsRows(17,17,false));
+    try std.testing.expectError(error.InvalidRows,swigluSumsRows(0,16,true));
+    try std.testing.expectError(error.InvalidRows,swigluSumsRows(129,144,true));
+    for(1..129)|rows|{const r:u32=@intCast(rows);const padded=16*((r+15)/16);try std.testing.expectEqual(padded,try swigluSumsRows(r,padded,true));if(padded>r)try std.testing.expectError(error.InvalidRows,swigluSumsRows(r,r,true));}
+    // Last41 rows of a1065-row fullstride buffer: the paddedXS check reaches exactly its last element.
+    try std.testing.expectEqual(@as(usize,80*1072-1024),@as(usize,79*1072)+try swigluSumsRows(41,1072,true));
 }

@@ -150,6 +150,7 @@ pub const flashnext_gen = @import("flashnext/sources_gen.zig");
 /// Nemotron's packed kernels prebuilt as one metallib, for a macOS whose runtime compiler refuses uint4b_format.
 pub const packed_metallib = @import("nemotron_packed_metallib").bytes;
 /// The core lane projection (tensor units): every window row's sums in one weight read, and its row order.
+pub const core_lane_prompt_rowgroups4 = @embedFile("core/lane_prompt_rowgroups4.metal");
 pub const core_lane_projection = @embedFile("core/lane_projection.metal");
 pub const core_lane_order = @embedFile("core/lane_order.metal");
 /// Lane rows attending a shared context through an explicit mask (core/shared_attention.zig).

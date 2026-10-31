@@ -47,11 +47,6 @@ pub fn promptSplit(n: usize, k: usize) ?u32 {
 }
 
 pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32) !Linear {
-    return prepareForced(device, allocator, owned, parts, tile, null);
-}
-
-/// The same matrix with `forced` adjacent tiles interleaved instead of `tileBatch`'s count.
-pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32) !Linear {
     if (tile != 32 or parts.len == 0) return error.BadProjectionShape;
     const bits = parts[0].bits;
     const group = parts[0].group;
@@ -69,7 +64,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
     if (!device.tensorUnits() or n % tile != 0) return prepareRows(device, allocator, owned, parts, n, k, tile, slices);
     if (bits != 4 or group != 64) return prepareLanes(device, allocator, owned, parts, n, k, tile, slices);
     slices = m5Split(n, k) orelse slices;
-    const batch: usize = forced orelse tileBatch(n, k);
+    const batch: usize = tileBatch(n, k);
     const stored = storedColumns(n, @intCast(batch));
     const w = try device.buffer(stored * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     owned.append(allocator, w) catch |err| {

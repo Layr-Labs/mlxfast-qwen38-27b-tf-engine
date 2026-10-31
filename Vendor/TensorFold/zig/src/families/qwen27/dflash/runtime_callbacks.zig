@@ -48,6 +48,7 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         try encodePrepared(b, e, x, y, adapter);
         return y;
     }
+    e.barrier();
     return y;
 }
 /// A prepared adapter's projection of `x` into `y`, sharing the input sums of an earlier projection of the same view.

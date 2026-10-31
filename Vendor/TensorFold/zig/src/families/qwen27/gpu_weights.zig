@@ -21,9 +21,6 @@ pub const Weights = struct {
     embed: projection.Triple,
     norm: Tensor,
     head: Linear,
-    /// The same matrix with eight adjacent tiles interleaved: a decoded round's head projection reads this one, and
-    /// a prompt's last row (and the drafter's span slice) the unbatched `head`.
-    head_decode: Linear,
     owned: std.ArrayList(mtl.Buffer) = .empty,
     runs: std.ArrayList([]projection.Run) = .empty,
 
@@ -94,11 +91,6 @@ const Builder = struct {
 
     /// `parts` (stacked in order, `n` rows of `k` each, at their widths) staged from the files and repacked.
     fn linear(b: Builder, parts: []const Part, k: usize) !Linear {
-        return b.linearForced(parts, k, null);
-    }
-
-    /// The same matrix prepared with `forced` adjacent tiles interleaved (see projection.prepareForced).
-    fn linearForced(b: Builder, parts: []const Part, k: usize, forced: ?u32) !Linear {
         var arena = std.heap.ArenaAllocator.init(b.allocator);
         defer arena.deinit();
         const names = try arena.allocator().alloc([]const u8, parts.len * 3);
@@ -119,20 +111,16 @@ const Builder = struct {
                 .group = p.w.group,
             };
         }
-        return b.stackForced(triples[0..parts.len], forced);
+        return b.stack(triples[0..parts.len]);
     }
 
     /// Fused members of one width take one matrix as before; a mixed stack becomes one matrix a member.
     fn stack(b: Builder, parts: []const projection.Triple) !Linear {
-        return b.stackForced(parts, null);
-    }
-
-    fn stackForced(b: Builder, parts: []const projection.Triple, forced: ?u32) !Linear {
         var ws: [3]Width = undefined;
         for (parts, 0..) |p, i| ws[i] = .{ .bits = p.bits, .group = @intCast(p.group) };
         var buf: [3][2]usize = undefined;
         const list = widths.runs(ws[0..parts.len], &buf);
-        if (list.len == 1) return projection.prepareForced(b.device, b.allocator, b.owned, parts, 32, forced);
+        if (list.len == 1) return projection.prepare(b.device, b.allocator, b.owned, parts, 32);
         const runs = try b.allocator.alloc(projection.Run, list.len);
         b.runs.append(b.allocator, runs) catch |err| {
             b.allocator.free(runs);
@@ -140,7 +128,7 @@ const Builder = struct {
         };
         var first: u32 = 0;
         for (list, runs) |r, *run| {
-            run.* = .{ .linear = try projection.prepareForced(b.device, b.allocator, b.owned, parts[r[0]..][0..r[1]], 32, forced), .first = first };
+            run.* = .{ .linear = try projection.prepare(b.device, b.allocator, b.owned, parts[r[0]..][0..r[1]], 32), .first = first };
             first += run.linear.n;
         }
         var fused = runs[0].linear;
@@ -216,19 +204,12 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     const embed = try b.quant("model.embed_tokens", c.vocab, c.hidden, ws.embed);
     const norm = try b.tensor("model.norm.weight", .bf16, &.{c.hidden});
     const head = try b.linear(&.{.{ .module = "lm_head", .n = c.vocab, .w = ws.head }}, c.hidden);
-    // A decoded round's head is the largest single matrix the round streams and the only decode shape `tileBatch`
-    // leaves unbatched. It takes its own copy with eight adjacent tiles interleaved, the order every other decode
-    // shape reads, while `head` keeps the row order the drafter slices 98,592 of its rows in (runtime_head.zig).
-    const batched_head = device.tensorUnits() and ws.head.bits == 4 and ws.head.group == 64 and c.vocab % 32 == 0;
-    const head_decode = if (batched_head) try b.linearForced(&.{.{ .module = "lm_head", .n = c.vocab, .w = ws.head }}, c.hidden, 8) else head;
-    var extra: ?Linear = null;
-    if (batched_head) extra = head_decode;
-    if (device.tensorUnits()) try laneOrder(allocator, device, layers, head, extra);
-    return .{ .allocator = allocator, .layers = layers, .embed = embed, .norm = norm, .head = head, .head_decode = head_decode, .owned = owned, .runs = runs };
+    if (device.tensorUnits()) try laneOrder(allocator, device, layers, head);
+    return .{ .allocator = allocator, .layers = layers, .embed = embed, .norm = norm, .head = head, .owned = owned, .runs = runs };
 }
 
 /// Tensor-unit projections leave load in lane_projection.reg_layout, the order quant_gpu's reg kernel reads.
-fn laneOrder(a: std.mem.Allocator, device: mtl.Device, layers: []const Layer, head: Linear, extra: ?Linear) !void {
+fn laneOrder(a: std.mem.Allocator, device: mtl.Device, layers: []const Layer, head: Linear) !void {
     var jobs: std.ArrayList(lane.Order) = .empty;
     defer jobs.deinit(a);
     for (layers) |l| {
@@ -239,7 +220,6 @@ fn laneOrder(a: std.mem.Allocator, device: mtl.Device, layers: []const Layer, he
         for (list) |p| try regJobs(a, &jobs, p);
     }
     try regJobs(a, &jobs, head);
-    if (extra) |p| try regJobs(a, &jobs, p);
     try lane.regOrder(device, jobs.items);
 }
 
