@@ -47,6 +47,8 @@ pub const Runner = struct {
     active: ?[32]u8 = null,
     failed: bool = false,
     capture_taps: bool = false,
+    /// Each attention layer's own keep K/V lanes, made at the first moving keep: the 16 gathers then run side by side.
+    keep_lanes: ?mtl.Buffer = null,
     accepted_chain: bool = false,
     last_gpu_seconds: f64 = 0,
     current_round: ?*const Round = null,
@@ -325,29 +327,58 @@ pub const Runner = struct {
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
         const rows = @import("core").tree_commit_gpu.Ref{ .buf = m.kept_rows.buffer, .off = m.kept_rows.offset };
         try ops.metadata(e, result, keep_ref, rows, null, p);
+        // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
+        // copy every kept row onto itself
+        const moves = !chainWindow(round.windows[0].parents);
+        // every attention layer's keep map beside the GDN metadata, under its one barrier: each map is its own binding's
+        // buffer, and the shared keep/rows words they rewrite hold the same values the first dispatch writes
+        if (moves) {
+            var ai: usize = 0;
+            for (r.model.weights.layers) |layer| switch (layer.mixer) {
+                .linear => {},
+                .attention => {
+                    var views: [attn.planning.max_streams]attn.Cache = undefined;
+                    const caches = r.layerCaches(ai, round, &views);
+                    try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
+                    const map = r.bindings[ai].get(.keep_map);
+                    try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
+                    ai += 1;
+                },
+            };
+        }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
         e.barrier();
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
-        e.barrier();
-        // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
-        // copy every kept row onto itself
-        if (chainWindow(round.windows[0].parents)) return;
+        // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
+        if (!moves) return e.barrier();
+        const g = r.scratch.limits.geometry;
+        const lane = @as(usize, r.scratch.limits.rows) * g.kv_heads * g.dim * 2;
+        const lanes = r.keep_lanes orelse made: {
+            const buffer = try r.model.device.buffer(lane * 2 * r.bindings.len, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            r.owned.append(r.allocator, buffer) catch |err| {
+                buffer.deinit();
+                return err;
+            };
+            r.keep_lanes = buffer;
+            break :made buffer;
+        };
+        e.useResource(lanes, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        // every layer gathers into its own lanes under one barrier, then every layer scatters under one more
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
             .attention => {
                 var views: [attn.planning.max_streams]attn.Cache = undefined;
                 const caches = r.layerCaches(ai, round, &views);
-                try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
-                const map = r.bindings[ai].get(.keep_map);
-                try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
-                e.barrier();
-                try r.attention.keep(e, &r.scratch, &r.bindings[ai], p.rows, caches);
+                try r.attention.keepGather(e, &r.bindings[ai], p.rows, caches, .{ .buffer = lanes, .offset = 2 * ai * lane }, .{ .buffer = lanes, .offset = (2 * ai + 1) * lane });
                 ai += 1;
             },
         };
+        e.barrier();
+        for (r.bindings[0..ai], 0..) |*binding, i| r.attention.keepScatter(e, binding, p.rows, .{ .buffer = lanes, .offset = 2 * i * lane }, .{ .buffer = lanes, .offset = (2 * i + 1) * lane });
+        e.barrier();
     }
 
     /// Whether every row's parent is the row before it (a chain), so any kept path is a prefix of the rows.
