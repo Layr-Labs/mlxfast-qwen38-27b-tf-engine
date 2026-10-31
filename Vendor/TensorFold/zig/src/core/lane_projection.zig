@@ -43,6 +43,8 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
     /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
+    tile_batch: usize = 1,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -59,6 +61,7 @@ pub const Layout = struct {
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.swiglu and (!l.rows8 or !l.serial_sk2 or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
+        if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -131,6 +134,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
+    if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
