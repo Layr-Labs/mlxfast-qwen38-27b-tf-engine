@@ -89,10 +89,32 @@ pub const Model = struct {
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
         m.frame = try Frame.init(m.device, c, @max(rows, promptRows(if (later) 0 else m.device.generation())));
         errdefer m.frame.deinit();
+        if (m.device.tensorUnits()) {
+            const shapes = decodeShapes(m.weights);
+            m.kernels.gateDepth(m.queue, &shapes) catch |err| std.log.info("qwen27: decode depth gate skipped ({s})", .{@errorName(err)});
+        }
         m.ane = null;
         m.share_pending = true;
         if (!later) try m.finishShare(null, share_fits);
         return m;
+    }
+
+    /// One of each decoded-row projection shape: a linear-attention layer's, an attention layer's and the head.
+    fn decodeShapes(w: wts.Weights) [11]@FieldType(wts.Weights, "head") {
+        var out: [11]@FieldType(wts.Weights, "head") = @splat(w.head);
+        var seen_linear = false;
+        var seen_attention = false;
+        for (w.layers) |l| switch (l.mixer) {
+            .linear => |g| if (!seen_linear) {
+                out[0..5].* = .{ g.qkv, g.zba, g.out, l.gu, l.down };
+                seen_linear = true;
+            },
+            .attention => |t| if (!seen_attention) {
+                out[5..10].* = .{ t.q, t.kv, t.out, l.gu, l.down };
+                seen_attention = true;
+            },
+        };
+        return out;
     }
 
     /// A deferred share takes at most `room` bytes; zero refuses it, and decided models stay as they are.
