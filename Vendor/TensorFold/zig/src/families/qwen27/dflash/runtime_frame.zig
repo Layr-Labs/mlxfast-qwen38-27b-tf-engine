@@ -97,6 +97,10 @@ pub const Frame = struct {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
         f.encoder.end();
         f.cb.commit();
+        while (true) switch (f.cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         f.cb.wait();
         f.completed = true;
         for (f.parts[0..f.part_count]) |cb| {

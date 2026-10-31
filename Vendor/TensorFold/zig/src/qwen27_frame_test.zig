@@ -15,6 +15,8 @@ test "qwen27 bank: narrow rounds bind narrow activations without changing the wi
     const wide = frame.get(.mixed).buffer;
     const logits = frame.get(.logits).buffer.id;
     const positions = frame.get(.positions).buffer.id;
+    const post_dims = frame.get(.last_post_dims).buffer;
+    try std.testing.expect(post_dims.id != frame.get(.dims).buffer.id);
     const ids: [2048]u32 = @splat(0);
     const pos: [2048]i32 = @splat(0);
     const calls = allocations.calls;
@@ -32,6 +34,9 @@ test "qwen27 bank: narrow rounds bind narrow activations without changing the wi
         try std.testing.expectEqual(positions, frame.get(.positions).buffer.id);
         try std.testing.expectEqual(@as(u32, 2048), frame.capacity);
         try std.testing.expectEqual(@as(i32, @intCast(rows)), frame.get(.dims).buffer.slice(i32, 8)[0]);
+        // Narrowing the final post stage must never mutate dimensions read by an earlier full-row dispatch.
+        try std.testing.expectEqual(post_dims.id, frame.get(.last_post_dims).buffer.id);
+        try std.testing.expectEqualSlices(i32, &.{ 1, 16, 0, 0, 0, 0, 0, 0 }, frame.get(.last_post_dims).buffer.slice(i32, 8));
         try std.testing.expectEqual(calls, allocations.calls);
     }
     const last = frame.get(.mixed).buffer.id;

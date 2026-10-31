@@ -167,7 +167,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.initWithSmall(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o, true);
             try @import("../residency.zig").putPrepared(b, key, adapter);
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
@@ -211,7 +211,7 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.initWithSmall(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order, true);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
