@@ -21,15 +21,38 @@ pub const Head = struct {
         const input_words = if (source.raw) |raw| raw.w else source.words.buffer;
         const input_offset = if (source.raw) |raw| raw.w_off else source.words.offset;
         const groups = k / source.group;
-        const words = try head.allocate(device, width * row);
+        // a tensor-unit head leaves load in interleaved code blocks of `batch` tiles (u32[N/32/B][K/64][B][2][32 lanes][4]):
+        // the copy keeps that order, so the trimmed head launches at the same batch and streams its own blocks interleaved
+        const batch: usize = if (source.raw == null) source.batch else 1;
+        const words = try head.allocate(device, projection.storedColumns(width, @intCast(batch)) * row);
         var destination: usize = 0;
-        for (spans) |span| {
-            const rows = span[1] - span[0];
-            const first = input_offset + @as(usize, span[0]) * row;
-            @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
-            destination += rows;
+        if (batch == 1) {
+            for (spans) |span| {
+                const rows = span[1] - span[0];
+                const first = input_offset + @as(usize, span[0]) * row;
+                @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
+                destination += rows;
+            }
+        } else {
+            // one tile a block: 32 rows of each group's codes, 64 uint4 at a tile's stride inside its batch's group
+            @memset(words.contents()[0..words.length()], 0);
+            const block = row / groups * 32;
+            var tiles: usize = 0;
+            for (spans) |span| {
+                const first: usize = span[0] / 32;
+                for (0..@as(usize, (span[1] - span[0]) / 32)) |i| {
+                    const source_tile: usize = first + i;
+                    for (0..groups) |g| {
+                        const from = input_offset + ((source_tile / batch) * groups + g) * batch * block + (source_tile % batch) * block;
+                        const to = ((tiles / batch) * groups + g) * batch * block + (tiles % batch) * block;
+                        @memcpy(words.contents()[to..][0..block], input_words.contents()[from..][0..block]);
+                    }
+                    tiles += 1;
+                }
+            }
         }
         head.linear.n = width;
+        head.linear.batch = @intCast(batch);
         head.linear.index = null;
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
