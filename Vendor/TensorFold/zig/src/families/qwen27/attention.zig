@@ -460,31 +460,6 @@ pub const Attention = struct {
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
         e.barrier();
     }
-    /// `keep`'s gather into a caller's own K/V lanes, without barriers: layers with distinct lanes gather side by side.
-    pub fn keepGather(a: *const Attention, e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache, keys: Ref, values: Ref) !void {
-        if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
-        try binding.checkCaches(caches);
-        const g = binding.limits.geometry;
-        for (binding.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        if (kept == 0) return;
-        for (caches) |cache| {
-            e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-            e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        }
-        e.setPipeline(a.io[5]);
-        bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
-        e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
-    }
-    /// `keep`'s scatter from the lanes `keepGather` filled, without barriers.
-    pub fn keepScatter(a: *const Attention, e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, keys: Ref, values: Ref) void {
-        if (kept == 0) return;
-        const g = binding.limits.geometry;
-        e.setPipeline(a.io[6]);
-        bind(e, .{ keys, values, binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
-        e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
-    }
 };
 test "cache and pack descriptors match native pointer and seven-word ABI" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(CachePtrs));

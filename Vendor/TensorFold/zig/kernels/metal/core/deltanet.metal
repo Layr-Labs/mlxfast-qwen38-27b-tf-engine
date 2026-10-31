@@ -453,6 +453,20 @@ kernel void tf_delta_gdn_chain(device const bfloat* query [[buffer(0)]],
 // Prompt chains (may differ in bits from decode): 8 lanes a pair of value columns, 16 key channels of both each; dk = 128.
 // Each column keeps its in-order 16-channel sums and xor 1, 2, 4 tree; the pair shares k and q, converted once a row.
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
+// One prompt row's scan inputs for a lane: its 16 key and query channels, its two value words, decay and mixing.
+inline void tf_delta_wide_inputs(device const bfloat* query, device const bfloat* key, device const bfloat* value,
+    device const float* decay, device const bfloat* mixing, constant TfDeltaParams& p, uint row, uint head, uint key_head,
+    uint dimension, uint sub, thread bfloat* k, thread bfloat* q, thread bfloat* v, thread float& d, thread bfloat& m) {
+  const uint at = row * p.nv + head;
+  device const bfloat* kr = key + (row * p.nk + key_head) * p.dk + sub * 16;
+  device const bfloat* qr = query + (row * p.nk + key_head) * p.dk + sub * 16;
+  TF_UNROLL for (uint i = 0; i < 16; ++i) k[i] = kr[i];
+  TF_UNROLL for (uint i = 0; i < 16; ++i) q[i] = qr[i];
+  v[0] = value[at * p.dv + dimension];
+  v[1] = value[at * p.dv + dimension + 1];
+  d = decay[at];
+  m = mixing[at];
+}
 template <bool M>
 inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     device const bfloat* key,
@@ -476,13 +490,17 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
   float state[2][16]; // state[c]: value column dimension + c, its words at column + c * p.dk
   TF_UNROLL for (uint c = 0; c < 2; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + c * p.dk + i];
+  // A row's inputs are read one row ahead, under the previous row's recurrence: the same words, so the same arithmetic.
+  bfloat kn[16], qn[16], vn[2], mn = bfloat(0.0f);
+  float dn = 0.0f;
+  if (span.rows > 0) tf_delta_wide_inputs(query, key, value, decay, mixing, p, span.first, head, key_head, dimension, sub, kn, qn, vn, dn, mn);
   for (uint node = 0; node < span.rows; ++node) {
     const uint row = span.first + node, at = row * p.nv + head;
-    device const bfloat* k = key + (row * p.nk + key_head) * p.dk + sub * 16;
-    device const bfloat* q = query + (row * p.nk + key_head) * p.dk + sub * 16;
     float kf[16], qf[16], remembered[2] = {0.0f, 0.0f}, correction[2], result[2] = {0.0f, 0.0f};
-    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
-    const float forget = decay[at];
+    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(kn[i]);
+    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(qn[i]);
+    const float forget = dn, mix = float(mn), incoming[2] = {float(vn[0]), float(vn[1])};
+    if (node + 1 < span.rows) tf_delta_wide_inputs(query, key, value, decay, mixing, p, row + 1, head, key_head, dimension, sub, kn, qn, vn, dn, mn);
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < 2; ++c) {
         state[c][i] = state[c][i] * forget;
@@ -490,9 +508,7 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
       }
     TF_UNROLL for (uint step = 1; step < 8; step <<= 1)
       TF_UNROLL for (uint c = 0; c < 2; ++c) remembered[c] += simd_shuffle_xor(remembered[c], step);
-    const float mix = float(mixing[at]);
-    TF_UNROLL for (uint c = 0; c < 2; ++c) correction[c] = (float(value[at * p.dv + dimension + c]) - remembered[c]) * mix;
-    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
+    TF_UNROLL for (uint c = 0; c < 2; ++c) correction[c] = (incoming[c] - remembered[c]) * mix;
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < 2; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
