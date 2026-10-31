@@ -3,6 +3,8 @@ const std = @import("std");
 const mtl = @import("metal");
 const profile = @import("core").gpu_profile;
 const Ref = @import("projection.zig").Ref;
+/// The out projection's group sums the merge writes: XS[group * stride + row] (quant_gpu.Sums' layout).
+pub const Sums = struct { ref: Ref, stride: u32 };
 const glue = @import("glue.zig");
 pub const planning = @import("attention_plan.zig");
 pub const Plan = planning.Plan;
@@ -310,8 +312,9 @@ pub const Attention = struct {
     }
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
-    /// q27_attn_pack_a stays out; the prompt path only.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool) !void {
+    /// q27_attn_pack_a stays out; the prompt path only. `sums` (decoded rows only): the merge also writes the out
+    /// projection's group sums of `out` there, so that projection dispatches no sums pass of its own.
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -331,6 +334,10 @@ pub const Attention = struct {
         if (raw_gate) |gate| {
             try span(gate, 2 * q_bytes);
             try disjoint(out, q_bytes, gate, 2 * q_bytes);
+        }
+        if (sums) |s| {
+            if (s.stride < plan.rows or a.promptPath(plan, prompt)) return error.TargetAttentionShape;
+            try span(s.ref, ((@as(usize, g.heads) * g.dim / 64 - 1) * s.stride + plan.rows) * 4);
         }
         const operands = [_]struct { ref: Ref, bytes: usize }{ .{ .ref = q, .bytes = q_bytes }, .{ .ref = k, .bytes = kv_bytes }, .{ .ref = v, .bytes = v_bytes }, .{ .ref = out, .bytes = q_bytes } };
         for (caches) |cache| for (operands) |operand| {
@@ -365,7 +372,7 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -396,7 +403,7 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
@@ -407,7 +414,9 @@ pub const Attention = struct {
         e.barrier();
         const scale: f32 = 0.0625;
         if (plan.prefix_chunks > 0) {
-            const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else 4); // a pair a tile; a long cache reads each chunk once for six tiles
+            // a pair a tile: a long cache reads each chunk once for six tiles; a short one (under 16 chunks) has too few
+            // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
+            const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
             e.setPipeline(a.prefix[sg - 1]);
             bind(e, .{ scratch.get(.qa), binding.get(.caches) });
             e.setValue(scale, 2);
@@ -435,6 +444,9 @@ pub const Attention = struct {
         e.setPipeline(a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 10);
+        const xs = if (sums) |s| s.ref else out;
+        e.setBuffer(xs.buffer, xs.offset, 11);
+        e.setValue(@as(u32, if (sums) |s| s.stride else 0), 12);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }

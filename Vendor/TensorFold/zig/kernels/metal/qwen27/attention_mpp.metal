@@ -268,6 +268,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device const float* POB [[buffer(3)]], device const float* PMB [[buffer(4)]], device const float* PLB [[buffer(5)]],
     device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
     device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
+    device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
@@ -323,5 +324,15 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
       const float gate = float(QG[((int64_t)node * (G * 4) + h) * 2 * D + D + lane * DP + i]);
       OUT[index] = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
     } else OUT[index] = v;
+  }
+  if (sums_stride != 0) {
+    simdgroup_barrier(mem_flags::mem_device);
+    if ((lane & 7) == 0) {
+      const int col = h * D + int(lane) * DP;
+      const int64_t at = (int64_t)node * (G * 4) * D + col;
+      float acc = 0.0f;
+      for (int i = 0; i < 64; i++) acc += float(OUT[at + i]);
+      XS[(int64_t)(col / 64) * sums_stride + node] = acc;
+    }
   }
 }
