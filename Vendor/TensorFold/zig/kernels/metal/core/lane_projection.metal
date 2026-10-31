@@ -15,6 +15,9 @@ using namespace mpp::tensor_ops;
 #ifndef TF_YS
 #define TF_YS TF_N
 #endif
+#ifndef TF_TPG
+#define TF_TPG 1
+#endif
 // Output rows lie TF_YS elements apart, so a member of a fused stack writes its columns of the fused rows.
 #define TF_ODD_WORDS (TF_GROUP * TF_BITS / 32 % 2)
 
@@ -284,17 +287,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
 #else
-[[max_total_threads_per_threadgroup(32 * TF_SK)]]
+[[max_total_threads_per_threadgroup(32 * TF_SK * TF_TPG)]]
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
-  const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+  const int r0 = int(tg.x) * 16, rows = mdims[0] - r0; // row blocks fastest: a tile's codes stay in cache for every block
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
   Y += (size_t)r0 * TF_YS;
   XS += r0;
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
+  // TF_TPG tiles per threadgroup over the same 16 rows: their X reads share the threadgroup's L1
+#if TF_TPG > 1
+  const int sub = int(sgi) / TF_SK, tj = int(tg.y) * TF_TPG + sub;
+  const bool live = tj < mdims[2];
+#else
+  constexpr int sub = 0;
+  const int tj = int(tg.y);
+  constexpr bool live = true;
+#endif
+  const int lane = int(lanei), ks = int(sgi) % TF_SK, M = min(rows, 16), stride = mdims[1], tile = tf_tile(live ? tj : 0), n0 = tile * NT;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
@@ -316,8 +328,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
   tf_reg_load next = {};
-  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
-  for (int g = first; g < last; g++) {
+  if (live && first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
+  for (int g = first; live && g < last; g++) {
     const tf_reg_load cur = next;
     for (int w = 0; w < 8; w++) {
       // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
@@ -345,14 +357,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
 #else
-  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+  threadgroup float part_all[TF_TPG][(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+  threadgroup float* part = part_all[sub];
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
-  if (ks == 0)
+  if (live && ks == 0)
     for (int i = 0; i < 16; i++) {
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
