@@ -10,12 +10,17 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, live_partials8: bool = false,
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
         const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
         return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
+
+    fn livePartials8(key: Key, rows: u32) bool {
+        const shape = (key.n == 5120 and (key.k == 17408 or key.k == 6144)) or (key.n == 6240 and key.k == 5120);
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.slices == 4 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and rows >= 1 and rows <= 8;
     }
 };
 
@@ -49,6 +54,43 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
+test "live partials8 admits exact three tuples and keeps cache and fallback guards" {
+    for ([_][2]u32{ .{ 5120, 17408 }, .{ 6240, 5120 }, .{ 5120, 6144 } }) |shape| {
+        const selected = Key{ .kind = .projection, .n = shape[0], .k = shape[1], .slices = 4 };
+        for (1..9) |rows| try std.testing.expect(selected.livePartials8(@intCast(rows)));
+        for ([_]u32{ 0, 9, 16, 128 }) |rows| try std.testing.expect(!selected.livePartials8(rows));
+        try std.testing.expect(!selected.serialSk2());
+        inline for (.{
+            .{ "kind", Kind.mlp },      .{ "bits", @as(u8, 8) },    .{ "group", @as(u32, 128) },
+            .{ "slices", @as(u32, 1) }, .{ "slices", @as(u32, 2) }, .{ "slices", @as(u32, 8) },
+            .{ "skip", @as(u32, 1) },   .{ "cut", [2]u32{ 1, 0 } }, .{ "cut", [2]u32{ 0, 20 } },
+        }) |change| {
+            var excluded = selected;
+            @field(excluded, change[0]) = change[1];
+            try std.testing.expect(!excluded.livePartials8(2));
+        }
+        var compact = selected;
+        compact.live_partials8 = compact.livePartials8(2);
+        var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+        defer cache.deinit();
+        try cache.put(selected, false);
+        try cache.put(compact, true);
+        try std.testing.expectEqual(@as(u32, 2), cache.count());
+        try std.testing.expect(!cache.get(selected).? and cache.get(compact).?);
+        var prompt = selected;
+        prompt.slices = projection.promptSplit(prompt.n, prompt.k) orelse prompt.slices;
+        try std.testing.expectEqual(shape[0] == 6240, prompt.livePartials8(2));
+    }
+    // These include every excluded cross-pair of the admitted N and K sets.
+    for ([_][2]u32{ .{ 5120, 5120 }, .{ 6240, 17408 }, .{ 6240, 6144 }, .{ 17408, 5120 }, .{ 34816, 5120 }, .{ 5120, 4096 } }) |shape| {
+        const excluded = Key{ .kind = .projection, .n = shape[0], .k = shape[1], .slices = 4 };
+        try std.testing.expect(!excluded.livePartials8(2));
+    }
+    try std.testing.expectEqual(@as(?u32, null), projection.promptSplit(6240, 5120));
+    try std.testing.expectEqual(@as(?u32, 2), projection.promptSplit(5120, 17408));
+    try std.testing.expectEqual(@as(?u32, 2), projection.promptSplit(5120, 6144));
+}
+
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
 pub const Kernels = struct {
@@ -202,14 +244,15 @@ pub const Kernels = struct {
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        key.live_partials8 = key.livePartials8(rows);
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .live_partials8 = key.live_partials8 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
