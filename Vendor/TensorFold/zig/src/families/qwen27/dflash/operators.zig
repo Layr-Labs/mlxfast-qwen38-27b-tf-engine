@@ -81,6 +81,10 @@ pub const Ops = struct {
         context_abort: *const fn (*anyopaque, u64) void,
         // a batched pass's stream k.
         stream_append: *const fn (*anyopaque, u64, u32, u32, View, View, []const u64) anyerror!void,
+        // one projection of a fused weight group (kind 1: k+v, 2: q+k+v, 3: gate+up) keyed by the group's first tensor; null: not fused
+        project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
+        // columns [first, first + width) of a view, an alias in the frame
+        slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
     };
 };
 
