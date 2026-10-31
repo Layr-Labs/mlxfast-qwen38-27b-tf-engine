@@ -183,7 +183,7 @@ pub const Layout = struct {
     indexed12: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
-    /// Prompt-row reg launches: 2 puts two adjacent tiles in a SIMD group, sharing each group's activation registers.
+    /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
 
     pub fn validate(l: Layout) !void {
@@ -207,7 +207,7 @@ pub const Layout = struct {
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.swiglu or l.serial_sk2 or l.ranges.len != 0 or
-            l.prompt_tn != 2 or l.tileCount() % l.prompt_tn != 0)) return error.InvalidSchedule;
+            (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or l.tileCount() % l.prompt_tn != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;

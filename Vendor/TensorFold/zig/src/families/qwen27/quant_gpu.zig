@@ -532,8 +532,13 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+/// 5120-deep mixer inputs (attention query+gate, GDN qkv) and the split-K MLP down and attention output, one elsewhere.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
-    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
+    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2()) return 1;
+    // the 5120-deep mixer inputs (attention query+gate, GDN qkv): two tiles a SIMD group share each activation load
+    if (key.k == 5120 and (n == 12288 or n == 10240) and key.batch % 2 == 0) return 2;
+    if (key.slices != 2 or n != 5120) return 1;
+    if (key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
     return if (key.k == 17408 or key.k == 6144) 2 else 1;
 }
+

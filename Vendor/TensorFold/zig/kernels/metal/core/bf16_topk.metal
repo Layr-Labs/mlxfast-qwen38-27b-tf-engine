@@ -28,6 +28,34 @@ inline void tf_topk_sift(thread uint* key, thread uint* id, thread uint* bits, u
     tf_topk_swap(key, id, bits, at, child); at = child;
   }
 }
+// A rank's tournament: each SIMD group's best candidate by xor shuffles (the same "before" order), then the group bests
+// through threadgroup memory, one barrier a rank (rank parity picks the half of `keys` it writes).
+struct TfCand { uint key, id, bits; };
+inline TfCand tf_simd_best(TfCand c) {
+  for (ushort step = 16; step > 0; step >>= 1) {
+    const TfCand o = { simd_shuffle_xor(c.key, step), simd_shuffle_xor(c.id, step), simd_shuffle_xor(c.bits, step) };
+    if (tf_topk_before(o.key, o.id, c.key, c.id)) c = o;
+  }
+  return c;
+}
+inline TfCand tf_tg_best(TfCand c, uint lane, uint rank, threadgroup uint* keys, threadgroup uint* ids, threadgroup uint* score_bits) {
+  const TfCand b = tf_simd_best(c);
+  const uint hb = (rank & 1) * (TF_TOPK_LANES / 32);
+  if ((lane & 31) == 0) { keys[hb + lane / 32] = b.key; ids[hb + lane / 32] = b.id; score_bits[hb + lane / 32] = b.bits; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  TfCand w = { keys[hb], ids[hb], score_bits[hb] };
+  for (uint g = 1; g < TF_TOPK_LANES / 32; g++)
+    if (tf_topk_before(keys[hb + g], ids[hb + g], w.key, w.id)) w = { keys[hb + g], ids[hb + g], score_bits[hb + g] };
+  return w;
+}
+inline uint tf_tg_or(uint m, uint lane, threadgroup uint* masks) {
+  const uint s = simd_or(m);
+  if ((lane & 31) == 0) masks[lane / 32] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint all = 0;
+  for (uint g = 0; g < TF_TOPK_LANES / 32; g++) all |= masks[g];
+  return all;
+}
 // The scan, local heaps and tournament over tokens [begin, end) of one row, into one Row.
 inline void tf_topk_span(const device ushort* logits, device Row& out, ulong begin, ulong end, constant Params& p,
                          uint lane, threadgroup uint* keys, threadgroup uint* ids, threadgroup uint* score_bits,
@@ -63,27 +91,14 @@ inline void tf_topk_span(const device ushort* logits, device Row& out, ulong beg
     tf_topk_swap(local_key, local_id, local_bits, 0, last - 1);
     tf_topk_sift(local_key, local_id, local_bits, last - 1);
   }
+  const uint all = tf_tg_or(mask, lane, masks);
+  if (all != 0) { if (lane == 0) out.nonfinite = all; return; }
   uint cursor = 0;
   for (uint rank = 0; rank < p.k; rank++) {
-    keys[lane] = cursor < p.k ? local_key[cursor] : 0;
-    ids[lane] = cursor < p.k ? local_id[cursor] : 0xffffffffu;
-    score_bits[lane] = cursor < p.k ? local_bits[cursor] : 0;
-    masks[lane] = mask;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = TF_TOPK_LANES / 2; step > 0; step >>= 1) {
-      if (lane < step) {
-        if (tf_topk_before(keys[lane + step], ids[lane + step], keys[lane], ids[lane])) {
-          keys[lane] = keys[lane + step]; ids[lane] = ids[lane + step]; score_bits[lane] = score_bits[lane + step];
-        }
-        masks[lane] |= masks[lane + step];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (masks[0] != 0) { if (lane == 0) out.nonfinite = masks[0]; return; }
-    const uint winner = ids[0];
-    if (lane == 0) { out.entries[rank] = { winner, score_bits[0] }; out.count = rank + 1; }
-    if (cursor < p.k && local_id[cursor] == winner) cursor++;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const TfCand c = cursor < p.k ? TfCand{ local_key[cursor], local_id[cursor], local_bits[cursor] } : TfCand{ 0u, 0xffffffffu, 0u };
+    const TfCand w = tf_tg_best(c, lane, rank, keys, ids, score_bits);
+    if (lane == 0) { out.entries[rank] = { w.id, w.bits }; out.count = rank + 1; }
+    if (cursor < p.k && local_id[cursor] == w.id) cursor++;
   }
 }
 
@@ -120,23 +135,12 @@ kernel void tf_bf16_topk_merge(const device Row* part [[buffer(0)]],
     output[row].nonfinite = 0; output[row].count = 0;
     for (uint i = 0; i < TF_TOPK_MAX_K; i++) output[row].entries[i] = { 0xffffffffu, 0u };
   }
+  const uint all = tf_tg_or(mask, lane, masks);
+  if (all != 0) { if (lane == 0) output[row].nonfinite = all; return; }
   for (uint rank = 0; rank < p.k; rank++) {
-    keys[lane] = key; ids[lane] = id; score_bits[lane] = bits; masks[lane] = mask;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = TF_TOPK_LANES / 2; step > 0; step >>= 1) {
-      if (lane < step) {
-        if (tf_topk_before(keys[lane + step], ids[lane + step], keys[lane], ids[lane])) {
-          keys[lane] = keys[lane + step]; ids[lane] = ids[lane + step]; score_bits[lane] = score_bits[lane + step];
-        }
-        masks[lane] |= masks[lane + step];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (masks[0] != 0) { if (lane == 0) output[row].nonfinite = masks[0]; return; }
-    const uint winner = ids[0];
-    if (lane == 0) { output[row].entries[rank] = { winner, score_bits[0] }; output[row].count = rank + 1; }
-    if (id == winner) { key = 0; id = 0xffffffffu; bits = 0; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const TfCand w = tf_tg_best(TfCand{ key, id, bits }, lane, rank, keys, ids, score_bits);
+    if (lane == 0) { output[row].entries[rank] = { w.id, w.bits }; output[row].count = rank + 1; }
+    if (id == w.id) { key = 0; id = 0xffffffffu; bits = 0; }
   }
 }
 
