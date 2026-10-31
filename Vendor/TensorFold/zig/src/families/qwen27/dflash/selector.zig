@@ -3,7 +3,8 @@ const std = @import("std");
 const weights = @import("weights.zig");
 const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
-pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null };
+/// rows: lattice depth rows the search may use (0: all); a depth-1 tree drafted over a wider block reads only row 0.
+pub const Options = struct { nodes: u32 = 15, children: u32 = 4, rows: u32 = 0, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null };
 /// Candidate count and maximum draft-parent path length are independent.
 pub const Policy = struct {
     nodes: usize,
@@ -107,7 +108,18 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     std.mem.sort(u32, order[0..lattice.topk], Rank{ .scores = scores[0..lattice.topk] }, Rank.less);
     for (order[0..@min(options.children, lattice.topk)]) |i| try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
 }
-pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {
+fn shallow(l: op.Lattice, rows: u32) op.Lattice {
+    if (rows == 0 or rows >= l.depth) return l;
+    var out = l;
+    out.depth = rows;
+    out.candidates = l.candidates[0 .. @as(usize, rows) * l.topk];
+    out.unary = l.unary[0 .. @as(usize, rows) * l.topk];
+    out.projected = l.projected[0 .. @as(usize, rows) * l.rank];
+    return out;
+}
+pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, whole: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {
+    try whole.check(g.config);
+    const lattice = shallow(whole, options.rows);
     try g.config.check();
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
