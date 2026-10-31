@@ -179,7 +179,13 @@ pub const Pool = struct {
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // a prompt pass's first z tiles go beside the prepare, the rest beside the scan
+        const early: ?gdn.Beside = blk: {
+            const b = beside orelse break :blk null;
+            const f = b.pre orelse break :blk null;
+            break :blk .{ .ptr = b.ptr, .encode = f };
+        };
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else try prepared.prepareRowsBeside(pre.encoder, pool.kernels.pre_rows, early);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();

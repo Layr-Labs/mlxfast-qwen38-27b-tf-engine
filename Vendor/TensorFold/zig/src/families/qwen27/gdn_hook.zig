@@ -29,7 +29,9 @@ pub const Hook = struct {
         var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt) };
         if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
+        // a prompt pass splits z: a third beside the latency-bound prepare, the rest beside the scan (chains only)
+        if (hook.accepted_chain and z.tiles >= 64 and z.tiles % 24 == 0) z.early = z.tiles / 24 * 8;
+        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode, .pre = if (z.early > 0) Late.encodePre else null } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         const xs = frame.get(.sums);
@@ -53,9 +55,15 @@ const Late = struct {
     sums: @import("quant_gpu.zig").Sums,
     rows: u32,
     tiles: u32,
+    /// z's first tiles, encoded beside the prepare (a multiple of the 8-tile code interleave); the rest go beside the scan
+    early: u32 = 0,
     fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
         const z: *Late = @ptrCast(@alignCast(ptr));
-        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.frame.get(.dims), z.frame.get(.mixed), z.rows, .{ 0, z.tiles });
+        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.frame.get(.dims), z.frame.get(.mixed), z.rows, .{ z.early, z.tiles - z.early });
+    }
+    fn encodePre(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
+        const z: *Late = @ptrCast(@alignCast(ptr));
+        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.frame.get(.dims), z.frame.get(.mixed), z.rows, .{ 0, z.early });
     }
 };
 

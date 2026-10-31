@@ -101,7 +101,8 @@ pub const Buffers = struct {
 /// Group sums a gate writes for the projection that reads its rows; `written` is set once a dispatch writes them.
 pub const Sums = struct { span: Span, stride: u32, written: *bool };
 /// Work encoded beside a scan, before the barrier that ends it: rows only the gate reads (the z projection's).
-pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
+/// Work encoded beside a stage, before the barrier that ends it; `pre`, when set, is encoded beside the prepare instead.
+pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void, pre: ?*const fn (*anyopaque, metal.ComputeEncoder) anyerror!void = null };
 
 pub const Round = struct {
     p: abi.Params,
@@ -150,6 +151,27 @@ pub const Round = struct {
         e.setValue(r.p, 9);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
+    /// prepareRows with `beside` encoded in the same barrier interval (a prompt pass's first z tiles: they read the norm's
+    /// rows and write only z's columns, which only the gate reads).
+    pub fn prepareRowsBeside(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, beside: ?Beside) !void {
+        const b = beside orelse return r.prepareRows(e, rows);
+        var fast = r.p.rows != 0 and r.p.dk == 128 and r.p.dv == 128 and r.p.taps == 4;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| fast = fast and s.offset % 8 == 0;
+        if (!fast) {
+            r.prepare(e);
+            try b.encode(b.ptr, e);
+            e.barrier();
+            return;
+        }
+        e.setPipeline(rows);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        try b.encode(b.ptr, e);
         e.barrier();
     }
 
