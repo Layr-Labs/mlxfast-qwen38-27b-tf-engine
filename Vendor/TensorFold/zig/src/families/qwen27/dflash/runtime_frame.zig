@@ -94,6 +94,7 @@ pub const Frame = struct {
     epoch: u64 = 0,
     active: bool = false,
     completed: bool = false,
+    committed: bool = false, // the last command buffer is committed (commitLast) and not yet waited for
     cb: mtl.CommandBuffer = undefined,
     encoder: mtl.ComputeEncoder = undefined,
     external: ?Entry = null,
@@ -106,6 +107,9 @@ pub const Frame = struct {
     residency: ?mtl.ResidencySet.Follow = null,
     /// Bridges a proposal's frame to the verify behind it (finishBridged, endBridge); none if it failed to build.
     bridge: ?Bridge = null,
+    /// Encoded behind a split lattice's top-k, in the frame's last command buffer, then cleared (a GPU-side pick).
+    pick: ?Pick = null,
+    pub const Pick = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, picks: Ref, ids: ?Ref, width: u32, projected: Ref) anyerror!void };
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -150,6 +154,7 @@ pub const Frame = struct {
         f.encoder = f.cb.compute(.concurrent);
         f.active = true;
         f.completed = false;
+        f.committed = false;
         f.part_count = 0;
         f.ops = 0;
         return f.epoch;
@@ -200,12 +205,32 @@ pub const Frame = struct {
         }
         if (failed(f.cb)) return error.DraftGpuFailure;
     }
+    /// finish's first half: the last command buffer committed, nothing waited for; no op may be encoded after it.
+    pub fn commitLast(f: *Frame) !void {
+        if (!f.active or f.completed or f.committed) return error.DraftFrameNotActive;
+        f.encoder.end();
+        f.cb.commit();
+        f.committed = true;
+    }
+    /// finish's second half, after commitLast: every part waited for; the frame is then complete.
+    pub fn waitAll(f: *Frame) !void {
+        if (!f.active or f.completed or !f.committed) return error.DraftFrameNotActive;
+        f.cb.wait();
+        f.completed = true;
+        for (f.parts[0..f.part_count]) |cb| {
+            cb.wait();
+            if (failed(cb)) return error.DraftGpuFailure;
+        }
+        if (failed(f.cb)) return error.DraftGpuFailure;
+    }
     pub fn release(f: *Frame) void {
         if (f.active and !f.completed) {
-            f.encoder.end();
             // an abandoned frame's buffer still goes to the queue: one left uncommitted holds a queue slot for good, and
             // enough of them block every later commandBuffer() (a hang, not an error). The caller fails the backend.
-            f.cb.commit();
+            if (!f.committed) {
+                f.encoder.end();
+                f.cb.commit();
+            }
             f.cb.wait();
             for (f.parts[0..f.part_count]) |cb| cb.wait(); // committed parts still use the pool
         }
@@ -213,7 +238,7 @@ pub const Frame = struct {
         f.external = null;
     }
     pub fn require(f: *const Frame, epoch: u64) !void {
-        if (!f.active or f.completed or f.epoch != epoch) return error.DraftFrameNotActive;
+        if (!f.active or f.completed or f.committed or f.epoch != epoch) return error.DraftFrameNotActive;
     }
     pub fn add(f: *Frame, r: Ref, rows: u32, width: u32, stride: u32, dtype: @import("../checkpoint.zig").DType) !op.View {
         const view = op.View{ .handle = (f.epoch << 32) | (f.entries.items.len + 1), .rows = rows, .width = width, .stride = stride, .dtype = dtype };
@@ -224,7 +249,7 @@ pub const Frame = struct {
         return view;
     }
     pub fn alloc(f: *Frame, rows: u32, width: u32, dtype: @import("../checkpoint.zig").DType) !op.View {
-        if (!f.active or f.completed or rows == 0 or width == 0) return error.DraftFrameNotActive;
+        if (!f.active or f.completed or f.committed or rows == 0 or width == 0) return error.DraftFrameNotActive;
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), dtype.size());
         if (f.cursor == f.pool.items.len) {
             const buffer = try f.device.buffer(bytes, options);

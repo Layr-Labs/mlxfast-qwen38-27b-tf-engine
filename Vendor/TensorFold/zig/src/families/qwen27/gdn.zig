@@ -107,6 +107,20 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    /// the output projection's group sums (rows padded to `sums_stride`), written by `post_sums` on the wide gate
+    sums: ?Span = null,
+    sums_stride: u32 = 0,
+    post_sums: ?metal.Pipeline = null,
+
+    /// whether `gate` writes the output's group sums: 128-wide heads on bfloat4 rows with a sums span and kernel.
+    pub fn writesSums(r: Round) bool {
+        return r.sums != null and r.post_sums != null and r.wideGate();
+    }
+    fn wideGate(r: Round) bool {
+        var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
+        inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // bfloat4 rows
+        return wide;
+    }
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -203,12 +217,16 @@ pub const Round = struct {
     /// tf_delta_gdn_post a simdgroup a (row, head); 128-wide heads on bfloat4 rows take `rows` (tf_delta_gdn_post_rows),
     /// 4 rows a group of 128.
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
-        var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
-        inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // bfloat4 rows
-        e.setPipeline(if (wide) rows else r.pipelines.post);
+        const wide = r.wideGate();
+        const own = r.writesSums();
+        e.setPipeline(if (own) r.post_sums.? else if (wide) rows else r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
+        if (own) {
+            r.sums.?.bind(e, 5);
+            e.setValue(r.sums_stride, 6);
+        }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
     }

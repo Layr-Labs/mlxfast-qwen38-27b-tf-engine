@@ -40,6 +40,8 @@ pub const Layout = struct {
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
     reg_lean: bool = false,
+    /// With serial_sk2 and without rows8: chain 0's sums wait in threadgroup memory while chain 1 runs (prompt rows).
+    ser_park: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -55,6 +57,7 @@ pub const Layout = struct {
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
+        if (l.ser_park and (!l.serial_sk2 or l.rows8)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -126,6 +129,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
+    if (l.ser_park) try text.appendSlice(a, "#define TF_SER_PARK 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);

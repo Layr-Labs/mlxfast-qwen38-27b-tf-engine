@@ -29,6 +29,42 @@ pub const Generation = struct {
     picked: ?@import("core").segments.Fence = null, // updated behind a verify's picks; its keep waits on it
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
+    /// A one-draft round's draft token picked on the GPU behind the drafter's top-k (null: the host's pick only).
+    pick: ?Pick = null,
+    const Pick = struct {
+        ops: @import("pick_gpu.zig").Ops,
+        out: mtl.Buffer, // [0] the GPU's pick, [1] whether it found one
+        fence: @import("core").segments.Fence, // updated behind the pick; the verify's first encoder waits on it
+        predecessor: Ref,
+        successor: Ref,
+        anchor: u32 = 0,
+        encoded: bool = false,
+        fn init(device: mtl.Device, draft: *Draft) !Pick {
+            const predecessor = try draft.backend.weight(draft.graph.predecessor);
+            const successor = try draft.backend.weight(draft.graph.successor);
+            const ops = try @import("pick_gpu.zig").Ops.init(device);
+            errdefer ops.deinit();
+            const out = try device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            errdefer out.deinit();
+            return .{ .ops = ops, .out = out, .fence = try @import("core").segments.Fence.init(device), .predecessor = .{ .buf = predecessor.buf, .off = predecessor.off }, .successor = .{ .buf = successor.buf, .off = successor.off } };
+        }
+        fn deinit(p: Pick) void {
+            p.fence.deinit();
+            p.out.deinit();
+            p.ops.deinit();
+        }
+        /// Frame.pick: the selector's one-draft choice over the top-k's first row, then the fence updated.
+        fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder, picks: Ref, ids: ?Ref, width: u32, projected: Ref) anyerror!void {
+            const g: *Generation = @ptrCast(@alignCast(ptr));
+            const p = &g.pick.?;
+            const c = g.draft.graph.config;
+            const options = @import("selector.zig").Options{};
+            try p.ops.encodePick(e, picks, ids, projected, p.predecessor, p.successor, .{ .buf = p.out }, .{ .anchor = p.anchor, .rank = c.rank, .k = c.topk, .width = width, .vocab = c.vocab, .mapped = @intFromBool(ids != null), .children = @min(options.children, c.topk), .edge = @floatCast(options.edge) });
+            p.fence.update(e);
+            p.encoded = true;
+        }
+    };
+    const Ref = @import("runtime_frame.zig").Ref;
     pub fn init(a: std.mem.Allocator, runner: *Runner, draft: *Draft) !Generation {
         if (runner.model != draft.backend.target or runner.model.config.hidden != draft.graph.config.hidden or runner.model.config.layers != draft.graph.config.target_layers) return error.TargetBinding;
         runner.capture_taps = true;
@@ -41,13 +77,17 @@ pub const Generation = struct {
         const matcher = try @import("round_gpu.zig").Matcher.init(runner.model.device);
         errdefer matcher.deinit();
         const commit = try @import("core").tree_commit_gpu.Ops.init(runner.model.device);
-        return .{ .allocator = a, .runner = runner, .draft = draft, .kept = kept, .taps = taps, .matcher = matcher, .commit = commit };
+        errdefer commit.deinit();
+        // without the codebooks on the GPU every round takes the host's pick
+        const pick = Pick.init(runner.model.device, draft) catch null;
+        return .{ .allocator = a, .runner = runner, .draft = draft, .kept = kept, .taps = taps, .matcher = matcher, .commit = commit, .pick = pick };
     }
     pub fn deinit(g: Generation) void {
         if (g.keep) |cb| {
             cb.wait();
             cb.release();
         }
+        if (g.pick) |p| p.deinit();
         g.commit.deinit();
         if (g.picked) |f| f.deinit();
         g.matcher.deinit();
@@ -164,12 +204,16 @@ pub const Generation = struct {
         eos: []const u32,
         round: *const Round,
         shape: ?@import("core").tree_round.Match = null,
+        gated: ?*Gated = null,
         fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;
             // the matcher and keep fence their own dependencies; taps and head read only the matcher's result
             const logits = g.runner.model.frame.get(.logits);
             const width: u32 = @intCast(g.runner.model.config.vocab);
+            // a gated round's row 1 is the GPU's pick, over the placeholder the matcher's ids take on the host (the
+            // matcher's barrier behind its argmax orders this copy before its match reads the ids)
+            if (p.gated != null) g.pick.?.ops.encodeCopy(e, .{ .buf = g.pick.?.out }, .{ .buf = g.matcher.buffers[0], .off = 4 });
             const shape = try g.matcher.encode(e, .{ .buf = logits.buffer, .off = logits.offset }, p.ids, p.parents, width, p.budget, p.eos);
             const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
             try g.commit.taps(e, result, .{ .buf = g.runner.taps.buffer }, .{ .buf = g.taps }, .{ .rows = shape.rows, .width = g.runner.taps.width, .capacity = g.runner.taps.capacity, .planes = 5 });
@@ -182,6 +226,8 @@ pub const Generation = struct {
         fn keep(ptr: *anyopaque) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;
+            // a gated round keeps nothing unless the host's selector picked the token the GPU did
+            if (p.gated) |s| if (!try s.check()) return;
             const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
             const keep_cb = g.runner.model.queue.commandBuffer();
             const k = keep_cb.compute(.concurrent);
@@ -198,17 +244,28 @@ pub const Generation = struct {
     };
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once.
     fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32) !@import("core").tree_round.Decoded {
+        return (try g.verifyAcceptFrom(round, ids, parents, budget, eos, null)) orelse error.DraftKeepGpuFailure;
+    }
+    /// verifyAccept, for a gated round too: null when its check found the two picks differ, so nothing was kept.
+    fn verifyAcceptFrom(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32, gated: ?*Gated) !?@import("core").tree_round.Decoded {
         // the picks rewrite the matcher's result, which a pending keep still reads
         std.debug.assert(g.keep == null);
         if (g.picked == null) g.picked = try @import("core").segments.Fence.init(g.runner.model.device);
-        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round };
+        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .gated = gated };
         g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
         defer g.runner.tail = null;
         g.runner.after = .{ .ptr = &picks, .run = Picks.keep };
         defer g.runner.after = null;
-        g.runner.lead = .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge };
+        // a gated round's verify is queued behind the drafter already: its lead waits for the pick, with no bridge to end
+        g.runner.lead = if (gated) |s| .{ .ptr = s, .encode = Gated.lead } else .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge };
         defer g.runner.lead = null;
         try g.runner.verifyHead(round, .all);
+        if (gated) |s| if (!s.agreed) {
+            // no keep was committed: the target stands as before this verify, and a verify of the same rows rewrites
+            // everything it wrote
+            g.runner.active = null;
+            return null;
+        };
         errdefer g.runner.failed = true;
         try g.runner.taps.complete();
         const shape = picks.shape orelse return error.DraftKeepGpuFailure;
@@ -227,7 +284,10 @@ pub const Generation = struct {
         return g.runImpl(count, false, nodes, eos, already_delivered);
     }
     /// `extend`: a copy from the context shares the tree's agreeing nodes and adds up to `extra` rows past them.
-    pub fn runRound(g: *Generation, remaining: u32, nodes: usize, eos: []const u32, already_delivered: bool, extend: ?Extender, extra: u32) !Result {
+    pub fn runRound(g: *Generation, remaining: u32, policy: @import("selector.zig").Policy, eos: []const u32, already_delivered: bool, extend: ?Extender, extra: u32) !Result {
+        const nodes = policy.nodes;
+        _ = try policy.block(g.draft.tree_block);
+        if (policy.max_depth != null and (g.proposer != null or extend != null or extra != 0)) return error.BadDraftOptions;
         if (g.runner.failed or g.runner.active != null or g.runner.offsets[0] == 0 or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != g.runner.offsets[0] or g.draft.committed_end == 0 or nodes == 0 or nodes > 15 or eos.len > 16) return error.BadDraftOptions;
         for (eos) |token| if (token >= g.runner.model.config.vocab) return error.BadDraftOptions;
         if (remaining == 0) return .{ .tokens = try g.allocator.alloc(u32, 0), .rounds = 0, .verified = 0, .matched = 0 };
@@ -243,9 +303,26 @@ pub const Generation = struct {
         const available = g.runner.capacity - g.runner.offsets[0];
         if (available == 0) return error.ContextFull;
         const offered: u32 = @intCast(@min(nodes, available - 1));
+        var offered_policy = policy;
+        offered_policy.nodes = offered;
         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
-        var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.propose(pending, offered);
+        // One draft from the drafter's own selector: its frame picks the token on the GPU too, and the verify, committed
+        // behind it, starts from that pick without waiting for the host (runGated).
+        var early: ?@import("selector.zig").Tree = null;
+        if (nodes == 1 and extend == null and g.proposer == null) if (g.pick) |*p| {
+            p.anchor = pending;
+            p.encoded = false;
+            g.draft.backend.frame.pick = .{ .ptr = g, .encode = Pick.encode };
+            const begun = g.draft.proposeBegin(pending, offered);
+            g.draft.backend.frame.pick = null;
+            if (try begun) |b| {
+                if (p.encoded) return g.runGated(b, pending, remaining, eos);
+                early = try g.draft.proposeEnd(b);
+            }
+        };
+        var tree = early orelse if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.proposePolicy(pending, offered_policy);
         defer tree.deinit();
+        try offered_policy.checkTree(tree.parents);
         const drafted = try tree.verifyParents(g.allocator);
         defer g.allocator.free(drafted);
         // a copy from the root shares the tree's nodes while they agree, and its rest hangs below the last shared one
@@ -275,7 +352,7 @@ pub const Generation = struct {
         defer round.deinit();
         errdefer g.finishKeep() catch {};
         try g.finishKeep();
-        const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos);
+        const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos);
         g.pending = accepted.pending;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         var landed: u32 = 0;
@@ -287,6 +364,73 @@ pub const Generation = struct {
             .accepted = @intCast(accepted.matched),
         });
         return .{ .tokens = tokens, .rounds = 1, .verified = ids.len, .matched = accepted.matched, .min_rows = @intCast(ids.len), .extended = @intCast(copied.len), .extension_landed = landed };
+    }
+    /// The GPU's pick and the host's, for a gated round's verify.
+    const Gated = struct {
+        g: *Generation,
+        begun: Draft.Begun,
+        tree: ?@import("selector.zig").Tree = null,
+        ended: bool = false,
+        agreed: bool = false,
+        token: u32 = 0, // the host's pick
+        /// First in the verify: the drafter's frame waited for on the GPU, then its pick into the embedding's ids row 1,
+        /// ahead of the embedding that reads it.
+        fn lead(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+            const s: *Gated = @ptrCast(@alignCast(ptr));
+            const p = &s.g.pick.?;
+            p.fence.wait(e);
+            // a spin an earlier ungated proposal left open ends here, as any verify's lead ends it
+            try @import("runtime_frame.zig").Frame.endBridge(&s.g.draft.backend.frame, e);
+            const ids = s.g.runner.model.frame.get(.ids);
+            p.ops.encodeCopy(e, .{ .buf = p.out }, .{ .buf = ids.buffer, .off = ids.offset + 4 });
+            e.barrier();
+        }
+        /// Before the keep: the drafter's frame waited for, its tree proposed by the host's selector as an ungated round
+        /// does, and that pick compared with the GPU's.
+        fn check(s: *Gated) !bool {
+            s.ended = true;
+            s.tree = try s.g.draft.proposeEnd(s.begun);
+            const t = s.tree.?;
+            if (t.tokens.len != 1 or t.parents.len != 1 or t.parents[0] != -1) return error.BadDraftRound;
+            s.token = t.tokens[0];
+            s.agreed = s.g.pick.?.out.slice(u32, 2)[0] == s.token;
+            return s.agreed;
+        }
+    };
+    /// runRound's one-draft round with the GPU's pick: a two-row chain whose second token reaches the verify on the GPU.
+    /// The round is kept only if the host's selector picked the same token; otherwise it is verified again with the
+    /// host's, so every kept round verified the host's pick.
+    fn runGated(g: *Generation, begun: Draft.Begun, pending: u32, remaining: u32, eos: []const u32) !Result {
+        var ids = [2]u32{ pending, pending }; // row 1 takes the GPU's pick on the GPU (Gated.lead, Picks.encode)
+        const parents = [2]i32{ -1, 0 };
+        var gated = Gated{ .g = g, .begun = begun };
+        defer if (gated.tree) |*t| t.deinit();
+        // a round that fails before its check still ends the drafter's frame
+        defer if (!gated.ended) {
+            if (g.draft.proposeEnd(gated.begun)) |t| {
+                var tree = t;
+                tree.deinit();
+            } else |_| {}
+        };
+        var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = &ids, .parents = &parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
+        defer round.deinit();
+        errdefer g.finishKeep() catch {};
+        try g.finishKeep();
+        const accepted = (try g.verifyAcceptFrom(&round, &ids, &parents, remaining, eos, &gated)) orelse again: {
+            ids[1] = gated.token;
+            var host = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = &ids, .parents = &parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
+            defer host.deinit();
+            break :again try g.verifyAccept(&host, &ids, &parents, remaining, eos);
+        };
+        g.pending = accepted.pending;
+        if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+        const tokens = try g.allocator.dupe(u32, accepted.tokens);
+        if (g.journal) |journal| journal.recordAssumeCapacity(.{
+            .committed = @intCast(tokens.len),
+            .drafted = 1,
+            .accepted = @intCast(accepted.matched),
+        });
+        return .{ .tokens = tokens, .rounds = 1, .verified = 2, .matched = accepted.matched, .min_rows = 2, .extended = 0, .extension_landed = 0 };
     }
     fn runImpl(g: *Generation, count: usize, force_length: bool, nodes: usize, eos_override: ?[]const u32, already_delivered: bool) !Result {
         g.pending = null;

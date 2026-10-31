@@ -24,7 +24,9 @@ pub const Hook = struct {
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
         try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e);
+        const r = try refs(weight, frame, rows);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), r, e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), r, e);
+        frame.out_sums = r.sums != null and hook.pool.wrote_sums;
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
@@ -33,12 +35,13 @@ pub const Hook = struct {
     }
 };
 
-/// z, b and a read in place from the fused zba rows.
-fn refs(weight: Weights.Gdn, frame: *Frame) !pool_gpu.Refs {
+/// z, b and a read in place from the fused zba rows; decoded rows (16 or fewer) have the gate write the output
+/// projection's group sums into act_sums, which nothing reads between the last layer's down projection and this one's.
+fn refs(weight: Weights.Gdn, frame: *Frame, rows: u32) !pool_gpu.Refs {
     const width = frame.config.gdnValueDim();
     const heads = frame.config.v_heads;
     const mixed = frame.get(.mixed);
-    return .{ .z = mixed, .b = .{ .buffer = mixed.buffer, .offset = mixed.offset + width * 2 }, .a = .{ .buffer = mixed.buffer, .offset = mixed.offset + (width + heads) * 2 }, .output = frame.get(.mixer_out), .scalars = try pool_gpu.Scalars.from(weight), .zba_stride = @intCast(width + 2 * heads) };
+    return .{ .z = mixed, .b = .{ .buffer = mixed.buffer, .offset = mixed.offset + width * 2 }, .a = .{ .buffer = mixed.buffer, .offset = mixed.offset + (width + heads) * 2 }, .output = frame.get(.mixer_out), .scalars = try pool_gpu.Scalars.from(weight), .zba_stride = @intCast(width + 2 * heads), .sums = if (rows <= 16) frame.get(.act_sums) else null };
 }
 
 fn devicePlan(plan: Plan, frame: *Frame) pool_gpu.DevicePlan {

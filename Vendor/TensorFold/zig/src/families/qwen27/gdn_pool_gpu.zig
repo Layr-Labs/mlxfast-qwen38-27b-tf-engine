@@ -51,7 +51,8 @@ pub const Scalars = struct {
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0 };
+/// `sums`: where the gate writes the output's 64-column group sums for the output projection (rows padded to 16).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?Ref = null };
 
 pub const Pool = struct {
     budget: Budget,
@@ -63,6 +64,8 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// whether the last round's gate wrote its output's group sums (`Refs.sums`)
+    wrote_sums: bool = false,
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -334,6 +337,13 @@ pub const Pool = struct {
         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
         result.tree_mode = pool.tree_mode;
         result.p.advance = @intFromBool(pool.advances(plan));
+        if (refs.sums) |s| {
+            const stride = @import("quant_gpu.zig").padded(@intCast(p.rows));
+            result.sums = try refSpan(s, (pool.budget.shape.value / 64) * stride * 4);
+            result.sums_stride = stride;
+            result.post_sums = pool.kernels.post_rows_sums;
+        }
+        pool.wrote_sums = result.writesSums();
         return result;
     }
 

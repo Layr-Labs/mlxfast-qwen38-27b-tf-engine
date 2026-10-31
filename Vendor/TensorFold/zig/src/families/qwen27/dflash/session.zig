@@ -40,6 +40,22 @@ pub const Session = struct {
         s.context = next;
         return selector.propose(gpa, graph, lattice, pending, try std.math.add(u64, next.end, 1), options);
     }
+    /// absorbTreeBlock in two halves: `Begin` encodes and commits the frame (null: the adapter has only the
+    /// one-call form; the session is unchanged), `End` waits for it and proposes the tree.
+    pub const Begun = struct { started: execution.Started, next: op.Context, pending: u32, options: selector.Options };
+    pub fn absorbTreeBlockBegin(s: *Session, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, batch: Batch, pending: u32, block: u32, options: selector.Options) !?Begun {
+        if (!std.meta.eql(s.config, graph.config) or !s.ready) return error.BadDraftContext;
+        const next = try s.admit(batch);
+        const started = (try execution.appendBlockBegin(ops, graph, preparation, s.context, batch.values, batch.positions, next, pending, block)) orelse return null;
+        s.context = next;
+        return .{ .started = started, .next = next, .pending = pending, .options = options };
+    }
+    pub fn absorbTreeBlockEnd(s: *Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, b: Begun) !selector.Tree {
+        if (!std.meta.eql(s.config, graph.config)) return error.BadDraftContext;
+        var lattice = try execution.appendBlockEnd(ops, graph, b.started);
+        defer lattice.deinit();
+        return selector.propose(gpa, graph, lattice, b.pending, try std.math.add(u64, b.next.end, 1), b.options);
+    }
     pub fn firstDraw(s: Session) !u64 {
         if (!s.ready) return error.DraftContextNotReady;
         return std.math.add(u64, s.context.end, 1);
