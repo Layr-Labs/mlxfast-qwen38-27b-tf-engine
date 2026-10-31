@@ -44,6 +44,10 @@ pub const Kernels = struct {
     post_rows: metal.Pipeline,
     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
     tree_pair: metal.Pipeline,
+    /// tf_delta_gdn_replay, conv_commit and publish_conv over every GDN layer of a pool in one launch each.
+    replay_layers: metal.Pipeline,
+    conv_commit_layers: metal.Pipeline,
+    publish_conv_layers: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -70,6 +74,9 @@ pub const Kernels = struct {
             "tree_slots_8",
             "tree_slots_16",
             "tree_pair",
+            "replay_layers",
+            "conv_commit_layers",
+            "publish_conv_layers",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -100,6 +107,9 @@ pub const Kernels = struct {
             .pre_rows = pipelines[13],
             .post_rows = pipelines[14],
             .tree_pair = pipelines[20],
+            .replay_layers = pipelines[21],
+            .conv_commit_layers = pipelines[22],
+            .publish_conv_layers = pipelines[23],
         };
     }
 
@@ -121,6 +131,9 @@ pub const Kernels = struct {
             k.pre_rows,
             k.post_rows,
             k.tree_pair,
+            k.replay_layers,
+            k.conv_commit_layers,
+            k.publish_conv_layers,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();
