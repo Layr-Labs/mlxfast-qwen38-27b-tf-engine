@@ -100,7 +100,9 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
+        // a DeltaNet gate over decode rows wrote the out projection's group sums; other rows sum their input first
+        const out_sums: ?@import("quant_gpu.zig").Sums = if (layer.mixer == .linear and outSums(s.rows)) sums(f, .sums, s.rows) else null;
+        try m.kernels.quant(e, out, mixer_out, out_sums, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
@@ -188,4 +190,10 @@ pub fn encode(m: *Model, e: mtl.ComputeEncoder, rows: u32, mixer: Mixer) !void {
 /// A norm's or the MLP gate's group sums for the frame's padded rows.
 pub fn sums(f: *Frame, field: @import("gpu_frame.zig").Field, rows: u32) @import("quant_gpu.zig").Sums {
     return .{ .ref = f.get(field), .stride = @import("quant_gpu.zig").padded(rows) };
+}
+
+/// Rows whose DeltaNet gate writes its out projection's group sums: a depth-1 verify's or step's few rows (from 5 rows the
+/// gate's 16-lane sum chain costs more than the separate sums launch, measured on an M4); more rows sum apart.
+pub fn outSums(rows: u32) bool {
+    return rows <= 4;
 }
