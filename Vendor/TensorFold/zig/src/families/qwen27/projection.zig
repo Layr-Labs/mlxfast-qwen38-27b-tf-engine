@@ -7,7 +7,7 @@ const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null };
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -95,8 +95,9 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         };
         base += rows;
     }
-    const index: ?Ref = if (try indexPairs(device, allocator, owned, pair, n, k)) |b| .{ .buffer = b } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index };
+    const packed12 = try indexPairs12(device, allocator, owned, pair, n, k);
+    const index: ?Ref = if (packed12) |b| .{ .buffer = b } else if (try indexPairs(device, allocator, owned, pair, n, k)) |b| .{ .buffer = b } else null;
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = packed12 != null };
 }
 
 /// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
@@ -122,6 +123,41 @@ fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arra
         }
         at.* = got.value_ptr.*;
     }
+    try owned.append(allocator, sb);
+    keep = true;
+    return sb;
+}
+
+/// lane_projection.indexed12_layout of packed pairs; null (nothing kept) past lane_projection.sb_table12 distinct pairs.
+fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+    const cap = lane.sb_table12;
+    var seen = std.AutoHashMap(u32, u16).init(allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(2 * cap);
+    const sb = try device.buffer(lane.indexed12Bytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    var keep = false;
+    defer if (!keep) sb.deinit();
+    const table = sb.slice(u32, cap);
+    @memset(table, 0);
+    const groups = k / 64;
+    const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
+    @memset(out, 0);
+    for (0..groups) |g| for (0..n) |c| {
+        const i = g * n + c;
+        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
+        const got = seen.getOrPutAssumeCapacity(word);
+        if (!got.found_existing) {
+            if (seen.count() > cap) return null;
+            got.value_ptr.* = @intCast(seen.count() - 1);
+            table[got.value_ptr.*] = word;
+        }
+        const x = c % 32;
+        const bit = 12 * ((x / 16) * 4 + x % 4);
+        const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
+        const ix: u64 = @as(u64, got.value_ptr.*) << @intCast(bit % 32);
+        out[at] |= @truncate(ix);
+        if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
+    };
     try owned.append(allocator, sb);
     keep = true;
     return sb;

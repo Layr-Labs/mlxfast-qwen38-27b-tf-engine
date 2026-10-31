@@ -288,6 +288,16 @@ inline uint4 tf_look(const device uint* tab, uint2 ix) {
   return uint4(tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]);
 }
 #endif
+// TF_SBI12: the same, with 12-bit indices: a lane's two quads are one packed_uint3 of eight indices, low bits first, as
+// lane_projection.indexed12_layout. The table words read are those of the 16-bit indices.
+#if defined(TF_SBI12)
+inline uint4 tf_look12a(const device uint* tab, uint3 ix) {
+  return uint4(tab[ix.x & 0xFFFu], tab[(ix.x >> 12) & 0xFFFu], tab[(ix.x >> 24) | ((ix.y & 0xFu) << 8)], tab[(ix.y >> 4) & 0xFFFu]);
+}
+inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
+  return uint4(tab[(ix.y >> 16) & 0xFFFu], tab[(ix.y >> 28) | ((ix.z & 0xFFu) << 4)], tab[(ix.z >> 8) & 0xFFFu], tab[ix.z >> 20]);
+}
+#endif
 
 // TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
 // so its accumulators, row sums, hand-over words and stores are left out. Every live row's words are unchanged.
@@ -381,14 +391,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
-#if defined(TF_SBI)
+#if defined(TF_SBI12)
+  const device uint* tab = (const device uint*)SB;
+  const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
+  uint3 ni = 0;
+  if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+#elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
+  const device uint4* wp = wl + (size_t)first * TF_TB * 64;
   for (int g = first; g < last; g++) {
-#if defined(TF_SBI)
+#if defined(TF_SBI12)
+    const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
+#elif defined(TF_SBI)
     const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
     const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
@@ -421,19 +439,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = cp[32];
 #else
-    { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
-#if defined(TF_SBI)
+    { const int stay = int(g + 1 >= last); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
+#if defined(TF_SBI12)
+    ni = ixs[(size_t)min(g + 1, last - 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
     { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
 #endif
 #endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
+#if defined(TF_REG_LEAN)
+    const array<int32_t, 2> xstr = {1, TF_K};
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + g * GS, dextents<int32_t, 2>(GS, M), xstr);
+#else
     auto x = a.slice(g * GS, 0);
+#endif
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
-      const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
-      const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
