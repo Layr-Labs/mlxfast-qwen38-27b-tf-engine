@@ -97,6 +97,12 @@ pub const Frame = struct {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
         f.encoder.end();
         f.cb.commit();
+        // the frame's tokens gate the next verify's encode: poll its status rather than sleep until the completion
+        // handler wakes this thread, then wait() returns at once
+        while (true) switch (f.cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         f.cb.wait();
         f.completed = true;
         for (f.parts[0..f.part_count]) |cb| {
