@@ -311,10 +311,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
 #endif
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
+#if defined(TF_REG_LEAN)
+  // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
+  // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
+  uint4 nw0 = 0, nw1 = 0;
+  if (first < last) { nw0 = wl[(size_t)first * 64]; nw1 = wl[(size_t)first * 64 + 32]; }
+  for (int g = first; g < last; g++) {
+    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+#else
   tf_reg_load next = {};
   if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
+#endif
     for (int w = 0; w < 8; w++) {
       // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
@@ -324,7 +333,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
+#if defined(TF_REG_LEAN)
+    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * 64]; nw1 = wl[(size_t)(g + 1) * 64 + 32]; }
+#else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
+#endif
     auto x = a.slice(g * GS, 0);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {

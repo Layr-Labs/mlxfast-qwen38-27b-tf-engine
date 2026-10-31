@@ -578,10 +578,13 @@ inline void tf_delta_gdn_post_body(device const bfloat* recurrence,
     device const void* norm,
     constant TfDeltaParams& p,
     device bfloat* output,
+    device float* sums,
+    uint sums_stride,
     uint3 group,
     uint lane) {
   const uint row = group.z, head = group.y, elements = C ? C : p.dv / 32;
   float values[C ? C : 8];
+  bfloat stored[C ? C : 8];
   float square = 0.0f;
   const uint at = (row * p.nv + head) * p.dv + lane * elements, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * elements : at;
   for (uint part = 0; part < elements; ++part) {
@@ -594,7 +597,21 @@ inline void tf_delta_gdn_post_body(device const bfloat* recurrence,
     const uint channel = lane * elements + part;
     const float normalized = float(bfloat(tf_delta_weight(norm, channel, p.weight_flags, 3) * (values[part] * inverse)));
     const float z = float(gate[z_at + part]);
-    output[at + part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    stored[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    output[at + part] = stored[part];
+  }
+  // sums_stride (C = 4): the out projection's 64-channel group sums as tf_lane_xsum adds them, 16 lanes in turn;
+  // row 0 also clears the padded rows' sums
+  if (C == 4 && sums_stride != 0) {
+    float acc = 0.0f;
+    for (uint turn = 0; turn < 16; ++turn) {
+      if ((lane & 15) == turn)
+        for (uint part = 0; part < 4; ++part) acc += float(stored[part]);
+      acc = simd_shuffle(acc, ushort((lane & 16) | turn));
+    }
+    const uint g = head * 2 + (lane >> 4);
+    if ((lane & 15) == 0) sums[g * sums_stride + row] = acc;
+    if (row == 0 && (lane & 15) < sums_stride - p.rows) sums[g * sums_stride + p.rows + (lane & 15)] = 0.0f;
   }
 }
 
@@ -603,10 +620,12 @@ kernel void tf_delta_gdn_post(device const bfloat* recurrence [[buffer(0)]],
                          device const void* norm [[buffer(2)]],
                          constant TfDeltaParams& p [[buffer(3)]],
                          device bfloat* output [[buffer(4)]],
+                         device float* sums [[buffer(5)]],
+                         constant uint& sums_stride [[buffer(6)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, group, lane);
-  else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, group, lane);
+  if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, sums, sums_stride, group, lane);
+  else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, sums, 0, group, lane);
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 

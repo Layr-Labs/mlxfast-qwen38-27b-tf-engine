@@ -107,6 +107,7 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    out_sums: ?Span = null, // the gate also writes the out projection's group sums here, rows padded to 16 (decode)
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -167,12 +168,7 @@ pub const Round = struct {
         }
         r.stateGrid(e);
         e.barrier();
-        e.setPipeline(r.pipelines.post);
-        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
-        e.setValue(r.p, 3);
-        r.b.output.bind(e, 4);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32, .height = 1, .depth = 1 });
-        e.barrier();
+        r.encodeGate(e);
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
@@ -190,11 +186,17 @@ pub const Round = struct {
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder) void {
+        r.encodeGate(e);
+    }
+
+    fn encodeGate(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32 });
+        (r.out_sums orelse r.b.output).bind(e, 5);
+        e.setValue(@as(u32, if (r.out_sums != null) 16 * ((r.p.rows + 15) / 16) else 0), 6);
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32, .height = 1, .depth = 1 });
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
