@@ -403,7 +403,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
-  const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+  // decoded rows prefetch codes two groups ahead: nw holds group g's words, mw group g + 1's, and each iteration loads
+  // group g + 2's (a chain's last groups reload the last one, which nothing reads)
+  const device uint4* wp = wl + (size_t)min(first + 1, last - 1) * TF_TB * 64;
+  uint4 mw0 = nw0, mw1 = nw1;
+  if (first < last) { mw0 = wp[0]; mw1 = wp[32]; }
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
     const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
@@ -441,7 +445,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = cp[32];
 #else
-    { const int stay = int(g + 1 >= last); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
+    nw0 = mw0;
+    nw1 = mw1;
+    { const int stay = int(g + 2 >= last); wp += (1 - stay) * TF_TB * 64; mw0 = wp[0]; mw1 = wp[32]; }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, last - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
