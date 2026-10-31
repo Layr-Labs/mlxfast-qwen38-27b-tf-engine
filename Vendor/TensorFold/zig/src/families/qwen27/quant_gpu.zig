@@ -10,7 +10,45 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
+const Key = struct {
+    kind: Kind,
+    n: u32 = 0,
+    k: u32,
+    slices: u32 = 0,
+    tile: u32 = 0,
+    tmr: u32 = 0,
+    edge: bool = false,
+    skip: u32 = 0,
+    cut: [2]u32 = .{ 0, 0 },
+    range: [2]u32 = .{ 0, 0 },
+    bits: u8 = 4,
+    group: u32 = 64,
+    rows8: bool = false,
+    lean: bool = false,
+    prompt_sr: bool = false,
+    batch: u32 = 1,
+    swiglu: bool = false,
+    sbi: bool = false,
+    sbi12: bool = false,
+    decode_parallel: bool = false,
+    ordinary_n16: bool = false,
+
+    fn fullDecode(key: Key, prompt: bool, rows: u32) bool {
+        return !prompt and rows > 0 and rows <= 8 and key.kind == .projection and key.bits == 4 and key.group == 64 and
+            key.rows8 and key.lean and key.batch == 8 and key.sbi and !key.prompt_sr and key.skip == 0 and
+            key.cut[0] == 0 and key.cut[1] == 0 and key.range[0] == 0 and key.range[1] == 0;
+    }
+
+    fn ordinaryN16Eligible(key: Key, prompt: bool, rows: u32) bool {
+        const selected = (key.n == 10240 and key.k == 5120 and key.slices == 2) or
+            (key.n == 5120 and key.k == 6144 and key.slices == 4);
+        return selected and key.fullDecode(prompt, rows) and !key.swiglu and !key.decode_parallel;
+    }
+
+    fn parallelEligible(key: Key, prompt: bool, rows: u32) bool {
+        return key.fullDecode(prompt, rows) and key.swiglu and key.n == 34816 and key.k == 5120 and
+            key.slices == 2 and !key.ordinary_n16;
+    }
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -70,6 +108,9 @@ pub const Kernels = struct {
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
+    /// Device-format result and actual-PSO results are separate; index12/16 variants never share admission blindly.
+    n16_format_qualified: ?bool = null,
+    decode_variant_available: std.AutoHashMapUnmanaged(Key, bool) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
@@ -96,6 +137,7 @@ pub const Kernels = struct {
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
+        k.decode_variant_available.deinit(k.allocator);
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -142,6 +184,62 @@ pub const Kernels = struct {
         return p;
     }
 
+    /// Optional geometries: all failures occur before encoding; the original key remains the fallback.
+    fn decodeKey(k: *Kernels, base: Key, rows: u32) !Key {
+        var selected = base;
+        if (base.parallelEligible(k.prompt, rows)) {
+            selected.decode_parallel = true;
+        } else if (base.ordinaryN16Eligible(k.prompt, rows)) {
+            selected.ordinary_n16 = true;
+        } else return base;
+        if (k.decode_variant_available.get(selected)) |available| return if (available) selected else base;
+        if (selected.ordinary_n16) {
+            if (k.n16_format_qualified == null) k.n16_format_qualified = lane.n16_qualification.qualify(k.device, k.allocator) catch |err| blk: {
+                std.log.info("qwen27: N16 format qualification unavailable ({t}); retaining original decode", .{err});
+                break :blk false;
+            };
+            if (!k.n16_format_qualified.?) {
+                try k.decode_variant_available.put(k.allocator, selected, false);
+                return base;
+            }
+        }
+        var made = lane.Projection.init(k.allocator, k.device, .{
+            .n = selected.n,
+            .k = selected.k,
+            .format = .{ .bits = selected.bits, .group = selected.group },
+            .sk = selected.slices,
+            .precompute_sums = true,
+            .reg = true,
+            .serial_sk2 = selected.serialSk2(),
+            .tile_batch = selected.batch,
+            .rows8 = true,
+            .reg_lean = true,
+            .swiglu = selected.swiglu,
+            .indexed = selected.sbi,
+            .indexed12 = selected.sbi12,
+            .decode_parallel = selected.decode_parallel,
+            .ordinary_n16 = selected.ordinary_n16,
+        }) catch |err| {
+            std.log.info("qwen27: decode geometry N={d} K={d} index12={} unavailable ({t}); retaining original", .{ selected.n, selected.k, selected.sbi12, err });
+            try k.decode_variant_available.put(k.allocator, selected, false);
+            return base;
+        };
+        const entry = k.lanes.getOrPut(k.allocator, selected) catch |err| {
+            made.deinit();
+            return err;
+        };
+        if (entry.found_existing) {
+            made.deinit();
+        } else {
+            entry.value_ptr.* = made;
+            k.joined(entry.value_ptr);
+        }
+        // Projection ownership has transferred to lanes; a later map-allocation failure must not destroy it.
+        try k.decode_variant_available.put(k.allocator, selected, true);
+        std.log.info("qwen27: decode geometry N={d} K={d} index12={} parallel={} ordinary_n16={} available=true", .{ selected.n, selected.k, selected.sbi12, selected.decode_parallel, selected.ordinary_n16 });
+        return selected;
+    }
+
     pub fn quant(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32) !void {
         return k.quantSkip(input_encoder, p, x, xs, dims, y, rows, 0);
     }
@@ -152,15 +250,16 @@ pub const Kernels = struct {
         if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
         if (!key.serialSk2() or p.n != 34816) return false;
+        key = try k.decodeKey(key, rows);
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = key.sbi, .indexed12 = key.sbi12, .decode_parallel = key.decode_parallel, .ordinary_n16 = key.ordinary_n16 });
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
@@ -304,7 +403,8 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12 };
+        const base_key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12 };
+        const key = try k.decodeKey(base_key, rows);
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -312,7 +412,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi, .indexed12 = key.sbi12, .decode_parallel = key.decode_parallel, .ordinary_n16 = key.ordinary_n16 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -331,7 +431,7 @@ pub const Kernels = struct {
     pub fn prepareDecode(k: *Kernels, p: projection.Linear, rows: u32) !void {
         if (k.prompt or rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return;
         const reg = p.bits == 4 and p.group == 64;
-        const key = Key{
+        const base_key = Key{
             .kind = .projection,
             .n = p.n,
             .k = p.k,
@@ -344,6 +444,7 @@ pub const Kernels = struct {
             .sbi = reg and p.index != null,
             .sbi12 = reg and p.index != null and p.index12,
         };
+        const key = try k.decodeKey(base_key, rows);
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (entry.found_existing) return;
         errdefer _ = k.lanes.remove(key);
@@ -359,7 +460,10 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
+            .decode_parallel = key.decode_parallel,
+            .ordinary_n16 = key.ordinary_n16,
         });
         k.joined(entry.value_ptr);
     }
@@ -536,4 +640,39 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
     return if (key.k == 17408 or key.k == 6144) 2 else 1;
+}
+
+test "optional decode geometries retain full-key guards and format separation" {
+    const q = Key{ .kind = .projection, .n = 10240, .k = 5120, .slices = 2, .rows8 = true, .lean = true, .batch = 8, .sbi = true };
+    try std.testing.expect(q.ordinaryN16Eligible(false, 1));
+    try std.testing.expect(q.ordinaryN16Eligible(false, 8));
+    try std.testing.expect(!q.ordinaryN16Eligible(true, 8));
+    try std.testing.expect(!q.ordinaryN16Eligible(false, 0));
+    try std.testing.expect(!q.ordinaryN16Eligible(false, 9));
+    inline for (.{ .{ "n", @as(u32, 5120) }, .{ "k", @as(u32, 17408) }, .{ "slices", @as(u32, 4) }, .{ "batch", @as(u32, 1) }, .{ "skip", @as(u32, 1) }, .{ "range", [2]u32{ 0, 1 } }, .{ "cut", [2]u32{ 0, 1 } }, .{ "sbi", false }, .{ "prompt_sr", true }, .{ "swiglu", true }, .{ "decode_parallel", true } }) |change| {
+        var no = q;
+        @field(no, change[0]) = change[1];
+        try std.testing.expect(!no.ordinaryN16Eligible(false, 8));
+    }
+    var out = q;
+    out.n = 5120;
+    out.k = 6144;
+    out.slices = 4;
+    try std.testing.expect(out.ordinaryN16Eligible(false, 8));
+    var gu = q;
+    gu.n = 34816;
+    gu.swiglu = true;
+    try std.testing.expect(gu.parallelEligible(false, 8));
+    try std.testing.expect(!gu.parallelEligible(true, 8));
+    var keys = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer keys.deinit();
+    try keys.put(q, true);
+    var variant = q;
+    variant.ordinary_n16 = true;
+    try keys.put(variant, true);
+    variant.sbi12 = true;
+    try keys.put(variant, true);
+    variant.range = .{ 1, 1 };
+    try keys.put(variant, true);
+    try std.testing.expectEqual(@as(usize, 4), keys.count());
 }

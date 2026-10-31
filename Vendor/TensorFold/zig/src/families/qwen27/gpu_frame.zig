@@ -44,8 +44,7 @@ pub const Frame = struct {
     config: Config,
     standby: ?[scratch_fields.len]mtl.Buffer = null,
     small: bool = false,
-    /// A GDN block's gate or a decoded-row attention merge wrote its out projection's group sums into `.sums` (read
-    /// and cleared by that projection).
+    /// A GDN block's gate wrote its out projection's group sums into `.sums` (read and cleared by that projection).
     mixer_sums: bool = false,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {

@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const frags = @import("frags.zig");
+pub const n16_qualification = @import("lane_n16_qualification.zig");
 
 pub const weight_layout = "u32[ceil(N/32)][K/group][32][group*bits/32], low-bit-first codes, columns past N zero";
 pub const reg_layout = "u32[N/32][K/64][2][32 lanes][4] 4-bit codes, regBlock order";
@@ -10,7 +11,7 @@ pub const metadata_layout = "bf16[K/group][N][scale,bias]";
 /// Lean decode-row reg launches may take the metadata indexed: u32[sb_table] distinct (scale | bias << 16) words, then u16[K/group][N]
 /// indices into them. A group's words are the pair it names, so its arithmetic is unchanged.
 pub const indexed_layout = "u32[sb_table] then u16[K/group][N]";
-pub const sb_table = 65536;
+pub const sb_table = 8192;
 
 pub fn indexedBytes(n: usize, k: usize, group: usize) usize {
     return sb_table * 4 + n * (k / group) * 2;
@@ -23,119 +24,6 @@ pub const sb_table12 = 4096;
 pub fn indexed12Bytes(n: usize, k: usize, group: usize) usize {
     return sb_table12 * 4 + (k / group) * (n / 32) * 48;
 }
-/// The distinct (scale | bias << 16) words of packed pairs ([K/64][N][scale, bias]), most used first (ties in first-seen
-/// order, as fkiene's d2bb6335 and terrapinelf's d81c8214 order them), and each group's rank among them. Every rank still
-/// names its group's own word, so a kernel reads the same values; the hot words only share fewer cache lines, so a decoded
-/// group's table lookups mostly hit lines already in cache. Null past `cap` distinct words.
-const Ranked = struct {
-    words: []u32,
-    ranks: []u16,
-    fn deinit(r: Ranked, allocator: std.mem.Allocator) void {
-        allocator.free(r.words);
-        allocator.free(r.ranks);
-    }
-};
-fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap: usize) !?Ranked {
-    var seen = std.AutoHashMap(u32, u16).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(@intCast(2 * cap));
-    const firsts = try allocator.alloc(u32, cap);
-    defer allocator.free(firsts);
-    const counts = try allocator.alloc(u32, cap);
-    defer allocator.free(counts);
-    @memset(counts, 0);
-    const ranks = try allocator.alloc(u16, groups);
-    errdefer allocator.free(ranks);
-    for (ranks, 0..) |*at, i| {
-        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
-        const got = seen.getOrPutAssumeCapacity(word);
-        if (!got.found_existing) {
-            if (seen.count() > cap) {
-                allocator.free(ranks);
-                return null;
-            }
-            got.value_ptr.* = @intCast(seen.count() - 1);
-            firsts[got.value_ptr.*] = word;
-        }
-        counts[got.value_ptr.*] += 1;
-        at.* = got.value_ptr.*;
-    }
-    // most used first, ties by first-seen id: key = (max - count) << 16 | id, ascending
-    const distinct = seen.count();
-    const keys = try allocator.alloc(u64, distinct);
-    defer allocator.free(keys);
-    for (keys, 0..) |*key, id| key.* = (@as(u64, std.math.maxInt(u32) - counts[id]) << 16) | @as(u64, id);
-    std.mem.sort(u64, keys, {}, std.sort.asc(u64));
-    const rank = try allocator.alloc(u16, distinct);
-    defer allocator.free(rank);
-    const words = try allocator.alloc(u32, distinct);
-    errdefer allocator.free(words);
-    for (keys, 0..) |key, r| {
-        const id: usize = @intCast(key & 0xFFFF);
-        rank[id] = @intCast(r);
-        words[r] = firsts[id];
-    }
-    for (ranks) |*at| at.* = rank[at.*];
-    return .{ .words = words, .ranks = ranks };
-}
-
-/// indexed_layout of packed pairs ([K/64][N][scale, bias]): rankPairs' words, then each group's u16 rank.
-/// Null (nothing kept) past sb_table distinct pairs.
-fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
-    const cap = sb_table;
-    const ranked = (try rankPairs(allocator, pair, n * (k / 64), cap)) orelse return null;
-    defer ranked.deinit(allocator);
-    const sb = try device.buffer(indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-    var keep = false;
-    defer if (!keep) sb.deinit();
-    const table = sb.slice(u32, cap);
-    @memset(table, 0);
-    @memcpy(table[0..ranked.words.len], ranked.words);
-    const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
-    @memcpy(index, ranked.ranks);
-    keep = true;
-    return sb;
-}
-
-/// indexed12_layout of packed pairs, with rankPairs' order; null (nothing kept) past
-/// sb_table12 distinct pairs.
-fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
-    const cap = sb_table12;
-    const groups = k / 64;
-    const ranked = (try rankPairs(allocator, pair, groups * n, cap)) orelse return null;
-    defer ranked.deinit(allocator);
-    const sb = try device.buffer(indexed12Bytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-    var keep = false;
-    defer if (!keep) sb.deinit();
-    const table = sb.slice(u32, cap);
-    @memset(table, 0);
-    @memcpy(table[0..ranked.words.len], ranked.words);
-    const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
-    @memset(out, 0);
-    for (0..groups) |g| for (0..n) |c| {
-        const i = g * n + c;
-        const x = c % 32;
-        const bit = 12 * ((x / 16) * 4 + x % 4);
-        const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
-        const ix: u64 = @as(u64, ranked.ranks[i]) << @intCast(bit % 32);
-        out[at] |= @truncate(ix);
-        if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
-    };
-    keep = true;
-    return sb;
-}
-
-/// An indexed copy of packed pairs and its form.
-pub const Indexed = struct { buffer: mtl.Buffer, twelve: bool };
-
-/// Packed pairs ([K/64][N][scale, bias]) as indexed12_layout when at most sb_table12 distinct pairs and N/32 tiles allow
-/// it, else indexed_layout, else null; tables most used first (rankPairs). The caller owns the buffer.
-pub fn indexMetadata(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?Indexed {
-    if (n % 32 == 0) if (try indexPairs12(device, allocator, pair, n, k)) |b| return .{ .buffer = b, .twelve = true };
-    if (try indexPairs(device, allocator, pair, n, k)) |b| return .{ .buffer = b, .twelve = false };
-    return null;
-}
-
 pub const Output = enum { bf16, f32 };
 
 pub const Format = struct {
@@ -165,6 +53,10 @@ pub const Layout = struct {
     reg: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
+    /// Decoded fused GU: execute the same two K chains concurrently, then ordered C0+C1 and original H/HS.
+    decode_parallel: bool = false,
+    /// Decoded ordinary projections: one N16 half of the original N32 code tile per group.
+    ordinary_n16: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
     prompt_sr: bool = false,
@@ -202,6 +94,10 @@ pub const Layout = struct {
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
+        if (l.decode_parallel and (!l.swiglu or !l.rows8 or !l.indexed or !l.serial_sk2 or l.sk != 2 or
+            l.tile_batch != 8 or l.ordinary_n16)) return error.InvalidSchedule;
+        if (l.ordinary_n16 and (!l.reg or !l.rows8 or !l.indexed or !l.reg_lean or l.swiglu or
+            l.ranges.len != 0 or l.groups != null)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
@@ -238,6 +134,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
+        if (l.decode_parallel) return 8192; // 4KiB partial + 2KiB BF16 GU + 2KiB FP32 H
         return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
     }
 
@@ -286,7 +183,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
-    try text.appendSlice(a, ks.core_lane_projection);
+    try text.appendSlice(a, if (l.decode_parallel) ks.core_lane_decode_parallel else if (l.ordinary_n16) ks.core_lane_decode_n16 else ks.core_lane_projection);
     return text.toOwnedSlice(a);
 }
 
@@ -407,6 +304,7 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
+    decode_parallel: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -420,7 +318,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.decode_parallel) @as(usize, 256) else if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -428,7 +326,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = (l.tiles() / l.prompt_tn) * (if (l.ordinary_n16) @as(usize, 2) else 1), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .decode_parallel = l.decode_parallel };
     }
 
     pub fn deinit(p: Projection) void {
@@ -471,7 +369,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
-        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(if (p.decode_parallel) 256 else 128, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
@@ -696,4 +594,27 @@ test "reg order puts every code in the tensor op's right-input register for its 
     try bad.validate();
     bad.format.group = 128;
     try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
+test "decode optional geometry preserves packed sizes and has explicit resource guards" {
+    const ordinary = Layout{ .n = 10240, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .reg = true, .serial_sk2 = true, .rows8 = true, .reg_lean = true, .indexed = true, .indexed12 = true, .tile_batch = 8, .ordinary_n16 = true };
+    try ordinary.validate();
+    var original = ordinary;
+    original.ordinary_n16 = false;
+    try std.testing.expectEqual(original.weightWords(), ordinary.weightWords());
+    try std.testing.expectEqual(original.metadataElements(), ordinary.metadataElements());
+    inline for (.{ .{ "rows8", false }, .{ "indexed", false }, .{ "reg_lean", false }, .{ "swiglu", true }, .{ "ranges", @as([]const [2]usize, &.{.{ 0, 1 }}) } }) |change| {
+        var no = ordinary;
+        @field(no, change[0]) = change[1];
+        try std.testing.expectError(error.InvalidSchedule, no.validate());
+    }
+    var gu = ordinary;
+    gu.n = 34816;
+    gu.ordinary_n16 = false;
+    gu.swiglu = true;
+    gu.decode_parallel = true;
+    try gu.validate();
+    try std.testing.expectEqual(@as(usize, 8192), gu.threadgroupBytes());
+    gu.sk = 4;
+    try std.testing.expectError(error.InvalidSchedule, gu.validate());
 }
