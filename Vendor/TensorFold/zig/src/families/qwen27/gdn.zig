@@ -113,6 +113,7 @@ pub const Round = struct {
     /// The out projection's group sums `gate` writes beside its rows (tf_lane_sums' layout, `stride` rows a group).
     sums: ?Sums = null,
     compact: bool,
+    depth_one: bool = false,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
@@ -123,7 +124,7 @@ pub const Round = struct {
         for (pipelines.tree_slots) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 128) return error.UnsupportedGdnPipeline;
         const slots = @import("core_delta").slotKernel(plan.slot_peak);
         if (plan.compact) for (plan.segments) |segment| try @import("core").tree_slots.validate(plan.parents[segment.first..][0..segment.rows], plan.slot_steps[segment.first..][0..segment.rows], segment.first, @import("core_delta").slot_kernels[slots]);
-        return .{ .slot_kernel = slots, .compact = plan.compact, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
+        return .{ .slot_kernel = slots, .compact = plan.compact, .depth_one = plan.depthOneStars(), .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
     }
 
     pub fn prepare(r: Round, e: metal.ComputeEncoder) void {
@@ -173,6 +174,22 @@ pub const Round = struct {
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        if (beside) |b| try b.encode(b.ptr, e);
+        e.barrier();
+        r.gate(e, post_rows);
+    }
+
+    /// Direct siblings retain only the anchor; native32-lane arithmetic and layout.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside) !void {
+        if (!r.usesSlots() or !r.depth_one) return r.forward(e, post_rows, beside);
+        e.setPipeline(pair);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+        e.setValue(r.p, 8);
+        bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
+        r.b.slot_steps.bind(e, 11);
+        r.b.state.bind(e, 12);
+        (r.b.before orelse r.b.state).bind(e, 13);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         r.gate(e, post_rows);

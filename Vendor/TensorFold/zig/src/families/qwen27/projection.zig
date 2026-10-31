@@ -47,6 +47,13 @@ pub fn promptSplit(n: usize, k: usize) ?u32 {
 }
 
 pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32) !Linear {
+    return prepareForced(device, allocator, owned, parts, tile, null);
+}
+
+/// The same matrix with `forced` adjacent tiles interleaved instead of `tileBatch`'s count: a caller that keeps one
+/// copy in the batched order for its decoded rows and another, unbatched, whose rows a span slice reads in order
+/// (the drafter's head) prepares one of each rather than sharing a layout only one of them can address.
+pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32) !Linear {
     if (tile != 32 or parts.len == 0) return error.BadProjectionShape;
     const bits = parts[0].bits;
     const group = parts[0].group;
@@ -64,7 +71,7 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
     if (!device.tensorUnits() or n % tile != 0) return prepareRows(device, allocator, owned, parts, n, k, tile, slices);
     if (bits != 4 or group != 64) return prepareLanes(device, allocator, owned, parts, n, k, tile, slices);
     slices = m5Split(n, k) orelse slices;
-    const batch: usize = tileBatch(n, k);
+    const batch: usize = forced orelse tileBatch(n, k);
     const stored = storedColumns(n, @intCast(batch));
     const w = try device.buffer(stored * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     owned.append(allocator, w) catch |err| {
@@ -95,72 +102,13 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
         };
         base += rows;
     }
-    const packed12 = try indexPairs12(device, allocator, owned, pair, n, k);
-    const index: ?Ref = if (packed12) |b| .{ .buffer = b } else if (try indexPairs(device, allocator, owned, pair, n, k)) |b| .{ .buffer = b } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = packed12 != null };
-}
-
-/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
-/// first-seen order, then each group's u16 index. Null (nothing kept) past lane_projection.sb_table distinct pairs.
-fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
-    const cap = lane.sb_table;
-    var seen = std.AutoHashMap(u32, u16).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(2 * cap);
-    const sb = try device.buffer(lane.indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-    var keep = false;
-    defer if (!keep) sb.deinit();
-    const table = sb.slice(u32, cap);
-    @memset(table, 0);
-    const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
-    for (index, 0..) |*at, i| {
-        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
-        const got = seen.getOrPutAssumeCapacity(word);
-        if (!got.found_existing) {
-            if (seen.count() > cap) return null;
-            got.value_ptr.* = @intCast(seen.count() - 1);
-            table[got.value_ptr.*] = word;
-        }
-        at.* = got.value_ptr.*;
-    }
-    try owned.append(allocator, sb);
-    keep = true;
-    return sb;
-}
-
-/// lane_projection.indexed12_layout of packed pairs; null (nothing kept) past lane_projection.sb_table12 distinct pairs.
-fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
-    const cap = lane.sb_table12;
-    var seen = std.AutoHashMap(u32, u16).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(2 * cap);
-    const sb = try device.buffer(lane.indexed12Bytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-    var keep = false;
-    defer if (!keep) sb.deinit();
-    const table = sb.slice(u32, cap);
-    @memset(table, 0);
-    const groups = k / 64;
-    const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
-    @memset(out, 0);
-    for (0..groups) |g| for (0..n) |c| {
-        const i = g * n + c;
-        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
-        const got = seen.getOrPutAssumeCapacity(word);
-        if (!got.found_existing) {
-            if (seen.count() > cap) return null;
-            got.value_ptr.* = @intCast(seen.count() - 1);
-            table[got.value_ptr.*] = word;
-        }
-        const x = c % 32;
-        const bit = 12 * ((x / 16) * 4 + x % 4);
-        const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
-        const ix: u64 = @as(u64, got.value_ptr.*) << @intCast(bit % 32);
-        out[at] |= @truncate(ix);
-        if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
+    const indexed = try lane.indexMetadata(device, allocator, pair, n, k);
+    if (indexed) |x| owned.append(allocator, x.buffer) catch |err| {
+        x.buffer.deinit();
+        return err;
     };
-    try owned.append(allocator, sb);
-    keep = true;
-    return sb;
+    const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {

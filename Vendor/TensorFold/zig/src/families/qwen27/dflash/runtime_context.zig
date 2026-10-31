@@ -48,7 +48,6 @@ fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("r
         for (slots[0..count], 0..) |*slot, i| slot.* = @intCast(positions[first + i] % b.config.window);
         if (values.stride != b.config.kvWidth() or keys.stride != b.config.kvWidth()) {
             try b.attention.appendKvStrided(e, slots[0..count], .{ .buf = k.buf, .off = k.off + first * keys.stride * 2 }, .{ .buf = v.buf, .off = v.off + first * values.stride * 2 }, .{ .buf = cache.keys }, .{ .buf = cache.values }, keys.stride, values.stride);
-            e.barrier();
             continue;
         }
         const off = first * b.config.kvWidth() * 2;

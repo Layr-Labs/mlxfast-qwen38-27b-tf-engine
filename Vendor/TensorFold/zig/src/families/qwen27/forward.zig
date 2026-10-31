@@ -91,8 +91,8 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
-        // read and cleared before any return, and used only by the block whose GDN gate wrote it
-        const gated = f.mixer_sums and layer.mixer == .linear;
+        // read and cleared before any return, and used only by the block whose GDN gate or attention merge wrote it
+        const gated = f.mixer_sums;
         f.mixer_sums = false;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
@@ -103,7 +103,7 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        // a GDN gate's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
+        // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
         try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
@@ -163,7 +163,10 @@ pub const Stages = struct {
                 input.offset += @as(usize, s.rows - 1) * m.config.hidden * 2;
                 head_sums.ref.offset += @as(usize, s.rows - 1) * 4;
             }
-            try m.kernels.quant(e, m.weights.head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
+            // a decoded round's rows read the copy whose eight adjacent tiles interleave; a prompt's last row the
+            // unbatched one
+            const head = if (s.head == .all) m.weights.head_decode else m.weights.head;
+            try m.kernels.quant(e, head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
