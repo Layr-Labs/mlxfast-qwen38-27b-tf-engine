@@ -284,18 +284,21 @@ struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, i
 // and four table words, the words the unindexed quad holds, so every product and FMA is unchanged. A group's indices load
 // one group ahead with its codes; its table words at the top of its own iteration.
 #if defined(TF_SBI)
-inline uint4 tf_look(const device uint* tab, uint2 ix) {
-  return uint4(tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]);
+// The table holds each distinct pair as the f32 values the loop multiplies: (scale * 2^24, bias), exactly the fold's
+// float(scale) * 2^24 and float(bias) of the pair's bf16 words.
+struct tf_quad { float2 e[4]; };
+inline tf_quad tf_look(const device float2* tab, uint2 ix) {
+  return {{tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]}};
 }
 #endif
 // TF_SBI12: the same, with 12-bit indices: a lane's two quads are one packed_uint3 of eight indices, low bits first, as
 // lane_projection.indexed12_layout. The table words read are those of the 16-bit indices.
 #if defined(TF_SBI12)
-inline uint4 tf_look12a(const device uint* tab, uint3 ix) {
-  return uint4(tab[ix.x & 0xFFFu], tab[(ix.x >> 12) & 0xFFFu], tab[(ix.x >> 24) | ((ix.y & 0xFu) << 8)], tab[(ix.y >> 4) & 0xFFFu]);
+inline tf_quad tf_look12a(const device float2* tab, uint3 ix) {
+  return {{tab[ix.x & 0xFFFu], tab[(ix.x >> 12) & 0xFFFu], tab[(ix.x >> 24) | ((ix.y & 0xFu) << 8)], tab[(ix.y >> 4) & 0xFFFu]}};
 }
-inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
-  return uint4(tab[(ix.y >> 16) & 0xFFFu], tab[(ix.y >> 28) | ((ix.z & 0xFFu) << 4)], tab[(ix.z >> 8) & 0xFFFu], tab[ix.z >> 20]);
+inline tf_quad tf_look12b(const device float2* tab, uint3 ix) {
+  return {{tab[(ix.y >> 16) & 0xFFFu], tab[(ix.y >> 28) | ((ix.z & 0xFFu) << 4)], tab[(ix.z >> 8) & 0xFFFu], tab[ix.z >> 20]}};
 }
 #endif
 
@@ -320,7 +323,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU)
+#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+#define TF_GU_TURNS 1
+#endif
+#if defined(TF_GU_TURNS)
+[[max_total_threads_per_threadgroup(64)]]
+#elif defined(TF_SWIGLU)
 [[max_total_threads_per_threadgroup(128)]]
 #elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
@@ -343,7 +351,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   Y += (size_t)r0 * TF_YS;
 #endif
   XS += r0;
-#if defined(TF_SWIGLU)
+#if defined(TF_GU_TURNS)
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1];
+#elif defined(TF_SWIGLU)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #else
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
@@ -356,10 +366,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
-  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane;
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
+#if defined(TF_GU_TURNS)
+  float G[16];
+  for (int turn = 0; turn < 2; turn++) {
+  const int tile = 2 * int(tg.x) + ks + turn * (TF_N / 64), n0 = tile * NT;
+#endif
+  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane;
 #if defined(TF_SERIAL_SK2)
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
@@ -380,25 +395,37 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
   const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+#if defined(TF_PROMPT_F32)
+  // TF_PROMPT_F32: the pairs as f32 (scale * 2^24, bias), two columns a float4: spf[0], spf[1] are sp[0]'s four columns,
+  // spf[8], spf[9] sp[4]'s
+  const device float4* spf = (const device float4*)SB + ((size_t)first * TF_N + n0 + nb) / 2;
+#else
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
+#endif
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   for (int g = first; g < last; g++) {
+#if defined(TF_PROMPT_F32)
+    const float4 fa = spf[0], fb = spf[1], fc = spf[8], fd = spf[9];
+    const tf_reg_load cur = {nw0, nw1, uint4(0), uint4(0), xp[0], xp[8]};
+    spf += TF_N / 2;
+#else
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
     sp += TF_N / 4;
+#endif
     xp += stride;
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
 #if defined(TF_SBI12)
-  const device uint* tab = (const device uint*)SB;
+  const device float2* tab = (const device float2*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
   uint3 ni = 0;
   if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
 #elif defined(TF_SBI)
-  const device uint* tab = (const device uint*)SB;
+  const device float2* tab = (const device float2*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
@@ -406,9 +433,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
-    const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
+    const tf_quad f0 = tf_look12a(tab, ni), f1 = tf_look12b(tab, ni);
+    const uint4 q0 = 0, q1 = 0;
 #elif defined(TF_SBI)
-    const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
+    const tf_quad f0 = tf_look(tab, ni0), f1 = tf_look(tab, ni1);
+    const uint4 q0 = 0, q1 = 0;
 #else
     const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
 #endif
@@ -464,8 +493,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
+#if defined(TF_SBI)
+      const float s0 = f0.e[j].x, b0 = f0.e[j].y, s1 = f1.e[j].x, b1 = f1.e[j].y;
+#elif defined(TF_PROMPT_F32)
+      const float2 ea = j == 0 ? fa.xy : j == 1 ? fa.zw : j == 2 ? fb.xy : fb.zw, eb = j == 0 ? fc.xy : j == 1 ? fc.zw : j == 2 ? fd.xy : fd.zw;
+      const float s0 = ea.x, b0 = ea.y, s1 = eb.x, b1 = eb.y;
+#else
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
-      const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
+#endif
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
@@ -480,6 +516,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] = C0[i] + C[i];
+#if defined(TF_GU_TURNS)
+    if (turn == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) G[i] = C[i];
+  }
+#endif
 #elif defined(TF_SERIAL_SK2)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
@@ -526,24 +566,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
-  threadgroup bfloat gu[4 * 8 * 32];
   threadgroup bfloat hb[8 * 64];
-  for (int i = 0; i < 16; i++) {
-    if (!TF_LIVE(i)) continue;
-    gu[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  if (mb < M) {
+    const int c0 = ks * 32 + nb;
+    device TF_OUT* yr = Y + (size_t)mb * (TF_N / 2) + int(tg.x) * 64 + c0;
+    threadgroup bfloat* hr = hb + mb * 64 + c0;
+    for (int i = 0; i < 16; i++) {
+      if (!TF_LIVE(i)) continue;
+      const int c = 16 * (i >> 3) + (i & 3);
+      const float gf = float(static_cast<bfloat>(G[i]));
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(static_cast<bfloat>(C[i])));
+      yr[c] = h;
+      hr[c] = h;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t = ks * 32 + lane;
-  for (int at = t; at < 8 * 64; at += 128) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu[((c >> 5) * 8 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb[at] = h;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int m = t; m < stride; m += 128) {
+  for (int m = t; m < stride; m += 64) {
     float acc = 0.0f;
     if (m < M)
       for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
@@ -584,9 +623,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
+#if defined(TF_PROMPT_F32)
+// TF_PROMPT_F32: the pairs as f32 (scale * 2^24, bias), two columns a float4 (spf[0], spf[1]: sp[0]'s columns; spf[8], spf[9]: sp[4]'s)
+#define TF_TN_META_DECL const device float4* spf = (const device float4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 2;
+#define TF_TN_META_LOAD(t) const float4 fa = spf[0], fb = spf[1], fc = spf[8], fd = spf[9]; \
+      spf += (t) + 1 < TN ? NT / 2 : (TF_N - (TN - 1) * NT) / 2;
+#define TF_TN_META_FOLD(j) const float2 ea = (j) == 0 ? fa.xy : (j) == 1 ? fa.zw : (j) == 2 ? fb.xy : fb.zw, \
+      eb = (j) == 0 ? fc.xy : (j) == 1 ? fc.zw : (j) == 2 ? fd.xy : fd.zw; \
+      const float s0 = ea.x, b0 = ea.y, s1 = eb.x, b1 = eb.y;
+#else
+#define TF_TN_META_DECL const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
+#define TF_TN_META_LOAD(t) const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4;
+#define TF_TN_META_FOLD(j) const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+#endif
 #define TF_TN_TILE(t) { \
-      const uint4 q0 = sp[0], q1 = sp[4]; \
-      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      TF_TN_META_LOAD(t) \
       thread half2* b2l = (thread half2*)&cbl[0]; \
       thread half2* b2h = (thread half2*)&cbh[0]; \
       TF_UNROLL \
@@ -606,8 +659,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       opa.run(xl1, cbh, P); \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
-        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
-        const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y); \
+        TF_TN_META_FOLD(j) \
         C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
@@ -666,7 +718,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
 #endif
   const device uint4* cp = W + ((size_t)(tile0 / TF_TB) * KG * TF_TB + tile0 % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
-  const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
+  TF_TN_META_DECL
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   float C[TN][16];
