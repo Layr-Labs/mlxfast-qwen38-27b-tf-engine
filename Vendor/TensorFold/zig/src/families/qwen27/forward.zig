@@ -39,6 +39,9 @@ pub const Stages = struct {
     after: ?Hook = null,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
+    /// The caller proved that only the final head row consumes the final layer's post-mixer work.
+    trim_last_post: bool = false,
+    compact_post: bool = false,
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
         const m = s.model;
         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
@@ -85,9 +88,20 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
-        try m.kernels.quant(e, out, f.get(.mixer_out), null, f.get(.dims), f.get(.output), s.rows);
+        var mixer_out = f.get(.mixer_out);
+        if (s.trim_last_post and index + 1 == m.config.layers and s.rows > 1) {
+            // All cache-producing mixer work and earlier taps have already consumed the full rows.
+            const last: usize = s.rows - 1;
+            mixer_out.offset += last * out.k * 2;
+            s.hidden.offset += last * m.config.hidden * 2;
+            s.residual.offset += last * m.config.hidden * 2;
+            s.rows = 1;
+            s.compact_post = true;
+        }
+        const dims = s.postDims();
+        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
         e.barrier();
-        try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);
@@ -117,12 +131,12 @@ pub const Stages = struct {
             s.pending = f.get(.output);
             return;
         } else {
-            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.dims), f.get(.mixed), s.rows);
+            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
             e.barrier();
-            try m.kernels.mlp(e, f.get(.mixed), up, f.get(.dims), f.get(.activated), f.get(.act_sums), width, s.rows);
+            try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
         }
         lane.enc.barrier();
-        try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.dims), f.get(.output), s.rows);
+        try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), dims, f.get(.output), s.rows);
         lane.enc.barrier();
         s.pending = f.get(.output);
     }
@@ -130,7 +144,8 @@ pub const Stages = struct {
         const m = s.model;
         const f = &m.frame;
         const e = lane.enc;
-        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+        const dims = s.postDims();
+        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
@@ -142,13 +157,16 @@ pub const Stages = struct {
                 input.offset += @as(usize, s.rows - 1) * m.config.hidden * 2;
                 head_sums.ref.offset += @as(usize, s.rows - 1) * 4;
             }
-            try m.kernels.quant(e, m.weights.head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
+            try m.kernels.quant(e, m.weights.head, input, head_sums, dims, f.get(.logits), if (s.head == .last) 1 else s.rows);
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
+    }
+    fn postDims(s: *const Stages) Ref {
+        return s.model.frame.get(if (s.compact_post) .last_post_dims else .dims);
     }
 };
 

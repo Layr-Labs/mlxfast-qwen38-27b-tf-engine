@@ -250,6 +250,9 @@ pub const Runner = struct {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .after = r.after, .images = placed.images };
+        stages.trim_last_post = accepted and r.model.kernels.prompt and head == .last and
+            round.slots.len == 1 and r.tail == null and r.after == null and r.model.ane == null and
+            (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {

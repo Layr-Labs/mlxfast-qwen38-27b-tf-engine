@@ -4,7 +4,7 @@ const mtl = @import("metal");
 const Config = @import("config.zig").Config;
 const Ref = @import("projection.zig").Ref;
 
-pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps };
+pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, last_post_dims };
 
 /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
 pub const max_rows = 2048;
@@ -24,7 +24,7 @@ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).l
         capacity * 4,                                                                       4,                                                                                                                                      capacity * 4,
         capacity * config.conv_kernel * 4,                                                  capacity * 4,                                                                                                                           capacity * 16,
         capacity * 16,                                                                      capacity * 4,                                                                                                                           capacity * config.kvDim() * 2,
-        capacity * 4,                                                                       capacity * @sizeOf(@import("core").tree_slots.Step),
+        capacity * 4,                                                                       capacity * @sizeOf(@import("core").tree_slots.Step), 8 * 4,
     };
 }
 
@@ -68,6 +68,7 @@ pub const Frame = struct {
             standby = bank;
         }
         buffers[@backingInt(Field.eps)].slice(f32, 1)[0] = config.eps;
+        @memcpy(buffers[@backingInt(Field.last_post_dims)].slice(i32, 8), &[_]i32{ 1, 16, 0, 0, 0, 0, 0, 0 });
         return .{ .buffers = buffers, .capacity = capacity, .config = config, .standby = standby };
     }
 
