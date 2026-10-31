@@ -128,15 +128,16 @@ kernel void tf_delta_gdn_pre(device const bfloat* projection [[buffer(0)]],
   else tf_delta_gdn_pre_body<0, false>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, tails, group, lane);
 }
 
-// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps 4 rows of a head on conv weights read once;
-// bfloat4 rows, and the gates a lane a row.
+// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps up to 4 rows of a head on conv weights read
+// once; bfloat4 rows, and the gates a lane a row. A group's rows split evenly over its four simdgroups (2 each for a
+// verify's 8 rows), so none walks more rows than it must; each row's arithmetic is the same whichever walks it.
 inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* windows, device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query,
     device bfloat* key, device bfloat* value, device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, first = (group.z * 4 + sg) * 4;
-  if (first >= p.rows) return;
-  const uint count = metal::min(4u, p.rows - first);
+  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  if (sg * per >= in_group) return;
+  const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
   const uint keep = p.taps - 1;
   const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
