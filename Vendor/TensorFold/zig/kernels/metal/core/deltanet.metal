@@ -709,3 +709,73 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+
+// One independent recurrent layer per grid.z; metadata remains GPU authoritative.
+struct TfDeltaKeepLayer {
+  device const bfloat* key;
+  device const bfloat* value;
+  device const float* decay;
+  device const bfloat* mixing;
+  device float* state;
+  device const float* before;
+  device bfloat* history;
+  device const bfloat* projection;
+  device bfloat* next_history;
+};
+
+kernel void tf_delta_gdn_keep_layers(constant TfDeltaKeepLayer* layers [[buffer(0)]],
+    device const uint* kept_rows [[buffer(1)]],
+    device const TfDeltaKeep* keeps [[buffer(2)]],
+    device const TfDeltaSegment* segments [[buffer(3)]],
+    device const uint* windows [[buffer(4)]],
+    constant TfDeltaParams& p [[buffer(5)]],
+    constant uint& state_groups [[buffer(6)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint ti [[thread_index_in_threadgroup]]) {
+  const TfDeltaKeepLayer layer = layers[group.z];
+  const TfDeltaKeep keep = keeps[group.y];
+  if (group.x < state_groups) {
+    const uint columns = (p.dv + 3) / 4;
+    const uint head = group.x / columns;
+    const uint dimension = (group.x % columns) * 4 + ti / 32;
+    const uint lane = ti % 32;
+    if (dimension >= p.dv) return;
+    if (p.advance != 0 && segments[group.y].rows == 1) {
+      if (keep.rows == 0) {
+        const uint stride = p.nv * p.dv * p.dk;
+        const uint column = (head * p.dv + dimension) * p.dk + lane * 4;
+        for (uint part = 0; part < 4; ++part)
+          layer.state[keep.next_slot * stride + column + part] = layer.before[keep.state_slot * stride + column + part];
+      }
+      return;
+    }
+    tf_delta_gdn_replay_body<4>(layer.key, layer.value, layer.decay, layer.mixing,
+        layer.state, kept_rows, keeps, p, layer.state,
+        uint3(lane, dimension, group.y * p.nv + head), lane);
+    return;
+  }
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const uint width = (p.taps - 1) * channels;
+  const uint item = (group.x - state_groups) * 128 + ti;
+  if (item >= width) return;
+  if (keep.rows == 0) {
+    layer.next_history[keep.next_slot * width + item] = layer.history[keep.state_slot * width + item];
+    return;
+  }
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  const uint source = windows[row * p.taps + item / channels + 1];
+  layer.next_history[keep.next_slot * width + item] = source < p.taps - 1
+      ? layer.history[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels]
+      : layer.projection[(source - (p.taps - 1)) * channels + item % channels];
+}
+
+kernel void tf_delta_gdn_publish_layers(constant TfDeltaKeepLayer* layers [[buffer(0)]],
+    device const TfDeltaKeep* keeps [[buffer(1)]],
+    constant TfDeltaParams& p [[buffer(2)]],
+    uint3 at [[thread_position_in_grid]]) {
+  const uint width = (p.taps - 1) * (2 * p.nk * p.dk + p.nv * p.dv);
+  const uint slot = keeps[at.y].next_slot;
+  const TfDeltaKeepLayer layer = layers[at.z];
+  if (at.x < width)
+    ((device ushort*)layer.history)[slot * width + at.x] = ((device const ushort*)layer.next_history)[slot * width + at.x];
+}

@@ -348,9 +348,9 @@ pub const Runner = struct {
         }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
+        try r.gdn.commitScanLayers(plan, e);
         e.barrier();
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+        try r.gdn.commitPublishLayers(plan, e);
         // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;

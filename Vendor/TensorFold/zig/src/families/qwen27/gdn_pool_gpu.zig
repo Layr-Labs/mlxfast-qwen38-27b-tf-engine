@@ -54,6 +54,15 @@ pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
 
+
+/// Metal pointer-table ABI; up to56 records fit setBytes'4096-byte limit.
+pub const KeepLayer = extern struct { key: u64, value: u64, decay: u64, mixing: u64, state: u64, before: u64, history: u64, projection: u64, next_history: u64 };
+pub const max_keep_layers = 56;
+comptime {
+    if (@sizeOf(KeepLayer) != 72 or @offsetOf(KeepLayer, "state") != 32 or @offsetOf(KeepLayer, "next_history") != 64 or max_keep_layers * @sizeOf(KeepLayer) > 4096) @compileError("GDN keep table ABI");
+}
+fn address(span: gdn.Span) u64 { return span.buffer.gpuAddress() + span.offset; }
+
 pub const Pool = struct {
     budget: Budget,
     buffers: [std.enums.values(Field).len]metal.Buffer,
@@ -159,7 +168,11 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.usesSlots() and prepared.depth_one) {
+            try prepared.forwardStar(scan.encoder, pool.kernels.star, pool.kernels.post_rows, beside);
+        } else {
+            try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        }
         try scan.end();
     }
 
@@ -282,6 +295,84 @@ pub const Pool = struct {
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+    }
+
+
+    /// Independent layers share dispatches; all acceptance descriptors stay on the GPU.
+    pub fn commitScanLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        if (pool.budget.shape.c.dk != 128) {
+            for (0..pool.budget.layers) |layer| try pool.commitScan(layer, plan, e);
+            return;
+        }
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        p.advance = @intFromBool(pool.advances(plan.host));
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        const state_groups: u32 = if (replays) p.nv * ((p.dv + 3) / 4) else 0;
+        pool.keepUse(e);
+        var table: [max_keep_layers]KeepLayer = undefined;
+        var first: usize = 0;
+        while (first < pool.budget.layers) {
+            const count = @min(table.len, pool.budget.layers - first);
+            for (table[0..count], 0..) |*entry, index| entry.* = try pool.keepLayer(first + index, plan.host);
+            e.setPipeline(pool.kernels.keep_layers);
+            e.setBytes(std.mem.sliceAsBytes(table[0..count]), 0);
+            const m = plan.metadata;
+            gdn.bind(e, .{ try refSpan(m.kept_rows, 0), try refSpan(m.keeps, 0), try refSpan(m.segments, 0), try refSpan(m.windows, 0) }, 1);
+            e.setValue(p, 5);
+            e.setValue(state_groups, 6);
+            e.dispatchGroups(.{ .width = state_groups + (pool.budget.shape.conv + 127) / 128, .height = plan.host.keeps.len, .depth = count }, .{ .width = 128 });
+            first += count;
+        }
+    }
+
+    /// The caller's shared replay fence precedes every layer's conv publication.
+    pub fn commitPublishLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        if (pool.budget.shape.c.dk != 128) {
+            for (0..pool.budget.layers) |layer| try pool.commitPublish(layer, plan, e);
+            return;
+        }
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        pool.keepUse(e);
+        var table: [max_keep_layers]KeepLayer = undefined;
+        var first: usize = 0;
+        while (first < pool.budget.layers) {
+            const count = @min(table.len, pool.budget.layers - first);
+            for (table[0..count], 0..) |*entry, index| entry.* = try pool.keepLayer(first + index, plan.host);
+            e.setPipeline(pool.kernels.publish_layers);
+            e.setBytes(std.mem.sliceAsBytes(table[0..count]), 0);
+            e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
+            e.setValue(p, 2);
+            e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len, .depth = count }, .{ .width = 256 });
+            first += count;
+        }
+    }
+
+    fn keepUse(pool: *const Pool, e: metal.ComputeEncoder) void {
+        inline for (.{ Field.key, .value, .decay, .mixing, .qkv }) |field| e.useResource(pool.get(field), metal.ResourceUsage.read);
+        inline for (.{ Field.state, .history, .next_history }) |field| e.useResource(pool.get(field), metal.ResourceUsage.read | metal.ResourceUsage.write);
+        if (pool.before) |buffer| e.useResource(buffer, metal.ResourceUsage.read);
+    }
+
+    fn keepLayer(pool: *const Pool, layer: usize, plan: Plan) !KeepLayer {
+        const state = try pool.layerSpan(.state, layer);
+        const before = (try pool.beforeSpan(layer, plan, pool.advances(plan))) orelse state;
+        return .{
+            .key = address(try pool.layerSpan(.key, layer)),
+            .value = address(try pool.layerSpan(.value, layer)),
+            .decay = address(try pool.layerSpan(.decay, layer)),
+            .mixing = address(try pool.layerSpan(.mixing, layer)),
+            .state = address(state), .before = address(before),
+            .history = address(try pool.layerSpan(.history, layer)),
+            .projection = address(try pool.layerSpan(.qkv, layer)),
+            .next_history = address(try pool.layerSpan(.next_history, layer)),
+        };
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {

@@ -40,6 +40,9 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         }
         defer for (pool.buffers) |b| a.free(b.data);
         pool.kernels = undefined;
+        pool.kernels.tree_pair = .{ .id = 10 };
+        pool.kernels.post_rows = .{ .id = 3 };
+        pool.kernels.star = .{ .id = 12 };
         pool.kernels.pipelines = .{ .pre = .{ .id = 0 }, .tree = .{ .id = 1 }, .replay = .{ .id = 2 }, .post = .{ .id = 3 }, .conv_commit = .{ .id = 4 }, .tree_slots = .{ .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 }, .{ .id = 13 }, .{ .id = 14 } } };
         pool.kernels.publish_conv = .{ .id = 8 };
         const bytes = 2 * shape.state * 4;
@@ -95,4 +98,86 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         try std.testing.expectEqual(@as(u32, 10), (try window.keep(&.{0})).length);
         try std.testing.expectEqual(@as(usize, if (empty_second) 2 else 1), record.restores);
     }
+}
+
+test "qwen27 speed: batched GPU keeps preserve distinct layer and slot ownership across table chunks" {
+    const a = std.testing.allocator;
+    var c: Config = undefined;
+    c.k_heads = 1; c.v_heads = 1; c.dk = 128; c.dv = 128;
+    c.conv_kernel = 2; c.layers = 57; c.eps = 1e-6;
+    const shape = try abi.Shape.init(c);
+    const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+    var window = try Window.init(a, 9, &.{-1}, 2, 64);
+    defer window.deinit();
+    for ([_]usize{ 3, 57 }) |layers| for ([_]bool{ false, true }) |batched| for ([_]bool{ false, true }) |empty_first| for ([_]bool{ false, true }) |empty_second| {
+        var pool: gpu.Pool = undefined;
+        pool.budget = try @import("families/qwen27/gdn_pool.zig").Budget.init(shape, layers, 2, 16);
+        pool.before = null; pool.before_slots = 0; pool.profiler = null; pool.tree_mode = .auto;
+        pool.residency = null; pool.marks = null;
+        const bytes = 2 * shape.state * 4;
+        const sizes = pool.budget.allocationSizes();
+        for (&pool.buffers, 0..) |*buffer, i| {
+            buffer.* = .{ .id = i + 1, .data = try a.alignedAlloc(u8, .@"16", @max(sizes[i], 16)) };
+            @memset(buffer.data, 0);
+        }
+        defer for (pool.buffers) |buffer| a.free(buffer.data);
+        pool.kernels = undefined;
+        pool.kernels.tree_pair = .{ .id = 10 };
+        pool.kernels.post_rows = .{ .id = 3 };
+        pool.kernels.star = .{ .id = 12 };
+        pool.kernels.keep_layers = .{ .id = 30 };
+        pool.kernels.publish_layers = .{ .id = 31 };
+        pool.kernels.pipelines = .{ .pre = .{ .id = 0 }, .tree = .{ .id = 1 }, .replay = .{ .id = 2 }, .post = .{ .id = 3 }, .conv_commit = .{ .id = 4 }, .tree_slots = .{ .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 }, .{ .id = 13 }, .{ .id = 14 } } };
+        pool.kernels.publish_conv = .{ .id = 8 };
+        var metadata: gpu.Metadata = undefined;
+        inline for (@typeInfo(gpu.Metadata).@"struct".field_names, 0..) |field, i| {
+            @field(metadata, field) = .{ .buffer = .{ .id = 100 + i, .data = try a.alignedAlloc(u8, .@"16", bytes) } };
+        }
+        defer inline for (@typeInfo(gpu.Metadata).@"struct".field_names) |field| a.free(@field(metadata, field).buffer.data);
+        for (0..layers) |layer| for (0..2) |slot| {
+            @memset(@constCast(try pool.committed(layer, slot, true)), @intCast(17 + layer * 2 + slot));
+            @memset(@constCast(try pool.committed(layer, slot, false)), @intCast(81 + layer * 2 + slot));
+        };
+        var plan = try Plan.init(a, try shape.params(2, 2, kinds), &.{
+            .{ .window = window, .state_slot = 0, .next_slot = 0, .path = &.{0} },
+            .{ .window = window, .state_slot = 1, .next_slot = 1, .path = &.{0} },
+        });
+        defer plan.deinit();
+        const scratch = metal.Buffer{ .id = 999, .data = try a.alignedAlloc(u8, .@"16", bytes) };
+        defer a.free(scratch.data);
+        const output = metal.Buffer{ .id = 1000, .data = try a.alignedAlloc(u8, .@"16", bytes) };
+        defer a.free(output.data);
+        const span = gdn.Span{ .buffer = scratch, .bytes = scratch.length() };
+        const refs = gpu.Refs{ .z = .{ .buffer = scratch }, .a = .{ .buffer = scratch }, .b = .{ .buffer = scratch }, .output = .{ .buffer = output }, .scalars = .{ .conv = span, .a_log = span, .dt = span, .norm = span, .kinds = kinds } };
+        var record: metal.Recorder = .{};
+        const e = metal.ComputeEncoder{ .record = &record };
+        var allocations: metal.Allocations = .{};
+        defer pool.releaseBefore();
+        try pool.prepare(.{ .allocations = &allocations }, plan, false);
+        for (0..layers) |layer| try pool.forward(layer, .{ .host = plan, .metadata = metadata }, refs, e, null);
+        var keep = try Plan.init(a, try shape.params(2, 2, kinds), &.{
+            .{ .window = window, .state_slot = 0, .next_slot = 0, .path = if (empty_first) &.{} else &.{0} },
+            .{ .window = window, .state_slot = 1, .next_slot = 1, .path = if (empty_second) &.{} else &.{0} },
+        });
+        defer keep.deinit();
+        try metadata.upload(keep);
+        const dp = gpu.DevicePlan{ .host = keep, .metadata = metadata };
+        const old_barriers = record.barriers;
+        if (batched) try pool.commitScanLayers(dp, e) else for (0..layers) |layer| try pool.commitScan(layer, dp, e);
+        e.barrier();
+        if (batched) try pool.commitPublishLayers(dp, e) else for (0..layers) |layer| try pool.commitPublish(layer, dp, e);
+        e.barrier();
+        try std.testing.expectEqual(old_barriers + 2, record.barriers);
+        try std.testing.expectEqual(if (batched) (layers + 55) / 56 else 0, record.batch_scans);
+        try std.testing.expectEqual(record.batch_scans, record.batch_publishes);
+        try std.testing.expectEqual(layers * (@as(usize, @intFromBool(empty_first)) + @intFromBool(empty_second)), record.restores);
+        for (0..layers) |layer| for (0..2) |slot| {
+            const restored = if (slot == 0) empty_first else empty_second;
+            const expected: u8 = @intCast(17 + layer * 2 + slot);
+            const words = std.mem.bytesAsSlice(u32, try pool.committed(layer, slot, true));
+            const word: u32 = @as(u32, expected) * 0x01010101;
+            for (words) |actual| try std.testing.expectEqual(word + @as(u32, if (restored) 0 else @intCast(7 + slot)), actual);
+            for (try pool.committed(layer, slot, false)) |actual| try std.testing.expectEqual(@as(u8, if (restored) @intCast(81 + layer * 2 + slot) else 0), actual);
+        };
+    };
 }
