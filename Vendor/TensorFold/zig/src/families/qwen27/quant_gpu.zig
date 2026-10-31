@@ -12,10 +12,11 @@ pub const Sums = struct { ref: Ref, stride: u32 };
 
 const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, swiglu: bool = false,
 
-    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
+    /// Projections whose K split is 2: decoded fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288),
+    /// and the prompt rows' FFN down (5120 x 17408) and mixer out (5120 x 6144), whose prompt split is 2 (decode splits them 4).
     fn serialSk2(key: Key) bool {
-        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+        const shape = (key.k == 5120 and (key.n == 34816 or key.n == 10240 or key.n == 12288)) or (key.n == 5120 and (key.k == 17408 or key.k == 6144));
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
 };
 
@@ -48,6 +49,15 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
         try std.testing.expect(!cache.get(excluded).?);
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
+    // prompt FFN down and mixer out take the chain at their prompt split of 2, never at the decode split of 4
+    for ([_]u32{ 17408, 6144 }) |k| {
+        const prompt = Key{ .kind = .projection, .n = 5120, .k = k, .slices = 2 };
+        try std.testing.expect(prompt.serialSk2());
+        try std.testing.expectEqual(@as(?u32, 2), projection.promptSplit(prompt.n, prompt.k));
+        var decode = prompt;
+        decode.slices = 4;
+        try std.testing.expect(!decode.serialSk2());
+    }
 }
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
