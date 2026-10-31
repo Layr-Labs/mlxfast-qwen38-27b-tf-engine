@@ -276,8 +276,24 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #if TF_BITS == 4 && defined(TF_REG)
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
+// TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
+// so its accumulators, row sums, hand-over words and stores are left out. Every live row's words are unchanged.
+#if defined(TF_ROWS8)
+#define TF_LIVE(i) ((((i) >> 2) & 1) == 0)
+#define TF_HALF(i) (((i) & 3) | (((i) >> 3) << 2))
+#define TF_PART 8
+#else
+#define TF_LIVE(i) true
+#define TF_HALF(i) (i)
+#define TF_PART 16
+#endif
+
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
+#if defined(TF_ROWS8)
+  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
+#else
   return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+#endif
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
@@ -335,15 +351,30 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
       const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
+#if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
+#endif
       C[8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0, C[8 + j]));
+#if !defined(TF_ROWS8)
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
+#endif
     }
   }
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
+    if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
+  }
+  for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] = C0[i] + C[i];
+#elif defined(TF_SERIAL_SK2)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_ROWS8)
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
+  if (TF_SK > 1) {
+    if (ks > 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) part[((ks - 1) * TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] += part[((s2 - 1) * TF_PART + TF_HALF(i)) * 32 + lane];
+  }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
@@ -352,10 +383,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
+#if defined(TF_ROWS8)
+  if (ks == 0)
+    for (int i = 0; i < 16; i++) {
+      if (!TF_LIVE(i)) continue;
+      const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+      if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+    }
+#else
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
     }
+#endif
 }
 #endif
