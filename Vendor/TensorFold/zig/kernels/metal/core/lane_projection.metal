@@ -276,8 +276,24 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #if TF_BITS == 4 && defined(TF_REG)
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
+// TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
+// so its accumulators, row sums, hand-over words and stores are left out. Every live row's words are unchanged.
+#if defined(TF_ROWS8)
+#define TF_LIVE(i) ((((i) >> 2) & 1) == 0)
+#define TF_HALF(i) (((i) & 3) | (((i) >> 3) << 2))
+#define TF_PART 8
+#else
+#define TF_LIVE(i) true
+#define TF_HALF(i) (i)
+#define TF_PART 16
+#endif
+
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
+#if defined(TF_ROWS8)
+  return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
+#else
   return {wl[(size_t)g * 64], wl[(size_t)g * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+#endif
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
@@ -315,10 +331,41 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
 #endif
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
+#if defined(TF_REG_LEAN)
+  // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
+  // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
+#if defined(TF_REG_PF0)
+  // prompt rows prefetch nothing: a launch holds eight row blocks a tile, so other SIMD groups hide each group's load
+  // and the next group's codes no longer hold 8 registers across the unpack and the tensor op
+#else
+  uint4 nw0 = 0, nw1 = 0;
+  if (first < last) { nw0 = wl[(size_t)first * 64]; nw1 = wl[(size_t)first * 64 + 32]; }
+#endif
+#if defined(TF_REG_LEAN2)
+  // two groups' codes in flight: the group after next's codes load before this group's unpack
+  uint4 aw0 = 0, aw1 = 0;
+  if (first + 1 < last) { aw0 = wl[(size_t)(first + 1) * 64]; aw1 = wl[(size_t)(first + 1) * 64 + 32]; }
+#endif
+  for (int g = first; g < last; g++) {
+#if defined(TF_REG_PF0)
+    const uint4 nw0 = wl[(size_t)g * 64], nw1 = wl[(size_t)g * 64 + 32];
+#endif
+#if defined(TF_ROWS8)
+    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
+#else
+    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+#endif
+#if defined(TF_REG_LEAN2)
+    nw0 = aw0;
+    nw1 = aw1;
+    if (g + 2 < last) { aw0 = wl[(size_t)(g + 2) * 64]; aw1 = wl[(size_t)(g + 2) * 64 + 32]; }
+#endif
+#else
   tf_reg_load next = {};
   if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
+#endif
     for (int w = 0; w < 8; w++) {
       // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
@@ -328,22 +375,42 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
+#if defined(TF_REG_LEAN2) || defined(TF_REG_PF0)
+#elif defined(TF_REG_LEAN)
+    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * 64]; nw1 = wl[(size_t)(g + 1) * 64 + 32]; }
+#else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
+#endif
     auto x = a.slice(g * GS, 0);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
       const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
+#if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
+#endif
       C[8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0, C[8 + j]));
+#if !defined(TF_ROWS8)
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
+#endif
     }
   }
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
+    if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
+  }
+  for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] = C0[i] + C[i];
+#elif defined(TF_SERIAL_SK2)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_ROWS8)
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
+  if (TF_SK > 1) {
+    if (ks > 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) part[((ks - 1) * TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] += part[((s2 - 1) * TF_PART + TF_HALF(i)) * 32 + lane];
+  }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
@@ -352,10 +419,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
+#if defined(TF_ROWS8)
+  if (ks == 0)
+    for (int i = 0; i < 16; i++) {
+      if (!TF_LIVE(i)) continue;
+      const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+      if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+    }
+#else
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
     }
+#endif
 }
 #endif
