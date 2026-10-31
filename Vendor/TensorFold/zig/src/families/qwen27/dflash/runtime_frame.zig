@@ -152,7 +152,13 @@ pub const Frame = struct {
     pub fn checkUnchecked(f: *Frame) !void {
         var bad = false;
         for (f.unchecked[0..f.n_unchecked]) |cb| {
-            cb.wait();
+            // a polled frame returns once its `poll_event` fires behind its last command; the parts were committed
+            // before it on the same queue, so a part that already reports completion needs no blocking wait, only its
+            // failure check (Metal reports failure once a command buffer has completed). The slow path is unchanged.
+            switch (cb.status()) {
+                .completed, .@"error" => {},
+                else => cb.wait(),
+            }
             bad = failed(cb) or bad;
             cb.release();
         }

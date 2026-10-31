@@ -149,7 +149,13 @@ pub const Generation = struct {
         const cb = g.keep orelse return;
         g.keep = null;
         defer cb.release();
-        cb.wait();
+        // the keep was committed behind the verify's last command buffer on the queue every later pass commits to, and
+        // this runs only after the next proposal has been proposed and waited for: a keep that already reports
+        // completion needs no second wait, only its failure check (Metal reports failure once a buffer has completed)
+        switch (cb.status()) {
+            .completed, .@"error" => {},
+            else => cb.wait(),
+        }
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
