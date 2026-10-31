@@ -373,7 +373,7 @@ pub fn lone(b: *Metal, s: *lanes.Stream, hooks: api.LoneHooks) !bool {
         }
         const room: u32 = @intCast(s.max_new - s.emitted().len);
         copies.history = s.context.items;
-        const result = try g.runRound(room, b.nodes, s.eos, true, if (extra > 0) .{ .ptr = &copies, .call = Copies.call } else null, extra);
+        const result = try g.runRound(room, .{ .nodes = b.nodes }, s.eos, true, if (extra > 0) .{ .ptr = &copies, .call = Copies.call } else null, extra);
         defer b.gpa.free(result.tokens);
         if (result.extended > 0) {
             try copies.lookup.observe(result.extended, result.extension_landed);
