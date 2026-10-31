@@ -29,6 +29,33 @@ kernel void tf_draft_rms(device const bfloat* X [[buffer(0)]],device const bfloa
     Y[size_t(block.y)*a.y_stride+block.x*a.dim+col]=bfloat(normalized*float(W[col]));
   }
 }
+kernel void tf_draft_rms_sums(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& stride [[buffer(5)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+  threadgroup float sums[32],inverse[1];
+  float value=0.0f;
+  const size_t base=size_t(block.y)*a.x_stride+block.x*a.dim;
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){float x=float(X[base+first+j]);value+=x*x;}
+  value=simd_sum(value);
+  if(sg==0)sums[lane]=0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(lane==0)sums[sg]=value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(sg==0){float total=simd_sum(sums[lane]);if(lane==0)inverse[0]=precise::rsqrt(total/float(a.dim)+a.eps);}
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){
+    const uint col=first+j;
+    float normalized=float(X[base+col])*inverse[0];
+    normalized=float(bfloat(normalized));
+    Y[size_t(block.y)*a.y_stride+block.x*a.dim+col]=bfloat(normalized*float(W[col]));
+  }
+  // Read the stored BF16 words after all writes. This is tf_lane_xsum's serial order from zero.
+  threadgroup_barrier(mem_flags::mem_device);
+  if(t<a.dim/64) {
+    float acc=0.0f;
+    for(uint i=0;i<64;i++)acc+=float(Y[size_t(block.y)*a.y_stride+t*64+i]);
+    XS[size_t(t)*stride+block.y]=acc;
+    if(block.y==0)for(uint row=a.rows;row<stride;row++)XS[size_t(t)*stride+row]=0.0f;
+  }
+}
 struct Conv { uint rows,width,group,block,branch,residual,x_stride,dynamic_stride,y_stride,rounding; };
 kernel void tf_dynamic_conv2(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],uint2 index [[thread_position_in_grid]]) {
   if(index.x>=a.width||index.y>=a.rows)return;
@@ -44,6 +71,40 @@ kernel void tf_dynamic_conv2(device const bfloat* X [[buffer(0)]],device const b
   Y[size_t(index.y)*a.y_stride+index.x]=bfloat(a.residual?float(R[size_t(index.y)*a.x_stride+index.x])+conv:conv);
 }
 struct Rope { uint rows,heads,dim,x_stride,y_stride;float theta; };
+// One row owns every raw BF16 store before its original RMS reduction reads that buffer.
+kernel void tf_dynamic_conv2_rms(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],device const bfloat* W [[buffer(4)]],constant Conv& a [[buffer(5)]],constant Norm& n [[buffer(6)]],device bfloat* RAW [[buffer(7)]],device bfloat* Y [[buffer(8)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+  const uint row=block.y;
+  for(uint first=4*t;first<a.width;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.width;j++){
+    const uint col=first+j,groups=a.width/a.group,g=col/a.group;
+    float total=0.0f;
+    for(uint lag=0;lag<2;lag++) {
+      const float x=lag&&row%a.block==0?0.0f:float(X[size_t(row-lag)*a.x_stride+col]);
+      const float base=float(B[(a.branch*2+lag)*a.width+col]);
+      const float dynamic=float(D[size_t(row)*a.dynamic_stride+(a.branch*2+lag)*groups+g]);
+      total=float(bfloat(total+float(bfloat(base*x))));total=float(bfloat(total+float(bfloat(dynamic*x))));
+    }
+    const float conv=float(bfloat(total));
+    RAW[size_t(row)*a.y_stride+col]=bfloat(a.residual?float(R[size_t(row)*a.x_stride+col])+conv:conv);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  threadgroup float sums[32],inverse[1];
+  float value=0.0f;
+  const size_t base=size_t(block.y)*n.x_stride+block.x*n.dim;
+  for(uint first=4*t;first<n.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<n.dim;j++){float x=float(RAW[base+first+j]);value+=x*x;}
+  value=simd_sum(value);
+  if(sg==0)sums[lane]=0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(lane==0)sums[sg]=value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(sg==0){float total=simd_sum(sums[lane]);if(lane==0)inverse[0]=precise::rsqrt(total/float(n.dim)+n.eps);}
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint first=4*t;first<n.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<n.dim;j++){
+    const uint col=first+j;
+    float normalized=float(RAW[base+col])*inverse[0];
+    normalized=float(bfloat(normalized));
+    Y[size_t(block.y)*n.y_stride+block.x*n.dim+col]=bfloat(normalized*float(W[col]));
+  }
+}
 kernel void tf_full_rope(device const bfloat* X [[buffer(0)]],device const ulong* positions [[buffer(1)]],constant Rope& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],uint3 index [[thread_position_in_grid]]) {
   if(index.x>=a.dim/2||index.y>=a.heads||index.z>=a.rows)return;
   const uint col=index.x,pairs=a.dim/2;

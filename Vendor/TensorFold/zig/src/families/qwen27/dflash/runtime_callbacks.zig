@@ -13,6 +13,7 @@ fn begin(ptr: *anyopaque) !u64 {
     const b = backend(ptr);
     if (b.failed) return error.DraftBackendFailed;
     b.input_sums = null;
+    b.head_sums = null;
     return b.frame.begin();
 }
 fn release(ptr: *anyopaque, epoch: u64) void {
@@ -88,9 +89,17 @@ fn sliceCols(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, width: u32) !o
 }
 fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
     const b = backend(ptr);
+    b.head_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
-    try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
+    const args = @import("core").draft_ops.Norm{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps };
+    const h = b.head.linear;
+    if (p.head_sums and b.target.device.tensorUnits() and h.raw == null and h.runs.len == 0 and h.bits == 4 and h.group == 64 and h.k == x.width and p.heads == 1 and p.head_dim == x.width and x.width % 64 == 0 and x.rows <= 128) {
+        const stride = @import("../quant_gpu.zig").padded(x.rows);
+        const values = try b.frame.alloc(x.width / 64, stride, .f32);
+        try b.primitives.normSums(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), try b.frame.ref(values), stride, args);
+        b.head_sums = .{ .input = y, .values = values, .stride = stride };
+    } else try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), args);
     return y;
 }
 fn embed(ptr: *anyopaque, epoch: u64, _: ck.Linear, ids: []const u32) !op.View {
@@ -110,6 +119,19 @@ fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
     try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
     return y;
+}
+fn convNorm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv, n: op.Norm) !?op.ConvNorm {
+    const b = backend(ptr);
+    if (b.primitives.conv_norm == null or x.width != 5120 or p.branch != 1 or p.residual == null or
+        p.residual.?.stride != x.stride or n.heads != 1 or n.head_dim != x.width) return null;
+    const e = try b.encoder(epoch);
+    const raw = try b.frame.alloc(x.rows, x.width, .bf16);
+    const y = try b.frame.alloc(x.rows, x.width, .bf16);
+    try b.primitives.convNorm(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), try b.frame.ref(p.residual.?), try b.weight(n.weight), try b.frame.ref(raw), try b.frame.ref(y), .{
+        .conv = .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = 1, .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = raw.stride },
+        .norm = .{ .rows = x.rows, .heads = n.heads, .dim = n.head_dim, .x_stride = raw.stride, .y_stride = y.stride, .eps = n.eps },
+    });
+    return .{ .raw = raw, .normalized = y };
 }
 fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     const b = backend(ptr);
@@ -137,11 +159,16 @@ fn maskRows(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, rows: u32) !op.
 }
 fn head(ptr: *anyopaque, epoch: u64, x: op.View) !op.Head {
     const b = backend(ptr);
+    defer b.head_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, b.head.linear.n, .bf16);
     const input = try b.frame.ref(x);
     const output = try b.frame.ref(y);
-    try b.target.kernels.quant(e, b.head.linear, .{ .buffer = input.buf, .offset = input.off }, null, b.target.frame.get(.dims), .{ .buffer = output.buf, .offset = output.off }, x.rows);
+    const sums: ?@import("../quant_gpu.zig").Sums = if (b.head_sums) |s| if (std.meta.eql(s.input, x)) blk: {
+        const values = try b.frame.ref(s.values);
+        break :blk .{ .ref = .{ .buffer = values.buf, .offset = values.off }, .stride = s.stride };
+    } else null else null;
+    try b.target.kernels.quant(e, b.head.linear, .{ .buffer = input.buf, .offset = input.off }, sums, b.target.frame.get(.dims), .{ .buffer = output.buf, .offset = output.off }, x.rows);
     return .{ .logits = y, .token_ids = if (b.head.ids) |ids| try b.frame.add(.{ .buf = ids }, 1, b.head.linear.n, b.head.linear.n, .u32) else null };
 }
 fn lattice(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Config) !op.Lattice {
@@ -189,4 +216,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
         made += 1;
     }
 }
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .conv_norm = convNorm };

@@ -6,11 +6,14 @@ pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 pub const Linear = extern struct { rows: u32, n: u32, k: u32, x_stride: u32, w_stride: u32, y_stride: u32 };
 pub const Norm = extern struct { rows: u32, heads: u32, dim: u32, x_stride: u32, y_stride: u32, round_normalized: u32 = 1, eps: f32 = 1e-6 };
 pub const Conv = extern struct { rows: u32, width: u32, group: u32 = 16, block: u32 = 8, branch: u32, residual: u32 = 0, x_stride: u32, dynamic_stride: u32, y_stride: u32, rounding: u32 = 0 };
+pub const ConvNorm = extern struct { conv: Conv, norm: Norm };
 pub const Rope = extern struct { rows: u32, heads: u32, dim: u32, x_stride: u32, y_stride: u32, theta: f32 = 10000000 };
 pub const Activation = extern struct { rows: u32, width: u32, gate_stride: u32, up_stride: u32, y_stride: u32, rounding: u32 = 0 };
 const Kind = enum { linear, norm, conv, rope, swiglu };
 pub const Ops = struct {
     pipes: [5]mtl.Pipeline,
+    norm_sums: ?mtl.Pipeline = null,
+    conv_norm: ?mtl.Pipeline = null,
     pub fn init(device: mtl.Device) !Ops {
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -21,10 +24,17 @@ pub const Ops = struct {
             pipe.* = try mtl.Pipeline.init(device, lib, name, false);
             count += 1;
         }
-        return .{ .pipes = pipes };
+        var result = Ops{ .pipes = pipes, .norm_sums = try mtl.Pipeline.init(device, lib, "tf_draft_rms_sums", false) };
+        if (device.tensorUnits()) {
+            const fused = mtl.Pipeline.init(device, lib, "tf_dynamic_conv2_rms", false) catch return result;
+            if (fused.simdWidth() == 32 and fused.maxThreads() >= 1024) result.conv_norm = fused else fused.deinit();
+        }
+        return result;
     }
     pub fn deinit(ops: Ops) void {
         for (ops.pipes) |pipe| pipe.deinit();
+        if (ops.norm_sums) |pipe| pipe.deinit();
+        if (ops.conv_norm) |pipe| pipe.deinit();
     }
     pub fn linear(ops: Ops, e: mtl.ComputeEncoder, x: Ref, weight: Ref, out: Ref, p: Linear) !void {
         try checkLinear(p);
@@ -48,6 +58,23 @@ pub const Ops = struct {
         e.setBuffer(out.buf, out.off, 3);
         e.dispatchGroups(mtl.Size.of(p.heads, p.rows, 1), mtl.Size.of(threads, 1, 1));
     }
+    /// RMSNorm's exact BF16 output, followed by serial group sums for a Q4/64 head.
+    pub fn normSums(ops: Ops, e: mtl.ComputeEncoder, x: Ref, gain: Ref, out: Ref, sums: Ref, stride: u32, p: Norm) !void {
+        const threads = try normThreads(p);
+        if (p.heads != 1 or p.dim % 64 != 0 or p.rows > 128 or stride != 16 * ((p.rows + 15) / 16) or sums.off % 4 != 0) return error.BadDraftShape;
+        const xb = try span(p.rows, p.x_stride, p.dim);
+        const yb = try span(p.rows, p.y_stride, p.dim);
+        const wb = @as(usize, p.dim) * 2;
+        try refs(out, yb, &.{ x, gain }, &.{ xb, wb });
+        try refs(sums, @as(usize, p.dim / 64) * stride * 4, &.{ x, gain, out }, &.{ xb, wb, yb });
+        e.setPipeline(ops.norm_sums orelse return error.BadDraftShape);
+        bind(e, .{ x, gain });
+        e.setValue(p, 2);
+        e.setBuffer(out.buf, out.off, 3);
+        e.setBuffer(sums.buf, sums.off, 4);
+        e.setValue(stride, 5);
+        e.dispatchGroups(mtl.Size.of(1, p.rows, 1), mtl.Size.of(threads, 1, 1));
+    }
     pub fn conv(ops: Ops, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: ?Ref, out: Ref, p: Conv) !void {
         try checkConv(p);
         if ((residual != null) != (p.residual == 1)) return error.BadDraftShape;
@@ -62,6 +89,24 @@ pub const Ops = struct {
         e.setValue(p, 4);
         e.setBuffer(out.buf, out.off, 5);
         e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(256, 1, 1));
+    }
+    pub fn convNorm(ops: Ops, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: Ref, gain: Ref, raw: Ref, out: Ref, p: ConvNorm) !void {
+        const pipe = ops.conv_norm orelse return error.DraftConvNormUnsupported;
+        const threads = try checkConvNorm(p);
+        const xb = try span(p.conv.rows, p.conv.x_stride, p.conv.width);
+        const db = try span(p.conv.rows, p.conv.dynamic_stride, 4 * (p.conv.width / p.conv.group));
+        const bb = @as(usize, p.conv.width) * 4 * 2;
+        const rb = try span(p.conv.rows, p.conv.y_stride, p.conv.width);
+        const wb = @as(usize, p.norm.dim) * 2;
+        try refs(raw, rb, &.{ x, dynamic, base, residual, gain }, &.{ xb, db, bb, xb, wb });
+        try refs(out, try span(p.norm.rows, p.norm.y_stride, p.norm.dim), &.{ x, dynamic, base, residual, gain, raw }, &.{ xb, db, bb, xb, wb, rb });
+        e.setPipeline(pipe);
+        bind(e, .{ x, dynamic, base, residual, gain });
+        e.setValue(p.conv, 5);
+        e.setValue(p.norm, 6);
+        e.setBuffer(raw.buf, raw.off, 7);
+        e.setBuffer(out.buf, out.off, 8);
+        e.dispatchGroups(mtl.Size.of(1, p.conv.rows, 1), mtl.Size.of(threads, 1, 1));
     }
     pub fn rope(ops: Ops, e: mtl.ComputeEncoder, x: Ref, positions: Ref, out: Ref, p: Rope) !void {
         try checkRope(p);
@@ -118,6 +163,13 @@ pub fn checkConv(p: Conv) !void {
     _ = try span(p.rows, p.x_stride, p.width);
     _ = try span(p.rows, p.y_stride, p.width);
     _ = try span(p.rows, p.dynamic_stride, 4 * (p.width / p.group));
+}
+pub fn checkConvNorm(p: ConvNorm) !u32 {
+    try checkConv(p.conv);
+    const threads = try normThreads(p.norm);
+    if (p.conv.width != 5120 or p.conv.branch != 1 or p.conv.residual != 1 or p.norm.heads != 1 or
+        p.norm.dim != p.conv.width or p.norm.rows != p.conv.rows or p.norm.x_stride != p.conv.y_stride) return error.BadDraftShape;
+    return threads;
 }
 pub fn checkRope(p: Rope) !void {
     if (p.heads == 0 or p.dim == 0 or p.dim % 2 != 0 or !std.math.isFinite(p.theta) or p.theta <= 0) return error.BadDraftShape;

@@ -225,6 +225,7 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
 }
 
 #if TF_PRECOMPUTE_SUMS
+[[max_total_threads_per_threadgroup(256)]]
 kernel void tf_lane_sums(const device bfloat* X [[buffer(0)]],constant int& rows [[buffer(1)]],device float* XS [[buffer(2)]],constant int& stride [[buffer(3)]],uint index [[thread_position_in_grid]]) {
   const int row=int(index)%stride,group=int(index)/stride;
   if(group>=KG)return;

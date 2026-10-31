@@ -95,6 +95,115 @@ test "residency owner Qwen27: actual reusable drafter frame buffers follow alloc
     try record.allFreed();
 }
 
+test "residency owner Qwen27: identical draft masks share an immutable frame view across parts" {
+    const context = @import("src/families/qwen27/dflash/runtime_context.zig");
+    var record: mtl.Record = .{ .gpa = a };
+    defer record.deinit();
+    {
+        var owner = (try mtl.resident.Resident.hold(a, std.testing.io, record.device(), record.queue(), &.{}, "qwen27")).?;
+        defer owner.deinit();
+        var frame: backend_mod.Frame = .{ .allocator = a, .device = record.device(), .queue = record.queue() };
+        defer frame.deinit();
+        frame.setResident(owner.follow());
+        _ = try frame.begin();
+        const first = try context.attentionMask(&frame, 63, 16, 64, 8);
+        const saved = try a.dupe(u8, first.buf.contents()[0 .. 16 * 79]);
+        defer a.free(saved);
+        try frame.part();
+        const count = record.allocations.items.len;
+        for (0..4) |_| {
+            const next = try context.attentionMask(&frame, 63, 16, 64, 8);
+            try std.testing.expectEqual(first.buf.id, next.buf.id);
+        }
+        try std.testing.expectEqual(count, record.allocations.items.len);
+        try std.testing.expectEqual(@as(usize, 1), frame.cursor);
+        const changed = try context.attentionMask(&frame, 63, 16, 64, 16);
+        try std.testing.expect(changed.buf.id != first.buf.id);
+        try std.testing.expectEqualSlices(u8, saved, first.buf.contents()[0..saved.len]);
+        try std.testing.expectEqual(@as(u8, 0), first.buf.contents()[71]);
+        try std.testing.expectEqual(@as(u8, 1), changed.buf.contents()[71]);
+        try std.testing.expectEqual(@as(u64, 2 * 16 * 79), frame.cacheBytes());
+        try std.testing.expectEqual(frame.cacheBytes(), frame.drain()); // active buffers remain visible
+        owner.held.flush();
+        try record.check();
+        try frame.finish();
+        frame.release();
+        try std.testing.expect(frame.attention_mask == null);
+        try std.testing.expectEqual(@as(u64, 0), frame.drain());
+        try record.check();
+    }
+    try record.allFreed();
+}
+
+test "residency owner Qwen27: draft masks refill reused capacity and reject completed or stale frames" {
+    const context = @import("src/families/qwen27/dflash/runtime_context.zig");
+    var record: mtl.Record = .{ .gpa = a };
+    defer record.deinit();
+    {
+        var frame: backend_mod.Frame = .{ .allocator = a, .device = record.device(), .queue = record.queue() };
+        defer frame.deinit();
+        _ = try frame.begin();
+        const first = try context.attentionMask(&frame, 63, 16, 64, 8);
+        const old_view = frame.attention_mask.?.view;
+        try frame.finish();
+        try std.testing.expectError(error.DraftFrameNotActive, context.attentionMask(&frame, 63, 16, 64, 8));
+        frame.release();
+        @memset(first.buf.contents()[0 .. 16 * 79], 0xa5);
+        const count = record.allocations.items.len;
+        _ = try frame.begin();
+        try std.testing.expect(frame.attention_mask == null);
+        try std.testing.expectError(error.StaleDraftView, frame.ref(old_view));
+        const next = try context.attentionMask(&frame, 63, 16, 64, 16);
+        try std.testing.expectEqual(first.buf.id, next.buf.id);
+        try std.testing.expectEqual(count, record.allocations.items.len);
+        var expected: [16 * 79]u8 = undefined;
+        try context.fillMask(&expected, 63, 16, 64, 16);
+        try std.testing.expectEqualSlices(u8, &expected, next.buf.contents()[0..expected.len]);
+        try frame.finish();
+        frame.release();
+        _ = frame.drain();
+        try std.testing.expectError(error.DraftFrameNotActive, context.attentionMask(&frame, 63, 16, 64, 16));
+    }
+    try record.allFreed();
+}
+
+test "residency owner Qwen27: refused draft masks preserve live views and do not publish failed fills" {
+    const context = @import("src/families/qwen27/dflash/runtime_context.zig");
+    var record: mtl.Record = .{ .gpa = a };
+    defer record.deinit();
+    {
+        var owner = (try mtl.resident.Resident.hold(a, std.testing.io, record.device(), record.queue(), &.{}, "qwen27")).?;
+        defer owner.deinit();
+        var frame: backend_mod.Frame = .{ .allocator = a, .device = record.device(), .queue = record.queue() };
+        defer frame.deinit();
+        frame.setResident(owner.follow());
+        _ = try frame.begin();
+        const first = try context.attentionMask(&frame, 1, 8, 16, 8);
+        record.fail_at = record.allocations.items.len;
+        try std.testing.expectError(error.InjectedBufferFailure, context.attentionMask(&frame, 2, 8, 16, 8));
+        try std.testing.expectEqual(first.buf.id, (try context.attentionMask(&frame, 1, 8, 16, 8)).buf.id);
+        try std.testing.expectEqual(@as(u64, 72), frame.cacheBytes());
+        frame.release();
+        _ = try frame.begin();
+        try std.testing.expectError(error.InjectedBufferFailure, context.attentionMask(&frame, 4, 8, 16, 8));
+        try std.testing.expect(frame.attention_mask == null);
+        try std.testing.expectEqual(@as(u64, 72), frame.cacheBytes());
+        record.fail_at = null;
+        const grown = try context.attentionMask(&frame, 4, 8, 16, 8);
+        try std.testing.expectEqual(@as(u64, 96), frame.cacheBytes());
+        try std.testing.expectError(error.BadDraftContext, context.attentionMask(&frame, 6, 8, 0, 8));
+        try std.testing.expectEqual(grown.buf.id, (try context.attentionMask(&frame, 4, 8, 16, 8)).buf.id);
+        try std.testing.expectEqual(@as(u64, 96 + 112), frame.cacheBytes());
+        owner.held.flush();
+        try record.check();
+        frame.release();
+        try std.testing.expect(frame.attention_mask == null);
+        try std.testing.expectEqual(@as(u64, 0), frame.drain());
+        try record.check();
+    }
+    try record.allFreed();
+}
+
 const model_mod = @import("src/families/qwen27/model.zig");
 const round_mod = @import("src/families/qwen27/decode_round.zig");
 const attn = @import("src/families/qwen27/attention.zig");

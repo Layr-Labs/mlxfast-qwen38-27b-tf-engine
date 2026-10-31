@@ -140,12 +140,24 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
     const v_ref: R = .{ .buf = v.buf, .off = v.off };
-    const mask = try b.frame.alloc(rows, keys, .u8);
-    const mask_ref = try b.frame.ref(mask);
-    try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
+    const mask_ref = try attentionMask(&b.frame, context_rows, rows, b.config.window, b.config.block);
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
     // Long contexts share each 256-key chunk across the query heads of one KV head.
     if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
+}
+
+/// Identical masks are read-only for the rest of this frame, including committed parts.
+pub fn attentionMask(f: *@import("runtime_frame.zig").Frame, context_rows: u32, rows: u32, window: u32, trained: u32) !Ref {
+    try f.require(f.epoch);
+    if (f.attention_mask) |kept| {
+        if (kept.context_rows == context_rows and kept.view.rows == rows and kept.window == window and kept.trained == trained) return f.ref(kept.view);
+    }
+    const keys = try std.math.add(u32, context_rows, rows);
+    const view = try f.alloc(rows, keys, .u8);
+    const ref = try f.ref(view);
+    try fillMask(ref.buf.contents()[ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, window, trained);
+    f.attention_mask = .{ .view = view, .context_rows = context_rows, .window = window, .trained = trained };
+    return ref;
 }
 
 /// Slots before `trained` cannot see later slots, retaining their trained-block mask.

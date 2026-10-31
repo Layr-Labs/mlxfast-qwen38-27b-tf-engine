@@ -18,9 +18,9 @@ fn group(ops: op.Ops, frame: u64, x: op.View, first: w.Tensor, kind: u32, mode: 
 fn cols(ops: op.Ops, frame: u64, x: op.View, first: u32, width: u32) !op.View {
     return (ops.vtable.slice_cols orelse return error.DraftOperatorShape)(ops.ptr, frame, x, first, width);
 }
-fn norm(ops: op.Ops, frame: u64, x: op.View, weight: w.Tensor, eps: f32, heads: u32, dim: u32) !op.View {
+fn norm(ops: op.Ops, frame: u64, x: op.View, weight: w.Tensor, eps: f32, heads: u32, dim: u32, head_sums: bool) !op.View {
     if (weight.rank != 1 or weight.shape[0] != dim or x.width != heads * dim) return error.DraftOperatorShape;
-    const y = try ops.vtable.norm(ops.ptr, frame, x, .{ .weight = weight, .eps = eps, .heads = heads, .head_dim = dim });
+    const y = try ops.vtable.norm(ops.ptr, frame, x, .{ .weight = weight, .eps = eps, .heads = heads, .head_dim = dim, .head_sums = head_sums });
     try y.check(x.rows, x.width, .bf16);
     return y;
 }
@@ -36,6 +36,19 @@ fn convolve(ops: op.Ops, frame: u64, x: op.View, dynamic: op.View, weights: w.Co
     const y = try ops.vtable.conv(ops.ptr, frame, x, .{ .dynamic = dynamic, .base = weights.base, .branch = branch, .group = c.group, .block = block, .residual = residual });
     try y.check(x.rows, c.hidden, .bf16);
     return y;
+}
+fn convolveNorm(ops: op.Ops, frame: u64, x: op.View, dynamic: op.View, weights: w.Conv, residual: op.View, gain: w.Tensor, c: Config, block: u32) !op.ConvNorm {
+    try x.check(x.rows, c.hidden, .bf16);
+    try dynamic.check(x.rows, c.dynamicWidth(), .bf16);
+    try residual.check(x.rows, x.width, .bf16);
+    if (gain.rank != 1 or gain.shape[0] != c.hidden) return error.DraftOperatorShape;
+    if (ops.vtable.conv_norm) |fused| if (try fused(ops.ptr, frame, x, .{ .dynamic = dynamic, .base = weights.base, .branch = 1, .group = c.group, .block = block, .residual = residual }, .{ .weight = gain, .eps = c.eps, .heads = 1, .head_dim = c.hidden })) |result| {
+        try result.raw.check(x.rows, x.width, .bf16);
+        try result.normalized.check(x.rows, x.width, .bf16);
+        return result;
+    };
+    const raw = try convolve(ops, frame, x, dynamic, weights, 1, residual, c, block);
+    return .{ .raw = raw, .normalized = try norm(ops, frame, raw, gain, c.eps, 1, c.hidden, false) };
 }
 
 pub fn append(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context) !void {
@@ -70,7 +83,7 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
 fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
     const c = g.config;
     const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
-    const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
+    const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden, false);
     for (g.layers, 0..) |layer, i| {
         var raw_keys: op.View = undefined;
         var values: op.View = undefined;
@@ -81,7 +94,7 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
             raw_keys = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
             values = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
         }
-        const keys = try rotate(ops, frame, try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim), positions, c.kv_heads, c);
+        const keys = try rotate(ops, frame, try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim, false), positions, c.kv_heads, c);
         switch (sink) {
             .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys, values, positions),
             .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys, values, positions),
@@ -143,7 +156,7 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
     try hidden.check(rows, c.hidden, .bf16);
     for (g.layers, 0..) |layer, i| {
         var residual = hidden;
-        const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
+        const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden, false);
         const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
         const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
         var raw_q: op.View = undefined;
@@ -158,13 +171,14 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
             raw_k = try project(ops, frame, input, layer.attention.k, preparation.mode);
             values = try project(ops, frame, input, layer.attention.v, preparation.mode);
         }
-        const query = try rotate(ops, frame, try norm(ops, frame, raw_q, layer.attention.q_norm, c.eps, c.heads, c.head_dim), positions[0..rows], c.heads, c);
-        const keys = try rotate(ops, frame, try norm(ops, frame, raw_k, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim), positions[0..rows], c.kv_heads, c);
+        const query = try rotate(ops, frame, try norm(ops, frame, raw_q, layer.attention.q_norm, c.eps, c.heads, c.head_dim, false), positions[0..rows], c.heads, c);
+        const keys = try rotate(ops, frame, try norm(ops, frame, raw_k, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim, false), positions[0..rows], c.kv_heads, c);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
-        hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
+        const post_attention = try convolveNorm(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, residual, layer.post_norm, c, block);
+        hidden = post_attention.raw;
         residual = hidden;
-        const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
+        const post = post_attention.normalized;
         const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
         const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
         var gate: op.View = undefined;
@@ -184,7 +198,7 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
     const masks = if (n == 1) try ops.vtable.mask_rows(ops.ptr, frame, hidden, 1, block - 1) else hidden;
     const headed = if (n == 1) block - 1 else rows;
     try masks.check(headed, c.hidden, .bf16);
-    const final = try norm(ops, frame, masks, g.norm, c.eps, 1, c.hidden);
+    const final = try norm(ops, frame, masks, g.norm, c.eps, 1, c.hidden, true);
     const head = try ops.vtable.head(ops.ptr, frame, final);
     if (head.logits.handle == 0 or head.logits.rows != headed or head.logits.dtype != .bf16 or head.logits.width == 0 or head.logits.width > c.vocab or head.logits.stride < head.logits.width) return error.DraftOperatorShape;
     if (head.token_ids) |mapping| try mapping.check(1, head.logits.width, .u32) else if (head.logits.width != c.vocab) return error.DraftCandidateId;

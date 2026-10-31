@@ -1,6 +1,11 @@
 //! Host regressions use no shaders, model or GPU execution.
 const std = @import("std");
 pub fn tests(b: *std.Build) void {
+    const conv_norm_metal = b.createModule(.{ .root_source_file = b.path("zig/gemma4_head_metal.zig"), .target = b.graph.host });
+    const conv_norm_core = b.createModule(.{ .root_source_file = b.path("zig/draft_conv_norm_core.zig"), .target = b.graph.host });
+    const conv_norm_sources = b.createModule(.{ .root_source_file = b.path("zig/draft_ops_sources.zig") });
+    const conv_norm = b.createModule(.{ .root_source_file = b.path("zig/draft_conv_norm_host.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "metal", .module = conv_norm_metal }, .{ .name = "core", .module = conv_norm_core }, .{ .name = "draft_ops_sources", .module = conv_norm_sources } } });
+    b.step("test-draft-conv-norm-host", "Drafter convolution and norm shapes, schedule and dispatch without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = conv_norm })).step);
     const attention_metal = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test_metal.zig"), .target = b.graph.host });
     const attention_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig") });
     const attention = b.createModule(.{ .root_source_file = b.path("zig/shared_attention_test.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "metal", .module = attention_metal }, .{ .name = "kernel_sources", .module = attention_sources } } });

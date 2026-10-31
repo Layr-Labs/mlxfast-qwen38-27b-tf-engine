@@ -13,6 +13,11 @@ const Fake = struct {
     fused_groups: u32 = 0,
     fused_slices: u32 = 0,
     convolutions: u32 = 0,
+    norms: u32 = 0,
+    conv_norm_attempts: u32 = 0,
+    conv_norms: u32 = 0,
+    decline_conv_norm: bool = false,
+    conv_norm_raw: ?u64 = null,
     attends: u32 = 0,
     commits: u32 = 0,
     stages: u32 = 0,
@@ -23,6 +28,7 @@ const Fake = struct {
     ids: [16]u32 = undefined,
     positions: [16]u64 = undefined,
     mask_first: u32 = 0,
+    head_norm: ?op.View = null,
     fn self(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }
@@ -65,7 +71,14 @@ const Fake = struct {
     }
     fn norm(ptr: *anyopaque, _: u64, x: op.View, n: op.Norm) !op.View {
         if (x.width != n.heads * n.head_dim) return error.FakeNormShape;
-        return self(ptr).view(x.rows, x.width);
+        const f = self(ptr);
+        f.norms += 1;
+        const y = f.view(x.rows, x.width);
+        if (n.head_sums) {
+            if (n.heads != 1 or f.head_norm != null) return error.FakeHeadNormOrder;
+            f.head_norm = y;
+        }
+        return y;
     }
     fn embed(ptr: *anyopaque, _: u64, _: ck.Linear, ids: []const u32) !op.View {
         @memcpy(self(ptr).ids[0..ids.len], ids);
@@ -74,8 +87,19 @@ const Fake = struct {
     fn conv(ptr: *anyopaque, _: u64, x: op.View, a: op.Conv) !op.View {
         const f = self(ptr);
         if (a.branch != f.convolutions % 2 or a.block != x.rows or a.group != 16 or ((a.residual != null) != (a.branch == 1))) return error.FakeConvOrder;
+        if (f.convolutions % 4 == 3) if (f.conv_norm_raw) |raw| if (a.residual.?.handle != raw) return error.FakeResidual;
         f.convolutions += 1;
         return f.view(x.rows, x.width);
+    }
+    fn convNorm(ptr: *anyopaque, frame: u64, x: op.View, a: op.Conv, n: op.Norm) !?op.ConvNorm {
+        const f = self(ptr);
+        f.conv_norm_attempts += 1;
+        if (f.decline_conv_norm) return null;
+        if (f.convolutions % 4 != 1 or n.heads != 1 or n.head_dim != x.width) return error.FakeConvOrder;
+        const raw = try conv(ptr, frame, x, a);
+        f.conv_norm_raw = raw.handle;
+        f.conv_norms += 1;
+        return .{ .raw = raw, .normalized = f.view(x.rows, x.width) };
     }
     fn rope(ptr: *anyopaque, _: u64, x: op.View, a: op.Rotary) !op.View {
         if (a.positions.len <= 16) @memcpy(self(ptr).positions[0..a.positions.len], a.positions);
@@ -96,7 +120,10 @@ const Fake = struct {
         return self(ptr).view(count, x.width);
     }
     fn head(ptr: *anyopaque, _: u64, x: op.View) !op.Head {
-        return .{ .logits = self(ptr).view(x.rows, fixtures.toy.vocab) };
+        const f = self(ptr);
+        if (!std.meta.eql(f.head_norm orelse return error.FakeHeadNormOrder, x)) return error.FakeHeadNormOrder;
+        f.head_norm = null;
+        return .{ .logits = f.view(x.rows, fixtures.toy.vocab) };
     }
     fn lattices(_: *anyopaque, _: u64, _: op.Head, _: op.View, _: cfg.Config, _: u32, _: []op.Lattice) !void {
         return error.FakeBatchedHead;
@@ -142,6 +169,9 @@ const Fake = struct {
     }
     fn ops(f: *Fake) op.Ops {
         return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend } };
+    }
+    fn convNormOps(f: *Fake) op.Ops {
+        return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend, .conv_norm = convNorm } };
     }
 };
 fn batch() session.Batch {
@@ -329,7 +359,6 @@ test "tiny conditional score differences collapse before sibling selection" {
     try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1 }, tree.parents);
 }
 
-
 test "fused draft groups preserve projection shapes across absorb and tree" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
@@ -346,4 +375,32 @@ test "fused draft groups preserve projection shapes across absorb and tree" {
     try std.testing.expectEqual(@as(u32, 35), fake.fused_slices);
     try std.testing.expectEqual(@as(usize, 15), tree.tokens.len);
     try std.testing.expectEqual(@as(u32, 5), fake.appends);
+}
+
+test "drafter conv-norm: paired callback preserves the raw residual and falls back without changing the schedule" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var g = try store.graph(a);
+    defer g.deinit();
+    const p = op.Preparation{ .mode = .bf16_reference };
+    var plain = Fake{};
+    var baseline = try session.Session.init(fixtures.toy, 1, 0);
+    try baseline.absorb(plain.ops(), &g, p, batch());
+    var expected = try baseline.tree(a, plain.ops(), &g, p, 5, 3, .{});
+    defer expected.deinit();
+    for ([_]bool{ false, true }) |decline| {
+        var fake = Fake{ .decline_conv_norm = decline };
+        var state = try session.Session.init(fixtures.toy, 1, 0);
+        try state.absorb(fake.convNormOps(), &g, p, batch());
+        var tree = try state.tree(a, fake.convNormOps(), &g, p, 5, 3, .{});
+        defer tree.deinit();
+        try std.testing.expectEqual(@as(u32, 5), fake.conv_norm_attempts);
+        try std.testing.expectEqual(@as(u32, if (decline) 0 else 5), fake.conv_norms);
+        try std.testing.expectEqual(plain.norms - @as(u32, if (decline) 0 else 5), fake.norms);
+        try std.testing.expectEqual(plain.convolutions, fake.convolutions);
+        try std.testing.expectEqual(plain.handle, fake.handle);
+        try std.testing.expectEqualSlices(u32, expected.tokens, tree.tokens);
+        try std.testing.expectEqualSlices(i32, expected.parents, tree.parents);
+    }
 }

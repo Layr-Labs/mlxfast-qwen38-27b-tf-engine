@@ -19,6 +19,7 @@ pub const Frame = struct {
     queue: mtl.Queue,
     pool: std.ArrayList(mtl.Buffer) = .empty,
     entries: std.ArrayList(Entry) = .empty,
+    attention_mask: ?struct { view: op.View, context_rows: u32, window: u32, trained: u32 } = null,
     cursor: usize = 0,
     epoch: u64 = 0,
     active: bool = false,
@@ -62,6 +63,7 @@ pub const Frame = struct {
         }
         f.pool.clearRetainingCapacity();
         f.entries.clearRetainingCapacity();
+        f.attention_mask = null;
         f.cursor = 0;
         f.external = null;
         return f.cacheBytes();
@@ -72,6 +74,7 @@ pub const Frame = struct {
         if (f.external_epoch != f.epoch) f.external = null;
         f.cursor = 0;
         f.entries.clearRetainingCapacity();
+        f.attention_mask = null;
         f.cb = f.queue.commandBuffer();
         f.encoder = f.cb.compute(.serial);
         f.active = true;
@@ -116,6 +119,7 @@ pub const Frame = struct {
         }
         f.active = false;
         f.external = null;
+        f.attention_mask = null;
     }
     pub fn require(f: *const Frame, epoch: u64) !void {
         if (!f.active or f.completed or f.epoch != epoch) return error.DraftFrameNotActive;

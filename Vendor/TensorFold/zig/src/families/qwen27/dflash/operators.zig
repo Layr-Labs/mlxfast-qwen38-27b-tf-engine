@@ -47,9 +47,10 @@ pub const Lattice = struct {
     }
 };
 pub const Context = struct { cache: u64, begin: u64, end: u64 };
-pub const Norm = struct { weight: ck.Tensor, eps: f32, heads: u32 = 1, head_dim: u32 };
+pub const Norm = struct { weight: ck.Tensor, eps: f32, heads: u32 = 1, head_dim: u32, head_sums: bool = false };
 pub const Rotary = struct { positions: []const u64, heads: u32, dim: u32, theta: f64 };
 pub const Conv = struct { dynamic: View, base: ck.Tensor, branch: u32, group: u32, block: u32, residual: ?View = null };
+pub const ConvNorm = struct { raw: View, normalized: View };
 pub const BlockMask = enum { all_slots };
 /// `streams`: a batched pass's contexts, one `block` of rows each, stream k's caches the backend's batch[k].
 pub const Attention = struct { context: Context, config: Config, layer: u32, query: View, keys: View, values: View, positions: []const u64, mask: BlockMask = .all_slots, streams: []const Context = &.{}, block: u32 = 0 };
@@ -85,6 +86,7 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        conv_norm: ?*const fn (*anyopaque, u64, View, Conv, Norm) anyerror!?ConvNorm = null,
     };
 };
 

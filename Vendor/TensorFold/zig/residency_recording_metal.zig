@@ -56,7 +56,7 @@ pub const objc = struct {
         return id;
     }
     pub fn msg(comptime R: type, _: Id, comptime _: [:0]const u8, _: anytype) R {
-        if (R != void) @compileError("ownership fixture permits only inert fence messages");
+        if (R == ?Id) return @as(Id, @ptrFromInt(1)) else if (R != void) @compileError("ownership fixture permits only inert fence messages");
     }
     pub const Pool = struct {
         pub fn push() @This() {
@@ -130,6 +130,7 @@ pub const Buffer = struct {
 };
 
 pub const Device = struct {
+    id: objc.Id = @ptrFromInt(1),
     record: *Record,
     pub fn buffer(d: Device, bytes: usize, _: usize) !Buffer {
         if (d.record.fail_at == d.record.allocations.items.len) return error.InjectedBufferFailure;

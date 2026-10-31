@@ -27,5 +27,6 @@ kernel void tf_round_keep_taps(device const TfCommitResult& result [[buffer(0)]]
 kernel void tf_round_keep_head(device const TfCommitResult& result [[buffer(0)]], device ushort* logits [[buffer(1)]], constant TfCommitHead& p [[buffer(2)]], uint column [[thread_position_in_grid]]) {
   if (!tf_commit_valid(result, p.rows) || column >= p.width) return;
   const uint row = result.path[result.consumed_count - 1];
+  if (row == 0) return;
   logits[column] = logits[ulong(row) * p.stride + column];
 }

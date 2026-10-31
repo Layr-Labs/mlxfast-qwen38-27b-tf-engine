@@ -79,6 +79,7 @@ pub const Backend = struct {
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
+    head_sums: ?struct { input: op.View, values: op.View, stride: u32 } = null,
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
