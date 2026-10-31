@@ -103,8 +103,9 @@ pub const Model = struct {
         while (m.session.context.end < m.committed_end) {
             const first = m.session.context.end;
             const slot: u32 = @intCast(first % m.graph.config.window);
-            const rows: u32 = @intCast(@min(@min(m.committed_end - first, 128), m.graph.config.window - slot));
-            var positions: [128]u64 = undefined;
+            // a prompt's taps catch up in passes of up to flush_rows rows: one frame and one wait each
+            const rows: u32 = @intCast(@min(@min(m.committed_end - first, flush_rows), m.graph.config.window - slot));
+            var positions: [flush_rows]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = first + i;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
@@ -297,3 +298,6 @@ fn binding(a: std.mem.Allocator, target: *Target, prefix: []const u8, module: []
     const b = Backend.cpu(try target.checkpoint.get(try std.mem.concat(a, u8, &.{ stem, ".biases" })));
     return ck.validate(w, s, b, format, target.config.vocab, target.config.hidden);
 }
+
+/// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
+const flush_rows = 1024;

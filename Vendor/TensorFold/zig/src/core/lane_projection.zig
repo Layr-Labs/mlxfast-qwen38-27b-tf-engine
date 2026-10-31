@@ -36,6 +36,9 @@ pub const Layout = struct {
     reg: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
+    /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
+    /// step a group.
+    prompt_sr: bool = false,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
@@ -58,10 +61,14 @@ pub const Layout = struct {
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
+        if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
-        if (l.swiglu and (!l.rows8 or !l.serial_sk2 or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
+        // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
+        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
+        if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
+            l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -131,6 +138,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
+    if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
@@ -304,13 +312,15 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
         try checkRef(sb, p.metadata_bytes, 16);
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
-        try checkRef(hs, (p.n / 128) * @as(usize, sums.stride) * 4, 4);
+        const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
+        try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
         e.setPipeline(p.pipe);
         e.setBuffer(x.buf, x.off, 0);
         e.setBuffer(w.buf, w.off, 1);
@@ -319,7 +329,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
-        e.dispatchGroups(mtl.Size.of(p.n / 128, 1, 1), mtl.Size.of(128, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
