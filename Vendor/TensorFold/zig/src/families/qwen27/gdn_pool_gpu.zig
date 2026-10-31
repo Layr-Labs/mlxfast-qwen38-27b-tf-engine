@@ -236,14 +236,43 @@ pub const Pool = struct {
 
     /// A commit's replay, in place, and its conv window, unfenced.
     pub fn commitScan(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try pool.commitReplay(layer, plan, e);
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const next_history = try pool.layerSpan(.next_history, layer);
+        e.setPipeline(pool.kernels.pipelines.conv_commit);
+        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setBuffer(next_history.buffer, next_history.offset, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
+    /// history by tf_delta_gdn_conv_keep (a thread a channel reads every source tap before it writes), so the keep
+    /// needs no next_history staging, no publish_conv launch and no fence between the two.
+    pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try pool.commitReplay(layer, plan, e);
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        e.setPipeline(pool.kernels.conv_keep);
+        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
+    fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
-        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
-        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         p.advance = @intFromBool(pool.advances(plan.host));
         const state = try pool.layerSpan(.state, layer);
-        const history = try pool.layerSpan(.history, layer);
-        const next_history = try pool.layerSpan(.next_history, layer);
         const m = plan.metadata;
         // windows the verify stepped in place replay nothing: skip the launch when that is all of them
         const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
@@ -260,21 +289,12 @@ pub const Pool = struct {
             e.setBuffer(state.buffer, state.offset, 8);
             e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
         }
-        e.setPipeline(pool.kernels.pipelines.conv_commit);
-        gdn.bind(e, .{ history, try pool.layerSpan(.qkv, layer) }, 0);
-        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
-        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
-        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
-        e.setValue(p, 5);
-        e.setBuffer(next_history.buffer, next_history.offset, 6);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
     /// After commitScan's fence: the new conv window into place, unfenced.
     pub fn commitPublish(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
-        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
-        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         const history = try pool.layerSpan(.history, layer);
         e.setPipeline(pool.kernels.publish_conv);
         gdn.bind(e, .{try pool.layerSpan(.next_history, layer)}, 0);
@@ -397,6 +417,9 @@ fn projectedWindows(plan: Plan, taps: u32) bool {
     }
     return true;
 }
+
+/// The scalar kinds every commit launch states in its params.
+const commit_kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
 
 fn inPlace(plan: Plan) bool {
     for (plan.keeps) |keep| if (keep.state_slot != keep.next_slot) return false;
