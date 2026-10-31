@@ -150,8 +150,7 @@ pub const Pool = struct {
         return .{ .buffer = span.buffer, .offset = span.offset };
     }
 
-    /// `beside`: encoded beside the scan, before the barrier that ends it.
-    pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+    pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
@@ -159,12 +158,12 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
         try scan.end();
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
-    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
+    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
@@ -187,11 +186,7 @@ pub const Pool = struct {
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
-            if (beside) |b| {
-                try b.encode(b.ptr, scan.encoder);
-                scan.encoder.barrier();
-            }
-        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, beside);
+        } else prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();

@@ -10,14 +10,102 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false,
+const Key = struct {
+    kind: Kind,
+    n: u32 = 0,
+    k: u32,
+    slices: u32 = 0,
+    tile: u32 = 0,
+    tmr: u32 = 0,
+    edge: bool = false,
+    skip: u32 = 0,
+    cut: [2]u32 = .{ 0, 0 },
+    bits: u8 = 4,
+    group: u32 = 64,
+    rows8: bool = false,
+    lean: bool = false,
+    prompt_sr: bool = false,
+    batch: u32 = 1,
+    swiglu: bool = false,
+    sbi: bool = false,
+    fused_n16: bool = false,
+    ordinary_n16: bool = false,
+
+    fn ordinaryN16Eligible(key: Key, prompt: bool, rows: u32) bool {
+        const selected = (key.n == 10240 and key.k == 5120 and key.slices == 2) or
+            (key.n == 5120 and key.k == 6144 and key.slices == 4);
+        return selected and !prompt and rows > 0 and rows <= 8 and key.kind == .projection and key.bits == 4 and
+            key.group == 64 and key.rows8 and key.lean and key.batch == 8 and key.sbi and !key.swiglu and
+            !key.fused_n16 and !key.prompt_sr and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
+
+    fn fusedN16Eligible(key: Key, prompt: bool, rows: u32) bool {
+        return !prompt and rows > 0 and rows <= 8 and key.kind == .projection and key.n == 34816 and key.k == 5120 and
+            key.bits == 4 and key.group == 64 and key.slices == 2 and key.rows8 and key.lean and key.batch == 8 and
+            key.swiglu and key.sbi and !key.prompt_sr and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
+
+    /// Full-span prompt gate/up with caller-owned XS and HS; other encodes keep their existing row limits.
+    fn fullSpanPromptGu(key: Key, rows: u32) bool {
+        return key.kind == .projection and key.n == 34816 and key.k == 5120 and key.bits == 4 and key.group == 64 and
+            key.slices == 1 and key.swiglu and key.prompt_sr and !key.rows8 and !key.sbi and key.skip == 0 and
+            key.cut[0] == 0 and key.cut[1] == 0 and rows > lane.reg_rows and rows <= lane.max_supplied_rows;
+    }
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
         const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
 };
+
+test "fused N16 cache key and admission retain fallback for every unsupported GU route" {
+    const yes = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2, .rows8 = true, .lean = true, .batch = 8, .swiglu = true, .sbi = true };
+    for (1..9) |rows| try std.testing.expect(yes.fusedN16Eligible(false, @intCast(rows)));
+    try std.testing.expect(!yes.fusedN16Eligible(true, 2));
+    try std.testing.expect(!yes.fusedN16Eligible(false, 0));
+    try std.testing.expect(!yes.fusedN16Eligible(false, 9));
+    inline for (.{ .{ "kind", Kind.mlp }, .{ "n", @as(u32, 10240) }, .{ "k", @as(u32, 6144) }, .{ "bits", @as(u8, 6) }, .{ "group", @as(u32, 32) }, .{ "slices", @as(u32, 1) }, .{ "rows8", false }, .{ "lean", false }, .{ "batch", @as(u32, 1) }, .{ "swiglu", false }, .{ "sbi", false }, .{ "prompt_sr", true }, .{ "skip", @as(u32, 1) }, .{ "cut", [2]u32{ 1, 0 } }, .{ "cut", [2]u32{ 0, 1 } } }) |change| {
+        var no = yes;
+        @field(no, change[0]) = change[1];
+        try std.testing.expect(!no.fusedN16Eligible(false, 2));
+    }
+    var narrow = yes;
+    narrow.fused_n16 = true;
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(yes, false);
+    try cache.put(narrow, true);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(!cache.get(yes).? and cache.get(narrow).?);
+}
+
+test "full span prompt GU excludes decode ordinary split and cut keys and out of range rows" {
+    const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 1, .lean = true, .prompt_sr = true, .batch = 8, .swiglu = true };
+    try std.testing.expect(eligible.fullSpanPromptGu(129));
+    try std.testing.expect(eligible.fullSpanPromptGu(2048));
+    try std.testing.expect(!eligible.fullSpanPromptGu(128));
+    try std.testing.expect(!eligible.fullSpanPromptGu(2049));
+    inline for (.{
+        .{ "kind", Kind.mlp },
+        .{ "n", @as(u32, 5120) },
+        .{ "k", @as(u32, 17408) },
+        .{ "bits", @as(u8, 6) },
+        .{ "group", @as(u32, 32) },
+        .{ "slices", @as(u32, 2) },
+        .{ "prompt_sr", false },
+        .{ "rows8", true },
+        .{ "swiglu", false },
+        .{ "sbi", true },
+        .{ "skip", @as(u32, 1) },
+        .{ "cut", [2]u32{ 1, 0 } },
+        .{ "cut", [2]u32{ 0, 40 } },
+    }) |change| {
+        var excluded = eligible;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!excluded.fullSpanPromptGu(1065));
+    }
+}
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
     const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
@@ -69,6 +157,9 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    fused_n16_qualified: ?bool = null,
+    ordinary_n16_format_qualified: ?bool = null,
+    ordinary_n16_available: [2]?bool = .{ null, null },
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
 
@@ -146,21 +237,71 @@ pub const Kernels = struct {
         return k.quantSkip(input_encoder, p, x, xs, dims, y, rows, 0);
     }
 
+    /// Device-local format qualification plus the actual eight-SIMD-group resource check, cached before selection.
+    fn qualifyFusedN16(k: *Kernels, base: Key) !bool {
+        if (k.fused_n16_qualified) |answer| return answer;
+        k.fused_n16_qualified = false;
+        const good = lane.n16_qualification.qualify(k.device, k.allocator) catch |err| blk: {
+            std.log.info("qwen27: fused N16 qualification unavailable ({t}); keeping N32", .{err});
+            break :blk false;
+        };
+        if (!good) return false;
+        var key = base;
+        key.fused_n16 = true;
+        const p = lane.Projection.init(k.allocator, k.device, .{ .n = key.n, .k = key.k, .format = .{ .bits = key.bits, .group = key.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .fused_n16 = true }) catch |err| {
+            std.log.info("qwen27: fused N16 pipeline unavailable ({t}); keeping N32", .{err});
+            return false;
+        };
+        errdefer p.deinit();
+        try k.lanes.put(k.allocator, key, p);
+        k.joined(k.lanes.getPtr(key).?);
+        k.fused_n16_qualified = true;
+        std.log.info("qwen27: indexed fused N16 geometry qualified=true", .{});
+        return true;
+    }
+
+    /// Independent format and actual-PSO admission for the two supported ordinary shapes.
+    fn qualifyOrdinaryN16(k: *Kernels, base: Key) !bool {
+        const slot: usize = if (base.n == 10240) 0 else 1;
+        if (k.ordinary_n16_available[slot]) |answer| return answer;
+        k.ordinary_n16_available[slot] = false;
+        if (k.ordinary_n16_format_qualified == null) {
+            k.ordinary_n16_format_qualified = lane.n16_qualification.qualify(k.device, k.allocator) catch |err| blk: {
+                std.log.info("qwen27: ordinary N16 qualification unavailable ({t}); keeping N32", .{err});
+                break :blk false;
+            };
+        }
+        if (!k.ordinary_n16_format_qualified.?) return false;
+        var key = base;
+        key.ordinary_n16 = true;
+        const p = lane.Projection.init(k.allocator, k.device, .{ .n = key.n, .k = key.k, .format = .{ .bits = key.bits, .group = key.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = true, .ordinary_n16 = true }) catch |err| {
+            std.log.info("qwen27: ordinary N16 pipeline {d}x{d} unavailable ({t}); keeping N32", .{ key.n, key.k, err });
+            return false;
+        };
+        errdefer p.deinit();
+        try k.lanes.put(k.allocator, key, p);
+        k.joined(k.lanes.getPtr(key).?);
+        k.ordinary_n16_available[slot] = true;
+        std.log.info("qwen27: ordinary N16 {d}x{d} SK{d} qualified=true", .{ key.n, key.k, key.slices });
+        return true;
+    }
+
     /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
         if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null };
         if (!key.serialSk2() or p.n != 34816) return false;
+        if (key.fusedN16Eligible(k.prompt, rows)) key.fused_n16 = try k.qualifyFusedN16(key);
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = key.sbi });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = key.sbi, .fused_n16 = key.fused_n16 });
             k.joined(entry.value_ptr);
         }
         try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
@@ -168,7 +309,7 @@ pub const Kernels = struct {
         return true;
     }
 
-    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch.
+    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, producer-owned sums.
     fn gateUpActivatedPrompt(
         k: *Kernels,
         input_encoder: mtl.ComputeEncoder,
@@ -215,9 +356,10 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         const half = p.n / 2;
+        const step: u32 = if (key.fullSpanPromptGu(rows)) lane.max_supplied_rows else lane.reg_rows;
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        while (first < rows) : (first += step) {
+            const n = @min(rows - first, step);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
@@ -233,37 +375,21 @@ pub const Kernels = struct {
 
     /// `quant` over input groups [cut[0], cut[0] + cut[1]) only, into fp32 partial sums.
     pub fn quantCut(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, dims: Ref, y: Ref, rows: u32, cut: [2]u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut, .{ 0, 0 });
-    }
-
-    /// `quant` over output tiles [range[0], range[0] + range[1]) only (32 columns a tile), each written at its own
-    /// columns with the full launch's code: the same words there, nothing elsewhere.
-    pub fn quantRange(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, range: [2]u32) !void {
-        if (range[1] == 0) return error.BadCoreProjectionRows;
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, .{ 0, 0 }, range);
-    }
-
-    /// Whether `quantRange` takes `p`: the 4-bit g64 reg path of a plain matrix.
-    pub fn ranged(p: projection.Linear) bool {
-        return p.runs.len == 0 and p.raw == null and p.bits == 4 and p.group == 64 and p.tile == 32;
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut);
     }
 
     /// `quant` over a fused two-half projection (the MLP's gate_up) without the first `skip` tiles of each half.
     pub fn quantSkip(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 }, .{ 0, 0 });
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 });
     }
 
-    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
-        if (p.runs.len > 0) {
-            if (range[1] > 0) return error.BadCoreProjectionRows;
-            return k.quantRuns(input_encoder, p, x, xs, dims, y, rows, skip, cut);
-        }
-        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut, range);
+    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32) !void {
+        if (p.runs.len > 0) return k.quantRuns(input_encoder, p, x, xs, dims, y, rows, skip, cut);
+        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut);
     }
 
-    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
-        if ((skip > 0 or cut[1] > 0 or range[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
-        if (range[1] > 0 and (skip > 0 or cut[1] > 0 or range[0] + range[1] > (p.n + 31) / 32)) return error.BadCoreProjectionRows;
+    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32) !void {
+        if ((skip > 0 or cut[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
         if (skip > 0 and (p.raw != null or skip >= p.n / 64)) return error.BadCoreProjectionRows;
         if (p.raw) |raw| if (raw.bits != 4 and k.tiled(raw)) {
             if (rows == 0 or rows > 128 or p.tile != 32) return error.BadCoreProjectionRows;
@@ -302,17 +428,17 @@ pub const Kernels = struct {
             return;
         }
         const reg = p.bits == 4 and p.group == 64;
-        if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
+        if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null };
+        if (p.raw == null and key.ordinaryN16Eligible(k.prompt, rows)) key.ordinary_n16 = try k.qualifyOrdinaryN16(key);
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
-        const tiles = [_][2]usize{.{ range[0], range[1] }};
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .indexed = key.sbi, .ordinary_n16 = key.ordinary_n16 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -331,7 +457,7 @@ pub const Kernels = struct {
     pub fn prepareDecode(k: *Kernels, p: projection.Linear, rows: u32) !void {
         if (k.prompt or rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return;
         const reg = p.bits == 4 and p.group == 64;
-        const key = Key{
+        var key = Key{
             .kind = .projection,
             .n = p.n,
             .k = p.k,
@@ -343,6 +469,7 @@ pub const Kernels = struct {
             .batch = if (reg) p.batch else 1,
             .sbi = reg and p.index != null,
         };
+        if (key.ordinaryN16Eligible(k.prompt, rows)) key.ordinary_n16 = try k.qualifyOrdinaryN16(key);
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (entry.found_existing) return;
         errdefer _ = k.lanes.remove(key);
@@ -359,6 +486,7 @@ pub const Kernels = struct {
             .rows8 = key.rows8,
             .reg_lean = key.lean,
             .indexed = key.sbi,
+            .ordinary_n16 = key.ordinary_n16,
         });
         k.joined(entry.value_ptr);
     }
@@ -375,7 +503,7 @@ pub const Kernels = struct {
                 const xr = Ref{ .buffer = x.buffer, .offset = x.offset + r * p.k * 2 };
                 const sr: ?Sums = if (xs) |s| .{ .ref = .{ .buffer = s.ref.buffer, .offset = s.ref.offset + r * 4 }, .stride = s.stride } else null;
                 const yr = Ref{ .buffer = y.buffer, .offset = y.offset + (r * p.n + run.first) * 2 };
-                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 }, .{ 0, 0 });
+                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 });
             }
         }
     }
@@ -530,9 +658,27 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
 
-/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
-fn promptTiles(key: Key, n: u32, skip: u32) usize {
-    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
-    return if (key.k == 17408 or key.k == 6144) 2 else 1;
+test "ordinary N16 admission selects only measured short decode shapes" {
+    const yes = Key{ .kind = .projection, .n = 10240, .k = 5120, .slices = 2, .rows8 = true, .lean = true, .batch = 8, .sbi = true };
+    for (1..9) |rows| try std.testing.expect(yes.ordinaryN16Eligible(false, @intCast(rows)));
+    const out = Key{ .kind = .projection, .n = 5120, .k = 6144, .slices = 4, .rows8 = true, .lean = true, .batch = 8, .sbi = true };
+    try std.testing.expect(out.ordinaryN16Eligible(false, 8));
+    const down = Key{ .kind = .projection, .n = 5120, .k = 17408, .slices = 4, .rows8 = true, .lean = true, .batch = 8, .sbi = true };
+    try std.testing.expect(!down.ordinaryN16Eligible(false, 8));
+    try std.testing.expect(!yes.ordinaryN16Eligible(true, 2));
+    try std.testing.expect(!yes.ordinaryN16Eligible(false, 0));
+    try std.testing.expect(!yes.ordinaryN16Eligible(false, 9));
+    inline for (.{ .{ "kind", Kind.mlp }, .{ "n", @as(u32, 12288) }, .{ "k", @as(u32, 6144) }, .{ "bits", @as(u8, 6) }, .{ "group", @as(u32, 32) }, .{ "slices", @as(u32, 4) }, .{ "rows8", false }, .{ "lean", false }, .{ "batch", @as(u32, 1) }, .{ "swiglu", true }, .{ "fused_n16", true }, .{ "sbi", false }, .{ "prompt_sr", true }, .{ "skip", @as(u32, 1) }, .{ "cut", [2]u32{ 1, 0 } }, .{ "cut", [2]u32{ 0, 1 } } }) |change| {
+        var no = yes;
+        @field(no, change[0]) = change[1];
+        try std.testing.expect(!no.ordinaryN16Eligible(false, 2));
+    }
+    var narrow = yes;
+    narrow.ordinary_n16 = true;
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(yes, false);
+    try cache.put(narrow, true);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(!cache.get(yes).? and cache.get(narrow).?);
 }

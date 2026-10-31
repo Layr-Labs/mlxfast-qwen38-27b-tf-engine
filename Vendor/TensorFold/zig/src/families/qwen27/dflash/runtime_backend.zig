@@ -140,8 +140,6 @@ pub const Backend = struct {
     stash: ?*Stash = null,
     fused_count: usize = 0,
     hazards: Hazards = .{},
-    /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
-    mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);

@@ -65,7 +65,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const core_row = b.createModule(.{ .root_source_file = b.path("zig/src/core/row_projection.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = core_row })).step);
     const core_lane = b.createModule(.{ .root_source_file = b.path("zig/src/core/lane_projection.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } });
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = core_lane })).step);
+    const core_lane_tests = b.addRunArtifact(b.addTest(.{ .root_module = core_lane }));
+    test_step.dependOn(&core_lane_tests.step);
     const lane_imports: []const std.Build.Module.Import = &.{ .{ .name = "metal", .module = metal }, .{ .name = "core_lane", .module = core_lane } };
     _ = program(b, "tf-core-lane-small", "Build bounded synthetic small-width core timing and retained-byte comparison", "zig/tests/core_lane_small.zig", target, false, lane_imports);
     _ = program(b, "tf-core-lane-reg-check", "Build the reg kernel's byte check against the cooperative kernel (M5 GPU)", "zig/tests/core_lane_reg.zig", target, false, lane_imports);
@@ -139,6 +140,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     test_step.dependOn(&qwen_tests.step);
     const qwen_test_step = b.step("test-qwen27", "CPU Qwen config, affine and complete tensor graph contracts");
     qwen_test_step.dependOn(&qwen_tests.step);
+    qwen_test_step.dependOn(&core_lane_tests.step);
     const width_tests = b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{ "proposal width and parent depth", "width two depth one uses", "depth one siblings keep", "depth one sibling terminal", "width seven depth one", "a probability floor drops" } }));
     b.step("test-qwen27-width2-host", "Depth-one sibling topology and keep maps without a GPU").dependOn(&width_tests.step);
     const header_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true }) }));

@@ -184,13 +184,13 @@ test "qwen27 bank: real two-layer verify and empty keep use partial strides and 
     defer plan.deinit();
     var record: metal.Recorder = .{ .segments = 2 };
     const e = metal.ComputeEncoder{ .record = &record };
-    try std.testing.expectError(error.MissingGdnBefore, f.pool.forward(0, .{ .host = plan, .metadata = f.metadata }, f.refs(), e, null));
+    try std.testing.expectError(error.MissingGdnBefore, f.pool.forward(0, .{ .host = plan, .metadata = f.metadata }, f.refs(), e));
     try f.pool.prepare(device, plan, false);
     try std.testing.expectEqual(@as(usize, 2), f.pool.before_slots);
     for (0..2) |layer| {
         const words = try f.pool.committed(layer, 1, true);
         @memset(@constCast(words), @intCast(0x21 + layer));
-        try f.pool.forward(layer, .{ .host = plan, .metadata = f.metadata }, f.refs(), e, null);
+        try f.pool.forward(layer, .{ .host = plan, .metadata = f.metadata }, f.refs(), e);
         try std.testing.expect(words[0] != 0x21 + layer);
     }
     var keep = try makePlan(&f.pool, &.{
@@ -207,7 +207,7 @@ test "qwen27 bank: real two-layer verify and empty keep use partial strides and 
     try std.testing.expectEqual(@as(usize, 2), record.restores);
     try f.pool.prepare(device, plan, true);
     try std.testing.expect(f.pool.before == null);
-    for (0..2) |layer| try f.pool.forwardChain(layer, .{ .host = plan, .metadata = f.metadata }, f.refs(), e, true, null);
+    for (0..2) |layer| try f.pool.forwardChain(layer, .{ .host = plan, .metadata = f.metadata }, f.refs(), e, true);
 }
 
 test {

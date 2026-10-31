@@ -193,3 +193,8 @@ pub const drama3 = struct {
     pub const sample = @embedFile("drama3/sample.metal");
     pub const codec = @embedFile("drama3/codec.metal");
 };
+
+pub const core_lane_fused_n16 = @embedFile("core/lane_fused_n16.metal");
+pub const core_lane_n16_qualification = @embedFile("core/lane_n16_qualification.metal");
+
+pub const core_lane_ordinary_n16 = @embedFile("core/lane_ordinary_n16.metal");

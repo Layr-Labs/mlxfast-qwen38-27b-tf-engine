@@ -2,7 +2,6 @@
 const std = @import("std");
 const mtl = @import("metal");
 const projection = @import("../projection.zig");
-const lane = @import("core").lane_projection;
 pub const spans = [_][2]u32{ .{ 0, 98304 }, .{ 248032, 248320 } };
 pub const width = 98592;
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
@@ -30,7 +29,7 @@ pub const Head = struct {
             destination += rows;
         }
         head.linear.n = width;
-        head.linear.index = null;
+        head.linear.index = null; // the spans' columns keep the pairs layout
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
@@ -66,22 +65,6 @@ pub const Head = struct {
                 }
             }
             head.linear.pairs = .{ .buffer = pairs };
-            // the source's indexed copy, trimmed to the spans' columns: the same table, each group's indices in span order
-            if (source.index) |index| {
-                const table = lane.sb_table * 4;
-                const trimmed = try head.allocate(device, lane.indexedBytes(width, k, source.group));
-                @memcpy(trimmed.contents()[0..table], index.buffer.contents()[index.offset..][0..table]);
-                for (0..groups) |g| {
-                    destination = 0;
-                    for (spans) |span| {
-                        const bytes = @as(usize, span[1] - span[0]) * 2;
-                        const first = index.offset + table + (g * source.n + span[0]) * 2;
-                        @memcpy(trimmed.contents()[table + (g * width + destination) * 2 ..][0..bytes], index.buffer.contents()[first..][0..bytes]);
-                        destination += span[1] - span[0];
-                    }
-                }
-                head.linear.index = .{ .buffer = trimmed };
-            }
         }
         head.ids = try head.allocate(device, width * 4);
         const ids = head.ids.?.slice(u32, width);

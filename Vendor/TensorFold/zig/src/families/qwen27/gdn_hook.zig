@@ -1,6 +1,4 @@
 //! QKV projects straight into the pool's log and ZBA into the frame's mixed buffer, side by side from the same input.
-//! A prompt pass on the reg path runs only b and a (the prepare's) beside QKV: z, which only the gate reads, runs beside
-//! the scan, whose sequential rows leave the GPU's tensor units idle.
 const metal = @import("metal");
 const Pool = @import("gdn_pool_gpu.zig").Pool;
 const pool_gpu = @import("gdn_pool_gpu.zig");
@@ -8,8 +6,6 @@ const Plan = @import("gdn_plan.zig").Plan;
 const Frame = @import("gpu_frame.zig").Frame;
 const Weights = @import("gpu_weights.zig");
 const Quant = @import("quant_gpu.zig").Kernels;
-const gdn = @import("gdn.zig");
-const Linear = @import("projection.zig").Linear;
 const Glue = @import("glue_gpu.zig").Kernels;
 
 pub const Hook = struct {
@@ -26,16 +22,14 @@ pub const Hook = struct {
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
-        var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt) };
-        if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
+        try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), gated, e, beside);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), gated, e);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
@@ -43,29 +37,6 @@ pub const Hook = struct {
         try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e);
     }
 };
-
-/// The z tiles of the fused zba rows, encoded beside the scan: they read the norm's rows and sums, which nothing writes
-/// before the gate, and write only z's columns, which only the gate reads.
-const Late = struct {
-    quant: *Quant,
-    zba: Linear,
-    frame: *Frame,
-    sums: @import("quant_gpu.zig").Sums,
-    rows: u32,
-    tiles: u32,
-    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
-        const z: *Late = @ptrCast(@alignCast(ptr));
-        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.frame.get(.dims), z.frame.get(.mixed), z.rows, .{ 0, z.tiles });
-    }
-};
-
-/// z's 32-column tiles for a prompt pass whose zba takes ranged launches, z ending on a tile boundary before b and a; 0
-/// keeps one launch (decoded rows: their short scan already keeps the GPU busy).
-fn zTiles(zba: Linear, frame: *Frame, prompt: bool) u32 {
-    const width: u32 = @intCast(frame.config.gdnValueDim());
-    if (!prompt or !Quant.ranged(zba) or width % 32 != 0 or zba.n % 32 != 0 or zba.n <= width) return 0;
-    return width / 32;
-}
 
 /// z, b and a read in place from the fused zba rows.
 fn refs(weight: Weights.Gdn, frame: *Frame) !pool_gpu.Refs {
