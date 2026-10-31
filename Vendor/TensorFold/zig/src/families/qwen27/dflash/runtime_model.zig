@@ -197,9 +197,13 @@ pub const Model = struct {
         return .{ .ring = m.pending, .slot = slot, .rows = @intCast(behind), .first = m.session.context.end, .next = .{ .cache = m.session.context.cache, .begin = begin, .end = m.committed_end } };
     }
     pub fn propose(m: *Model, pending: u32, nodes: u32) !@import("selector.zig").Tree {
-        if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab or nodes > 15 or m.tree_block == 0 or m.tree_block > 16) return error.BadDraftOptions;
+        return m.proposePolicy(pending, .{ .nodes = nodes });
+    }
+    pub fn proposePolicy(m: *Model, pending: u32, policy: @import("selector.zig").Policy) !@import("selector.zig").Tree {
+        const block = try policy.block(m.tree_block);
+        const nodes: u32 = @intCast(policy.nodes);
+        if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab) return error.BadDraftOptions;
         if (m.committed_end == 0) return error.DraftContextNotReady;
-        const block = @min(m.tree_block, nodes + 1);
         if (block < 2) return .{ .gpa = m.allocator, .tokens = &.{}, .parents = &.{}, .scores = &.{} };
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;

@@ -23,6 +23,8 @@ const Fake = struct {
     ids: [16]u32 = undefined,
     positions: [16]u64 = undefined,
     mask_first: u32 = 0,
+    embedded_rows: u32 = 0,
+    lattice_rows: u32 = 0,
     fn self(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }
@@ -68,6 +70,7 @@ const Fake = struct {
         return self(ptr).view(x.rows, x.width);
     }
     fn embed(ptr: *anyopaque, _: u64, _: ck.Linear, ids: []const u32) !op.View {
+        self(ptr).embedded_rows = @intCast(ids.len);
         @memcpy(self(ptr).ids[0..ids.len], ids);
         return self(ptr).view(@intCast(ids.len), fixtures.toy.hidden);
     }
@@ -104,7 +107,8 @@ const Fake = struct {
     fn streamAppend(_: *anyopaque, _: u64, _: u32, _: u32, _: op.View, _: op.View, _: []const u64) !void {
         return error.FakeBatchedHead;
     }
-    fn lattice(_: *anyopaque, _: u64, _: op.Head, projected: op.View, c: cfg.Config) !op.Lattice {
+    fn lattice(ptr: *anyopaque, _: u64, _: op.Head, projected: op.View, c: cfg.Config) !op.Lattice {
+        self(ptr).lattice_rows = projected.rows;
         if (projected.rows == 0 or projected.rows > 15 or projected.width != c.rank) return error.FakeProjectionShape;
         const a = std.testing.allocator;
         const ids = try a.alloc(u32, projected.rows * c.topk);
@@ -329,7 +333,6 @@ test "tiny conditional score differences collapse before sibling selection" {
     try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1 }, tree.parents);
 }
 
-
 test "fused draft groups preserve projection shapes across absorb and tree" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
@@ -346,4 +349,38 @@ test "fused draft groups preserve projection shapes across absorb and tree" {
     try std.testing.expectEqual(@as(u32, 35), fake.fused_slices);
     try std.testing.expectEqual(@as(usize, 15), tree.tokens.len);
     try std.testing.expectEqual(@as(u32, 5), fake.appends);
+}
+
+test "width two depth one uses one genuine future head row and sibling parents" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    const policy = selector.Policy{ .nodes = 2, .max_depth = 1 };
+    const block = try policy.block(16);
+    for ([_]bool{ false, true }) |merged| {
+        var fake = Fake{};
+        var state = try session.Session.init(fixtures.toy, 1, 0);
+        const preparation = op.Preparation{ .mode = .bf16_reference };
+        try state.absorb(fake.ops(), &graph, preparation, batch());
+        fake.appends = 0;
+        const more = session.Batch{ .values = batch().values, .positions = &.{ 2, 3 }, .layers = cfg.tap_ids, .target_end = 4 };
+        if (!merged) try state.absorb(fake.ops(), &graph, preparation, more);
+        var tree = if (merged)
+            try state.absorbTreeBlock(a, fake.ops(), &graph, preparation, more, 5, block, .{ .nodes = 2 })
+        else
+            try state.treeBlock(a, fake.ops(), &graph, preparation, 5, try state.firstDraw(), block, .{ .nodes = 2 });
+        defer tree.deinit();
+        try std.testing.expectEqual(@as(u32, 2), fake.embedded_rows);
+        try std.testing.expectEqual(@as(u32, 1), fake.lattice_rows);
+        try policy.checkTree(tree.parents);
+        try std.testing.expectEqual(@as(usize, 2), tree.tokens.len);
+        try std.testing.expectEqualSlices(i32, &.{ -1, -1 }, tree.parents);
+        const parents = try tree.verifyParents(a);
+        defer a.free(parents);
+        try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, parents);
+        try std.testing.expectEqualSlices(u32, &.{ 5, fixtures.toy.mask }, fake.ids[0..2]);
+        try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, fake.positions[0..2]);
+    }
 }

@@ -55,7 +55,7 @@ test "a round that accepts no drafts commits one token" {
     try std.testing.expectEqual(@as(u32, 0), journal.rounds.items[0].accepted);
 }
 
-test "depth one drafts at most one token per round" {
+test "single-proposal rounds report at most one drafted token" {
     var journal: dflash_audit.Journal = .{};
     defer journal.deinit(std.testing.allocator);
     const result = try drive(&.{
@@ -65,4 +65,24 @@ test "depth one drafts at most one token per round" {
     }, &journal);
     for (journal.rounds.items) |round| try std.testing.expect(round.drafted <= 1);
     try std.testing.expect(result.stats.drafted <= result.stats.rounds);
+}
+
+
+test "width two depth one truthfully reports both proposals and one selected path" {
+    const a = std.testing.allocator;
+    var journal: dflash_audit.Journal = .{};
+    defer journal.deinit(a);
+    const result = try drive(&.{
+        .{ .tokens = &.{4}, .drafted = 2, .accepted = 0 },
+        .{ .tokens = &.{ 2, 5 }, .drafted = 2, .accepted = 1 },
+        .{ .tokens = &.{ 3, 6 }, .drafted = 2, .accepted = 1 },
+    }, &journal);
+    var wire = bench_session.DflashAudit.init();
+    defer wire.deinit(a);
+    try dflash_audit.appendTo(&journal, &wire, a);
+    try wire.check(@intCast(result.emitted));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 2 }, wire.acceptance_lengths.items);
+    try std.testing.expectEqual(@as(u64, 6), wire.drafted_total);
+    try std.testing.expectEqual(@as(u64, 2), wire.accepted_total);
+    try std.testing.expectEqual(@as(u64, 5), wire.committed_total);
 }
