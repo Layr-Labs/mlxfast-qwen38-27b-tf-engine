@@ -48,7 +48,6 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         try encodePrepared(b, e, x, y, adapter);
         return y;
     }
-    e.barrier();
     return y;
 }
 /// A prepared adapter's projection of `x` into `y`, sharing the input sums of an earlier projection of the same view.
@@ -66,14 +65,14 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         if (!cacheable or (if (b.input_sums) |s| !std.meta.eql(s.view, x) else false)) b.input_sums = null;
         if (b.input_sums) |s| {
             b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
-            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
+            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
         } else if (cacheable) {
             // the sums, a barrier, the product: no barrier behind it, so independent work runs beside it
             const sums_span = Span.whole(p.sums_buffer.?);
             b.access(e, &.{xs}, &.{sums_span});
             const sums = try p.encodeSumsOf(e, .{ .buf = input.buf, .off = input.off }, x.rows);
             b.access(e, &.{ xs, sums_span }, &.{ys});
-            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, sums, .{ .buf = output.buf, .off = output.off }, x.rows);
+            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows);
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
