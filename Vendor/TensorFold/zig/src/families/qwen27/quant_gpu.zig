@@ -17,6 +17,14 @@ const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 
         const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
         return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
+
+    /// One SIMD group running both of `serialSk2`'s chains is a port of the CUDA fold, and it costs a warp a tile: on
+    /// decoded rows the two chains trade the fold for a second SIMD group (the same `TF_G0/TF_GN` partition, the same
+    /// `p0 + p1` on slice 0) because a tile's two warps keep twice the bytes in flight — 500 -> 917 GB/s on qkv,
+    /// 588 -> 1086 on the query stack, measured on Solomon. Prompt rows keep the fold.
+    fn serialChain(key: Key) bool {
+        return key.serialSk2() and !key.rows8;
+    }
 };
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
@@ -295,7 +303,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .indexed = key.sbi });
+entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialChain(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .indexed = key.sbi });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -337,7 +345,7 @@ pub const Kernels = struct {
             .output = .bf16,
             .precompute_sums = reg,
             .reg = reg,
-            .serial_sk2 = key.serialSk2(),
+            .serial_sk2 = key.serialChain(),
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
