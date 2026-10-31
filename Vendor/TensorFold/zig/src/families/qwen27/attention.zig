@@ -77,8 +77,12 @@ pub const Binding = struct {
         b.kept = null;
     }
     pub fn check(b: *const Binding, plan: Plan, caches: []const Cache) !void {
+        if (b.uploaded == null) return error.AttentionNotUploaded;
+        try b.checkDigest(plan, caches, fingerprint(plan));
+    }
+    fn checkDigest(b: *const Binding, plan: Plan, caches: []const Cache, digest: [32]u8) !void {
         const uploaded = b.uploaded orelse return error.AttentionNotUploaded;
-        if (!std.mem.eql(u8, &uploaded, &fingerprint(plan))) return error.AttentionNotUploaded;
+        if (!std.mem.eql(u8, &uploaded, &digest)) return error.AttentionNotUploaded;
         try b.checkCaches(caches);
         for (caches, 0..) |cache, i| {
             const at = 8 + i * 12;
@@ -151,8 +155,13 @@ pub const Scratch = struct {
         s.uploaded = fingerprint(plan);
     }
     pub fn check(s: *const Scratch, plan: Plan) !void {
+        _ = try s.checkedDigest(plan);
+    }
+    fn checkedDigest(s: *const Scratch, plan: Plan) ![32]u8 {
         const uploaded = s.uploaded orelse return error.AttentionNotUploaded;
-        if (!std.mem.eql(u8, &uploaded, &fingerprint(plan))) return error.AttentionNotUploaded;
+        const digest = fingerprint(plan);
+        if (!std.mem.eql(u8, &uploaded, &digest)) return error.AttentionNotUploaded;
+        return digest;
     }
 };
 fn validLimits(limits: Limits) !void {
@@ -306,8 +315,9 @@ pub const Attention = struct {
         errdefer timing.cancel();
         const e = timing.encoder;
 
-        try scratch.check(plan);
-        try binding.check(plan, caches);
+        // Both checks inspect this plan synchronously; reuse only this call's fresh digest.
+        const digest = try scratch.checkedDigest(plan);
+        try binding.checkDigest(plan, caches, digest);
         try spanAligned(q, q_bytes, 16);
         try span(k, kv_bytes);
         try span(v, kv_bytes);

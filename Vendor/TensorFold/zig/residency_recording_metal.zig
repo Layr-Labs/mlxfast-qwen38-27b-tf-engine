@@ -56,6 +56,7 @@ pub const objc = struct {
         return id;
     }
     pub fn msg(comptime R: type, _: Id, comptime _: [:0]const u8, _: anytype) R {
+        if (R == ?Id) return @as(Id, @ptrFromInt(1));
         if (R != void) @compileError("ownership fixture permits only inert fence messages");
     }
     pub const Pool = struct {
@@ -67,7 +68,11 @@ pub const objc = struct {
 };
 
 const Allocation = struct { record: *Record, data: []align(256) u8, bytes: usize, alive: bool = true, enrolled: bool = false };
+pub const DispatchRecord = @import("gemma4_recording_metal.zig").Record;
 pub const Record = struct {
+    dispatches: ?*DispatchRecord = null,
+    barriers: usize = 0,
+    last_dispatch: ?DispatchType = null,
     gpa: std.mem.Allocator,
     allocations: std.ArrayList(*Allocation) = .empty,
     active: bool = false,
@@ -130,6 +135,7 @@ pub const Buffer = struct {
 };
 
 pub const Device = struct {
+    id: objc.Id = @ptrFromInt(1),
     record: *Record,
     pub fn buffer(d: Device, bytes: usize, _: usize) !Buffer {
         if (d.record.fail_at == d.record.allocations.items.len) return error.InjectedBufferFailure;
@@ -222,8 +228,9 @@ pub const CommandBuffer = struct {
     pub fn blit(c: CommandBuffer) BlitEncoder {
         return .{ .record = c.record };
     }
-    pub fn compute(_: CommandBuffer, _: DispatchType) ComputeEncoder {
-        return .{};
+    pub fn compute(c: CommandBuffer, kind: DispatchType) ComputeEncoder {
+        c.record.last_dispatch = kind;
+        return .{ .record = c.record.dispatches, .owner = c.record };
     }
     pub fn commit(c: CommandBuffer) void {
         c.record.commits += 1;
@@ -269,13 +276,41 @@ pub const BlitEncoder = struct {
 
 pub const ComputeEncoder = struct {
     id: objc.Id = @ptrFromInt(1),
-    pub fn setPipeline(_: @This(), _: Pipeline) void {}
-    pub fn setBuffer(_: @This(), _: Buffer, _: usize, _: usize) void {}
-    pub fn setValue(_: @This(), _: anytype, _: usize) void {}
-    pub fn setBytes(_: @This(), _: []const u8, _: usize) void {}
-    pub fn dispatchThreads(_: @This(), _: Size, _: Size) void {}
-    pub fn dispatchGroups(_: @This(), _: Size, _: Size) void {}
+    record: ?*DispatchRecord = null,
+    owner: ?*Record = null,
+    pub fn setPipeline(e: @This(), p: Pipeline) void {
+        if (e.record) |r| r.current.pipe = @intCast(@intFromPtr(p.id));
+    }
+    pub fn setBuffer(e: @This(), b: Buffer, off: usize, i: usize) void {
+        if (e.record) |r| r.current.buffers[i] = .{ .id = @intFromPtr(b.id), .off = off };
+    }
+    pub fn setValue(e: @This(), value: anytype, i: usize) void {
+        e.setBytes(std.mem.asBytes(&value), i);
+    }
+    pub fn setBytes(e: @This(), bytes: []const u8, i: usize) void {
+        if (e.record) |r| {
+            r.current.lengths[i] = bytes.len;
+            @memcpy(r.current.values[i][0..bytes.len], bytes);
+        }
+    }
+    fn dispatch(e: @This(), groups: Size, threads: Size, direct: bool) void {
+        if (e.record) |r| {
+            r.current.grid = .{ .width = groups.width, .height = groups.height, .depth = groups.depth };
+            r.current.threads = .{ .width = threads.width, .height = threads.height, .depth = threads.depth };
+            r.current.direct = direct;
+            r.passes[r.n] = r.current;
+            r.n += 1;
+        }
+    }
+    pub fn dispatchThreads(e: @This(), groups: Size, threads: Size) void {
+        e.dispatch(groups, threads, true);
+    }
+    pub fn dispatchGroups(e: @This(), groups: Size, threads: Size) void {
+        e.dispatch(groups, threads, false);
+    }
     pub fn dispatchIndirect(_: @This(), _: Buffer, _: usize, _: Size) void {}
-    pub fn barrier(_: @This()) void {}
+    pub fn barrier(e: @This()) void {
+        if (e.owner) |r| r.barriers += 1;
+    }
     pub fn end(_: @This()) void {}
 };

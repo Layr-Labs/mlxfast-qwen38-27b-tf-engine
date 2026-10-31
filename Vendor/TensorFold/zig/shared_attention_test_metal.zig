@@ -35,7 +35,7 @@ pub const Library = struct {
 pub const Pipeline = struct {
     id: u32,
     pub fn init(_: Device, _: Library, name: []const u8, _: bool) !Pipeline {
-        return .{ .id = if (std.mem.endsWith(u8, name, "_split")) 1 else if (std.mem.endsWith(u8, name, "_merge")) 2 else 0 };
+        return .{ .id = if (std.mem.endsWith(u8, name, "_split_ring")) 3 else if (std.mem.endsWith(u8, name, "_split")) 1 else if (std.mem.endsWith(u8, name, "_merge")) 2 else 0 };
     }
     pub fn deinit(_: Pipeline) void {}
     pub fn simdWidth(_: Pipeline) usize {
