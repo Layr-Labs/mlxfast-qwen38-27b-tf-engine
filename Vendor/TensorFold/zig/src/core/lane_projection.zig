@@ -185,6 +185,12 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 puts two adjacent tiles in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// A GDN layer's qkv rows on a verify (rows8, serial SK2): four tiles a threadgroup, one 128-channel head, whose stored
+    /// words then take that head's verify prepare (encodeGdnPre).
+    gdn_pre: bool = false,
+    /// A GDN layer's fused zba rows on a verify (rows8): the b and a words also give the round's mixing and decay
+    /// (encodeGdnGates).
+    gdn_gates: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -208,6 +214,10 @@ pub const Layout = struct {
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.swiglu or l.serial_sk2 or l.ranges.len != 0 or
             l.prompt_tn != 2 or l.tileCount() % l.prompt_tn != 0)) return error.InvalidSchedule;
+        const gdn_plain = l.rows8 and l.reg_lean and !l.swiglu and l.output == .bf16 and l.ranges.len == 0 and
+            l.groups == null and l.y_stride == null and l.prompt_tn == 1;
+        if (l.gdn_pre and (!gdn_plain or !l.serial_sk2 or l.gdn_gates or l.n % 128 != 0)) return error.InvalidSchedule;
+        if (l.gdn_gates and (!gdn_plain or l.gdn_pre)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -285,6 +295,8 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
+    if (l.gdn_pre) try text.appendSlice(a, "#define TF_GDN_PRE 1\n");
+    if (l.gdn_gates) try text.appendSlice(a, "#define TF_GDN_GATES 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -407,6 +419,10 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
+    /// Built with Layout.gdn_pre: encodeGdnPre only.
+    gdn_pre: bool = false,
+    /// Built with Layout.gdn_gates: encodeGdnGates only.
+    gdn_gates: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -420,7 +436,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu or l.gdn_pre) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -428,7 +444,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .gdn_pre = l.gdn_pre, .gdn_gates = l.gdn_gates };
     }
 
     pub fn deinit(p: Projection) void {
@@ -472,6 +488,71 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
+    }
+
+    /// A gdn_pre projection of a verify's rows (at most 8, `sums` its input's group sums): `y` gets the rows encodeSums
+    /// writes, and `g`'s query, key and value the verify prepare of each 128-channel head (tf_delta_gdn_pre_rows4's words).
+    pub fn encodeGdnPre(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, g: GdnPre) !void {
+        if (!p.gdn_pre or p.n % 128 != 0) return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        const a = g.args;
+        if (a.dk != 128 or a.dv != 128 or a.taps != 4 or p.n != 2 * a.nk * a.dk + a.nv * a.dv) return error.InvalidShape;
+        try checkRef(x, rows * p.k * 2, 2);
+        try checkRef(w, p.weight_bytes, 16);
+        try checkRef(sb, p.metadata_bytes, 16);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
+        try checkRef(g.query, @as(usize, rows) * a.nk * a.dk * 2, 8);
+        try checkRef(g.key, @as(usize, rows) * a.nk * a.dk * 2, 8);
+        try checkRef(g.value, @as(usize, rows) * a.nv * a.dv * 2, 8);
+        try checkRef(g.windows, @as(usize, rows) * a.taps * 4, 4);
+        try checkRef(g.row_slots, @as(usize, rows) * 4, 4);
+        if (g.history.off % 8 != 0) return error.InvalidStorage;
+        e.setPipeline(p.pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setBuffer(w.buf, w.off, 1);
+        e.setBuffer(sb.buf, sb.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
+        e.setBuffer(y.buf, y.off, 4);
+        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        e.setBuffer(g.history.buf, g.history.off, 6);
+        e.setBuffer(g.weights.buf, g.weights.off, 7);
+        e.setBuffer(g.windows.buf, g.windows.off, 8);
+        e.setBuffer(g.row_slots.buf, g.row_slots.off, 9);
+        e.setBuffer(g.query.buf, g.query.off, 10);
+        e.setBuffer(g.key.buf, g.key.off, 11);
+        e.setBuffer(g.value.buf, g.value.off, 12);
+        e.setValue(a, 13);
+        e.dispatchGroups(mtl.Size.of(p.n / 128, 1, 1), mtl.Size.of(128, 1, 1));
+    }
+
+    /// A gdn_gates projection of a verify's rows: `y` gets the rows encodeSums writes, and `g`'s mixing and decay the
+    /// round's values from the b and a words (the columns past `g.args.width`), as tf_delta_gdn_pre_rows4 makes them.
+    pub fn encodeGdnGates(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, g: GdnGates) !void {
+        if (!p.gdn_gates) return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        const a = g.args;
+        if (p.n != a.width + 2 * a.nv or p.y_stride != p.n) return error.InvalidShape;
+        try checkRef(x, rows * p.k * 2, 2);
+        try checkRef(w, p.weight_bytes, 16);
+        try checkRef(sb, p.metadata_bytes, 16);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
+        try checkRef(g.decay, @as(usize, rows) * a.nv * 4, 4);
+        try checkRef(g.mixing, @as(usize, rows) * a.nv * 2, 2);
+        e.setPipeline(p.pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setBuffer(w.buf, w.off, 1);
+        e.setBuffer(sb.buf, sb.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
+        e.setBuffer(y.buf, y.off, 4);
+        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        e.setBuffer(g.decay.buf, g.decay.off, 6);
+        e.setBuffer(g.mixing.buf, g.mixing.off, 7);
+        e.setBuffer(g.a_log.buf, g.a_log.off, 8);
+        e.setBuffer(g.dt.buf, g.dt.off, 9);
+        e.setValue(a, 10);
+        e.dispatchGroups(mtl.Size.of(p.tile_count, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
@@ -526,6 +607,15 @@ pub const reg_rows = 128;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
+
+/// A GDN layer's shapes as lane_projection.metal's tf_gdn_args (TfDeltaParams' nk, nv, dk, dv, taps, weight_flags, and
+/// the z width of its fused zba rows).
+pub const GdnArgs = extern struct { nk: u32, nv: u32, dk: u32, dv: u32, taps: u32, flags: u32, width: u32 };
+/// What a gdn_pre launch's prepare reads and writes besides its rows: the layer's conv history and weights, the round's
+/// windows and row slots, and its query, key and value rows.
+pub const GdnPre = struct { history: Ref, weights: Ref, windows: Ref, row_slots: Ref, query: Ref, key: Ref, value: Ref, args: GdnArgs };
+/// What a gdn_gates launch writes besides its rows (the round's decay and mixing) and the weights its gates read.
+pub const GdnGates = struct { decay: Ref, mixing: Ref, a_log: Ref, dt: Ref, args: GdnArgs };
 
 test "rows8 is off by default, needs the reg kernel and only adds its define" {
     var l = Layout{ .n = 10240, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .serial_sk2 = true };

@@ -10,7 +10,7 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, gdn_pre: bool = false, gdn_gates: bool = false,
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -325,6 +325,59 @@ pub const Kernels = struct {
             if (sums) |s| try entry.value_ptr.encodeSums(e, xr, w, sb, .{ .ref = .{ .buf = s.ref.buffer, .off = s.ref.offset + @as(usize, first) * 4 }, .stride = s.stride }, yr, @min(rows - first, step)) else try entry.value_ptr.encode(e, xr, w, sb, yr, @min(rows - first, step));
         }
         try span.end();
+    }
+
+    /// Whether a verify's GDN qkv and zba rows (`rows` decoded rows, `args` the layer's shapes) take gdnPrepared: the
+    /// reg path's 4-bit g64 matrices, the qkv shape's serial split, and z, b and a in one fused row.
+    pub fn gdnFusable(k: *const Kernels, qkv: projection.Linear, zba: projection.Linear, rows: u32, args: lane.GdnArgs) bool {
+        if (k.prompt or rows == 0 or rows > 8 or !ranged(qkv) or !ranged(zba) or qkv.k != zba.k) return false;
+        if (!gdnKey(qkv, true).serialSk2() or qkv.n % 128 != 0) return false;
+        if (args.dk != 128 or args.dv != 128 or args.taps != 4 or args.width != args.nv * args.dv) return false;
+        return qkv.n == 2 * args.nk * args.dk + args.nv * args.dv and zba.n == args.width + 2 * args.nv;
+    }
+
+    /// A verify's GDN qkv and zba rows (gdnFusable) as `quant` writes them into `qkv_out` and `zba_out`; the qkv launch
+    /// also writes each head's verify prepare into `pre`'s query, key and value, and the zba launch `gates`' decay and
+    /// mixing, the words tf_delta_gdn_pre_rows4 writes from those rows.
+    pub fn gdnPrepared(k: *Kernels, input_encoder: mtl.ComputeEncoder, qkv: projection.Linear, zba: projection.Linear, x: Ref, xs: Sums, qkv_out: Ref, zba_out: Ref, rows: u32, pre: lane.GdnPre, gates: lane.GdnGates) !void {
+        if (!k.gdnFusable(qkv, zba, rows, pre.args)) return error.BadCoreProjectionRows;
+        const pq = try k.gdnEntry(qkv, true);
+        const pz = try k.gdnEntry(zba, false);
+        const xr = lane.Ref{ .buf = x.buffer, .off = x.offset };
+        const sums = lane.Sums{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride };
+        inline for (.{ .{ pq, qkv, qkv_out }, .{ pz, zba, zba_out } }, 0..) |job, i| {
+            var span = profile.begin(k.profiler, input_encoder, .dense);
+            span.shape = .{ .n = job[1].n, .k = job[1].k, .sk = job[1].slices, .bits = job[1].bits };
+            errdefer span.cancel();
+            const w = lane.Ref{ .buf = job[1].words.buffer, .off = job[1].words.offset };
+            const y = lane.Ref{ .buf = job[2].buffer, .off = job[2].offset };
+            if (i == 0) try job[0].encodeGdnPre(span.encoder, xr, w, metadata(job[1], job[1].index != null), sums, y, rows, pre) else try job[0].encodeGdnGates(span.encoder, xr, w, metadata(job[1], job[1].index != null), sums, y, rows, gates);
+            try span.end();
+        }
+    }
+
+    /// Compiles at load the pipelines gdnPrepared takes for a GDN layer's qkv and zba: no other launch takes them.
+    pub fn prepareGdn(k: *Kernels, qkv: projection.Linear, zba: projection.Linear) !void {
+        if (k.prompt or !ranged(qkv) or !ranged(zba) or !gdnKey(qkv, true).serialSk2() or qkv.n % 128 != 0) return;
+        _ = try k.gdnEntry(qkv, true);
+        _ = try k.gdnEntry(zba, false);
+    }
+
+    /// The decode-row `quant` key of `p` (rows8, its own split, batch and metadata form) with the GDN epilogue flag.
+    fn gdnKey(p: projection.Linear, pre: bool) Key {
+        return .{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .gdn_pre = pre, .gdn_gates = !pre };
+    }
+
+    /// `quant`'s decode-row lane layout of `p` with the GDN epilogue: every K-loop word and store as that launch's.
+    fn gdnEntry(k: *Kernels, p: projection.Linear, pre: bool) !lane.Projection {
+        const key = gdnKey(p, pre);
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .output = .bf16, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .gdn_pre = pre, .gdn_gates = !pre });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr.*;
     }
 
     /// Compiles at load the pipeline a decode-row `quant` of `p` over `rows` takes (for shapes no target layer uses).

@@ -11,6 +11,11 @@ const Quant = @import("quant_gpu.zig").Kernels;
 const gdn = @import("gdn.zig");
 const Linear = @import("projection.zig").Linear;
 const Glue = @import("glue_gpu.zig").Kernels;
+const lane = @import("core").lane_projection;
+
+fn lref(s: gdn.Span) lane.Ref {
+    return .{ .buf = s.buffer, .off = s.offset };
+}
 
 pub const Hook = struct {
     pool: *Pool,
@@ -25,6 +30,7 @@ pub const Hook = struct {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
+        if (!hook.accepted_chain and try hook.fused(e, layer, weight, frame, rows, sums)) return;
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
         var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt) };
         if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
@@ -36,6 +42,34 @@ pub const Hook = struct {
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
         if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), gated, e, beside);
+    }
+
+    /// A verify whose prepare the qkv and zba launches write (Quant.gdnPrepared): qkv and zba, their barrier, then the
+    /// scan and gate as forward encodes them. False (nothing encoded) where forward's own prepare is needed.
+    fn fused(hook: *Hook, e: metal.ComputeEncoder, layer: u32, weight: Weights.Gdn, frame: *Frame, rows: u32, sums: @import("quant_gpu.zig").Sums) !bool {
+        if (hook.quant.prompt or zTiles(weight.zba, frame, hook.quant.prompt) != 0) return false;
+        var gated = try refs(weight, frame);
+        const xs = frame.get(.sums);
+        frame.mixer_sums = false;
+        gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
+        const prepared = try hook.pool.verifyRound(layer, devicePlan(hook.plan.*, frame), gated);
+        const p = prepared.p;
+        const args = lane.GdnArgs{ .nk = p.nk, .nv = p.nv, .dk = p.dk, .dv = p.dv, .taps = p.taps, .flags = p.weight_flags, .width = p.nv * p.dv };
+        if (!prepared.rowsPrepare() or p.zba_stride != weight.zba.n or !hook.quant.gdnFusable(weight.qkv, weight.zba, rows, args)) return false;
+        const b = prepared.b;
+        try hook.quant.gdnPrepared(e, weight.qkv, weight.zba, frame.get(.input), sums, try hook.pool.projected(layer), frame.get(.mixed), rows, .{
+            .history = lref(b.history),
+            .weights = lref(b.conv_weight),
+            .windows = lref(b.windows),
+            .row_slots = lref(b.row_slots),
+            .query = lref(b.query),
+            .key = lref(b.key),
+            .value = lref(b.value),
+            .args = args,
+        }, .{ .decay = lref(b.decay), .mixing = lref(b.mixing), .a_log = lref(b.a_log), .dt = lref(b.dt), .args = args });
+        e.barrier();
+        try hook.pool.scanPrepared(prepared, e, null);
+        return true;
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

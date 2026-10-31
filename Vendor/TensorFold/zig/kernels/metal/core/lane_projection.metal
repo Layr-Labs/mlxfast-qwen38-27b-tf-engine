@@ -319,8 +319,84 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 }
 
+#if defined(TF_GDN_PRE) || defined(TF_GDN_GATES)
+// A GDN layer's shapes (TfDeltaParams' nk, nv, dk, dv, taps, weight_flags) and its z width (nv * dv) in the fused zba rows.
+struct tf_gdn_args { uint nk, nv, dk, dv, taps, flags, width; };
+inline float tf_gdn_weight(device const void* data, uint at, uint flags, uint bit) {
+  if ((flags & (1u << bit)) != 0) return ((device const float*)data)[at];
+  return float(((device const bfloat*)data)[at]);
+}
+#endif
+#if defined(TF_GDN_PRE)
+// tf_delta_gdn_pre_rows4 for one head of a verify's rows, reading the round's projected rows from `gp` (the bf16 words
+// this launch stores, one head's 128 channels a row) instead of the projection buffer: every value and every operation
+// in the same order.
+inline void tf_gdn_prepare(threadgroup const bfloat* gp, device const bfloat* history, device const void* weights,
+    device const uint* windows, device const uint* row_slot, constant tf_gdn_args& p, device bfloat* query,
+    device bfloat* key, device bfloat* value, uint head, uint rows, uint sg, uint lane) {
+  const uint per = (rows + 3) / 4;
+  if (sg * per >= rows) return;
+  const uint first = sg * per, count = metal::min(per, rows - sg * per);
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const uint keep = p.taps - 1;
+  const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
+  const uint channel = channel0 + lane * 4;
+  float weight[4][4];
+  for (uint part = 0; part < 4; ++part)
+    for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_gdn_weight(weights, (channel + part) * p.taps + tap, p.flags, 0);
+  for (uint i = 0; i < count; ++i) {
+    const uint row = first + i;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint tap = 0; tap < 4; ++tap) {
+      const uint source = windows[row * p.taps + tap];
+      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (row_slot[row] * keep + source) * channels + channel)
+                                          : *(threadgroup const bfloat4*)(gp + (source - keep) * 128 + lane * 4);
+      for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
+    }
+    float activated[4];
+    for (uint part = 0; part < 4; ++part) {
+      const float rounded = float(bfloat(result[part]));
+      const float sigmoid = float(bfloat(1.0f / (1.0f + metal::exp(-rounded))));
+      activated[part] = float(bfloat(rounded * sigmoid));
+    }
+    if (head < 2 * p.nk) {
+      float square = 0.0f;
+      for (uint part = 0; part < 4; ++part) square += activated[part] * activated[part];
+      square = metal::simd_sum(square);
+      const float inverse = metal::rsqrt(square / float(p.dk) + 1e-6f);
+      const float scale = head < p.nk ? float(bfloat(1.0f / float(p.dk))) : float(bfloat(metal::rsqrt(float(p.dk))));
+      bfloat4 normalized;
+      for (uint part = 0; part < 4; ++part) normalized[part] = bfloat(scale * float(bfloat(activated[part] * inverse)));
+      *(device bfloat4*)((head < p.nk ? query : key) + (row * p.nk + head % p.nk) * p.dk + lane * 4) = normalized;
+    } else {
+      bfloat4 activation;
+      for (uint part = 0; part < 4; ++part) activation[part] = bfloat(activated[part]);
+      *(device bfloat4*)(value + (row * p.nv + head - 2 * p.nk) * p.dv + lane * 4) = activation;
+    }
+  }
+}
+#endif
+#if defined(TF_GDN_GATES)
+// tf_delta_gdn_pre_rows4's decay and mixing of one fused-row b or a column (`column` past the z width), from the bf16 word
+// this launch stores there.
+inline void tf_gdn_gate(device float* decay, device bfloat* mixing, device const void* decay_weight, device const void* time_bias,
+    constant tf_gdn_args& p, bfloat v, uint row, uint column) {
+  if (column < p.nv) {
+    mixing[row * p.nv + column] = bfloat(1.0f / (1.0f + metal::exp(-float(v))));
+    return;
+  }
+  const uint output_head = column - p.nv, at = row * p.nv + output_head;
+  const float shifted = float(bfloat(float(v) + tf_gdn_weight(time_bias, output_head, p.flags, 2)));
+  const float softplus = float(bfloat(metal::max(shifted, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(shifted)))));
+  decay[at] = metal::exp(-metal::exp(tf_gdn_weight(decay_weight, output_head, p.flags, 1)) * softplus);
+}
+#endif
+
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU)
+// TF_GDN_PRE: a GDN layer's qkv rows, four tiles (one 128-channel head) a threadgroup, each SIMD group its tile's serial
+// split as the one-tile launch runs it; the head's verify prepare then runs on the stored words. TF_GDN_GATES: the fused
+// zba rows, whose b and a words also give the round's mixing and decay.
+#if defined(TF_SWIGLU) || defined(TF_GDN_PRE)
 [[max_total_threads_per_threadgroup(128)]]
 #elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
@@ -331,6 +407,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
+#endif
+#if defined(TF_GDN_PRE)
+    const device bfloat* GH [[buffer(6)]], const device void* GW [[buffer(7)]], const device uint* GWIN [[buffer(8)]],
+    const device uint* GSLOT [[buffer(9)]], device bfloat* GQ [[buffer(10)]], device bfloat* GK [[buffer(11)]],
+    device bfloat* GV [[buffer(12)]], constant tf_gdn_args& GP [[buffer(13)]],
+#endif
+#if defined(TF_GDN_GATES)
+    device float* GDECAY [[buffer(6)]], device bfloat* GMIX [[buffer(7)]], const device void* GALOG [[buffer(8)]],
+    const device void* GDT [[buffer(9)]], constant tf_gdn_args& GP [[buffer(10)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
@@ -345,6 +430,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   XS += r0;
 #if defined(TF_SWIGLU)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
+#elif defined(TF_GDN_PRE)
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 4 * int(tg.x) + ks, n0 = tile * NT;
 #else
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
 #endif
@@ -549,12 +636,27 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
     HS[int(tg.x) * stride + m] = acc;
   }
+#elif defined(TF_GDN_PRE)
+  // each SIMD group stores its own tile as the one-tile launch does, and keeps the words for the head's prepare
+  threadgroup bfloat gp[8 * 128];
+  for (int i = 0; i < 16; i++) {
+    if (!TF_LIVE(i)) continue;
+    const int m = mb + 8 * ((i >> 2) & 1), c = nb + 16 * (i >> 3) + (i & 3), n = n0 + c;
+    const bfloat y = static_cast<bfloat>(C[i]);
+    if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = y;
+    gp[m * 128 + ks * 32 + c] = y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  tf_gdn_prepare(gp, GH, GW, GWIN, GSLOT, GP, GQ, GK, GV, uint(tg.x), uint(M), uint(ks), uint(lane));
 #elif defined(TF_ROWS8)
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       if (!TF_LIVE(i)) continue;
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+#if defined(TF_GDN_GATES)
+      if (m < M && n >= int(GP.width) && n < TF_N) tf_gdn_gate(GDECAY, GMIX, GALOG, GDT, GP, static_cast<bfloat>(C[i]), uint(m), uint(n) - GP.width);
+#endif
     }
 #else
   if (ks == 0)

@@ -153,6 +153,14 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// Whether prepareRows takes tf_delta_gdn_pre_rows (128-wide heads, 4 taps, bfloat4 rows), whose words a projection's
+    /// epilogue may write instead (lane_projection.metal's TF_GDN_PRE and TF_GDN_GATES).
+    pub fn rowsPrepare(r: Round) bool {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4 or r.p.zba_stride == 0) return false;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return false;
+        return true;
+    }
+
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.
     pub fn prepareStep(r: Round, e: metal.ComputeEncoder, step: metal.Pipeline) void {
         e.setPipeline(step);

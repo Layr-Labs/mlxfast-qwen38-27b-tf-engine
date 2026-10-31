@@ -155,6 +155,11 @@ pub const Backend = struct {
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
         try target.kernels.prepareDecode(head.linear, 1);
+        // a verify's GDN qkv and zba pipelines (quant_gpu gdnPrepared) compile here as well: no other launch takes them
+        for (target.weights.layers) |layer| switch (layer.mixer) {
+            .linear => |g| try target.kernels.prepareGdn(g.qkv, g.zba),
+            .attention => {},
+        };
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches };
     }

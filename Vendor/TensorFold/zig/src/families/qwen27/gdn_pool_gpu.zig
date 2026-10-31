@@ -163,6 +163,22 @@ pub const Pool = struct {
         try scan.end();
     }
 
+    /// `forward`'s round for a verify of `layer` (plan validated, metadata uploaded) whose projections write its prepare
+    /// (gdn.Round.rowsPrepare); scanPrepared then encodes the rest of `forward`.
+    pub fn verifyRound(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs) !gdn.Round {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        const prepared = try pool.round(layer, plan, refs, false);
+        try plan.metadata.upload(plan.host);
+        return prepared;
+    }
+
+    /// `forward`'s scan and gate for a verifyRound whose query, key, value, decay and mixing are written.
+    pub fn scanPrepared(pool: *Pool, prepared: gdn.Round, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+        var scan = profile.begin(pool.profiler, e, .gdn_scan);
+        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        try scan.end();
+    }
+
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
     pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
