@@ -100,7 +100,9 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
+        const own_sums = f.out_sums;
+        f.out_sums = false;
+        try m.kernels.quant(e, out, mixer_out, if (own_sums and !s.compact) sums(f, .act_sums, s.rows) else null, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
