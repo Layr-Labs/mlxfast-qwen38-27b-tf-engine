@@ -378,6 +378,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
     sp += TF_N / 4;
     xp += stride;
+#elif defined(TF_SBI) && defined(TF_ROWS8)
+  // decoded rows on indexed metadata step pointers a fixed stride a group, like the prompt loop: the same words as
+  // wl[g * TF_TB * 64], ixs[g * (TF_N / 4)] (and + 4) and XS[g * stride + mb], without per-group 64-bit index math
+  const device uint* tab = (const device uint*)SB;
+  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+  const device uint2* ip = (const device uint2*)(tab + TF_SBI) + (size_t)first * (TF_N / 4) + (n0 + nb) / 4;
+  const device float* xp = XS + first * stride + mb;
+  uint4 nw0 = 0, nw1 = 0;
+  uint2 ni0 = 0, ni1 = 0;
+  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; ni0 = ip[0]; ni1 = ip[4]; }
+  for (int g = first; g < last; g++) {
+    const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
+    const tf_reg_load cur = {nw0, nw1, q0, q1, xp[0], 0.0f};
+    xp += stride;
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
@@ -420,6 +434,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     cp += g + 1 < last ? TF_TB * 64 : 0;
     nw0 = cp[0];
     nw1 = cp[32];
+#elif defined(TF_SBI) && defined(TF_ROWS8)
+    // a chain's last group reloads its own codes and indices, which nothing reads
+    {
+      const bool more = g + 1 < last;
+      cp += more ? TF_TB * 64 : 0;
+      ip += more ? TF_N / 4 : 0;
+    }
+    nw0 = cp[0];
+    nw1 = cp[32];
+    ni0 = ip[0];
+    ni1 = ip[4];
 #else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
 #if defined(TF_SBI)
