@@ -58,7 +58,8 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         const ys = try b.span(y);
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
-        const p = adapter.projection;
+        // decoded rows (at most 8) take the adapter's ROWS8 pipeline; longer views its full one
+        const p = adapter.forRows(x.rows);
         const cacheable = p.reg and p.sums_pipe != null and p.sums_buffer != null and
             x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
             x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
