@@ -196,8 +196,9 @@ pub const Pool = struct {
         errdefer publication.cancel();
         const e = publication.encoder;
         if (pool.marks) |m| try m.convolution(layer, prepared, e, pool.kernels.mark_conv);
-        if (in_place and projectedWindows(plan.host, prepared.p.taps)) {
-            // no kept window reads its history: each lands there directly and nothing is left to publish
+        if (in_place and (pool.convInPlace() or projectedWindows(plan.host, prepared.p.taps))) {
+            // tf_delta_gdn_conv_commit reads a channel's taps before it writes them, or no kept window reads its
+            // history: each lands there directly and nothing is left to publish
             var direct = prepared;
             direct.b.next_history = prepared.b.history;
             direct.commitConv(e);
@@ -237,7 +238,7 @@ pub const Pool = struct {
         p.advance = @intFromBool(pool.advances(plan.host));
         const state = try pool.layerSpan(.state, layer);
         const history = try pool.layerSpan(.history, layer);
-        const next_history = try pool.layerSpan(.next_history, layer);
+        const next_history = if (pool.convInPlace()) history else try pool.layerSpan(.next_history, layer);
         const m = plan.metadata;
         // windows the verify stepped in place replay nothing: skip the launch when that is all of them
         const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
@@ -267,6 +268,7 @@ pub const Pool = struct {
     /// After commitScan's fence: the new conv window into place, unfenced.
     pub fn commitPublish(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        if (pool.convInPlace()) return; // commitScan kept the window in place
         const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
         const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
         const history = try pool.layerSpan(.history, layer);
@@ -276,6 +278,11 @@ pub const Pool = struct {
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// Whether tf_delta_gdn_conv_commit may write a kept conv window over the history it reads (8 taps or fewer).
+    pub fn convInPlace(pool: *const Pool) bool {
+        return pool.budget.shape.c.conv_kernel <= 9;
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {

@@ -652,13 +652,28 @@ kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]
   const uint width = (p.taps - 1) * channels, item = position.x;
   const TfDeltaKeep keep = keeps[position.y];
   if (item >= width) return;
-  if (keep.rows == 0) {
-    next[keep.next_slot * width + item] = committed[keep.state_slot * width + item];
+  if (p.taps - 1 > 8) {
+    if (keep.rows == 0) {
+      next[keep.next_slot * width + item] = committed[keep.state_slot * width + item];
+      return;
+    }
+    const uint row = kept_rows[keep.first + keep.rows - 1];
+    const uint source = windows[row * p.taps + item / channels + 1];
+    next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
     return;
   }
-  const uint row = kept_rows[keep.first + keep.rows - 1];
-  const uint source = windows[row * p.taps + item / channels + 1];
-  next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
+  if (item >= channels) return;
+  bfloat words[8];
+  if (keep.rows == 0) {
+    for (uint tap = 0; tap < p.taps - 1; ++tap) words[tap] = committed[keep.state_slot * width + tap * channels + item];
+  } else {
+    const uint row = kept_rows[keep.first + keep.rows - 1];
+    for (uint tap = 0; tap < p.taps - 1; ++tap) {
+      const uint source = windows[row * p.taps + tap + 1];
+      words[tap] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item] : projection[(source - (p.taps - 1)) * channels + item];
+    }
+  }
+  for (uint tap = 0; tap < p.taps - 1; ++tap) next[keep.next_slot * width + tap * channels + item] = words[tap];
 }
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 

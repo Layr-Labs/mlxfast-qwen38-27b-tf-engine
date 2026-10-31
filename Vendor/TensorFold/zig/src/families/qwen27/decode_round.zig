@@ -322,8 +322,11 @@ pub const Runner = struct {
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
         e.barrier();
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
-        e.barrier();
+        // a channel's kept conv window lands over its history in commitScan, so no publication wave follows it
+        if (!r.gdn.convInPlace()) {
+            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+            e.barrier();
+        }
         // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
         // copy every kept row onto itself
         if (chainWindow(round.windows[0].parents)) return;
