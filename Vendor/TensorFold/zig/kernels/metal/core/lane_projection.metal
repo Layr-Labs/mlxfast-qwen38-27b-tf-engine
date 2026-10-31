@@ -346,13 +346,24 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
   // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
+  // the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group: the same words as
+  // wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N and n0 + nb are multiples of 4)
+  const device uint4* cp = wl;
+  const device uint4* sp = sbv;
+  const device float* xp = XS;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+  // An empty split has no valid first element; do not form offsets for it.
+  if (first < last) {
+    cp += (size_t)first * TF_TB * 64;
+    sp += ((size_t)first * TF_N + n0 + nb) / 4;
+    xp += (size_t)first * stride + mb;
+    nw0 = cp[0]; nw1 = cp[32];
+  }
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
+    const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], 0.0f};
 #else
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+    const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
 #endif
 #else
   tf_reg_load next = {};
@@ -371,7 +382,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
-    { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+    // Do not form a pointer past the last valid group on the final iteration.
+    const size_t advance = g + 1 < last ? 1 : 0;
+    cp += advance * TF_TB * 64;
+    sp += advance * (TF_N / 4);
+    xp += advance * stride;
+    nw0 = cp[0];
+    nw1 = cp[32];
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
@@ -431,12 +448,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb[at] = h;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int m = t; m < stride; m += 128) {
+  // each row's 64-channel group sum as a 16-lane relay (lane l holds channels 4l..4l+3 and adds them on turn l), so the
+  // sum is ((h0 + h1) + h2) + ... + h63 exactly as the sequential loop adds it, with 16 dependent steps instead of 64;
+  // SIMD group ks takes rows 2 ks and 2 ks + 1 (M <= 8 here), padded rows keep their zero sums
+  {
+    const int m = 2 * ks + (lane >> 4), l = lane & 15;
     float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
-    HS[int(tg.x) * stride + m] = acc;
+    for (int turn = 0; turn < 16; turn++) {
+      if (l == turn && m < M)
+        for (int part = 0; part < 4; part++) acc += float(hb[m * 64 + 4 * l + part]);
+      acc = simd_shuffle(acc, ushort((lane & 16) | turn));
+    }
+    if (l == 0 && m < stride) HS[int(tg.x) * stride + m] = m < M ? acc : 0.0f;
   }
+  for (int m = 8 + t; m < stride; m += 128) HS[int(tg.x) * stride + m] = 0.0f;
 #elif defined(TF_ROWS8)
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
