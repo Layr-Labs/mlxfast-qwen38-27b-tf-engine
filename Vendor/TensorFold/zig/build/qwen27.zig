@@ -139,6 +139,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     test_step.dependOn(&qwen_tests.step);
     const qwen_test_step = b.step("test-qwen27", "CPU Qwen config, affine and complete tensor graph contracts");
     qwen_test_step.dependOn(&qwen_tests.step);
+    const lane_cpu_tests = b.addRunArtifact(b.addTest(.{ .root_module = core_lane }));
+    qwen_test_step.dependOn(&lane_cpu_tests.step);
     const header_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true }) }));
     qwen_test_step.dependOn(&header_tests.step);
     test_step.dependOn(&header_tests.step);

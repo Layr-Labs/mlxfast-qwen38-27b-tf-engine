@@ -55,6 +55,7 @@ test {
     _ = @import("rope_test.zig");
     _ = state;
     _ = projection;
+    _ = quant_gpu;
     _ = model;
     _ = round_plan;
     _ = attention;

@@ -34,6 +34,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
+    /// Opt-in traversal, separated in the caller pipeline cache key.
+    grouped_walk: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
@@ -43,6 +45,7 @@ pub const Layout = struct {
         try l.format.validate();
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
         if (l.reg and (l.cooperative or l.format.bits != 4 or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
+        if (l.grouped_walk and (!l.reg or l.ranges.len != 0 or l.groups != null)) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
         if (l.y_stride) |s| if (s < l.n or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
@@ -76,6 +79,11 @@ pub const Layout = struct {
         var count: usize = 0;
         for (l.ranges) |r| count += r[1];
         return count;
+    }
+
+    /// Only dense register layouts use the bounded traversal; sparse tiles and K cuts keep their grid.
+    pub fn groupedWalk(l: Layout) bool {
+        return l.grouped_walk and l.reg and l.ranges.len == 0 and l.groups == null;
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
@@ -117,9 +125,10 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.appendSlice(a, if (l.ranges.len == 0) "  return j;\n}\n" else "  return 0;\n}\n");
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
+    if (l.groupedWalk()) try text.appendSlice(a, "#define TF_GROUPED_WALK 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
-    try text.appendSlice(a, ks.core_lane_projection);
+    try text.appendSlice(a, if (l.groupedWalk()) ks.core_lane_projection_grouped else ks.core_lane_projection);
     return text.toOwnedSlice(a);
 }
 
@@ -236,6 +245,7 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    grouped_walk: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -257,7 +267,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .grouped_walk = l.groupedWalk() };
     }
 
     pub fn deinit(p: Projection) void {
@@ -274,13 +284,14 @@ pub const Projection = struct {
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
     pub fn encodeSums(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32) !void {
         if (!p.reg) return error.SumsNeedReg;
-        if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > max_reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         return p.encodeImpl(e, x, w, sb, sums, y, rows);
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
-        if (rows == 0 or rows > @as(u32, if (p.reg) reg_rows else 16)) return error.InvalidRows;
+        const row_limit: u32 = if (p.reg and given != null) max_reg_rows else if (p.reg) reg_rows else 16;
+        if (rows == 0 or rows > row_limit) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
@@ -303,13 +314,16 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        const grouped = p.grouped_walk and rows > 16;
+        e.dispatchGroups(mtl.Size.of(if (grouped) ((p.tile_count + 1) / 2) * ((blocks + 7) / 8) * 16 else p.tile_count, if (grouped) 1 else if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
 
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
+/// Only caller-supplied group sums permit wider windows; owned scratch stays at reg_rows.
+pub const max_reg_rows = 2048;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
@@ -465,4 +479,27 @@ test "reg order puts every code in the tensor op's right-input register for its 
     try bad.validate();
     bad.format.group = 128;
     try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
+
+test "grouped source opt-in keeps default shader bytes and rejects incompatible layouts" {
+    var l = Layout{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .reg = true, .precompute_sums = true };
+    try std.testing.expect(!l.groupedWalk());
+    const original = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(original);
+    try std.testing.expect(std.mem.endsWith(u8, original, ks.core_lane_projection));
+    try std.testing.expect(std.mem.indexOf(u8, original, "TF_GROUPED_WALK") == null);
+    l.grouped_walk = true;
+    const grouped = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(grouped);
+    try std.testing.expect(std.mem.endsWith(u8, grouped, ks.core_lane_projection_grouped));
+    try std.testing.expect(std.mem.indexOf(u8, grouped, "#define TF_GROUPED_WALK 1") != null);
+    l.ranges = &.{.{ 0, 1 }};
+    try std.testing.expectError(error.UnsupportedRegFormat, l.validate());
+    l.ranges = &.{};
+    l.groups = .{ 0, 1 };
+    try std.testing.expectError(error.UnsupportedRegFormat, l.validate());
+    l.groups = null;
+    l.reg = false;
+    try std.testing.expectError(error.UnsupportedRegFormat, l.validate());
 }

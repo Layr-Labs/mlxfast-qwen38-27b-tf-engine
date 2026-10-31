@@ -10,7 +10,12 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, prompt_walk: bool = false,
+
+    fn promptWalkEligible(key: Key, prompt: bool, rows: u32, has_sums: bool) bool {
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and key.n > 0 and key.n % 32 == 0 and
+            prompt and rows > 16 and rows <= lane.max_reg_rows and has_sums and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+    }
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
@@ -202,17 +207,18 @@ pub const Kernels = struct {
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+        key.prompt_walk = key.promptWalkEligible(k.prompt, rows, xs != null);
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .grouped_walk = key.prompt_walk, .serial_sk2 = key.serialSk2() });
             k.joined(entry.value_ptr);
         }
-        const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+        const step: u32 = if (entry.value_ptr.grouped_walk and k.prompt and sums != null) lane.max_reg_rows else if (entry.value_ptr.reg) lane.reg_rows else 16;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
@@ -383,4 +389,32 @@ pub fn padded(rows: u32) u32 {
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+}
+
+
+test "prompt walk selection excludes decode tails missing sums sparse formats and separates cache" {
+    const base = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 1 };
+    try std.testing.expect(base.promptWalkEligible(true, 17, true));
+    try std.testing.expect(base.promptWalkEligible(true, lane.max_reg_rows, true));
+    try std.testing.expect(!base.promptWalkEligible(false, 128, true));
+    try std.testing.expect(!base.promptWalkEligible(true, 16, true));
+    try std.testing.expect(!base.promptWalkEligible(true, lane.max_reg_rows + 1, true));
+    try std.testing.expect(!base.promptWalkEligible(true, 128, false));
+    inline for (.{
+        .{ "kind", Kind.mlp }, .{ "bits", @as(u8, 8) }, .{ "group", @as(u32, 32) },
+        .{ "n", @as(u32, 48) }, .{ "skip", @as(u32, 1) }, .{ "cut", [2]u32{ 1, 0 } }, .{ "cut", [2]u32{ 0, 40 } },
+    }) |change| {
+        var excluded = base;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!excluded.promptWalkEligible(true, 128, true));
+    }
+    var grouped = base;
+    grouped.prompt_walk = true;
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(base, false);
+    try cache.put(grouped, true);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(!cache.get(base).?);
+    try std.testing.expect(cache.get(grouped).?);
 }
