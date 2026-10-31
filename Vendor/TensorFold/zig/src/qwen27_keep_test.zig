@@ -79,7 +79,7 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         var allocations: metal.Allocations = .{};
         defer pool.releaseBefore();
         try pool.prepare(.{ .allocations = &allocations }, plan, false);
-        try pool.forward(0, .{ .host = plan, .metadata = metadata }, refs, e);
+        try pool.forward(0, .{ .host = plan, .metadata = metadata }, refs, e, null);
         try std.testing.expect(!std.mem.eql(u8, original, state));
         var keep = try Plan.init(a, try shape.params(2, 2, kinds), &.{
             .{ .window = window, .state_slot = 0, .next_slot = 0, .path = &.{} },
