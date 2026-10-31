@@ -19,6 +19,8 @@ pub const Adapter = struct {
         errdefer metadata.deinit();
         try lane.pack(layout, prepared.words, prepared.scales, prepared.biases, words.slice(u32, layout.weightWords()), metadata.slice(u16, layout.metadataElements()));
         if (order) |o| try o.run(&.{.{ .w = .{ .buf = words }, .n = prepared.n, .k = prepared.k }});
+        // the reg kernel's scales carry 2^24 (lane.foldScale); the cooperative kernel reads them as packed
+        if (order != null) try lane.foldScales(metadata.slice(u16, layout.metadataElements()));
         // reg adapters read the pairs through an index (the same words, fewer bytes a group) when they fit its table
         var index: ?mtl.Buffer = null;
         errdefer if (index) |b| b.deinit();
