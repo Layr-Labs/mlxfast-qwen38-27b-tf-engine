@@ -26,11 +26,15 @@ fn m5Split(n: usize, k: usize) ?u32 {
     return null;
 }
 
+/// Adjacent tiles a batched matrix interleaves by group: sixteen, so that tiles running together read one longer run of the
+/// weight stream at each group.
+pub const tile_batch: u32 = 16;
+
 /// Adjacent tiles whose code blocks interleave by group: tiles running together read neighbouring lines (the weight stream's GB/s).
 pub fn tileBatch(n: usize, k: usize) u32 {
     // with the four mixer input projections (GDN qkv, GDN z|b|a, attention query+gate, attention k|v), as in fkiene's 8e8e27e2
     const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 }, .{ 10240, 5120 }, .{ 6240, 5120 }, .{ 12288, 5120 }, .{ 2048, 5120 } };
-    for (table) |t| if (t[0] == n and t[1] == k) return 8;
+    for (table) |t| if (t[0] == n and t[1] == k) return tile_batch;
     return 1;
 }
 
@@ -47,6 +51,11 @@ pub fn promptSplit(n: usize, k: usize) ?u32 {
 }
 
 pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32) !Linear {
+    return prepareForced(device, allocator, owned, parts, tile, null);
+}
+
+/// The same matrix with `forced` adjacent tiles interleaved instead of `tileBatch`'s count.
+pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32) !Linear {
     if (tile != 32 or parts.len == 0) return error.BadProjectionShape;
     const bits = parts[0].bits;
     const group = parts[0].group;
@@ -64,7 +73,7 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
     if (!device.tensorUnits() or n % tile != 0) return prepareRows(device, allocator, owned, parts, n, k, tile, slices);
     if (bits != 4 or group != 64) return prepareLanes(device, allocator, owned, parts, n, k, tile, slices);
     slices = m5Split(n, k) orelse slices;
-    const batch: usize = tileBatch(n, k);
+    const batch: usize = forced orelse tileBatch(n, k);
     const stored = storedColumns(n, @intCast(batch));
     const w = try device.buffer(stored * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     owned.append(allocator, w) catch |err| {
