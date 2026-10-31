@@ -324,6 +324,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 [[max_total_threads_per_threadgroup(128)]]
 #elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
+#elif defined(TF_DUAL_SK4)
+[[max_total_threads_per_threadgroup(64)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
@@ -360,7 +362,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_DUAL_SK4)
+  // Two physical SIMD groups retain all four original chains. Group0 owns0/2, group1 owns1/3.
+  float C0[16];
+  for (int split = ks; split < 4; split += 2) {
+  const int first = TF_G0 + (split * TF_GN) / 4, last = TF_G0 + ((split + 1) * TF_GN) / 4;
+#elif defined(TF_SERIAL_SK2)
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
@@ -475,7 +482,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     }
   }
-#if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
+#if defined(TF_DUAL_SK4)
+    if (split == ks) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
+  }
+  threadgroup float dual_part[2 * TF_PART * 32];
+  if (ks == 1) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) {
+    dual_part[TF_HALF(i) * 32 + lane] = C0[i];
+    dual_part[(TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) {
+    float sum = C0[i];
+    sum += dual_part[TF_HALF(i) * 32 + lane];
+    sum += C[i];
+    sum += dual_part[(TF_PART + TF_HALF(i)) * 32 + lane];
+    C[i] = sum;
+  }
+#elif defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
     if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] = C0[i] + C[i];
