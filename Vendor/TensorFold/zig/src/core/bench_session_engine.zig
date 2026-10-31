@@ -226,6 +226,10 @@ pub const EngineDflashBinding = struct {
     }
 };
 
+/// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
+/// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
+pub const dflash_width = 7;
+
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
     return struct {
@@ -248,7 +252,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             try binding.resetNow();
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
-            const result = try binding.generation.runRound(1, .{ .nodes = 4, .max_depth = depth }, &.{}, false, null, 0);
+            const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .max_depth = depth }, &.{}, false, null, 0);
             defer binding.generation.allocator.free(result.tokens);
             if (result.tokens.len != 1) return error.BadDraftRound;
             return result.tokens[0];
@@ -265,7 +269,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             defer journal.deinit(binding.generation.allocator);
             binding.generation.journal = &journal;
             defer binding.generation.journal = null;
-            const result = try binding.generation.runRound(remaining, .{ .nodes = 4, .max_depth = binding.depth }, &.{}, true, null, 0);
+            const result = try binding.generation.runRound(remaining, .{ .nodes = dflash_width, .children = dflash_width, .max_depth = binding.depth }, &.{}, true, null, 0);
             defer binding.generation.allocator.free(result.tokens);
             if (result.tokens.len == 0 or result.tokens.len > out.len) return error.BadDraftRound;
             if (result.rounds != 1) return error.BadDraftRound;
