@@ -56,6 +56,8 @@ pub const Runner = struct {
     after: ?forward.Hook = null,
     /// Encoded first in the next verify's first command buffer, then cleared by its caller.
     lead: ?forward.Tail = null,
+    /// forward.Stages.hold for the next verify: called once just before its first command buffer is committed.
+    hold: ?forward.Tail = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     terminal_head: forward.Head = .all,
@@ -252,11 +254,11 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.model.ane == null and
+        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.hold == null and r.model.ane == null and
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .hold = r.hold, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -488,6 +490,11 @@ fn allocation(a: std.mem.Allocator, device: mtl.Device, owned: *std.ArrayList(mt
         return err;
     };
     return b;
+}
+
+/// A verify encoded ahead of its draft (Runner.hold) rewrote a row's token before commit: the keep's fingerprint follows.
+pub fn refreshActive(r: *Runner, round: *const Round) void {
+    if (r.active != null) r.active = fingerprint(round);
 }
 
 fn fingerprint(round: *const Round) [32]u8 {

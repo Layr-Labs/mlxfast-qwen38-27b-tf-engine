@@ -197,9 +197,10 @@ pub const Generation = struct {
         }
     };
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once.
-    fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32) !@import("core").tree_round.Decoded {
-        // the picks rewrite the matcher's result, which a pending keep still reads
-        std.debug.assert(g.keep == null);
+    fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32, held: bool) !@import("core").tree_round.Decoded {
+        // the picks rewrite the matcher's result, which a pending keep still reads; a held verify ends that keep in its
+        // hold (Early.hold), before its picks are encoded
+        std.debug.assert(held or g.keep == null);
         if (g.picked == null) g.picked = try @import("core").segments.Fence.init(g.runner.model.device);
         var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round };
         g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
@@ -244,6 +245,7 @@ pub const Generation = struct {
         if (available == 0) return error.ContextFull;
         const offered: u32 = @intCast(@min(nodes, available - 1));
         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
+        if (g.proposer == null and extend == null and offered == 1) return g.runRoundEarly(remaining, pending, eos);
         var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.propose(pending, offered);
         defer tree.deinit();
         const drafted = try tree.verifyParents(g.allocator);
@@ -275,7 +277,7 @@ pub const Generation = struct {
         defer round.deinit();
         errdefer g.finishKeep() catch {};
         try g.finishKeep();
-        const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos);
+        const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos, false);
         g.pending = accepted.pending;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         var landed: u32 = 0;
@@ -288,6 +290,55 @@ pub const Generation = struct {
         });
         return .{ .tokens = tokens, .rounds = 1, .verified = ids.len, .matched = accepted.matched, .min_rows = @intCast(ids.len), .extended = @intCast(copied.len), .extension_landed = landed };
     }
+    /// A one-node round (the bench's depth-1 round) whose verify is prepared and its first layers encoded before the
+    /// draft exists: row 1 holds `pending` as a placeholder until the verify's hold, just before its first commit, runs
+    /// the drafter, takes its token into the round, the frame's id rows and the keep's fingerprint, and ends the
+    /// previous round's keep. No GPU work of the verify is committed before that, so every word it reads is the draft's.
+    /// The host's round setup and encode then overlap the previous keep instead of following the drafter frame.
+    fn runRoundEarly(g: *Generation, remaining: u32, pending: u32, eos: []const u32) !Result {
+        var ids = [2]u32{ pending, pending };
+        const parents = [2]i32{ -1, 0 };
+        var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = &ids, .parents = &parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
+        defer round.deinit();
+        errdefer g.finishKeep() catch {};
+        var early = Early{ .g = g, .pending = pending, .ids = &ids, .round = &round };
+        g.runner.hold = .{ .ptr = &early, .encode = Early.hold };
+        defer g.runner.hold = null;
+        const accepted = try g.verifyAccept(&round, &ids, &parents, remaining, eos, true);
+        if (!early.done) return error.DraftHoldSkipped;
+        g.pending = accepted.pending;
+        if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+        const tokens = try g.allocator.dupe(u32, accepted.tokens);
+        if (g.journal) |journal| journal.recordAssumeCapacity(.{
+            .committed = @intCast(tokens.len),
+            .drafted = 1,
+            .accepted = @intCast(accepted.matched),
+        });
+        return .{ .tokens = tokens, .rounds = 1, .verified = 2, .matched = accepted.matched, .min_rows = 2, .extended = 0, .extension_landed = 0 };
+    }
+    const Early = struct {
+        g: *Generation,
+        pending: u32,
+        ids: *[2]u32,
+        round: *Round,
+        done: bool = false,
+        /// forward.Stages.hold: the draft, proposed while the verify's first chunk waits uncommitted.
+        fn hold(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+            const x: *Early = @ptrCast(@alignCast(ptr));
+            const g = x.g;
+            var tree = try g.draft.propose(x.pending, 1);
+            defer tree.deinit();
+            if (tree.tokens.len != 1 or tree.parents.len != 1 or tree.parents[0] != -1) return error.BadDraftParents;
+            x.ids[1] = tree.tokens[0];
+            x.round.ids[1] = tree.tokens[0];
+            try g.runner.model.frame.setRows(x.round.ids, x.round.feed_positions);
+            @import("../decode_round.zig").refreshActive(g.runner, x.round);
+            // the proposal left its bridge spin open behind its frame; this encoder ends it once the verify runs
+            try @import("runtime_frame.zig").Frame.endBridge(&g.draft.backend.frame, e);
+            try g.finishKeep();
+            x.done = true;
+        }
+    };
     fn runImpl(g: *Generation, count: usize, force_length: bool, nodes: usize, eos_override: ?[]const u32, already_delivered: bool) !Result {
         g.pending = null;
         if (g.runner.failed or g.runner.active != null or g.runner.offsets[0] == 0 or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != g.runner.offsets[0] or g.draft.committed_end == 0 or nodes == 0 or nodes > 15 or count > 65536) return error.BadDraftOptions;
@@ -319,7 +370,7 @@ pub const Generation = struct {
             var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
             defer round.deinit();
             try g.finishKeep();
-            const accepted = try g.verifyAccept(&round, ids, parents, @intCast(count - tokens.items.len), eos);
+            const accepted = try g.verifyAccept(&round, ids, parents, @intCast(count - tokens.items.len), eos, false);
             rounds += 1;
             verified += ids.len;
             min_rows = if (min_rows == 0) @intCast(ids.len) else @min(min_rows, @as(u32, @intCast(ids.len)));

@@ -39,6 +39,9 @@ pub const Stages = struct {
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
     after: ?Hook = null,
+    /// Run once with the first chunk's open encoder, just before it is committed (segments.runCommittingFrom): a
+    /// verify encoded ahead of its draft takes the draft here, before any of its words reach the GPU.
+    hold: ?Tail = null,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -56,6 +59,11 @@ pub const Stages = struct {
             m.glue.imageRows(lane.enc, s.hidden, rows, m.frame.get(.takes), @intCast(m.config.hidden), s.rows);
             lane.enc.barrier();
         }
+    }
+    pub fn beforeCommit(s: *Stages, lane: *@import("core").segments.Lane) !void {
+        const t = s.hold orelse return;
+        s.hold = null;
+        try t.encode(t.ptr, lane.enc);
     }
     pub fn wait(_: *Stages, _: usize) @import("core").segments.Wait {
         return .mixer;
