@@ -287,6 +287,12 @@ struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, i
 inline uint4 tf_look(const device uint* tab, uint2 ix) {
   return uint4(tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]);
 }
+// TF_SBI12 (lane_projection.indexed12_layout): a quad's four indices as its low bytes `ix.x` and its high nibbles `ix.y`,
+// column j of the quad's at bits 8j and 4j; the same table words as tf_look's u16 indices.
+inline uint4 tf_look12(const device uint* tab, uint2 ix) {
+  return uint4(tab[(ix.x & 0xFFu) | ((ix.y & 0xFu) << 8)], tab[((ix.x >> 8) & 0xFFu) | ((ix.y & 0xF0u) << 4)],
+               tab[((ix.x >> 16) & 0xFFu) | (ix.y & 0xF00u)], tab[(ix.x >> 24) | ((ix.y & 0xF000u) >> 4)]);
+}
 #endif
 
 // TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
@@ -383,12 +389,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
 #if defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
+#if defined(TF_SBI12)
+  // the quad's low bytes as one word and its high nibbles as one u16, both loaded one group ahead
+  const device uint* ixl = tab + TF_SBI + (n0 + nb) / 4;
+  const device ushort* ixh = (const device ushort*)(tab + TF_SBI + (size_t)KG * (TF_N / 4)) + (n0 + nb) / 4;
+  uint2 ni0 = 0, ni1 = 0;
+  if (first < last) {
+    const size_t gi = (size_t)first * (TF_N / 4);
+    ni0 = uint2(ixl[gi], ixh[gi]);
+    ni1 = uint2(ixl[gi + 4], ixh[gi + 4]);
+  }
+#else
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
+#endif
   for (int g = first; g < last; g++) {
-#if defined(TF_SBI)
+#if defined(TF_SBI12)
+    const uint4 q0 = tf_look12(tab, ni0), q1 = tf_look12(tab, ni1);
+#elif defined(TF_SBI)
     const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
     const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
@@ -422,7 +442,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw1 = cp[32];
 #else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
-#if defined(TF_SBI)
+#if defined(TF_SBI12)
+    { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = uint2(ixl[gi], ixh[gi]); ni1 = uint2(ixl[gi + 4], ixh[gi + 4]); }
+#elif defined(TF_SBI)
     { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
 #endif
 #endif
