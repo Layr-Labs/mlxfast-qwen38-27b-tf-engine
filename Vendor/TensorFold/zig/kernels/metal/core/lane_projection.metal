@@ -324,7 +324,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const half2 bias = half2(1024.0h);
   float C[16];
 #if defined(TF_SERIAL_SK2)
+#if defined(TF_SER_PARK)
+  threadgroup float park[16 * 32];
+#else
   float C0[16];
+#endif
   for (int split = 0; split < TF_SK; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
@@ -381,6 +385,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] = C0[i] + C[i];
+#elif defined(TF_SERIAL_SK2) && defined(TF_SER_PARK)
+    // chain 0's sums wait in threadgroup memory (one SIMD group: each lane reads back only its own words) instead of
+    // registers while chain 1 runs
+    if (split == 0) for (int i = 0; i < 16; i++) park[i * 32 + lane] = C[i];
+  }
+  for (int i = 0; i < 16; i++) C[i] = park[i * 32 + lane] + C[i];
 #elif defined(TF_SERIAL_SK2)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
