@@ -320,9 +320,8 @@ pub const Runner = struct {
         try ops.metadata(e, result, keep_ref, rows, null, p);
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
-        e.barrier();
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+        // every GDN layer's replay, conv window and publication: one launch each over the pool's layer slices
+        try r.gdn.commitLayers(plan, e);
         e.barrier();
         // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
         // copy every kept row onto itself
