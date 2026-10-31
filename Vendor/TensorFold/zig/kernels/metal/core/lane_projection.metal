@@ -509,3 +509,97 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 }
 #endif
+
+#if TF_BITS == 4 && defined(TF_REG) && defined(TF_SHARED_B)
+// Prompt launches: one threadgroup a 32-column tile holds its 8 row blocks (128 rows) x TF_SK chains of SIMD groups.
+// Every row block needs the same unpacked codes (the same half values in the same cooperative-tensor slots), so each
+// SIMD group unpacks one eighth of its chain's group (4 source lanes x 8 words) into a threadgroup image indexed by
+// (slot, lane); after one barrier every lane reads its own 32 half2 back into the tensor-op input tile. The tile, the
+// tensor op, the scale/bias fold and the chain reduction are the base's, so every output word is unchanged.
+#define TF_RB 8
+[[max_total_threads_per_threadgroup(32 * TF_SK * TF_RB)]]
+[[kernel]] void tf_lane_reg_shared(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const int lane = int(lanei), ks = int(sgi) % TF_SK, rb = int(sgi) / TF_SK;
+  const int r0 = rb * 16, rows = mdims[0] - r0;
+  const bool live = rows > 0; // an empty row block still unpacks its share and meets every barrier
+  const int M = live ? min(rows, 16) : 1, stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
+  const int rr = live ? r0 : 0;
+  const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroup> op;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)(X + (size_t)rr * TF_K), dextents<int32_t, 2>(TF_K, M));
+  auto a0 = a.slice(0, 0);
+  auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+  thread half2* b2 = (thread half2*)&cb[0];
+  // this SIMD group's share of each group's unpack: source lane src's word w, which lands in src's slots e, e+1, e+8, e+9
+  const int src = 4 * rb + (lane >> 3), w = lane & 7, e = 16 * (w & 1) + 2 * (w >> 1);
+  const device uint4* wt = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64;
+  const device uint* wp = (const device uint*)(wt + src + (w < 4 ? 0 : 32)) + (w & 3);
+  threadgroup uint4 img[2][TF_SK][8][32]; // [buffer][chain][slot / 4][lane]: four half2 slots of one lane an entry
+  const device uint4* sbv = (const device uint4*)SB;
+  const half2 bias = half2(1024.0h);
+  float C[16];
+  for (int i = 0; i < 16; i++) C[i] = 0.0f;
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+  const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
+  const device float* xp = XS + rr + first * stride + mb;
+  const device uint* cp = wp + (size_t)first * TF_TB * 64 * 4;
+  uint next = first < last ? cp[0] : 0u;
+  for (int g = first; g < last; g++) {
+    const int buf = (g - first) & 1;
+    const uint word = next, lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
+    cp += g + 1 < last ? TF_TB * 64 * 4 : 0;
+    next = cp[0];
+    const half2 h0 = as_type<half2>((lo & 0x00FF00FFu) | 0x64006400u) - bias;
+    const half2 h1 = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias;
+    const half2 h8 = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+    const half2 h9 = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+    ((threadgroup uint2*)&img[buf][ks][e >> 2][src])[(e >> 1) & 1] = uint2(as_type<uint>(h0), as_type<uint>(h1));
+    ((threadgroup uint2*)&img[buf][ks][(e + 8) >> 2][src])[((e + 8) >> 1) & 1] = uint2(as_type<uint>(h8), as_type<uint>(h9));
+    const uint4 q0 = sp[0], q1 = sp[4];
+    const float x0 = xp[0], x1 = xp[8];
+    sp += TF_N / 4;
+    xp += stride;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < 8; q++) {
+      const uint4 u = img[buf][ks][q][lane];
+      b2[4 * q] = as_type<half2>(u.x);
+      b2[4 * q + 1] = as_type<half2>(u.y);
+      b2[4 * q + 2] = as_type<half2>(u.z);
+      b2[4 * q + 3] = as_type<half2>(u.w);
+    }
+    if (live) {
+      auto x = a.slice(g * GS, 0);
+      op.run(x, cb, P);
+      for (int j = 0; j < 4; j++) {
+        const float s0 = as_type<float>(q0[j] << 16), b0 = as_type<float>(q0[j] & 0xFFFF0000u);
+        const float s1 = as_type<float>(q1[j] << 16), b1 = as_type<float>(q1[j] & 0xFFFF0000u);
+        C[j] = fma(s0, P[j], fma(b0, x0, C[j]));
+        C[4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[4 + j]));
+        C[8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[8 + j]));
+        C[12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[12 + j]));
+      }
+    }
+  }
+  if (TF_SK > 1) {
+    // chain 0 adds chains 1.. in order (the base's reduction), through the image's storage
+    threadgroup float* part = (threadgroup float*)&img[0][0][0][0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s2 = 1; s2 < TF_SK; s2++) {
+      if (ks == s2) for (int i = 0; i < 16; i++) part[(rb * 16 + i) * 32 + lane] = C[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (ks == 0) for (int i = 0; i < 16; i++) C[i] += part[(rb * 16 + i) * 32 + lane];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  if (ks == 0 && live)
+    for (int i = 0; i < 16; i++) {
+      const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+      if (m < M && n < TF_N) Y[(size_t)(rr + m) * TF_YS + n] = static_cast<TF_OUT>(C[i]);
+    }
+}
+#endif
+
