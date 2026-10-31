@@ -279,6 +279,24 @@ pub const Projection = struct {
         return p.encodeImpl(e, x, w, sb, sums, y, rows);
     }
 
+    /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
+    /// caller orders it before the encodeSums dispatches that read the returned sums.
+    pub fn encodeSumsOf(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32) !Sums {
+        if (!p.reg) return error.SumsNeedReg;
+        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        const pipe = p.sums_pipe orelse return error.SumsNeedReg;
+        const buffer = p.sums_buffer orelse return error.SumsNeedReg;
+        try checkRef(x, rows * p.k * 2, 2);
+        const stride: u32 = 16 * ((rows + 15) / 16);
+        e.setPipeline(pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setValue(@as(i32, @intCast(rows)), 1);
+        e.setBuffer(buffer, 0, 2);
+        e.setValue(@as(i32, @intCast(stride)), 3);
+        e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
+        return .{ .ref = .{ .buf = buffer }, .stride = stride };
+    }
+
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
         if (rows == 0 or rows > @as(u32, if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;

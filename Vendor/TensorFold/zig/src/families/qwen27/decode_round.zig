@@ -54,6 +54,8 @@ pub const Runner = struct {
     tail: ?forward.Tail = null,
     /// Committed right after the next verify's last command buffer, then cleared by its caller.
     after: ?forward.Hook = null,
+    /// Encoded first in the next verify's first command buffer, then cleared by its caller.
+    lead: ?forward.Tail = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     current_placed: image_rows.Placed = .{},
@@ -249,7 +251,7 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
