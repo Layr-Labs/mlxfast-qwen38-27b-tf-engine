@@ -93,6 +93,9 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
+        // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
+        try target.kernels.prepareDecode(head.linear, 1);
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue }, .caches = caches };
     }
