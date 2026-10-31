@@ -270,6 +270,90 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
+    /// commitScan for every layer in one launch each (tf_delta_gdn_replay_layers, tf_delta_gdn_conv_commit_layers): every
+    /// thread is the per-layer launch's thread at its layer, so each layer's words get the same operations in the same order.
+    pub fn commitScanLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        p.advance = @intFromBool(pool.advances(plan.host));
+        const keeps: u32 = @intCast(plan.host.keeps.len);
+        const layers: u32 = @intCast(pool.budget.layers);
+        var l = try pool.layerStrides();
+        const state = try pool.layerSpan(.state, 0);
+        const m = plan.metadata;
+        // windows the verify stepped in place replay nothing: skip the launch when that is all of them
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        if (replays) {
+            const before = try pool.beforeSpan(0, plan.host, pool.advances(plan.host));
+            l.before = if (before) |b| b.bytes / 4 else l.state;
+            l.per_layer = p.nv * keeps;
+            e.setPipeline(pool.kernels.replay_layers);
+            e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+            (before orelse state).bind(e, 10);
+            gdn.bind(e, .{ try pool.layerSpan(.key, 0), try pool.layerSpan(.value, 0), try pool.layerSpan(.decay, 0), try pool.layerSpan(.mixing, 0), state }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+            e.setValue(p, 7);
+            e.setBuffer(state.buffer, state.offset, 8);
+            e.setValue(l, 11);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * keeps * layers }, .{ .width = 32, .height = 4 });
+        }
+        l.per_layer = keeps;
+        e.setPipeline(pool.kernels.conv_commit_layers);
+        gdn.bind(e, .{ try pool.layerSpan(.history, 0), try pool.layerSpan(.qkv, 0) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        (try pool.layerSpan(.next_history, 0)).bind(e, 6);
+        e.setValue(l, 7);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = keeps * layers }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// commitPublish for every layer in one launch (tf_delta_gdn_publish_conv_layers), after commitScanLayers' barrier.
+    pub fn commitPublishLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        const keeps: u32 = @intCast(plan.host.keeps.len);
+        var l = try pool.layerStrides();
+        l.per_layer = keeps;
+        e.setPipeline(pool.kernels.publish_conv_layers);
+        (try pool.layerSpan(.next_history, 0)).bind(e, 0);
+        e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
+        e.setValue(p, 2);
+        (try pool.layerSpan(.history, 0)).bind(e, 3);
+        e.setValue(l, 4);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = keeps * @as(u32, @intCast(pool.budget.layers)) }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// TfDeltaLayers: each pool field's per-layer stride (layerSpan's), in elements.
+    fn layerStrides(pool: *const Pool) !Layers {
+        return .{
+            .per_layer = 0,
+            .layers = @intCast(pool.budget.layers),
+            .key = try pool.elementStride(.key, 2),
+            .value = try pool.elementStride(.value, 2),
+            .decay = try pool.elementStride(.decay, 4),
+            .mixing = try pool.elementStride(.mixing, 2),
+            .state = try pool.elementStride(.state, 4),
+            .before = 0,
+            .history = try pool.elementStride(.history, 2),
+            .projection = try pool.elementStride(.qkv, 2),
+            .next_history = try pool.elementStride(.next_history, 2),
+        };
+    }
+
+    fn elementStride(pool: *const Pool, field: Field, size: usize) !u64 {
+        const bytes = pool.get(field).length() / pool.budget.layers;
+        if (bytes % size != 0) return error.BadGdnBuffer;
+        return bytes / size;
+    }
+
     /// After commitScan's fence: the new conv window into place, unfenced.
     pub fn commitPublish(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
@@ -375,6 +459,9 @@ pub const Pool = struct {
         return .{ .buffer = buffer, .offset = layer * bytes, .bytes = bytes };
     }
 };
+
+/// deltanet.metal's TfDeltaLayers.
+const Layers = extern struct { per_layer: u32, layers: u32, key: u64, value: u64, decay: u64, mixing: u64, state: u64, before: u64, history: u64, projection: u64, next_history: u64 };
 
 fn tensorSpan(t: Tensor) gdn.Span {
     return .{ .buffer = t.buffer, .offset = t.offset, .bytes = t.bytes };

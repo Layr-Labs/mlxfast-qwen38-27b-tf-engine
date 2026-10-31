@@ -16,8 +16,10 @@ fn failed(cb: mtl.CommandBuffer) bool {
 /// Keeps the GPU busy from a proposal's last command buffer until the verify behind it starts. The host reads the
 /// proposal before it encodes the verify, and a GPU left idle meanwhile starts the verify's first command buffer a few
 /// hundred microseconds after its commit; a busy one starts it within a few tens. One 32-thread group spins behind the
-/// proposal until the verify's first encoder stores the spin's epoch (`end`), or for `bound` iterations (a few
-/// milliseconds) when no verify follows. It reads and writes nothing else, so no result depends on it.
+/// proposal until the verify's first encoder stores the spin's epoch (`end`), or for `bound` iterations (about half a
+/// millisecond, twice the host's usual proposal-to-verify time). The GPU does not always run the verify's command
+/// buffer beside the spin's: then the verify starts only when the spin ends, so a long bound idles it (3 ms at 50,000
+/// in about one round of seven). It reads and writes nothing else, so no result depends on it.
 pub const Bridge = struct {
     spin: mtl.Pipeline,
     stop: mtl.Pipeline,
@@ -25,7 +27,7 @@ pub const Bridge = struct {
     flag: mtl.Buffer,
     epoch: u32 = 0,
     open: bool = false,
-    const bound: u32 = 50_000;
+    const bound: u32 = 8_000;
     const source =
         \\#include <metal_stdlib>
         \\using namespace metal;

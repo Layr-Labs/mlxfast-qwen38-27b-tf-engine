@@ -46,6 +46,10 @@ pub const Kernels = struct {
     tree_pair: metal.Pipeline,
     /// A depth-one star's verify (node 0 and its children) for two adjacent value columns a simdgroup.
     star_pair: metal.Pipeline,
+    /// tf_delta_gdn_replay, conv_commit and publish_conv over every layer of a pool in one launch (TfDeltaLayers).
+    replay_layers: metal.Pipeline,
+    conv_commit_layers: metal.Pipeline,
+    publish_conv_layers: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -73,6 +77,9 @@ pub const Kernels = struct {
             "tree_slots_16",
             "tree_pair",
             "star_pair",
+            "replay_layers",
+            "conv_commit_layers",
+            "publish_conv_layers",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -104,6 +111,9 @@ pub const Kernels = struct {
             .post_rows = pipelines[14],
             .tree_pair = pipelines[20],
             .star_pair = pipelines[21],
+            .replay_layers = pipelines[22],
+            .conv_commit_layers = pipelines[23],
+            .publish_conv_layers = pipelines[24],
         };
     }
 
@@ -126,6 +136,9 @@ pub const Kernels = struct {
             k.post_rows,
             k.tree_pair,
             k.star_pair,
+            k.replay_layers,
+            k.conv_commit_layers,
+            k.publish_conv_layers,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();
