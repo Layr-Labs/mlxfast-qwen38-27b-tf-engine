@@ -59,13 +59,14 @@ pub const Plan = struct {
         for (inputs, 0..) |input, segment| {
             const n: u32 = @intCast(input.window.parents.len);
             @memcpy(parents[first..][0..n], input.window.parents);
-            slot_peak = @max(slot_peak, tree_slots.build(gpa, input.window.parents, slot_steps[first..][0..n], first, slot_limit) catch |err| switch (err) {
+            const built = tree_slots.build(gpa, input.window.parents, slot_steps[first..][0..n], first, slot_limit) catch |err| switch (err) {
                 error.SlotOverflow => blk: {
                     compact = false;
                     break :blk 0;
                 },
                 else => return err,
-            });
+            };
+            slot_peak = @max(slot_peak, if (compact) try storeless(gpa, input.window.parents, slot_steps[first..][0..n], first) else built);
             @memset(slots[first..][0..n], input.state_slot);
             for (input.window.conv, 0..) |index, at| windows[first * p.taps + at] = if (index < p.taps - 1) index else index + first;
             for (input.path, 0..) |row, at| kept_rows[keep_first + at] = first + row;
@@ -75,6 +76,22 @@ pub const Plan = struct {
             keep_first += @intCast(input.path.len);
         }
         return .{ .gpa = gpa, .parents = parents, .windows = windows, .row_slots = slots, .segments = segments, .keeps = keeps, .kept_rows = kept_rows, .slot_steps = slot_steps, .compact = compact, .slot_peak = slot_peak };
+    }
+
+    /// No later row reads a leaf's state, so a leaf's step stores none: returns the slots the stored states take
+    /// (a star of siblings then fits the one-slot kernels).
+    fn storeless(gpa: std.mem.Allocator, parents: []const i32, steps: []tree_slots.Step, first: u32) !usize {
+        const read = try gpa.alloc(bool, parents.len);
+        defer gpa.free(read);
+        @memset(read, false);
+        for (parents) |parent| if (parent >= 0) {
+            read[@intCast(parent)] = true;
+        };
+        var slots: usize = 0;
+        for (steps) |*step| {
+            if (!read[step.row - first]) step.write_slot = -1 else slots = @max(slots, @as(usize, @intCast(step.write_slot)) + 1);
+        }
+        return slots;
     }
 
     pub fn deinit(plan: *Plan) void {

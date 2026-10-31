@@ -107,6 +107,8 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    /// Every segment is a depth-one star of two or more rows (row 0 the root, every later row its child).
+    star: bool = false,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -116,7 +118,15 @@ pub const Round = struct {
         for (pipelines.tree_slots) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 128) return error.UnsupportedGdnPipeline;
         const slots = @import("core_delta").slotKernel(plan.slot_peak);
         if (plan.compact) for (plan.segments) |segment| try @import("core").tree_slots.validate(plan.parents[segment.first..][0..segment.rows], plan.slot_steps[segment.first..][0..segment.rows], segment.first, @import("core_delta").slot_kernels[slots]);
-        return .{ .slot_kernel = slots, .compact = plan.compact, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
+        return .{ .slot_kernel = slots, .star = stars(plan), .compact = plan.compact, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
+    }
+
+    fn stars(plan: Plan) bool {
+        for (plan.segments) |segment| {
+            if (segment.rows < 2) return false;
+            for (plan.parents[segment.first..][0..segment.rows], 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else 0)) return false;
+        }
+        return true;
     }
 
     pub fn prepare(r: Round, e: metal.ComputeEncoder) void {
@@ -129,14 +139,16 @@ pub const Round = struct {
     }
 
     /// prepare for 128-wide heads and 4 taps by `rows` (tf_delta_gdn_pre_rows): 16 rows a group of 128.
-    pub fn prepareRows(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+    /// `one`: tf_delta_gdn_pre_rows1, which decoded rows (16 or fewer) take a simdgroup each, 4 rows a group.
+    pub fn prepareRows(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, one: metal.Pipeline) void {
         if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
         inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
-        e.setPipeline(rows);
+        const decoded = r.p.rows <= 16;
+        e.setPipeline(if (decoded) one else rows);
         bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
         e.setValue(r.p, 9);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
-        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = if (decoded) (r.p.rows + 3) / 4 else (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
     }
 
@@ -156,8 +168,19 @@ pub const Round = struct {
     }
 
     /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
-    pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
+    /// `star`: tf_delta_gdn_tree_star, which a round of depth-one stars takes in place of `pair`.
+    pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, star: metal.Pipeline, post_rows: metal.Pipeline) void {
         if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
+        if (r.star) {
+            // two simdgroups a column pair, each with half of the root's children
+            e.setPipeline(star);
+            bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+            e.setValue(r.p, 8);
+            r.b.recurrent.bind(e, 9);
+            e.dispatchGroups(.{ .width = 1, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 64, .height = 1, .depth = 1 });
+            e.barrier();
+            return r.gate(e, post_rows);
+        }
         e.setPipeline(pair);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
         e.setValue(r.p, 8);

@@ -190,6 +190,50 @@ test "cross-stream conv rows and a broken retained path refuse before encoding" 
     try std.testing.expectError(error.BadGdnPoolPlan, @import("gdn_pool.zig").validatePlan(shape, 2, 32, plan));
 }
 
+test "depth-one stars store only the root's state and every tree replays leaves without storing them" {
+    const a = std.testing.allocator;
+    const slots = @import("core").tree_slots;
+    const shape = try abi.Shape.init(config());
+    for (2..9) |rows| {
+        var parents: [8]i32 = undefined;
+        for (parents[0..rows], 0..) |*parent, row| parent.* = if (row == 0) -1 else 0;
+        var window = try Window.init(a, 10, parents[0..rows], 4, 64);
+        defer window.deinit();
+        var plan = try plan_mod.Plan.init(a, try shape.params(@intCast(rows), 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = &.{0} }});
+        defer plan.deinit();
+        try std.testing.expect(plan.compact);
+        try std.testing.expectEqual(@as(usize, 1), plan.slot_peak);
+        try slots.validate(parents[0..rows], plan.slot_steps, 0, 1);
+        for (plan.slot_steps) |step| try std.testing.expectEqual(@as(i32, if (step.row == 0) 0 else -1), step.write_slot);
+    }
+    // kernel semantics on random trees: a row reads its parent's state from a slot, and a leaf stores none
+    var random: u64 = 1729;
+    for ([_]usize{ 2, 5, 8, 17, 64 }) |width| for (0..32) |_| {
+        var parents: [64]i32 = undefined;
+        var expected: [64]u64 = undefined;
+        var actual: [64]u64 = undefined;
+        for (parents[0..width], 0..) |*parent, row| {
+            random = random *% 6364136223846793005 +% 1442695040888963407;
+            parent.* = if (row == 0) -1 else @intCast(random % row);
+            const value = if (parent.* < 0) @as(u64, 23) else expected[@intCast(parent.*)];
+            expected[row] = value *% 65537 +% row +% 1;
+        }
+        var window = try Window.init(a, 10, parents[0..width], 4, 128);
+        defer window.deinit();
+        var plan = try plan_mod.Plan.init(a, try shape.params(@intCast(width), 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = &.{0} }});
+        defer plan.deinit();
+        try std.testing.expect(plan.compact and plan.slot_peak <= slots.max_slots);
+        try slots.validate(parents[0..width], plan.slot_steps, 0, @import("core_delta").slot_kernels[@import("core_delta").slotKernel(plan.slot_peak)]);
+        var registers: [slots.max_slots]u64 = @splat(0);
+        for (plan.slot_steps) |step| {
+            const value = if (step.read_slot < 0) @as(u64, 23) else registers[@intCast(step.read_slot)];
+            actual[step.row] = value *% 65537 +% step.row +% 1;
+            if (step.write_slot >= 0) registers[@intCast(step.write_slot)] = actual[step.row];
+        }
+        try std.testing.expectEqualSlices(u64, expected[0..width], actual[0..width]);
+    };
+}
+
 test "depth one siblings keep none first or second draft with matching state and audit maps" {
     const a = std.testing.allocator;
     const matcher = @import("core").tree_round;
@@ -222,8 +266,9 @@ test "depth one siblings keep none first or second draft with matching state and
         var recurrent = try plan_mod.Plan.init(a, try shape.params(3, 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = accepted.path }});
         defer recurrent.deinit();
         try std.testing.expectEqualSlices(u32, want_path, recurrent.kept_rows);
-        try std.testing.expectEqual(@as(usize, 2), recurrent.slot_peak);
-        try @import("core").tree_slots.validate(&parents, recurrent.slot_steps, 0, 2);
+        // the siblings are leaves and store no state: the root's is the only one held
+        try std.testing.expectEqual(@as(usize, 1), recurrent.slot_peak);
+        try @import("core").tree_slots.validate(&parents, recurrent.slot_steps, 0, 1);
         const kept = try window.keep(accepted.path);
         try std.testing.expectEqual(@as(u32, @intCast(10 + want_path.len)), kept.length);
         try std.testing.expectEqual(@as(?u32, want_path[want_path.len - 1]), kept.conv_tail_row);

@@ -64,7 +64,7 @@ pub fn validate(parents: []const i32, steps: []const Step, first: u32, limit: us
     if (parents.len == 0 or parents.len != steps.len or limit == 0 or limit > max_slots) return error.BadSlotPlan;
     var owners: [max_slots]i32 = @splat(-2);
     for (steps, 0..) |step, at| {
-        if (step.row < first or step.row - first >= parents.len or step.read_slot < -1 or step.read_slot >= limit or step.write_slot < 0 or step.write_slot >= limit) return error.BadSlotPlan;
+        if (step.row < first or step.row - first >= parents.len or step.read_slot < -1 or step.read_slot >= limit or step.write_slot < -1 or step.write_slot >= limit) return error.BadSlotPlan;
         const row = step.row - first;
         const parent = parents[row];
         if (parent < -1 or parent >= row) return error.BadSlotParents;
@@ -72,7 +72,8 @@ pub fn validate(parents: []const i32, steps: []const Step, first: u32, limit: us
             if (parent != -1) return error.BadSlotPlan;
         } else if (owners[@intCast(step.read_slot)] != parent) return error.BadSlotPlan;
         for (steps[0..at]) |prior| if (prior.row == step.row) return error.BadSlotPlan;
-        owners[@intCast(step.write_slot)] = @intCast(row);
+        // a step that stores nothing (-1) leaves every slot's owner, so no later row can read it as a parent
+        if (step.write_slot >= 0) owners[@intCast(step.write_slot)] = @intCast(row);
     }
 }
 

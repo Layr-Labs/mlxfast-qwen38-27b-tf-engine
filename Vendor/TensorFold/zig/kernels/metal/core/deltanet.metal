@@ -128,15 +128,16 @@ kernel void tf_delta_gdn_pre(device const bfloat* projection [[buffer(0)]],
   else tf_delta_gdn_pre_body<0, false>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, tails, group, lane);
 }
 
-// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps 4 rows of a head on conv weights read once;
-// bfloat4 rows, and the gates a lane a row.
+// tf_delta_gdn_pre_body<4, false> for 4 taps: a simdgroup steps PER rows of a head on conv weights read once (4 for
+// prompt rows; 1 for decoded rows, a simdgroup each); bfloat4 rows, and the gates a lane a row.
+template <uint PER>
 inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* windows, device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query,
     device bfloat* key, device bfloat* value, device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, first = (group.z * 4 + sg) * 4;
+  const uint head = group.y, first = (group.z * 4 + sg) * PER;
   if (first >= p.rows) return;
-  const uint count = metal::min(4u, p.rows - first);
+  const uint count = metal::min(PER, p.rows - first);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
   const uint keep = p.taps - 1;
   const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
@@ -203,7 +204,29 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         uint3 group [[threadgroup_position_in_grid]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
-  if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+  if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4<4>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+}
+
+// tf_delta_gdn_pre_rows for decoded rows (16 or fewer): a simdgroup a row, 4 rows a group of 128.
+kernel void tf_delta_gdn_pre_rows1(device const bfloat* projection [[buffer(0)]],
+                        device const bfloat* a [[buffer(1)]],
+                        device const bfloat* b [[buffer(2)]],
+                        device const bfloat* history [[buffer(3)]],
+                        device const void* weights [[buffer(4)]],
+                        device const void* decay_weight [[buffer(5)]],
+                        device const void* time_bias [[buffer(6)]],
+                        device const uint* windows [[buffer(7)]],
+                        device const uint* row_slot [[buffer(8)]],
+                        constant TfDeltaParams& p [[buffer(9)]],
+                        device bfloat* query [[buffer(10)]],
+                        device bfloat* key [[buffer(11)]],
+                        device bfloat* value [[buffer(12)]],
+                        device float* decay [[buffer(13)]],
+                        device bfloat* mixing [[buffer(14)]],
+                        uint3 group [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4<1>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
 // tf_delta_gdn_pre_body<4, true> over 4 simdgroups a head; each lane's 4 squares summed in order before simd_sum.
