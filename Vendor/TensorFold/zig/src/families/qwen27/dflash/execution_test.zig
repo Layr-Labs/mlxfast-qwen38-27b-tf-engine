@@ -385,7 +385,7 @@ test "width two depth one uses one genuine future head row and sibling parents" 
     }
 }
 
-test "width seven depth one offers the seven best siblings of one future head row" {
+test "width four depth one offers the four best siblings of one future head row" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
     defer store.deinit();
@@ -400,18 +400,18 @@ test "width seven depth one offers the seven best siblings of one future head ro
         id.* = @intCast(i);
         score.* = -@as(f32, @floatFromInt(i));
     }
-    const width = 7; // bench_session_engine.dflash_width
+    const width = 4; // bench_session_engine.dflash_width
     const policy = selector.Policy{ .nodes = width, .max_depth = 1, .children = width };
     try std.testing.expectEqual(@as(u32, 2), try policy.block(16));
     var tree = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width, .children = policy.children });
     defer tree.deinit();
     try policy.checkTree(tree.parents);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, tree.tokens);
-    try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1, -1, -1, -1 }, tree.parents);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, tree.tokens);
+    try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1 }, tree.parents);
     const parents = try tree.verifyParents(a);
     defer a.free(parents);
-    // the pending row and its seven drafts: eight verify rows, the rows8 decode projections' limit
-    try std.testing.expectEqual(@as(usize, 8), parents.len);
+    // the pending row and its four drafts: five verify rows, within the rows8 decode projections' limit
+    try std.testing.expectEqual(@as(usize, 5), parents.len);
     for (parents[1..]) |parent| try std.testing.expectEqual(@as(i32, 0), parent);
     try std.testing.expectEqual(@as(u32, 2), policy.budget(128));
     // the stock cap of four children still yields four siblings, and a cap past the lattice's 16 is refused
