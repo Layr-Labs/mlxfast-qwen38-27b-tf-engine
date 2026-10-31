@@ -226,9 +226,11 @@ pub const EngineDflashBinding = struct {
     }
 };
 
-/// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
-/// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
-pub const dflash_width = 7;
+/// Depth-one siblings a DFlash round verifies: the pending row and 15 drafts fill the 16-row tensor-op tile every decode
+/// projection issues (`matmul2d_descriptor(16, NT, ...)`): one weight read and one tile a threadgroup either way, and
+/// rows8 only drops the unused half's epilogue, so each further sibling costs its own GDN tree step, attention row and
+/// argmax and buys its chance to land.
+pub const dflash_width = 15;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
 /// Siblings at 0.7-1% land about 2% of the time, a full round each, against about 0.13 ms a row; below 0.7% they

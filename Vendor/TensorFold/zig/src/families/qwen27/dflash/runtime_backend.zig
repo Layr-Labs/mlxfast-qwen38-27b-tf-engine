@@ -155,6 +155,16 @@ pub const Backend = struct {
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
         try target.kernels.prepareDecode(head.linear, 1);
+        // A verify round of sixteen rows takes the decode projections' sixteen-row epilogue (`rows8` off), a key of its
+        // own: compile it here, for every target layer's matrix, so the round that first runs it is not the one that
+        // builds it. A shape whose pipeline does not build here still compiles at its first launch.
+        for (target.weights.layers) |layer| {
+            const list = switch (layer.mixer) {
+                .linear => |g| [_]@import("../projection.zig").Linear{ g.qkv, g.zba, g.out, layer.gu, layer.down },
+                .attention => |t| [_]@import("../projection.zig").Linear{ t.q, t.kv, t.out, layer.gu, layer.down },
+            };
+            for (list) |p| target.kernels.prepareDecode(p, 16) catch {};
+        }
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches };
     }
