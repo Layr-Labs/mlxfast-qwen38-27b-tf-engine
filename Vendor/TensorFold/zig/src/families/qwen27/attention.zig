@@ -192,6 +192,8 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 /// The prompt kernel's threads a group: eight simdgroups, both kernels (attention_prompt*.metal's SG = 8).
 const prompt_threads = 256;
 /// h_end and w_end above 0: an M-RoPE round, the h and w position planes `plane` rows past each other in `positions`.
+/// Work encoded beside an attention launch, before the barrier that ends it.
+pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
 /// key_stride: values from one key row to the next (0: kv_heads * dim); strided keys take the fused norm and rope alone.
 /// packed_rows above 0: `query` is the scratch's qa, filled for a one-stream prompt plan of that many packed rows as
 /// q27_attn_pack_a fills it (`encode` with `prepacked`); the fused norm and rope alone.
@@ -311,7 +313,8 @@ pub const Attention = struct {
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool) !void {
+    /// `beside`: encoded beside the attention itself, before the barrier that ends it (a projection only the gate reads).
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, beside: ?Beside) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -356,7 +359,7 @@ pub const Attention = struct {
         }
         if (a.promptPath(plan, prompt)) {
             e.barrier();
-            try a.promptRows(e, scratch, binding, plan, out);
+            try a.promptRows(e, scratch, binding, plan, out, beside);
             if (raw_gate) |gate| {
                 e.setPipeline(a.io[9]);
                 bind(e, .{ out, gate });
@@ -365,11 +368,11 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, beside);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
-    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, out: Ref) !void {
+    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, out: Ref, beside: ?Beside) !void {
         const g = plan.geometry;
         const start: i32 = plan.meta[planning.global_words + 4];
         for (plan.positions, 0..) |position, i| if (position != start + @as(i32, @intCast(i))) return error.PromptRowsNotChain; // the kernel places row i at start + i
@@ -387,6 +390,7 @@ pub const Attention = struct {
         e.setBuffer(scratch.get(parts[1]).buffer, 0, 4);
         e.setBuffer(scratch.get(parts[2]).buffer, 0, 5);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, chunks, (plan.tiles + pairs - 1) / pairs), mtl.Size.of(prompt_threads, 1, 1));
+        if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         e.setPipeline(a.prompt.?[1]);
         bind(e, .{ scratch.get(parts[0]), scratch.get(parts[1]), scratch.get(parts[2]) });
@@ -396,7 +400,8 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, beside: ?Beside) !void {
+        var pending = beside;
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
@@ -418,6 +423,8 @@ pub const Attention = struct {
             e.setBuffer(scratch.get(.pla).buffer, 0, 7);
             e.setBuffer(scratch.get(.nodes).buffer, 0, 8);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(64 * sg, 1, 1));
+            if (pending) |b| try b.encode(b.ptr, e);
+            pending = null;
             e.barrier();
         }
         if (!plan.fused) {
@@ -430,6 +437,12 @@ pub const Attention = struct {
                 e.setBuffer(r.buffer, 0, i);
             }
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
+            if (pending) |b| try b.encode(b.ptr, e);
+            pending = null;
+            e.barrier();
+        }
+        if (pending) |b| {
+            try b.encode(b.ptr, e);
             e.barrier();
         }
         e.setPipeline(a.io[4]);

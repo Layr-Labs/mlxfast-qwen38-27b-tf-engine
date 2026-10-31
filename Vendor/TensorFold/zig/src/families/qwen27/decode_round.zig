@@ -481,6 +481,12 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
+        // on the reg path only the queries project here: the gates, which only the attention's gate reads, run beside
+        // the attention itself
+        const half: u32 = @intCast(r.model.config.head_dim / 32);
+        const gated = @import("quant_gpu.zig").Kernels.ranged(weights.q) and r.model.config.head_dim % 32 == 0 and weights.q.n == r.model.config.heads * r.model.config.head_dim * 2;
+        var gates: GateTiles = undefined;
+        var beside: ?attn.Beside = null;
         if (dead < rows) {
             var input = f.get(.input);
             input.offset += @as(usize, dead) * weights.q.k * 2;
@@ -488,7 +494,11 @@ pub const Runner = struct {
             query_sums.ref.offset += @as(usize, dead) * 4;
             var query = f.get(.q_gate);
             query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            if (gated) {
+                try r.model.kernels.quantRange(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead, .{ 0, half, 2 * half });
+                gates = .{ .quant = &r.model.kernels, .q = weights.q, .input = input, .sums = query_sums, .dims = f.get(.dims), .out = query, .rows = rows - dead, .range = .{ half, half, 2 * half } };
+                beside = .{ .ptr = &gates, .encode = GateTiles.encode };
+            } else try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
         }
         try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
         e.barrier();
@@ -500,7 +510,7 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, beside);
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
@@ -542,3 +552,20 @@ fn fingerprint(round: *const Round) [32]u8 {
     hash.final(&out);
     return out;
 }
+
+/// An attention's gate tiles of its fused query and gate rows, encoded beside the attention: they read the norm's rows
+/// and sums, which nothing writes before the gate reads them, and write only the gates' columns, which only it reads.
+const GateTiles = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    q: @import("projection.zig").Linear,
+    input: @import("projection.zig").Ref,
+    sums: @import("quant_gpu.zig").Sums,
+    dims: @import("projection.zig").Ref,
+    out: @import("projection.zig").Ref,
+    rows: u32,
+    range: [3]u32,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const g: *GateTiles = @ptrCast(@alignCast(ptr));
+        try g.quant.quantRange(e, g.q, g.input, g.sums, g.dims, g.out, g.rows, g.range);
+    }
+};
