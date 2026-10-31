@@ -333,6 +333,34 @@ test "serial SK2 keeps logical split and is off by default" {
     try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 
+test "serial SK2 prompt FFN down keeps its full layout and logical split" {
+    const original = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true };
+    var serial = original;
+    serial.serial_sk2 = true;
+    try serial.validate();
+    try std.testing.expectEqual(original.weightWords(), serial.weightWords());
+    try std.testing.expectEqual(original.metadataElements(), serial.metadataElements());
+    try std.testing.expectEqual(original.packedBytes(), serial.packedBytes());
+    try std.testing.expectEqual(original.tiles(), serial.tiles());
+    try std.testing.expectEqual([2]usize{ 0, 272 }, serial.groupCut());
+    const text = try source(std.testing.allocator, serial);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "#define TF_N 5120\n#define TF_K 17408\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SK 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_G0 0\n#define TF_GN 272\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_OUT bfloat\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SERIAL_SK2 1\n") != null);
+    var bad = serial;
+    bad.sk = 4;
+    try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    bad = serial;
+    bad.format.bits = 8;
+    try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+    bad = serial;
+    bad.format.group = 128;
+    try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
 fn checkRef(r: Ref, need: usize, alignment: usize) !void {
     if (r.off % alignment != 0) return error.MisalignedBuffer;
     const len = r.buf.length();

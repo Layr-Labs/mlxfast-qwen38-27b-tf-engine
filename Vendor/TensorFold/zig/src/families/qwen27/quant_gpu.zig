@@ -12,10 +12,10 @@ pub const Sums = struct { ref: Ref, stride: u32 };
 
 const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64,
 
-    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
+    /// Projections whose effective K split is 2, including prompt FFN down.
     fn serialSk2(key: Key) bool {
-        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
+        const shape = (key.k == 5120 and (key.n == 34816 or key.n == 10240 or key.n == 12288)) or (key.n == 5120 and key.k == 17408);
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
 };
 
@@ -48,6 +48,35 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
         try std.testing.expect(!cache.get(excluded).?);
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
+}
+
+test "serial SK2 admits prompt FFN down without admitting decode, cuts or other formats" {
+    const prompt = Key{ .kind = .projection, .n = 5120, .k = 17408, .slices = 2 };
+    try std.testing.expect(prompt.serialSk2());
+    try std.testing.expectEqual(@as(?u32, 2), projection.promptSplit(prompt.n, prompt.k));
+    inline for (.{
+        .{ "kind", Kind.mlp },
+        .{ "slices", @as(u32, 4) },
+        .{ "k", @as(u32, 6144) },
+        .{ "skip", @as(u32, 1) },
+        .{ "cut", [2]u32{ 1, 0 } },
+        .{ "cut", [2]u32{ 0, 136 } },
+        .{ "bits", @as(u8, 8) },
+        .{ "group", @as(u32, 128) },
+    }) |change| {
+        var excluded = prompt;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!excluded.serialSk2());
+    }
+    var decode = prompt;
+    decode.slices = 4;
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(prompt, prompt.serialSk2());
+    try cache.put(decode, decode.serialSk2());
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(cache.get(prompt).?);
+    try std.testing.expect(!cache.get(decode).?);
 }
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
