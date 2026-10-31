@@ -28,7 +28,8 @@ fn m5Split(n: usize, k: usize) ?u32 {
 
 /// Adjacent tiles whose code blocks interleave by group: tiles running together read neighbouring lines (the weight stream's GB/s).
 pub fn tileBatch(n: usize, k: usize) u32 {
-    const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 } };
+    // with the four mixer input projections (GDN qkv, GDN z|b|a, attention query+gate, attention k|v), as in fkiene's 8e8e27e2
+    const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 }, .{ 10240, 5120 }, .{ 6240, 5120 }, .{ 12288, 5120 }, .{ 2048, 5120 } };
     for (table) |t| if (t[0] == n and t[1] == k) return 8;
     return 1;
 }

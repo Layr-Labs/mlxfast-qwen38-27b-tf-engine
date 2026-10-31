@@ -365,19 +365,23 @@ pub const Runner = struct {
             break :made buffer;
         };
         e.useResource(lanes, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        // every layer gathers into its own lanes under one barrier, then every layer scatters under one more
+        // every layer gathers into its own lanes in one launch under one barrier, then every layer scatters in one more
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
             .attention => {
                 var views: [attn.planning.max_streams]attn.Cache = undefined;
                 const caches = r.layerCaches(ai, round, &views);
-                try r.attention.keepGather(e, &r.bindings[ai], p.rows, caches, .{ .buffer = lanes, .offset = 2 * ai * lane }, .{ .buffer = lanes, .offset = (2 * ai + 1) * lane });
+                try attn.Attention.keepUse(e, &r.bindings[ai], p.rows, caches);
                 ai += 1;
             },
         };
+        var table: [attn.max_keep_layers]attn.KeepLayer = undefined;
+        if (ai > table.len) return error.AttentionKeep;
+        const words: u32 = @intCast(lane / 2);
+        try r.attention.keepGatherLayers(e, r.bindings[0..ai], p.rows, table[0..ai], lanes, words);
         e.barrier();
-        for (r.bindings[0..ai], 0..) |*binding, i| r.attention.keepScatter(e, binding, p.rows, .{ .buffer = lanes, .offset = 2 * i * lane }, .{ .buffer = lanes, .offset = (2 * i + 1) * lane });
+        r.attention.keepScatterLayers(e, g, p.rows, table[0..ai], lanes, words);
         e.barrier();
     }
 
@@ -496,7 +500,9 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
+        const merged = !prepacked and rows <= 16 and r.model.kernels.takesSums(weights.out);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (merged) attn.Sums{ .ref = f.get(.sums), .stride = @import("quant_gpu.zig").padded(rows) } else null);
+        f.out_sums = merged;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {

@@ -24,7 +24,12 @@ pub const Hook = struct {
         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
         try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
         e.barrier();
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), try refs(weight, frame), e);
+        // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
+        var gated = try refs(weight, frame);
+        const xs = frame.get(.sums);
+        frame.mixer_sums = false;
+        gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt) else try hook.pool.forward(layer, devicePlan(hook.plan.*, frame), gated, e);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

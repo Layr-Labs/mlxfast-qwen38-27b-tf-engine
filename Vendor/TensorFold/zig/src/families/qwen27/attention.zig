@@ -6,6 +6,8 @@ const Ref = @import("projection.zig").Ref;
 const glue = @import("glue.zig");
 pub const planning = @import("attention_plan.zig");
 pub const Plan = planning.Plan;
+/// A projection input's group sums: [group * stride + row], fp32.
+pub const Sums = struct { ref: Ref, stride: u32 };
 pub const Cache = struct { keys: Ref, values: Ref, capacity: u32, key_stride: u32 = 0, value_stride: u32 = 0 };
 const CachePtrs = extern struct { keys: u64, values: u64 };
 const PackArgs = extern struct { rows: u32, packed_rows: u32, heads: u32 = 24, kv_heads: u32 = 4, dim: u32 = 256, group: u32 = 6, v_stride: u32 = 4 * 256 };
@@ -199,7 +201,7 @@ pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, nor
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [12]mtl.Pipeline,
+    io: [14]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
@@ -211,10 +213,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [12]mtl.Pipeline = undefined;
+        var io: [14]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -311,7 +313,8 @@ pub const Attention = struct {
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool) !void {
+    /// `sums`: the merge also writes `out`'s group sums there (decoded and tree rows only), for the projection that reads `out` next.
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -328,6 +331,10 @@ pub const Attention = struct {
         try span(k, kv_bytes);
         try span(v, v_bytes);
         try span(out, q_bytes);
+        if (sums) |s| {
+            if (a.promptPath(plan, prompt) or s.stride < plan.rows) return error.TargetAttentionShape;
+            try spanAligned(s.ref, @as(usize, g.heads) * g.dim / 64 * s.stride * 4, 4);
+        }
         if (raw_gate) |gate| {
             try span(gate, 2 * q_bytes);
             try disjoint(out, q_bytes, gate, 2 * q_bytes);
@@ -365,7 +372,7 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -396,7 +403,7 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
@@ -435,6 +442,9 @@ pub const Attention = struct {
         e.setPipeline(a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 10);
+        const xs = if (sums) |s| s.ref else out;
+        e.setBuffer(xs.buffer, xs.offset, 11);
+        e.setValue(if (sums) |s| s.stride else 0, 12);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
@@ -462,19 +472,24 @@ pub const Attention = struct {
     }
     /// `keep`'s gather into a caller's own K/V lanes, without barriers: layers with distinct lanes gather side by side.
     pub fn keepGather(a: *const Attention, e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache, keys: Ref, values: Ref) !void {
+        try keepUse(e, binding, kept, caches);
+        if (kept == 0) return;
+        const g = binding.limits.geometry;
+        e.setPipeline(a.io[5]);
+        bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
+        e.setValue(kept, 5);
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
+    }
+    /// The checks and resource uses of `keepGather`, without its dispatch (the all-layer launch reads through pointers).
+    pub fn keepUse(e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache) !void {
         if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
         try binding.checkCaches(caches);
-        const g = binding.limits.geometry;
         for (binding.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
         if (kept == 0) return;
         for (caches) |cache| {
             e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
             e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
         }
-        e.setPipeline(a.io[5]);
-        bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
-        e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
     }
     /// `keep`'s scatter from the lanes `keepGather` filled, without barriers.
     pub fn keepScatter(a: *const Attention, e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, keys: Ref, values: Ref) void {
@@ -485,7 +500,40 @@ pub const Attention = struct {
         e.setValue(kept, 5);
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
     }
+    /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
+    /// `lanes`, each `lane_words` bf16 words; `layers` receives the per-binding table the scatter reuses.
+    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
+        if (bindings.len == 0 or bindings.len > max_keep_layers or layers.len != bindings.len) return error.AttentionKeep;
+        for (bindings, layers) |*binding, *layer| {
+            if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
+            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(binding.get(.keep_map)) };
+        }
+        if (kept == 0) return;
+        const g = bindings[0].limits.geometry;
+        e.setPipeline(a.io[12]);
+        e.setBytes(std.mem.sliceAsBytes(layers), 0);
+        e.setBuffer(lanes, 0, 1);
+        e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept * @as(u32, @intCast(bindings.len))), mtl.Size.of(32, 4, 1));
+    }
+    /// `keepScatter` for every binding in one launch, from the lanes and table `keepGatherLayers` filled.
+    pub fn keepScatterLayers(a: *const Attention, e: mtl.ComputeEncoder, geometry: planning.Geometry, kept: u32, layers: []const KeepLayer, lanes: mtl.Buffer, lane_words: u32) void {
+        if (kept == 0 or layers.len == 0) return;
+        e.setPipeline(a.io[13]);
+        e.setBytes(std.mem.sliceAsBytes(layers), 0);
+        e.setBuffer(lanes, 0, 1);
+        e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
+        e.dispatchThreads(mtl.Size.of(geometry.dim, geometry.kv_heads, kept * @as(u32, @intCast(layers.len))), mtl.Size.of(32, 4, 1));
+    }
 };
+/// attention_io.metal's Q27KeepLayer: GPU addresses of one binding's cache pointers, metadata and keep map.
+pub const KeepLayer = extern struct { caches: u64, meta: u64, map: u64 };
+const KeepLayers = extern struct { kept: u32, lane: u32 };
+/// Bindings one all-layer keep launch takes; its table stays within setBytes' 4 KiB.
+pub const max_keep_layers = 64;
+fn address(r: Ref) u64 {
+    return r.buffer.gpuAddress() + @as(u64, r.offset);
+}
 test "cache and pack descriptors match native pointer and seven-word ABI" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(CachePtrs));
     try std.testing.expectEqual(@as(usize, 28), @sizeOf(PackArgs));

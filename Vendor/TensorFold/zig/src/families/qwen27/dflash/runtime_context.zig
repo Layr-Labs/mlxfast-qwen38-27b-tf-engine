@@ -140,8 +140,15 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     }
     const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
     // the gathers and these copies write disjoint rows; the attention below reads them all
-    b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
-    try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
+    // keys rotated straight into their ring slots (norm_rope with a sink) need no copy, and the values' copy reads only
+    // what an earlier barrier completed, so it runs beside the norm/rope dispatches
+    const keys_in_place = first == 0 and own_k.buf.id == k.buf.id and own_k.off == k.off + off;
+    if (keys_in_place) {
+        b.access(e, &.{try b.span(p.values)}, &.{Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2)});
+    } else {
+        b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
+        try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
+    }
     try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
     const v_ref: R = .{ .buf = v.buf, .off = v.off };

@@ -267,7 +267,7 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
 kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const float* PMA [[buffer(1)]], device const float* PLA [[buffer(2)]],
     device const float* POB [[buffer(3)]], device const float* PMB [[buffer(4)]], device const float* PLB [[buffer(5)]],
     device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
-    device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
+    device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]], device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
@@ -316,12 +316,25 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     m = nm;
   }
   const int h = hk * G + g;
+  float stored[DP];
   for (int i = 0; i < DP; i++) {
     const int64_t index = ((int64_t)node * (G * 4) + h) * D + lane * DP + i;
     const bfloat v = static_cast<bfloat>(o[i] / l);
+    bfloat w = v;
     if (gated) {
       const float gate = float(QG[((int64_t)node * (G * 4) + h) * 2 * D + D + lane * DP + i]);
-      OUT[index] = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
-    } else OUT[index] = v;
+      w = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
+    }
+    OUT[index] = w;
+    stored[i] = float(w);
+  }
+  // the out projection's group sums (tf_lane_xsum's order: each group's 64 stored values added in turn from zero), so no sums dispatch
+  if (sums_stride != 0) {
+    constexpr uint LG = 64 / DP; // lanes a group
+    const uint first = lane & ~(LG - 1);
+    float acc = 0.0f;
+    for (uint j = 0; j < LG; j++)
+      for (int i = 0; i < DP; i++) acc += simd_shuffle(stored[i], ushort(first + j));
+    if ((lane & (LG - 1)) == 0) XS[(uint(h) * (D / 64) + lane / LG) * sums_stride + uint(node)] = acc;
   }
 }
