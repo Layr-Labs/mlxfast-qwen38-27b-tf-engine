@@ -14,6 +14,8 @@ const selector = @import("selector.zig");
 const backend_mod = @import("runtime_backend.zig");
 const Cache = backend_mod.Cache;
 const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+/// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
+const flush_rows = 1024;
 pub const Model = struct {
     allocator: std.mem.Allocator,
     checkpoint: core.checkpoint_metal.Checkpoint,
@@ -103,8 +105,9 @@ pub const Model = struct {
         while (m.session.context.end < m.committed_end) {
             const first = m.session.context.end;
             const slot: u32 = @intCast(first % m.graph.config.window);
-            const rows: u32 = @intCast(@min(@min(m.committed_end - first, 128), m.graph.config.window - slot));
-            var positions: [128]u64 = undefined;
+            // a prompt's taps catch up in passes of up to flush_rows rows: one frame and one wait each
+            const rows: u32 = @intCast(@min(@min(m.committed_end - first, flush_rows), m.graph.config.window - slot));
+            var positions: [flush_rows]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = first + i;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
@@ -197,9 +200,13 @@ pub const Model = struct {
         return .{ .ring = m.pending, .slot = slot, .rows = @intCast(behind), .first = m.session.context.end, .next = .{ .cache = m.session.context.cache, .begin = begin, .end = m.committed_end } };
     }
     pub fn propose(m: *Model, pending: u32, nodes: u32) !@import("selector.zig").Tree {
-        if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab or nodes > 15 or m.tree_block == 0 or m.tree_block > 16) return error.BadDraftOptions;
+        return m.proposePolicy(pending, .{ .nodes = nodes });
+    }
+    pub fn proposePolicy(m: *Model, pending: u32, policy: @import("selector.zig").Policy) !@import("selector.zig").Tree {
+        const block = try policy.block(m.tree_block);
+        const nodes: u32 = @intCast(policy.nodes);
+        if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab) return error.BadDraftOptions;
         if (m.committed_end == 0) return error.DraftContextNotReady;
-        const block = @min(m.tree_block, nodes + 1);
         if (block < 2) return .{ .gpa = m.allocator, .tokens = &.{}, .parents = &.{}, .scores = &.{} };
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;

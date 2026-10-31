@@ -189,3 +189,78 @@ test "cross-stream conv rows and a broken retained path refuse before encoding" 
     plan.kept_rows[0] = 1;
     try std.testing.expectError(error.BadGdnPoolPlan, @import("gdn_pool.zig").validatePlan(shape, 2, 32, plan));
 }
+
+test "depth one siblings keep none first or second draft with matching state and audit maps" {
+    const a = std.testing.allocator;
+    const matcher = @import("core").tree_round;
+    const audit = @import("dflash/audit.zig");
+    const parents = [_]i32{ -1, 0, 0 };
+    const tokens = [_]u32{ 1, 2, 3 };
+    const shape = try abi.Shape.init(config());
+    var window = try Window.init(a, 10, &parents, 4, 64);
+    defer window.deinit();
+    var attention = try @import("attention_plan.zig").Plan.init(a, &.{.{ .parents = &parents, .start = 10, .capacity = 64 }}, .{});
+    defer attention.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 10, 11, 11 }, attention.positions);
+    for ([_]u32{ 4, 2, 3 }, 0..) |root_pick, which| {
+        const picks = [_]matcher.Pick{ .{ .token = root_pick }, .{ .token = 5 }, .{ .token = 6 } };
+        const match = matcher.Match{ .rows = 3, .vocab = 8, .budget = 2 };
+        const raw = try matcher.oracle(match, &tokens, &parents, &picks, &.{});
+        const accepted = try matcher.decode(&raw, match);
+        const want_path: []const u32 = switch (which) {
+            0 => &.{0},
+            1 => &.{ 0, 1 },
+            else => &.{ 0, 2 },
+        };
+        const want_tokens: []const u32 = switch (which) {
+            0 => &.{4},
+            1 => &.{ 2, 5 },
+            else => &.{ 3, 6 },
+        };
+        try std.testing.expectEqualSlices(u32, want_path, accepted.path);
+        try std.testing.expectEqualSlices(u32, want_tokens, accepted.tokens);
+        var recurrent = try plan_mod.Plan.init(a, try shape.params(3, 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = accepted.path }});
+        defer recurrent.deinit();
+        try std.testing.expectEqualSlices(u32, want_path, recurrent.kept_rows);
+        try std.testing.expectEqual(@as(usize, 2), recurrent.slot_peak);
+        try @import("core").tree_slots.validate(&parents, recurrent.slot_steps, 0, 2);
+        const kept = try window.keep(accepted.path);
+        try std.testing.expectEqual(@as(u32, @intCast(10 + want_path.len)), kept.length);
+        try std.testing.expectEqual(@as(?u32, want_path[want_path.len - 1]), kept.conv_tail_row);
+        const map = try attention.keepRows(a, &.{accepted.path});
+        defer a.free(map);
+        var cache = [_]u32{ 101, 202, 303 };
+        var gathered: [2]u32 = undefined;
+        for (map) |row| gathered[row.row] = cache[row.source];
+        for (map) |row| cache[row.destination] = gathered[row.row];
+        try std.testing.expectEqual(@as(u32, 101), cache[0]);
+        if (which != 0) try std.testing.expectEqual(@as(u32, if (which == 1) 202 else 303), cache[1]);
+        var journal: audit.Journal = .{};
+        defer journal.deinit(a);
+        try journal.record(a, .{ .committed = @intCast(accepted.tokens.len), .drafted = 2, .accepted = accepted.matched });
+        try std.testing.expectEqual(@as(u64, 2), journal.drafted_total);
+        try std.testing.expectEqual(@as(u64, if (which == 0) 0 else 1), journal.accepted_total);
+        try std.testing.expectEqual(@as(u64, want_tokens.len), journal.committed_total);
+        try std.testing.expect(journal.committed_total <= 2);
+    }
+}
+
+test "depth one sibling terminal and remaining-one commits retain only the root state" {
+    const a = std.testing.allocator;
+    const matcher = @import("core").tree_round;
+    var window = try Window.init(a, 10, &.{ -1, 0, 0 }, 4, 64);
+    defer window.deinit();
+    const shape = try abi.Shape.init(config());
+    for ([_]u32{ 2, 3 }) |pick| for ([_]bool{ false, true }) |eos| {
+        const match = matcher.Match{ .rows = 3, .vocab = 8, .budget = if (eos) 2 else 1, .eos_count = @intFromBool(eos) };
+        const stop = [_]u32{pick};
+        const raw = try matcher.oracle(match, &.{ 1, 2, 3 }, &.{ -1, 0, 0 }, &.{ .{ .token = pick }, .{ .token = 5 }, .{ .token = 6 } }, if (eos) &stop else &.{});
+        const accepted = try matcher.decode(&raw, match);
+        try std.testing.expectEqualSlices(u32, &.{0}, accepted.path);
+        try std.testing.expectEqualSlices(u32, &stop, accepted.tokens);
+        var plan = try plan_mod.Plan.init(a, try shape.params(3, 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = accepted.path }});
+        defer plan.deinit();
+        try std.testing.expectEqualSlices(u32, &.{0}, plan.kept_rows);
+        try std.testing.expectEqual(@as(u32, 11), (try window.keep(accepted.path)).length);
+    };
+}
