@@ -66,8 +66,18 @@ pub const Head = struct {
                 }
             }
             head.linear.pairs = .{ .buffer = pairs };
-            // the source's indexed copy, trimmed to the spans' columns: the same table, each group's indices in span order
-            if (source.index) |index| {
+            // decoded rows read the spans' own (scale, bias) dictionary (lane.indexMetadata: 12-bit when the spans hold at
+            // most 4096 distinct pairs), as ArthurOstapenko's 38826d66 does: a smaller, use-sorted table than the target
+            // head's; the target head's trimmed index stays the fallback
+            const own = try lane.indexMetadata(device, a, @as([*]const u16, @ptrCast(@alignCast(pairs.contents())))[0 .. 2 * width * groups], width, k);
+            if (own) |x| {
+                head.owned.append(a, x.buffer) catch |err| {
+                    x.buffer.deinit();
+                    return err;
+                };
+                head.linear.index = .{ .buffer = x.buffer };
+                head.linear.index12 = x.twelve;
+            } else if (source.index) |index| {
                 const table = lane.sb_table * 4;
                 const trimmed = try head.allocate(device, lane.indexedBytes(width, k, source.group));
                 @memcpy(trimmed.contents()[0..table], index.buffer.contents()[index.offset..][0..table]);
