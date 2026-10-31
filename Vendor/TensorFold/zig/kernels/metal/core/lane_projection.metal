@@ -279,6 +279,16 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #endif
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
+// TF_SBI (decoded rows' lean loop only): metadata indexed as lane_projection.indexed_layout, TF_SBI distinct
+// (scale | bias << 16) words, then a u16 index per group and column. A lane's quad of four columns is one uint2 of indices
+// and four table words, the words the unindexed quad holds, so every product and FMA is unchanged. A group's indices load
+// one group ahead with its codes; its table words at the top of its own iteration.
+#if defined(TF_SBI)
+inline uint4 tf_look(const device uint* tab, uint2 ix) {
+  return uint4(tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]);
+}
+#endif
+
 // TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
 // so its accumulators, row sums, hand-over words and stores are left out. Every live row's words are unchanged.
 #if defined(TF_ROWS8)
@@ -371,11 +381,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+#if defined(TF_SBI)
+  const device uint* tab = (const device uint*)SB;
+  const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
+  uint2 ni0 = 0, ni1 = 0;
+  if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+#endif
   for (int g = first; g < last; g++) {
-#if defined(TF_ROWS8)
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
+#if defined(TF_SBI)
+    const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+    const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
+#endif
+#if defined(TF_ROWS8)
+    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], 0.0f};
+#else
+    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], XS[g * stride + mb + 8]};
 #endif
 #endif
 #else
@@ -401,6 +422,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw1 = cp[32];
 #else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+#if defined(TF_SBI)
+    { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#endif
 #endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
