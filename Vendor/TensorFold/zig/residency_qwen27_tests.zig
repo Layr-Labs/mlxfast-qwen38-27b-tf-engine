@@ -240,6 +240,7 @@ test "residency owner Qwen27: native inventory and lazy owners match every alloc
                 b.prepared = .empty;
                 b.tiled = .empty;
                 var adapter: @import("src/core/affine4_lane.zig").Adapter = undefined;
+                adapter.compact_projection = null;
                 adapter.words = try owned.take();
                 adapter.metadata = try owned.take();
                 adapter.projection.sums_buffer = try owned.take();
@@ -303,6 +304,7 @@ test "residency owner Qwen27: native inventory and lazy owners match every alloc
                 try record.check();
                 draft_model.backend.frame.release();
                 var next_adapter: @import("src/core/affine4_lane.zig").Adapter = undefined;
+                next_adapter.compact_projection = null;
                 next_adapter.words = try owned.take();
                 next_adapter.metadata = try owned.take();
                 next_adapter.projection.sums_buffer = try owned.take();

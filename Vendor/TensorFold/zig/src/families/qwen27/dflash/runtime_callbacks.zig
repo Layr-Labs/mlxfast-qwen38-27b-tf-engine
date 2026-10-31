@@ -50,7 +50,7 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
     {
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
-        const p = adapter.projection;
+        const p = adapter.select(x.rows);
         const cacheable = p.reg and p.sums_pipe != null and p.sums_buffer != null and
             x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
             x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
@@ -63,7 +63,7 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
             var first: u32 = 0;
             while (first < x.rows) : (first += step) {
-                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));
+                try p.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));
             }
             if (cacheable) b.input_sums = .{ .view = x, .sums = .{ .ref = .{ .buf = p.sums_buffer.? }, .stride = 16 } };
         }

@@ -152,6 +152,11 @@ pub const Backend = struct {
         if (b.stash != null) try b.buildGroups(order, &stash);
         if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
     }
+    fn compactPrepared(n: usize, k: usize) bool {
+        const shapes = [_][2]usize{ .{ 1280, 5120 }, .{ 6144, 5120 }, .{ 5120, 4096 }, .{ 5120, 17408 }, .{ 256, 5120 }, .{ 5120, 25600 }, .{ 2048, 5120 } };
+        for (shapes) |shape| if (n == shape[0] and k == shape[1]) return true;
+        return false;
+    }
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
@@ -167,7 +172,8 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const create: *const @TypeOf(core.affine4_lane.Adapter.init) = if (compactPrepared(shape[0], shape[1])) core.affine4_lane.Adapter.initLivePartials8 else core.affine4_lane.Adapter.init;
+            const adapter = try create(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
@@ -211,7 +217,8 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const create: *const @TypeOf(core.affine4_lane.Adapter.init) = if (compactPrepared(n, k)) core.affine4_lane.Adapter.initLivePartials8 else core.affine4_lane.Adapter.init;
+        const adapter = try create(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
