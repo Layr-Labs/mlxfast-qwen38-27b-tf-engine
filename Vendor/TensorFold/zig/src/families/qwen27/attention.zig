@@ -407,7 +407,9 @@ pub const Attention = struct {
         e.barrier();
         const scale: f32 = 0.0625;
         if (plan.prefix_chunks > 0) {
-            const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else 4); // a pair a tile; a long cache reads each chunk once for six tiles
+            // a pair a tile; a long cache reads each chunk once for six tiles, a short one gives every tile's pair its own
+            // threadgroup so the few chunks spread over the GPU's cores (each pair's arithmetic is the same either way)
+            const sg: u32 = if (plan.prefix_chunks >= 64) @min(plan.tiles, 6) else 1;
             e.setPipeline(a.prefix[sg - 1]);
             bind(e, .{ scratch.get(.qa), binding.get(.caches) });
             e.setValue(scale, 2);

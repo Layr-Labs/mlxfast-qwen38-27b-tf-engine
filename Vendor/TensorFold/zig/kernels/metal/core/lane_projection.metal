@@ -382,6 +382,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* cp = wl + (size_t)first * TF_TB * 64;
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
   const device float* xp = XS + first * stride + mb;
+  const device bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   for (int g = first; g < last; g++) {
@@ -451,11 +452,24 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #if defined(TF_REG_LEAN)
     const array<int32_t, 2> xstr = {1, TF_K};
+#if defined(TF_PROMPT_SR)
+    // a full 16-row block names its activation block with static extents: every row is in range, so no row is bounded
+    if (M == 16) {
+      tensor<device bfloat, extents<int32_t, GS, 16>, tensor_inline> x16((device bfloat*)xv, extents<int32_t, GS, 16>(), xstr);
+      op.run(x16, cb, P);
+    } else {
+      tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr);
+      op.run(x, cb, P);
+    }
+    xv += GS;
+#else
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + g * GS, dextents<int32_t, 2>(GS, M), xstr);
+    op.run(x, cb, P);
+#endif
 #else
     auto x = a.slice(g * GS, 0);
-#endif
     op.run(x, cb, P);
+#endif
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
@@ -573,11 +587,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #ifndef TF_UNROLL
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
 #endif
+// Uint4s between a tile's codes and the next tile's: adjacent tiles of a batch sit one 64-uint4 block apart per group.
+#define TF_TN_CODES (TF_TB > 1 ? 64 : KG * 64)
 // One tile of a group: unpack its codes (1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting
-// 1024 is exact), prefetch its next codes (a chain's last group reloads its own, which nothing reads), run, then FMAs.
+// 1024 is exact), prefetch its next codes, run, then FMAs.
 #define TF_TN_TILE(t, CB, PP) { \
-      const uint4 q0 = sp[t][0], q1 = sp[t][4]; \
-      sp[t] += TF_N / 4; \
+      const uint4 q0 = sp[(t) * (NT / 4)], q1 = sp[(t) * (NT / 4) + 4]; \
       thread half2* b2l = (thread half2*)&CB##l[0]; \
       thread half2* b2h = (thread half2*)&CB##h[0]; \
       TF_UNROLL \
@@ -590,15 +605,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
         b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
       } \
-      cp[t] += g + 1 < last ? TF_TB * 64 : 0; \
-      nw0[t] = cp[t][0]; \
-      nw1[t] = cp[t][32]; \
+      nw0[t] = cp[(t) * TF_TN_CODES]; \
+      nw1[t] = cp[(t) * TF_TN_CODES + 32]; \
       opm.run(xl0, CB##l, PP); \
       opa.run(xl1, CB##h, PP); \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
-        const float s0 = as_type<float>(q0[j] << 16), b0 = as_type<float>(q0[j] & 0xFFFF0000u); \
-        const float s1 = as_type<float>(q1[j] << 16), b1 = as_type<float>(q1[j] & 0xFFFF0000u); \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
         C[t][j] = fma(s0, PP[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, PP[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, PP[8 + j], fma(b1, x0, C[t][8 + j])); \
@@ -625,7 +639,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
   matmul2d<d64, execution_simdgroup> op64;
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
@@ -638,29 +651,34 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const half2 bias = half2(1024.0h);
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
   const device uint4* sbv = (const device uint4*)SB;
-  const device uint4* cp[TN];
-  const device uint4* sp[TN];
+  // one pointer each for codes and metadata: the tiles' words lie fixed distances apart
+  const device uint4* cp = W + ((size_t)(tile0 / TF_TB) * KG * TF_TB + tile0 % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
+  const device uint4* sp = sbv + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
   uint4 nw0[TN], nw1[TN];
   float C[TN][16];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
-    const int tile = tile0 + t;
-    cp[t] = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
-    sp[t] = sbv + ((size_t)first * TF_N + tile * NT + nb) / 4;
     nw0[t] = 0; nw1[t] = 0;
-    if (first < last) { nw0[t] = cp[t][0]; nw1[t] = cp[t][32]; }
+    if (first < last) { nw0[t] = cp[t * TF_TN_CODES]; nw1[t] = cp[t * TF_TN_CODES + 32]; }
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
   const device float* xp = XS + first * stride + mb;
+  const device bfloat* xv = X + (size_t)first * GS;
+  const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(a.slice(g * GS, 0));
+    // a full 16-row block's activation block has static extents, as in the lean loop
+    if (M == 16) x64.load(tensor<device bfloat, extents<int32_t, GS, 16>, tensor_inline>((device bfloat*)xv, extents<int32_t, GS, 16>(), xstr));
+    else x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+    xv += GS;
+    cp += g + 1 < last ? TF_TB * 64 : 0; // a chain's last group reloads its own codes, which nothing reads
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
     TF_TN_TILE(0, cb0, P0)
     TF_TN_TILE(1, cb1, P1)
+    sp += TF_N / 4;
   }
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
   if (TF_SK > 1) {
