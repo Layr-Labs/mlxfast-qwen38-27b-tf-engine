@@ -71,23 +71,29 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
     const c = g.config;
     const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
     const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
+    // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
+    // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
+    var keys: [max_layers]op.View = undefined;
+    var values: [max_layers]op.View = undefined;
+    if (g.layers.len > max_layers) return error.DraftOperatorShape;
     for (g.layers, 0..) |layer, i| {
-        var raw_keys: op.View = undefined;
-        var values: op.View = undefined;
         if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
-            raw_keys = try cols(ops, frame, kv, 0, c.kvWidth());
-            values = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
+            keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());
+            values[i] = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
         } else {
-            raw_keys = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
-            values = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
-        }
-        const keys = try rotate(ops, frame, try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim), positions, c.kv_heads, c);
-        switch (sink) {
-            .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys, values, positions),
-            .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys, values, positions),
+            keys[i] = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
+            values[i] = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
         }
     }
+    for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
+    for (g.layers, 0..) |_, i| keys[i] = try rotate(ops, frame, keys[i], positions, c.kv_heads, c);
+    for (g.layers, 0..) |_, i| switch (sink) {
+        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
+        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
+    };
 }
+/// Layers a stage-by-stage append holds at once.
+const max_layers = 16;
 
 /// append then forwardBlock in one frame: one commit and one wait for the committed taps and the block that reads them.
 pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !op.Lattice {
@@ -146,20 +152,23 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
         const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
         const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
-        var raw_q: op.View = undefined;
-        var raw_k: op.View = undefined;
+        // the products, then both norms, then both ropes: independent neighbours for the concurrent encoder
+        var raw_query: op.View = undefined;
+        var raw_keys: op.View = undefined;
         var values: op.View = undefined;
         if (try group(ops, frame, input, layer.attention.q, 2, preparation.mode)) |qkv| {
-            raw_q = try cols(ops, frame, qkv, 0, c.qWidth());
-            raw_k = try cols(ops, frame, qkv, c.qWidth(), c.kvWidth());
+            raw_query = try cols(ops, frame, qkv, 0, c.qWidth());
+            raw_keys = try cols(ops, frame, qkv, c.qWidth(), c.kvWidth());
             values = try cols(ops, frame, qkv, c.qWidth() + c.kvWidth(), c.kvWidth());
         } else {
-            raw_q = try project(ops, frame, input, layer.attention.q, preparation.mode);
-            raw_k = try project(ops, frame, input, layer.attention.k, preparation.mode);
+            raw_query = try project(ops, frame, input, layer.attention.q, preparation.mode);
+            raw_keys = try project(ops, frame, input, layer.attention.k, preparation.mode);
             values = try project(ops, frame, input, layer.attention.v, preparation.mode);
         }
-        const query = try rotate(ops, frame, try norm(ops, frame, raw_q, layer.attention.q_norm, c.eps, c.heads, c.head_dim), positions[0..rows], c.heads, c);
-        const keys = try rotate(ops, frame, try norm(ops, frame, raw_k, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim), positions[0..rows], c.kv_heads, c);
+        const normed_query = try norm(ops, frame, raw_query, layer.attention.q_norm, c.eps, c.heads, c.head_dim);
+        const normed_keys = try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
+        const query = try rotate(ops, frame, normed_query, positions[0..rows], c.heads, c);
+        const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
@@ -185,10 +194,11 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
     const headed = if (n == 1) block - 1 else rows;
     try masks.check(headed, c.hidden, .bf16);
     const final = try norm(ops, frame, masks, g.norm, c.eps, 1, c.hidden);
+    // the small projection first: the head then reads the group sums of `final` it leaves behind
+    const projected = try project(ops, frame, final, g.hidden_projection, preparation.mode);
     const head = try ops.vtable.head(ops.ptr, frame, final);
     if (head.logits.handle == 0 or head.logits.rows != headed or head.logits.dtype != .bf16 or head.logits.width == 0 or head.logits.width > c.vocab or head.logits.stride < head.logits.width) return error.DraftOperatorShape;
     if (head.token_ids) |mapping| try mapping.check(1, head.logits.width, .u32) else if (head.logits.width != c.vocab) return error.DraftCandidateId;
-    const projected = try project(ops, frame, final, g.hidden_projection, preparation.mode);
     return .{ .head = head, .projected = projected };
 }
 /// A stream's new taps for a batched pass: absorbed into its caches before its block reads them.

@@ -278,6 +278,71 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
+    /// Every layer's commitScan, a fence, then every layer's commitPublish, unfenced after: one launch per kernel for
+    /// the whole pool instead of one per layer. Layer l's operands are the pool's l-th equal slice of each buffer
+    /// (layerSpan, beforeSpan), so each thread runs the per-layer kernel's code on the same elements.
+    pub fn commitLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const layers = pool.budget.layers;
+        if (layers == 0) return error.BadGdnPoolIndex;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        const advance = pool.advances(plan.host);
+        p.advance = @intFromBool(advance);
+        const m = plan.metadata;
+        const groups = p.nv * @as(u32, @intCast(plan.host.keeps.len));
+        const before = try pool.beforeSpan(0, plan.host, advance);
+        const strides = LayerStrides{
+            .key = try pool.layerElements(.key, 2),
+            .value = try pool.layerElements(.value, 2),
+            .decay = try pool.layerElements(.decay, 4),
+            .mixing = try pool.layerElements(.mixing, 2),
+            .state = try pool.layerElements(.state, 4),
+            .before = if (before) |b| @as(u64, b.bytes / 4) else try pool.layerElements(.state, 4),
+            .qkv = try pool.layerElements(.qkv, 2),
+            .conv = try pool.layerElements(.history, 2),
+            .next_conv = try pool.layerElements(.next_history, 2),
+            .groups = groups,
+        };
+        const state = try pool.layerSpan(.state, 0);
+        // windows the verify stepped in place replay nothing: skip the launch when that is all of them
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        if (replays) {
+            e.setPipeline(pool.kernels.replay_layers);
+            e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+            (before orelse state).bind(e, 10);
+            gdn.bind(e, .{ try pool.layerSpan(.key, 0), try pool.layerSpan(.value, 0), try pool.layerSpan(.decay, 0), try pool.layerSpan(.mixing, 0), state }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+            e.setValue(p, 7);
+            e.setBuffer(state.buffer, state.offset, 8);
+            e.setValue(strides, 11);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = groups * @as(u32, @intCast(layers)) }, .{ .width = 32, .height = 4 });
+        }
+        const history = try pool.layerSpan(.history, 0);
+        const next_history = try pool.layerSpan(.next_history, 0);
+        e.setPipeline(pool.kernels.conv_commit_layers);
+        gdn.bind(e, .{ history, try pool.layerSpan(.qkv, 0) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setBuffer(next_history.buffer, next_history.offset, 6);
+        e.setValue(strides, 7);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len, .depth = layers }, .{ .width = 256 }); // a word a thread
+        e.barrier();
+        e.setPipeline(pool.kernels.publish_conv_layers);
+        gdn.bind(e, .{next_history}, 0);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 1);
+        e.setValue(p, 2);
+        e.setBuffer(history.buffer, history.offset, 3);
+        e.setValue(strides, 4);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len, .depth = layers }, .{ .width = 256 }); // a word a thread
+    }
+
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
@@ -361,7 +426,17 @@ pub const Pool = struct {
         const bytes = buffer.length() / pool.budget.layers;
         return .{ .buffer = buffer, .offset = layer * bytes, .bytes = bytes };
     }
+
+    /// Elements of `size` bytes from one layer's slice of `field` to the next (layerSpan's stride).
+    fn layerElements(pool: *const Pool, field: Field, size: usize) !u64 {
+        const bytes = pool.get(field).length() / pool.budget.layers;
+        if (bytes % size != 0) return error.BadGdnPoolIndex;
+        return bytes / size;
+    }
 };
+
+/// TfDeltaLayerStrides (deltanet.metal): per-layer element strides of a pool's buffers, and the per-layer z extent.
+const LayerStrides = extern struct { key: u64, value: u64, decay: u64, mixing: u64, state: u64, before: u64, qkv: u64, conv: u64, next_conv: u64, groups: u32 };
 
 fn tensorSpan(t: Tensor) gdn.Span {
     return .{ .buffer = t.buffer, .offset = t.offset, .bytes = t.bytes };
