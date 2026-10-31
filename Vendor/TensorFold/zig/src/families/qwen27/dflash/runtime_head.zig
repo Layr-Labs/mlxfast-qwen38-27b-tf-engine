@@ -29,7 +29,6 @@ pub const Head = struct {
             destination += rows;
         }
         head.linear.n = width;
-        head.linear.index = null; // the spans' columns keep the pairs layout
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);

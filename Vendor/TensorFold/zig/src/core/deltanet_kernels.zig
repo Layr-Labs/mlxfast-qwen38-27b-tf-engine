@@ -44,6 +44,10 @@ pub const Kernels = struct {
     post_rows: metal.Pipeline,
     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
     tree_pair: metal.Pipeline,
+    /// A depth-one keep's kept rows into the layer's stash (the next verify applies them).
+    stash: metal.Pipeline,
+    /// A stash applied in place when no verify follows.
+    unstash: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -70,6 +74,8 @@ pub const Kernels = struct {
             "tree_slots_8",
             "tree_slots_16",
             "tree_pair",
+            "stash",
+            "unstash",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -100,6 +106,8 @@ pub const Kernels = struct {
             .pre_rows = pipelines[13],
             .post_rows = pipelines[14],
             .tree_pair = pipelines[20],
+            .stash = pipelines[21],
+            .unstash = pipelines[22],
         };
     }
 
@@ -121,6 +129,8 @@ pub const Kernels = struct {
             k.pre_rows,
             k.post_rows,
             k.tree_pair,
+            k.stash,
+            k.unstash,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

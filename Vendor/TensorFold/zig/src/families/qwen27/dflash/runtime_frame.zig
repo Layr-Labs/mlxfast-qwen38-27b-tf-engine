@@ -106,6 +106,12 @@ pub const Frame = struct {
     residency: ?mtl.ResidencySet.Follow = null,
     /// Bridges a proposal's frame to the verify behind it (finishBridged, endBridge); none if it failed to build.
     bridge: ?Bridge = null,
+    /// Signalled behind a frame's last command: finish returns once the GPU reaches it, and the frame's command buffers
+    /// are waited for and checked when the next frame begins (checkUnchecked).
+    poll_event: ?mtl.SharedEvent = null,
+    poll_value: u64 = 0,
+    unchecked: [9]mtl.CommandBuffer = undefined,
+    n_unchecked: usize = 0,
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -115,6 +121,8 @@ pub const Frame = struct {
     }
     pub fn deinit(f: *Frame) void {
         f.release();
+        f.checkUnchecked() catch {};
+        if (f.poll_event) |ev| ev.deinit();
         f.setResident(null);
         if (f.fence) |fence| mtl.objc.release(fence);
         if (f.bridge) |*b| b.deinit();
@@ -140,8 +148,20 @@ pub const Frame = struct {
         f.external = null;
         return f.cacheBytes();
     }
+    /// Waits for and checks the command buffers a finished frame returned before they reported completion.
+    pub fn checkUnchecked(f: *Frame) !void {
+        var bad = false;
+        for (f.unchecked[0..f.n_unchecked]) |cb| {
+            cb.wait();
+            bad = failed(cb) or bad;
+            cb.release();
+        }
+        f.n_unchecked = 0;
+        if (bad) return error.DraftGpuFailure;
+    }
     pub fn begin(f: *Frame) !u64 {
         if (f.active or f.epoch >= 0x7fffffff) return error.DraftFrameBusy;
+        try f.checkUnchecked();
         f.epoch += 1;
         if (f.external_epoch != f.epoch) f.external = null;
         f.cursor = 0;
@@ -184,10 +204,28 @@ pub const Frame = struct {
         if (bridged and f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
         if (bridged) mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
         f.encoder.end();
+        if (f.poll_event == null) f.poll_event = f.device.sharedEvent() catch null;
+        if (f.poll_event) |ev| {
+            f.poll_value += 1;
+            f.cb.signal(ev, f.poll_value);
+        }
         f.cb.commit();
         if (bridged) f.bridge.?.launch(f.queue, f.fence.?);
-        // the frame's tokens gate the next verify's encode: poll its status rather than sleep until the completion
-        // handler wakes this thread, then wait() returns at once
+        // the frame's tokens gate the next verify's encode: return once the GPU reaches the frame's last command
+        if (f.poll_event) |ev| {
+            while (ev.value() < f.poll_value and f.cb.status() != .@"error") std.atomic.spinLoopHint();
+            if (f.cb.status() != .@"error") {
+                for (f.parts[0..f.part_count]) |cb| {
+                    f.unchecked[f.n_unchecked] = cb.retain();
+                    f.n_unchecked += 1;
+                }
+                f.unchecked[f.n_unchecked] = f.cb.retain();
+                f.n_unchecked += 1;
+                f.completed = true;
+                return;
+            }
+        }
+        // poll its status rather than sleep until the completion handler wakes this thread, then wait() returns at once
         while (true) switch (f.cb.status()) {
             .completed, .@"error" => break,
             else => std.atomic.spinLoopHint(),
