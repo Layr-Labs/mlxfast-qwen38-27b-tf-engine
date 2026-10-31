@@ -128,3 +128,34 @@ TF_TREE_SLOTS(2)
 TF_TREE_SLOTS(4)
 TF_TREE_SLOTS(8)
 TF_TREE_SLOTS(16)
+// A depth-one star (each segment's node 0, then its other rows as children of node 0) for two adjacent value columns a
+// simdgroup: every node of each column is tf_delta_tree_node from the same parent state as in tf_delta_gdn_tree_slots,
+// so each column's arithmetic is that kernel's; the star needs no slot steps, no parent selects and no kept states.
+// Verify rounds only (no advance): no state is written.
+kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
+                                   device const bfloat* key [[buffer(1)]],
+                                   device const bfloat* value [[buffer(2)]],
+                                   device const float* decay [[buffer(3)]],
+                                   device const bfloat* mixing [[buffer(4)]],
+                                   device const float* committed [[buffer(5)]],
+                                   device const TfDeltaSegment* segments [[buffer(7)]],
+                                   constant TfDeltaParams& p [[buffer(8)]],
+                                   device bfloat* output [[buffer(9)]],
+                                   uint3 position [[thread_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+  const uint d0 = 2 * position.y, key_head = head / (p.nv / p.nk);
+  const TfDeltaSegment span = segments[segment_index];
+  const uint column = (head * p.dv + d0) * p.dk + lane * 4, base = span.state_slot * p.nv * p.dv * p.dk;
+  float4 r0, r1;
+  for (uint part = 0; part < 4; ++part) {
+    r0[part] = committed[base + column + part];
+    r1[part] = committed[base + column + p.dk + part];
+  }
+  const float4 n0 = tf_delta_tree_node(r0, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
+  const float4 n1 = tf_delta_tree_node(r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0 + 1, lane);
+  for (uint c = 1; c < span.rows; ++c) {
+    tf_delta_tree_node(n0, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
+    tf_delta_tree_node(n1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0 + 1, lane);
+  }
+}

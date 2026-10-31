@@ -114,6 +114,8 @@ pub const Round = struct {
     sums: ?Sums = null,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
+    star: bool = false,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -123,7 +125,11 @@ pub const Round = struct {
         for (pipelines.tree_slots) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 128) return error.UnsupportedGdnPipeline;
         const slots = @import("core_delta").slotKernel(plan.slot_peak);
         if (plan.compact) for (plan.segments) |segment| try @import("core").tree_slots.validate(plan.parents[segment.first..][0..segment.rows], plan.slot_steps[segment.first..][0..segment.rows], segment.first, @import("core_delta").slot_kernels[slots]);
-        return .{ .slot_kernel = slots, .compact = plan.compact, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
+        var star = plan.compact and p.advance == 0 and b.before == null and p.dk == 128 and p.dv % 2 == 0;
+        for (plan.segments) |segment| for (plan.parents[segment.first..][0..segment.rows], 0..) |parent, i| {
+            if (parent != @as(i32, if (i == 0) -1 else 0)) star = false;
+        };
+        return .{ .slot_kernel = slots, .compact = plan.compact, .star = star, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
     }
 
     pub fn prepare(r: Round, e: metal.ComputeEncoder) void {
@@ -190,6 +196,21 @@ pub const Round = struct {
             (r.b.before orelse r.b.state).bind(e, 13);
         }
         r.stateGrid(e);
+        if (beside) |b| try b.encode(b.ptr, e);
+        e.barrier();
+        r.gate(e, post_rows);
+    }
+
+    /// forward for a depth-one star (`star`): tf_delta_gdn_star_pair, two value columns a simdgroup, each node of each
+    /// column tf_delta_gdn_tree_slots' arithmetic from the same parent state.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside) !void {
+        if (!r.star or !r.usesSlots()) return error.BadGdnPlan;
+        e.setPipeline(star);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
+        r.b.segments.bind(e, 7);
+        e.setValue(r.p, 8);
+        r.b.recurrent.bind(e, 9);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         r.gate(e, post_rows);
