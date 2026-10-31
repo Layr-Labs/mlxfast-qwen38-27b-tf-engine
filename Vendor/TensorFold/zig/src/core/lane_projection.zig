@@ -35,6 +35,23 @@ const Ranked = struct {
         allocator.free(r.ranks);
     }
 };
+
+/// The reg kernel's codes are fp16 subnormals (code * 2^-24), so reg metadata stores every scale times 2^24: prompt and
+/// decoded rows, pairs and dictionaries alike, and no reg kernel multiplies a scale of its own. foldScale maps a bf16 scale
+/// to the bf16 of scale * 2^24 (exact: a power of two; subnormals normalize within bf16) and refuses anything else.
+pub fn foldScale(scale: u16) !u16 {
+    const value: f32 = @bitCast(@as(u32, scale) << 16);
+    const folded: u32 = @bitCast(value * 16777216.0);
+    if (folded & 0xFFFF != 0 or !std.math.isFinite(value * 16777216.0)) return error.BadAffineMetadata;
+    return @intCast(folded >> 16);
+}
+
+/// foldScale over packed pairs' scale words (metadata_layout: [K/group][N][scale, bias]).
+pub fn foldScales(pairs: []u16) !void {
+    var i: usize = 0;
+    while (i < pairs.len) : (i += 2) pairs[i] = try foldScale(pairs[i]);
+}
+
 fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap: usize) !?Ranked {
     var seen = std.AutoHashMap(u32, u16).init(allocator);
     defer seen.deinit();
@@ -73,7 +90,7 @@ fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap
     for (keys, 0..) |key, r| {
         const id: usize = @intCast(key & 0xFFFF);
         rank[id] = @intCast(r);
-        words[r] = firsts[id];
+        words[r] = firsts[id]; // the pairs' scales arrive folded by 2^24 (foldScale)
     }
     for (ranks) |*at| at.* = rank[at.*];
     return .{ .words = words, .ranks = ranks };
@@ -174,8 +191,8 @@ pub const Layout = struct {
     reg_lean: bool = false,
     /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
     tile_batch: usize = 1,
-    /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
-    /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
+    /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's two SIMD groups each run a gate tile then its up
+    /// tile (64 columns); it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
@@ -185,6 +202,9 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
+    /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
+    residual: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -210,6 +230,7 @@ pub const Layout = struct {
         if (l.swiglu and l.prompt_tn != 1 and (l.prompt_tn != 2 or l.sk != 1 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
+        if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -293,6 +314,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
@@ -419,6 +441,8 @@ pub const Projection = struct {
     swiglu: bool = false,
     /// A swiglu launch's threads a group: four one-tile SIMD groups, or two two-tile ones (Layout.prompt_tn 2).
     swiglu_threads: usize = 128,
+    /// Built with Layout.residual: encodeResid only.
+    residual: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -432,7 +456,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -440,7 +464,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2) 64 else 128 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual };
     }
 
     pub fn deinit(p: Projection) void {
@@ -451,15 +475,30 @@ pub const Projection = struct {
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
     pub fn encode(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32) !void {
-        return p.encodeImpl(e, x, w, sb, null, y, rows);
+        if (p.residual) return error.InvalidSchedule;
+        return p.encodeImpl(e, x, w, sb, null, y, rows, null);
     }
 
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
     pub fn encodeSums(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32) !void {
         if (!p.reg) return error.SumsNeedReg;
+        if (p.residual) return error.InvalidSchedule;
         if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null);
+    }
+
+    /// A residual projection (Layout.residual): `ro` gets `h` + the output rows, each word rounded to bf16 first, as
+    /// q27_norm_xs forms the residual stream; no output rows are stored. `sums` null: the projection's own sums pass.
+    pub fn encodeResid(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: ?Sums, h: Ref, ro: Ref, rows: u32) !void {
+        if (!p.residual) return error.InvalidSchedule;
+        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (sums) |s| {
+            if (s.stride < rows) return error.InvalidRows;
+            try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
+        }
+        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
+        return p.encodeImpl(e, x, w, sb, sums, ro, rows, h);
     }
 
     /// A swiglu projection: `h` gets silu(gate) * up of the rows' bf16 gate/up words (N / 2 columns a row) and `hs` its
@@ -504,7 +543,7 @@ pub const Projection = struct {
         return .{ .ref = .{ .buf = buffer }, .stride = stride };
     }
 
-    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
+    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref) !void {
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
@@ -528,6 +567,11 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
+        if (hidden) |h| {
+            // TF_RESID: the hidden rows in, the residual rows (`y`) out
+            e.setBuffer(h.buf, h.off, 6);
+            e.setBuffer(y.buf, y.off, 7);
+        }
         e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
