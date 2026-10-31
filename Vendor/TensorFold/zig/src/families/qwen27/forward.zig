@@ -36,6 +36,8 @@ pub const Stages = struct {
     residual: Ref = undefined,
     head: Head = .all,
     tail: ?Tail = null,
+    /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
+    lead: ?Tail = null,
     after: ?Hook = null,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
@@ -44,6 +46,7 @@ pub const Stages = struct {
         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
         s.hidden = m.frame.get(.hidden);
         s.residual = m.frame.get(.residual);
+        if (s.lead) |t| try t.encode(t.ptr, lane.enc);
         try m.glue.embedding(lane.enc, m.config, m.weights.embed, m.frame.get(.ids), s.hidden, s.rows);
         lane.enc.barrier();
         if (s.images) |rows| {
@@ -146,6 +149,10 @@ pub const Stages = struct {
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
+    }
+    /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
+    pub fn polls(s: *const Stages) bool {
+        return s.rows <= 16;
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
