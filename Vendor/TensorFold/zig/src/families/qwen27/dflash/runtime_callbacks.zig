@@ -17,10 +17,7 @@ fn begin(ptr: *anyopaque) !u64 {
 }
 fn release(ptr: *anyopaque, epoch: u64) void {
     const b = backend(ptr);
-    if (epoch != b.frame.epoch) return;
-    // a frame abandoned before finish (an error path) now runs, and its context appends may overwrite ring rows
-    if (b.frame.active and !b.frame.completed) b.failed = true;
-    b.frame.release();
+    if (epoch == b.frame.epoch) b.frame.release();
 }
 fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode) !op.View {
     const b = backend(ptr);
@@ -39,15 +36,6 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         s.encode(e, try s.call(&b.simd.?, t.n, t.k, x.rows, false, false), t.matrix(), input.buf, input.off, output.buf, output.off);
     } else {
         const adapter = b.prepared.get(@intFromPtr(w.bytes.ptr)) orelse return error.DraftPreparationUnqualified;
-        try encodePrepared(b, e, x, y, adapter);
-        return y;
-    }
-    e.barrier();
-    return y;
-}
-/// A prepared adapter's projection of `x` into `y`, sharing the input sums of an earlier projection of the same view.
-fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y: op.View, adapter: @import("core").affine4_lane.Adapter) !void {
-    {
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
         const p = adapter.projection;
@@ -59,32 +47,14 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         if (b.input_sums) |s| {
             try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
         } else {
-            // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
-            const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
             var first: u32 = 0;
-            while (first < x.rows) : (first += step) {
-                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));
+            while (first < x.rows) : (first += 16) {
+                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, 16));
             }
             if (cacheable) b.input_sums = .{ .view = x, .sums = .{ .ref = .{ .buf = p.sums_buffer.? }, .stride = 16 } };
         }
     }
-}
-fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
-    const b = backend(ptr);
-    if (mode == .bf16_reference or b.fused_count == 0) return null;
-    const adapter = b.prepared.get(@intFromPtr(w.bytes.ptr) + kind) orelse return null;
-    errdefer b.input_sums = null;
-    const e = try b.encoder(epoch);
-    const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
-    try encodePrepared(b, e, x, y, adapter);
     return y;
-}
-fn sliceCols(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, width: u32) !op.View {
-    const b = backend(ptr);
-    _ = try b.encoder(epoch);
-    if (first > x.width or width > x.width - first) return error.DraftOperatorShape;
-    const r = try b.frame.ref(x);
-    return b.frame.add(.{ .buf = r.buf, .off = r.off + @as(usize, first) * 2 }, x.rows, width, x.stride, .bf16);
 }
 fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
     const b = backend(ptr);
@@ -189,4 +159,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
         made += 1;
     }
 }
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend };

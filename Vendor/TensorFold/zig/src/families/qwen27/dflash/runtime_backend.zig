@@ -9,7 +9,6 @@ const Target = @import("../model.zig").Model;
 const callbacks = @import("runtime_callbacks.zig");
 pub const Head = @import("runtime_head.zig").Head;
 pub const Frame = @import("runtime_frame.zig").Frame;
-pub const frame_mod = @import("runtime_frame.zig");
 pub const Ref = core.draft_ops.Ref;
 const caches_impl = @import("caches.zig");
 pub const Cache = caches_impl.Pair(mtl.Buffer);
@@ -48,12 +47,6 @@ pub const Tiled = struct {
     }
 };
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
-const Stashed = struct { prepared: core.affine4.Prepared, key: usize };
-pub const Stash = std.StringHashMapUnmanaged(Stashed);
-/// Fused weight groups: one prepared matrix of several linears' rows that share an input.
-pub const group_kv = 1;
-pub const group_qkv = 2;
-pub const group_gu = 3;
 /// Ops a draft frame encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const part_ops = 40;
 /// The first part is short, so the GPU starts while the rest is still being encoded.
@@ -81,8 +74,6 @@ pub const Backend = struct {
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
-    stash: ?*Stash = null,
-    fused_count: usize = 0,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -122,104 +113,33 @@ pub const Backend = struct {
         const order = if (units) try core.lane_projection.RegOrder.init(b.target.device) else null;
         defer if (order) |o| o.deinit();
         if (!units) b.simd = try simd.Pipelines.load(b.target.device);
-        var stash: Stash = .empty;
-        defer {
-            var it = stash.iterator();
-            while (it.next()) |entry| {
-                b.allocator.free(entry.key_ptr.*);
-                var p = entry.value_ptr.prepared;
-                p.deinit();
-            }
-            stash.deinit(b.allocator);
-        }
-        if (units) b.stash = &stash;
-        defer b.stash = null;
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(b.allocator);
         var kept = b.checkpoint.tensors.iterator();
         while (kept.next()) |entry| if (linear(entry.key_ptr.*, entry.value_ptr.rank)) {
             const t = entry.value_ptr.*;
-            try b.prepareOne(order, entry.key_ptr.*, @intFromPtr(t.buffer.contents() + t.offset), t.dtype, t.shape, t.host(u16));
+            try b.prepareOne(order, @intFromPtr(t.buffer.contents() + t.offset), t.dtype, t.shape, t.host(u16));
         };
         var later = b.checkpoint.deferred.iterator();
         while (later.next()) |entry| if (linear(entry.key_ptr.*, entry.value_ptr.rank)) {
             const d = entry.value_ptr.*;
             try rows.resize(b.allocator, d.bytes / 2);
             try b.checkpoint.read(entry.key_ptr.*, 0, std.mem.sliceAsBytes(rows.items));
-            try b.prepareOne(order, entry.key_ptr.*, @intFromPtr((try b.checkpoint.view(entry.key_ptr.*)).ptr), d.dtype, d.shape, rows.items);
+            try b.prepareOne(order, @intFromPtr((try b.checkpoint.view(entry.key_ptr.*)).ptr), d.dtype, d.shape, rows.items);
         };
-        const expected = b.config.linearCount();
-        if (b.stash != null) try b.buildGroups(order, &stash);
-        if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+        if ((if (units) b.prepared.count() else b.tiled.count()) != b.config.linearCount()) return error.DraftTensorCoverage;
     }
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
-    fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
+    fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
         var prepared_words = try core.affine4.prepare(b.allocator, rows, shape[0], shape[1]);
         defer prepared_words.deinit();
-        if (b.stash) |st| if (shortName(name)) |short| {
-            const layer = layerOf(name) orelse return error.DraftTensorCoverage;
-            var buf: [16]u8 = undefined;
-            const id = try std.fmt.bufPrint(&buf, "{d}{s}", .{ layer, short });
-            const owned = try b.allocator.dupe(u8, id);
-            errdefer b.allocator.free(owned);
-            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases) };
-            try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
-        };
         if (order) |o| {
             const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
-        }
-    }
-    fn shortName(name: []const u8) ?[]const u8 {
-        const table = [_][2][]const u8{ .{ "self_attn.q_proj.weight", "q" }, .{ "self_attn.k_proj.weight", "k" }, .{ "self_attn.v_proj.weight", "v" }, .{ "mlp.gate_proj.weight", "g" }, .{ "mlp.up_proj.weight", "u" } };
-        for (table) |t| if (std.mem.endsWith(u8, name, t[0])) return t[1];
-        return null;
-    }
-    fn layerOf(name: []const u8) ?usize {
-        const at = std.mem.indexOf(u8, name, "layers.") orelse return null;
-        const rest = name[at + 7 ..];
-        const end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
-        return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
-    }
-    fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
-        var n: usize = 0;
-        var k: usize = 0;
-        var buf: [16]u8 = undefined;
-        for (parts) |p| {
-            const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })) orelse return;
-            n += got.prepared.n;
-            if (k != 0 and k != got.prepared.k) return error.DraftPreparationUnqualified;
-            k = got.prepared.k;
-        }
-        const words = try b.allocator.alloc(u32, n * k / 8);
-        defer b.allocator.free(words);
-        const scales = try b.allocator.alloc(u16, n * k / 64);
-        defer b.allocator.free(scales);
-        const biases = try b.allocator.alloc(u16, n * k / 64);
-        defer b.allocator.free(biases);
-        var at: usize = 0;
-        for (parts) |p| {
-            const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })).?;
-            @memcpy(words[at * k / 8 ..][0..got.prepared.words.len], got.prepared.words);
-            @memcpy(scales[at * k / 64 ..][0..got.prepared.scales.len], got.prepared.scales);
-            @memcpy(biases[at * k / 64 ..][0..got.prepared.biases.len], got.prepared.biases);
-            at += got.prepared.n;
-        }
-        const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
-        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
-        try @import("../residency.zig").putPrepared(b, key, adapter);
-        b.fused_count += 1;
-    }
-    fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
-        for (0..b.config.layers) |layer| {
-            try b.fuse(order, st, layer, "kv", 'k', group_kv);
-            try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
-            try b.fuse(order, st, layer, "gu", 'g', group_gu);
         }
     }
     /// The draft's linears: its rank-2 weights, which q4 drafts read only through their prepared copies.
@@ -257,7 +177,7 @@ pub const Backend = struct {
         if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) try b.frame.part();
         return b.frame.encoder;
     }
-    pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32, stride: u32) !void {
-        try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
+    pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32) !void {
+        try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = width, .offset = 0 });
     }
 };

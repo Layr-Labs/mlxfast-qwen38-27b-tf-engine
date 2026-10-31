@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const frags = @import("frags.zig");
+pub const n16_qualification = @import("lane_n16_qualification.zig");
 
 pub const weight_layout = "u32[ceil(N/32)][K/group][32][group*bits/32], low-bit-first codes, columns past N zero";
 pub const reg_layout = "u32[N/32][K/64][2][32 lanes][4] 4-bit codes, regBlock order";
@@ -34,6 +35,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
+    /// Qualified 16-column tensor tiles read either half of the unchanged 32-column reg weight tile.
+    reg_n16: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
@@ -43,6 +46,7 @@ pub const Layout = struct {
         try l.format.validate();
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
         if (l.reg and (l.cooperative or l.format.bits != 4 or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
+        if (l.reg_n16 and (!l.reg or l.ranges.len != 0 or l.groups != null)) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
         if (l.y_stride) |s| if (s < l.n or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
@@ -78,8 +82,19 @@ pub const Layout = struct {
         return count;
     }
 
+    /// Dispatch geometry can be narrower than the physical packing geometry.
+    pub fn dispatchTiles(l: Layout) usize {
+        return l.tiles() * @as(usize, if (l.reg_n16) 2 else 1);
+    }
+
+    /// A bounded walk for multi-row register windows; sparse layouts retain their original grid.
+    pub fn groupedWalk(l: Layout) bool {
+        return l.reg and !l.reg_n16 and l.ranges.len == 0 and l.groups == null;
+    }
+
     pub fn threadgroupBytes(l: Layout) usize {
-        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * 16 * 32 * @sizeOf(f32);
+        const accumulators: usize = if (l.reg_n16) 8 else 16;
+        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * accumulators * 32 * @sizeOf(f32);
     }
 
     pub fn weightWords(l: Layout) usize {
@@ -117,6 +132,8 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.appendSlice(a, if (l.ranges.len == 0) "  return j;\n}\n" else "  return 0;\n}\n");
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
+    if (l.groupedWalk()) try text.appendSlice(a, "#define TF_GROUPED_WALK 1\n");
+    if (l.reg_n16) try text.appendSlice(a, "#define TF_REG_N16 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
@@ -236,6 +253,8 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    grouped_walk: bool = false,
+    reg_n16: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -257,7 +276,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.dispatchTiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .reg_n16 = l.reg_n16, .grouped_walk = l.groupedWalk() };
     }
 
     pub fn deinit(p: Projection) void {
@@ -280,6 +299,7 @@ pub const Projection = struct {
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32) !void {
+        if (p.reg_n16 and rows > 8) return error.InvalidRows;
         if (rows == 0 or rows > @as(u32, if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
@@ -303,7 +323,8 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        const grouped = p.grouped_walk and rows > 16;
+        e.dispatchGroups(mtl.Size.of(if (grouped) ((p.tile_count + 3) / 4) * ((blocks + 3) / 4) * 16 else p.tile_count, if (grouped) 1 else if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
@@ -337,6 +358,56 @@ fn checkRef(r: Ref, need: usize, alignment: usize) !void {
     if (r.off % alignment != 0) return error.MisalignedBuffer;
     const len = r.buf.length();
     if (r.off > len or need > len - r.off) return error.BufferTooSmall;
+}
+
+test "N16 dispatch halves preserve original weight layout and logical SK" {
+    var wide = Layout{ .n = 64, .k = 256, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .serial_sk2 = true };
+    const plain = try source(std.testing.allocator, wide);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_REG_N16 1\n") == null);
+    var narrow = wide;
+    narrow.reg_n16 = true;
+    const text = try source(std.testing.allocator, narrow);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_REG_N16 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SK 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SERIAL_SK2 1\n") != null);
+    try std.testing.expectEqual(wide.weightWords(), narrow.weightWords());
+    try std.testing.expectEqual(wide.metadataElements(), narrow.metadataElements());
+    try std.testing.expectEqual(wide.tileCount(), narrow.tileCount());
+    try std.testing.expectEqual(wide.dispatchTiles() * 2, narrow.dispatchTiles());
+    narrow.ranges = &.{.{ 0, 1 }};
+    try std.testing.expectError(error.UnsupportedRegFormat, narrow.validate());
+    narrow.ranges = &.{};
+    narrow.groups = .{ 0, 2 };
+    try std.testing.expectError(error.UnsupportedRegFormat, narrow.validate());
+    narrow.groups = null;
+    narrow.reg = false;
+    try std.testing.expectError(error.UnsupportedRegFormat, narrow.validate());
+    wide.reg = false;
+    wide.serial_sk2 = false;
+    try wide.validate();
+}
+
+test "N16 halves uniquely cover baseline output slots and preserve ordered split addresses" {
+    for (0..32) |lane_id| {
+        var covered: [16]bool = @splat(false);
+        for (0..2) |half| for (0..8) |i| {
+            const old_i = i + half * 8;
+            try std.testing.expect(!covered[old_i]);
+            covered[old_i] = true;
+            const mb = ((lane_id >> 1) & 3) + 4 * ((lane_id >> 4) & 1);
+            const nb = 4 * (lane_id & 1) + 8 * ((lane_id >> 3) & 1);
+            try std.testing.expectEqual(mb + 8 * ((old_i >> 2) & 1), mb + 8 * (i >> 2));
+            try std.testing.expectEqual(nb + 16 * (old_i >> 3) + (old_i & 3), half * 16 + nb + (i & 3));
+            for ([_]usize{ 1, 2, 4, 8 }) |sk| for (0..sk) |split| {
+                const slot = (split * 8 + i) * 32 + lane_id;
+                try std.testing.expectEqual((slot / 32) / 8, split);
+                try std.testing.expectEqual((slot / 32) % 8, i);
+            };
+        };
+        for (covered) |seen| try std.testing.expect(seen);
+    }
 }
 
 test "layouts reject unsupported formats, schedules, cuts and overlapping tile reads" {

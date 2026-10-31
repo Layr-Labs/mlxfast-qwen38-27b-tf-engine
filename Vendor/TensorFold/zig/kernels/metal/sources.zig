@@ -151,6 +151,7 @@ pub const flashnext_gen = @import("flashnext/sources_gen.zig");
 pub const packed_metallib = @import("nemotron_packed_metallib").bytes;
 /// The core lane projection (tensor units): every window row's sums in one weight read, and its row order.
 pub const core_lane_projection = @embedFile("core/lane_projection.metal");
+pub const core_lane_n16_qualification = @embedFile("core/lane_n16_qualification.metal");
 pub const core_lane_order = @embedFile("core/lane_order.metal");
 /// Lane rows attending a shared context through an explicit mask (core/shared_attention.zig).
 pub const core_shared_attention = @embedFile("core/shared_attention.metal");

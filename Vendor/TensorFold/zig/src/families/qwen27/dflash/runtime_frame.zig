@@ -108,10 +108,6 @@ pub const Frame = struct {
     pub fn release(f: *Frame) void {
         if (f.active and !f.completed) {
             f.encoder.end();
-            // an abandoned frame's buffer still goes to the queue: one left uncommitted holds a queue slot for good, and
-            // enough of them block every later commandBuffer() (a hang, not an error). The caller fails the backend.
-            f.cb.commit();
-            f.cb.wait();
             for (f.parts[0..f.part_count]) |cb| cb.wait(); // committed parts still use the pool
         }
         f.active = false;

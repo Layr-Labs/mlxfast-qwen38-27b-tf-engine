@@ -176,18 +176,6 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 #endif
 }
 
-// The same append from row-strided K and V (views into a fused projection's output).
-[[kernel]] void tf_lane_append_kv_strided(const device bfloat* K [[buffer(0)]], const device bfloat* V [[buffer(1)]],
-    constant uint* slots [[buffer(2)]], constant tf_context_args& args [[buffer(3)]],
-    device bfloat* cacheK [[buffer(4)]], device bfloat* cacheV [[buffer(5)]],
-    constant uint2& strides [[buffer(6)]], uint index [[thread_position_in_grid]]) {
-  const uint width = TF_KVH * TF_D;
-  if ((size_t)index >= (size_t)args.rows * width) return;
-  const uint row = index / width, column = index % width;
-  const size_t target = (size_t)slots[row] * width + column;
-  cacheK[target] = K[(size_t)row * strides.x + column]; cacheV[target] = V[(size_t)row * strides.y + column];
-}
-
 // Only newly produced rows are written. Prompt and previous-round cache slots are never copied or rewritten.
 [[kernel]] void tf_lane_append_kv(const device bfloat* K [[buffer(0)]], const device bfloat* V [[buffer(1)]],
     constant uint* slots [[buffer(2)]], constant tf_context_args& args [[buffer(3)]],

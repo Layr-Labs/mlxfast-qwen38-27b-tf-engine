@@ -10,8 +10,6 @@ const selector = @import("selector.zig");
 const Fake = struct {
     handle: u64 = 1,
     projects: u32 = 0,
-    fused_groups: u32 = 0,
-    fused_slices: u32 = 0,
     convolutions: u32 = 0,
     attends: u32 = 0,
     commits: u32 = 0,
@@ -41,26 +39,6 @@ const Fake = struct {
         f.projects += 1;
         var y = f.view(x.rows, @intCast(t.shape[0]));
         if (f.wrong_dtype) y.dtype = .f32;
-        return y;
-    }
-    fn projectGroup(ptr: *anyopaque, _: u64, x: op.View, _: ck.Tensor, kind: u32, _: op.Mode) !?op.View {
-        const f = self(ptr);
-        f.fused_groups += 1;
-        const c = fixtures.toy;
-        const width: u32 = switch (kind) {
-            1 => 2 * c.kvWidth(),
-            2 => c.qWidth() + 2 * c.kvWidth(),
-            3 => 2 * c.intermediate,
-            else => return error.FakeProjectionShape,
-        };
-        return f.view(x.rows, width);
-    }
-    fn sliceCols(ptr: *anyopaque, _: u64, x: op.View, first: u32, width: u32) !op.View {
-        if (first > x.width or width > x.width - first) return error.FakeProjectionShape;
-        const f = self(ptr);
-        f.fused_slices += 1;
-        var y = f.view(x.rows, width);
-        y.stride = x.stride;
         return y;
     }
     fn norm(ptr: *anyopaque, _: u64, x: op.View, n: op.Norm) !op.View {
@@ -136,9 +114,6 @@ const Fake = struct {
     }
     fn abort(ptr: *anyopaque, _: u64) void {
         self(ptr).aborts += 1;
-    }
-    fn fusedOps(f: *Fake) op.Ops {
-        return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend, .project_group = projectGroup, .slice_cols = sliceCols } };
     }
     fn ops(f: *Fake) op.Ops {
         return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend } };
@@ -327,23 +302,4 @@ test "tiny conditional score differences collapse before sibling selection" {
     defer tree.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, tree.tokens);
     try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1 }, tree.parents);
-}
-
-
-test "fused draft groups preserve projection shapes across absorb and tree" {
-    const a = std.testing.allocator;
-    var store = try fixtures.Store.init(a);
-    defer store.deinit();
-    var g = try store.graph(a);
-    defer g.deinit();
-    var fake = Fake{};
-    var state = try session.Session.init(fixtures.toy, 1, 0);
-    const p = op.Preparation{ .mode = .bf16_reference };
-    try state.absorb(fake.fusedOps(), &g, p, batch());
-    var tree = try state.tree(a, fake.fusedOps(), &g, p, 5, 3, .{});
-    defer tree.deinit();
-    try std.testing.expectEqual(@as(u32, 15), fake.fused_groups);
-    try std.testing.expectEqual(@as(u32, 35), fake.fused_slices);
-    try std.testing.expectEqual(@as(usize, 15), tree.tokens.len);
-    try std.testing.expectEqual(@as(u32, 5), fake.appends);
 }

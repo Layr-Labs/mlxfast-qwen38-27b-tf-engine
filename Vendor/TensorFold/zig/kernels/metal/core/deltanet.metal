@@ -608,36 +608,6 @@ kernel void tf_delta_gdn_post(device const bfloat* recurrence [[buffer(0)]],
   if (p.dv == 128) tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, group, lane);
   else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, group, lane);
 }
-
-// tf_delta_gdn_post_body<4> on bfloat4 rows: a simdgroup a row, 4 rows a group of 128.
-kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]],
-                         device const bfloat* gate [[buffer(1)]],
-                         device const void* norm [[buffer(2)]],
-                         constant TfDeltaParams& p [[buffer(3)]],
-                         device bfloat* output [[buffer(4)]],
-                         uint3 group [[threadgroup_position_in_grid]],
-                         uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-  const uint row = group.z * 4 + sg, head = group.y;
-  if (row >= p.rows || p.dv != 128) return;
-  const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
-  const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
-  float values[4];
-  float square = 0.0f;
-  for (uint part = 0; part < 4; ++part) {
-    values[part] = float(x[part]);
-    square += values[part] * values[part];
-  }
-  square = simd_sum(square);
-  const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
-  bfloat4 y;
-  for (uint part = 0; part < 4; ++part) {
-    const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
-    const float z = float(z4[part]);
-    y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
-  }
-  *(device bfloat4*)(output + at) = y;
-}
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
 kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]],

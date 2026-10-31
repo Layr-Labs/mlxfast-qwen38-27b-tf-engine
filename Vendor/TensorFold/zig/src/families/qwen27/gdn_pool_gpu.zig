@@ -157,7 +157,7 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
+        prepared.forward(scan.encoder);
         try scan.end();
     }
 
@@ -189,27 +189,20 @@ pub const Pool = struct {
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
-        prepared.gate(gate.encoder, pool.kernels.post_rows);
+        prepared.gate(gate.encoder);
         try gate.end();
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
         errdefer publication.cancel();
         const e = publication.encoder;
         if (pool.marks) |m| try m.convolution(layer, prepared, e, pool.kernels.mark_conv);
-        if (in_place and projectedWindows(plan.host, prepared.p.taps)) {
-            // no kept window reads its history: each lands there directly and nothing is left to publish
-            var direct = prepared;
-            direct.b.next_history = prepared.b.history;
-            direct.commitConv(e);
-            return publication.end();
-        }
         prepared.commitConv(e);
         e.setPipeline(pool.kernels.publish_conv);
         gdn.bind(e, .{prepared.b.next_history}, 0);
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(prepared.p, 2);
         gdn.bind(e, .{prepared.b.history}, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
         e.barrier();
         try publication.end();
     }
@@ -261,7 +254,7 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.setBuffer(next_history.buffer, next_history.offset, 6);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
     }
 
     /// After commitScan's fence: the new conv window into place, unfenced.
@@ -275,7 +268,7 @@ pub const Pool = struct {
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
@@ -372,16 +365,6 @@ pub var step_rounds = true;
 
 fn oneRowSegments(plan: Plan) bool {
     for (plan.segments) |segment| if (segment.rows != 1) return false;
-    return true;
-}
-
-/// Whether every kept window (a keep's last row's next conv window) reads projected rows alone.
-fn projectedWindows(plan: Plan, taps: u32) bool {
-    for (plan.keeps) |keep| {
-        if (keep.rows == 0) continue;
-        const row: usize = plan.kept_rows[keep.first + keep.rows - 1];
-        for (plan.windows[row * taps + 1 ..][0 .. taps - 1]) |source| if (source < taps - 1) return false;
-    }
     return true;
 }
 

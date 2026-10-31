@@ -127,12 +127,9 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
-  // keys from the group's last live row's own count on are masked for all its rows: those steps change nothing
-  const int first_row = int(tg.z) * (SG / 2) * 16, last_row = min(args.rows * PG, first_row + (SG / 2) * 16) - 1;
-  const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;
-  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
-  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+  for (; kt + PTK <= kend; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+  if (kt < kend) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
   if (!live) return;
   const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
   _Pragma("clang loop unroll(full)")

@@ -43,7 +43,6 @@ pub const Attention = struct {
     decode: mtl.Pipeline,
     rope: mtl.Pipeline,
     append: mtl.Pipeline,
-    append_strided: mtl.Pipeline,
     split: mtl.Pipeline,
     merge: mtl.Pipeline,
     /// encodeSplit's chunk partials: [16 rows][kv heads][chunks][query heads a kv head][head_dim + 2] fp32.
@@ -62,22 +61,19 @@ pub const Attention = struct {
         errdefer rope.deinit();
         const append = try mtl.Pipeline.init(device, lib, "tf_lane_append_kv", false);
         errdefer append.deinit();
-        const append_strided = try mtl.Pipeline.init(device, lib, "tf_lane_append_kv_strided", false);
-        errdefer append_strided.deinit();
         const split = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split", false);
         errdefer split.deinit();
         const merge = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge", false);
         errdefer merge.deinit();
         if (attend.simdWidth() != 32 or attend.maxThreads() < 32 or split.simdWidth() != 32 or merge.simdWidth() != 32) return error.UnsupportedAttentionPipeline;
         const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity, s.split_chunk) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .append_strided = append_strided, .split = split, .merge = merge, .part = part };
+        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .split = split, .merge = merge, .part = part };
     }
     pub fn deinit(p: Attention) void {
         p.attend.deinit();
         p.decode.deinit();
         p.rope.deinit();
         p.append.deinit();
-        p.append_strided.deinit();
         p.split.deinit();
         p.merge.deinit();
         p.part.deinit();
@@ -171,29 +167,6 @@ pub const Attention = struct {
     }
 
     /// Prepared K and unmodified V go directly to unique physical slots; caller orders subsequent attention.
-    /// appendKv from row-strided sources (element strides), no overlap checks beyond the cache's.
-    pub fn appendKvStrided(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, k_stride: u32, v_stride: u32) !void {
-        if (slots.len == 0 or slots.len > 16) return error.InvalidAppendView;
-        for (slots, 0..) |slot, i| {
-            if (slot >= p.shape.capacity) return error.InvalidAppendSlot;
-            for (slots[0..i]) |prior| if (prior == slot) return error.DuplicateAppendSlot;
-        }
-        const width = p.shape.kv_heads * p.shape.head_dim;
-        if (k_stride < width or v_stride < width) return error.InvalidAppendView;
-        try check(k, ((slots.len - 1) * k_stride + width) * 2, 2);
-        try check(v, ((slots.len - 1) * v_stride + width) * 2, 2);
-        try check(cache_k, p.shape.capacity * width * 2, 2);
-        try check(cache_v, p.shape.capacity * width * 2, 2);
-        e.setPipeline(p.append_strided);
-        e.setBuffer(k.buf, k.off, 0);
-        e.setBuffer(v.buf, v.off, 1);
-        e.setBytes(std.mem.sliceAsBytes(slots), 2);
-        e.setValue(Args{ .rows = @intCast(slots.len) }, 3);
-        e.setBuffer(cache_k.buf, cache_k.off, 4);
-        e.setBuffer(cache_v.buf, cache_v.off, 5);
-        e.setValue([2]u32{ k_stride, v_stride }, 6);
-        e.dispatchThreads(mtl.Size.of(slots.len * width, 1, 1), mtl.Size.of(128, 1, 1));
-    }
     pub fn appendKv(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref) !void {
         if (slots.len == 0 or slots.len > 16) return error.InvalidAppendView;
         for (slots, 0..) |slot, i| {
