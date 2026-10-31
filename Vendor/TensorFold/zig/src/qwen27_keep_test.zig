@@ -30,7 +30,7 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
     for ([_]bool{ false, true }) |empty_second| {
         var pool: gpu.Pool = undefined;
         pool.budget = try @import("families/qwen27/gdn_pool.zig").Budget.init(shape, 1, 2, 2);
-        pool.before = null;
+        pool.before = null; pool.residency = null; pool.marks = null;
         pool.before_slots = 0;
         pool.profiler = null;
         pool.tree_mode = .auto;
@@ -40,6 +40,9 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         }
         defer for (pool.buffers) |b| a.free(b.data);
         pool.kernels = undefined;
+        pool.kernels.tree_pair = .{ .id = 10 };
+        pool.kernels.post_rows = .{ .id = 3 };
+        pool.kernels.star_pair = .{ .id = 12 };
         pool.kernels.pipelines = .{ .pre = .{ .id = 0 }, .tree = .{ .id = 1 }, .replay = .{ .id = 2 }, .post = .{ .id = 3 }, .conv_commit = .{ .id = 4 }, .tree_slots = .{ .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 }, .{ .id = 13 }, .{ .id = 14 } } };
         pool.kernels.publish_conv = .{ .id = 8 };
         const bytes = 2 * shape.state * 4;
