@@ -336,8 +336,10 @@ pub const Attention = struct {
             try disjoint(out, q_bytes, gate, 2 * q_bytes);
         }
         if (sums) |s| {
-            if (s.stride < plan.rows or a.promptPath(plan, prompt)) return error.TargetAttentionShape;
-            try span(s.ref, ((@as(usize, g.heads) * g.dim / 64 - 1) * s.stride + plan.rows) * 4);
+            if (s.stride < plan.rows) return error.TargetAttentionShape;
+            // The prompt merge also zeroes padded rows; its last group needs the complete stride.
+            const sum_rows = if (a.promptPath(plan, prompt)) s.stride else plan.rows;
+            try span(s.ref, ((@as(usize, g.heads) * g.dim / 64 - 1) * s.stride + sum_rows) * 4);
         }
         const operands = [_]struct { ref: Ref, bytes: usize }{ .{ .ref = q, .bytes = q_bytes }, .{ .ref = k, .bytes = kv_bytes }, .{ .ref = v, .bytes = v_bytes }, .{ .ref = out, .bytes = q_bytes } };
         for (caches) |cache| for (operands) |operand| {
@@ -363,20 +365,13 @@ pub const Attention = struct {
         }
         if (a.promptPath(plan, prompt)) {
             e.barrier();
-            try a.promptRows(e, scratch, binding, plan, out);
-            if (raw_gate) |gate| {
-                e.setPipeline(a.io[9]);
-                bind(e, .{ out, gate });
-                e.setValue(glue.Element{ .width = g.dim, .heads = g.heads, .rows = plan.rows, .activation = .bf16 }, 2);
-                e.setBuffer(out.buffer, out.offset, 3);
-                e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
-                e.barrier();
-            }
+            // The merge retains normalized BF16 rounding, then gates and writes ordered group sums.
+            try a.promptRows(e, scratch, binding, plan, out, raw_gate, sums);
         } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
-    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, out: Ref) !void {
+    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, out: Ref, raw_gate: ?Ref, sums: ?Sums) !void {
         const g = plan.geometry;
         const start: i32 = plan.meta[planning.global_words + 4];
         for (plan.positions, 0..) |position, i| if (position != start + @as(i32, @intCast(i))) return error.PromptRowsNotChain; // the kernel places row i at start + i
@@ -399,7 +394,15 @@ pub const Attention = struct {
         bind(e, .{ scratch.get(parts[0]), scratch.get(parts[1]), scratch.get(parts[2]) });
         e.setValue(args, 3);
         e.setBuffer(out.buffer, out.offset, 4);
-        e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
+        const gate = raw_gate orelse out;
+        e.setBuffer(gate.buffer, gate.offset, 5);
+        const xs = if (sums) |s| s.ref else scratch.get(.pma);
+        e.setBuffer(xs.buffer, xs.offset, 6);
+        e.setValue(@as(u32, if (sums) |s| s.stride else 0), 7);
+        e.setValue(@as(u32, @intFromBool(raw_gate != null)), 8);
+        // Padded sum rows return before reading partials or addressing the output buffer.
+        const merge_rows = if (sums) |s| s.stride else plan.rows;
+        e.dispatchGroups(mtl.Size.of(g.kv_heads, merge_rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
