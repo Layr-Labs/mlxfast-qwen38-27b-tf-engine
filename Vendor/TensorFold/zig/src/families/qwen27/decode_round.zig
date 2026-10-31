@@ -326,12 +326,12 @@ pub const Runner = struct {
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
         const rows = @import("core").tree_commit_gpu.Ref{ .buf = m.kept_rows.buffer, .off = m.kept_rows.offset };
-        try ops.metadata(e, result, keep_ref, rows, null, p);
         // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
         // copy every kept row onto itself
         const moves = !chainWindow(round.windows[0].parents);
-        // every attention layer's keep map beside the GDN metadata, under its one barrier: each map is its own binding's
-        // buffer, and the shared keep/rows words they rewrite hold the same values the first dispatch writes
+        // the keep map depends only on the verify result, never on the layer: the first attention binding's map is
+        // written once, by the dispatch that writes the GDN keep and rows, and every layer's gather and scatter read it
+        var shared_map: ?@import("core").tree_commit_gpu.Ref = null;
         if (moves) {
             var ai: usize = 0;
             for (r.model.weights.layers) |layer| switch (layer.mixer) {
@@ -340,12 +340,15 @@ pub const Runner = struct {
                     var views: [attn.planning.max_streams]attn.Cache = undefined;
                     const caches = r.layerCaches(ai, round, &views);
                     try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
-                    const map = r.bindings[ai].get(.keep_map);
-                    try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
                     ai += 1;
                 },
             };
+            if (ai > 0) {
+                const map = r.bindings[0].get(.keep_map);
+                shared_map = .{ .buf = map.buffer, .off = map.offset };
+            }
         }
+        try ops.metadata(e, result, keep_ref, rows, shared_map, p);
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
@@ -379,7 +382,7 @@ pub const Runner = struct {
         var table: [attn.max_keep_layers]attn.KeepLayer = undefined;
         if (ai > table.len) return error.AttentionKeep;
         const words: u32 = @intCast(lane / 2);
-        try r.attention.keepGatherLayers(e, r.bindings[0..ai], p.rows, table[0..ai], lanes, words);
+        try r.attention.keepGatherLayers(e, r.bindings[0..ai], p.rows, r.bindings[0].get(.keep_map), table[0..ai], lanes, words);
         e.barrier();
         r.attention.keepScatterLayers(e, g, p.rows, table[0..ai], lanes, words);
         e.barrier();
@@ -500,7 +503,9 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
+        const merged = !prepacked and rows <= 16 and r.model.kernels.takesSums(weights.out);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (merged) attn.Sums{ .ref = f.get(.sums), .stride = @import("quant_gpu.zig").padded(rows) } else null);
+        f.out_sums = merged;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {

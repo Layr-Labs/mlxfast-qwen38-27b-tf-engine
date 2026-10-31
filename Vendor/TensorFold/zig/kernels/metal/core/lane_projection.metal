@@ -370,12 +370,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     xp += stride;
 #else
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+  const device uint4* sq = sbv + (size_t)(first < last ? first : 0) * (TF_N / 4) + (size_t)(n0 + nb) / 4;
+  const device float* xs = XS + (size_t)(first < last ? first : 0) * stride + mb;
+  const device uint4* wp = wl + (size_t)(first < last ? first : 0) * TF_TB * 64;
+  if (first < last) { nw0 = wp[0]; nw1 = wp[32]; }
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
+    const tf_reg_load cur = {nw0, nw1, sq[0], sq[4], xs[0], 0.0f};
 #else
-    const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+    const tf_reg_load cur = {nw0, nw1, sq[0], sq[4], xs[0], xs[8]};
 #endif
 #endif
 #else
@@ -400,7 +403,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = cp[32];
 #else
-    { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+    sq += TF_N / 4;
+    xs += stride;
+    if (g + 1 < last) wp += TF_TB * 64;
+    nw0 = wp[0]; nw1 = wp[32];
 #endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);

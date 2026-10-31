@@ -6,6 +6,8 @@ const Ref = @import("projection.zig").Ref;
 const glue = @import("glue.zig");
 pub const planning = @import("attention_plan.zig");
 pub const Plan = planning.Plan;
+/// A projection input's group sums: [group * stride + row], fp32.
+pub const Sums = struct { ref: Ref, stride: u32 };
 pub const Cache = struct { keys: Ref, values: Ref, capacity: u32, key_stride: u32 = 0, value_stride: u32 = 0 };
 const CachePtrs = extern struct { keys: u64, values: u64 };
 const PackArgs = extern struct { rows: u32, packed_rows: u32, heads: u32 = 24, kv_heads: u32 = 4, dim: u32 = 256, group: u32 = 6, v_stride: u32 = 4 * 256 };
@@ -311,7 +313,8 @@ pub const Attention = struct {
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool) !void {
+    /// `sums`: the merge also writes `out`'s group sums there (decoded and tree rows only), for the projection that reads `out` next.
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -328,6 +331,10 @@ pub const Attention = struct {
         try span(k, kv_bytes);
         try span(v, v_bytes);
         try span(out, q_bytes);
+        if (sums) |s| {
+            if (a.promptPath(plan, prompt) or s.stride < plan.rows) return error.TargetAttentionShape;
+            try spanAligned(s.ref, @as(usize, g.heads) * g.dim / 64 * s.stride * 4, 4);
+        }
         if (raw_gate) |gate| {
             try span(gate, 2 * q_bytes);
             try disjoint(out, q_bytes, gate, 2 * q_bytes);
@@ -365,7 +372,7 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -396,7 +403,7 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
@@ -435,6 +442,9 @@ pub const Attention = struct {
         e.setPipeline(a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 10);
+        const xs = if (sums) |s| s.ref else out;
+        e.setBuffer(xs.buffer, xs.offset, 11);
+        e.setValue(if (sums) |s| s.stride else 0, 12);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
@@ -491,12 +501,13 @@ pub const Attention = struct {
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
-    /// `lanes`, each `lane_words` bf16 words; `layers` receives the per-binding table the scatter reuses.
-    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
+    /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding shares; `layers` receives the
+    /// per-binding table the scatter reuses.
+    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, map: Ref, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
         if (bindings.len == 0 or bindings.len > max_keep_layers or layers.len != bindings.len) return error.AttentionKeep;
         for (bindings, layers) |*binding, *layer| {
             if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
-            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(binding.get(.keep_map)) };
+            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(map) };
         }
         if (kept == 0) return;
         const g = bindings[0].limits.geometry;

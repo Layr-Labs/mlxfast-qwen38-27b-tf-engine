@@ -142,6 +142,11 @@ pub const Kernels = struct {
         return p;
     }
 
+    /// Whether `quant` of `p` on decoded rows takes its input's group sums from the producer (the lane kernel on sums).
+    pub fn takesSums(k: *const Kernels, p: projection.Linear) bool {
+        return !k.prompt and p.runs.len == 0 and p.raw == null and p.bits == 4 and p.group == 64 and p.tile == 32;
+    }
+
     pub fn quant(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32) !void {
         return k.quantSkip(input_encoder, p, x, xs, dims, y, rows, 0);
     }
