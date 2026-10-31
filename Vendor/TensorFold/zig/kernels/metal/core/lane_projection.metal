@@ -281,7 +281,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_PAIRED_SK4)
+[[max_total_threads_per_threadgroup(64)]]
+#elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
@@ -307,9 +309,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_PAIRED_SK4)
+  threadgroup float part[2 * 16 * 32];
+#endif
+#if defined(TF_SERIAL_SK2) || defined(TF_PAIRED_SK4)
   float C0[16];
+#if defined(TF_PAIRED_SK4)
+  for (int split = ks * 2; split < (ks + 1) * 2; split++) {
+#else
   for (int split = 0; split < TF_SK; split++) {
+#endif
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
@@ -340,7 +349,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
     }
   }
-#if defined(TF_SERIAL_SK2)
+#if defined(TF_PAIRED_SK4)
+    if (ks == 0) {
+      if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+      else for (int i = 0; i < 16; i++) C0[i] += C[i];
+    } else for (int i = 0; i < 16; i++) part[((split - 2) * 16 + i) * 32 + lane] = C[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) {
+    for (int i = 0; i < 16; i++) C[i] = C0[i];
+    for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) C[i] += part[(s2 * 16 + i) * 32 + lane];
+  }
+#elif defined(TF_SERIAL_SK2)
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
