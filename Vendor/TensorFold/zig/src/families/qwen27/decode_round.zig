@@ -348,7 +348,15 @@ pub const Runner = struct {
         }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
+        // a depth-one window keeps at most its root and one child: the stash holds them for the verifies that follow
+        const same_slot = r.gdn.fold_rounds == 0 or r.gdn.fold_slot == round.slots[0];
+        r.gdn.fold = r.gdn.stash != null and round.slots.len == 1 and recurrent.segments.len == 1 and same_slot and r.gdn.fold_rounds < @import("gdn_pool_gpu.zig").Pool.fold_limit and depthOneWindow(round.windows[0].parents);
+        defer r.gdn.fold = false;
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
+        if (r.gdn.fold) {
+            r.gdn.fold_rounds += 1;
+            r.gdn.fold_slot = round.slots[0];
+        }
         e.barrier();
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
         // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
@@ -383,6 +391,12 @@ pub const Runner = struct {
         e.barrier();
         r.attention.keepScatterLayers(e, g, p.rows, table[0..ai], lanes, words);
         e.barrier();
+    }
+
+    /// Whether every row but the root hangs from the root (depth one), so a kept path has at most two rows.
+    fn depthOneWindow(parents: []const i32) bool {
+        for (parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else 0)) return false;
+        return parents.len >= 2;
     }
 
     /// Whether every row's parent is the row before it (a chain), so any kept path is a prefix of the rows.
@@ -421,6 +435,25 @@ pub const Runner = struct {
     pub fn readingSlot(r: *Runner, slot: u32, cb: mtl.CommandBuffer) void {
         r.settleSlot(slot);
         r.reading[slot] = cb.retain();
+    }
+
+    /// The DeltaNet stash's rounds (gdn_pool_gpu.Pool.fold_rounds) applied in place, for readers of the committed state.
+    pub fn flushFold(r: *Runner) !void {
+        if (r.gdn.fold_rounds == 0) return;
+        if (r.failed or r.active != null) return error.RoundNotReady;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = r.model.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        const flushed = r.gdn.flushFold(e);
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (gpuFailed(cb, "a DeltaNet stash flush")) {
+            r.failed = true;
+            return error.RoundGpuFailure;
+        }
+        return flushed;
     }
 
     pub fn reset(r: *Runner, slot: u32) !void {

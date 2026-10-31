@@ -64,11 +64,56 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// A layer a stride: depth-one rounds' kept rows, which their keeps stash instead of replaying them (fold). The
+    /// verifies that follow apply the `fold_rounds` stashed rounds to `fold_slot`'s loaded state; the one that finds
+    /// `fold_limit` of them writes the state back in place, and the stash starts over.
+    stash: ?metal.Buffer = null,
+    fold: bool = false,
+    fold_rounds: u32 = 0,
+    fold_slot: u32 = 0,
+    pub const fold_limit: u32 = 4; // TF_FOLD_ROUNDS in deltanet_slots.metal
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
+        if (pool.residency) |f| if (pool.stash) |b| f.leave(f.ctx, b);
         pool.residency = hook;
         if (hook) |f| metal.resident.fields.apply(pool, f, true);
+        if (hook) |f| if (pool.stash) |b| f.join(f.ctx, b);
+    }
+
+    /// Bytes of one layer's stash: two rows a round of keys, values, decays and mixings, then each round's row count.
+    fn stashStride(pool: *const Pool) !usize {
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(1, pool.budget.slots, kinds);
+        const rows: usize = 2 * fold_limit;
+        const bytes = rows * (@as(usize, p.nk) * p.dk + @as(usize, p.nv) * p.dv) * 2 + rows * @as(usize, p.nv) * 6 + fold_limit * 4;
+        return std.mem.alignForward(usize, bytes, 256);
+    }
+
+    fn stashSpan(pool: *const Pool, layer: usize) !gdn.Span {
+        const buffer = pool.stash orelse return error.MissingGdnStash;
+        const stride = try pool.stashStride();
+        return .{ .buffer = buffer, .offset = layer * stride, .bytes = stride };
+    }
+
+    /// The stashed rounds applied to their slot's state in place, before any work but a verify that takes them.
+    pub fn flushFold(pool: *Pool, e: metal.ComputeEncoder) !void {
+        if (pool.fold_rounds == 0) return;
+        const rounds = pool.fold_rounds;
+        pool.fold_rounds = 0;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(1, pool.budget.slots, kinds);
+        e.barrier();
+        e.setPipeline(pool.kernels.unstash);
+        for (0..pool.budget.layers) |layer| {
+            (try pool.layerSpan(.state, layer)).bind(e, 0);
+            (try pool.stashSpan(layer)).bind(e, 1);
+            e.setValue(p, 2);
+            e.setValue(pool.fold_slot, 3);
+            e.setValue(rounds, 4);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv }, .{ .width = 32, .height = 4 });
+        }
+        e.barrier();
     }
 
     /// One state a slot: every round's keeps stay in their slots and update them in place.
@@ -78,7 +123,9 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        var pool: Pool = .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        if (shape.c.dk == 128 and shape.c.dv == 128) pool.stash = device.buffer(layers * (pool.stashStride() catch 0), metal.ResourceOptions.shared | metal.ResourceOptions.untracked) catch null;
+        return pool;
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -97,6 +144,7 @@ pub const Pool = struct {
     pub fn deinit(pool: *Pool) void {
         pool.setResident(null);
         pool.releaseBefore();
+        if (pool.stash) |b| b.deinit();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
     }
@@ -152,7 +200,17 @@ pub const Pool = struct {
 
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
-        const prepared = try pool.round(layer, plan, refs, false);
+        var prepared = try pool.round(layer, plan, refs, false);
+        if (pool.fold_rounds > 0) {
+            // the stashed rounds go into this verify's slot kernels when they load their slot's root state; the verify
+            // that finds the stash full writes the state with them back in place
+            if (plan.host.segments.len == 1 and plan.host.segments[0].state_slot == pool.fold_slot and prepared.usesSlots()) {
+                const back = pool.fold_rounds == fold_limit;
+                prepared.b.stash = try pool.stashSpan(layer);
+                prepared.fold = pool.fold_rounds | (if (back) @as(u32, 256) else 0);
+                if (back and layer + 1 == pool.budget.layers) pool.fold_rounds = 0;
+            } else try pool.flushFold(e);
+        }
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
@@ -169,6 +227,7 @@ pub const Pool = struct {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
             for (0..segment.rows) |row| if (plan.host.parents[segment.first + row] != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
         }
+        try pool.flushFold(input_encoder);
         // Each scan thread reads and writes only its own state words, so a chain that keeps its slots scans in place.
         var prepared = try pool.round(layer, plan, refs, true);
         const in_place = inPlace(plan.host);
@@ -216,6 +275,7 @@ pub const Pool = struct {
     }
 
     pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try pool.flushFold(e);
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         try plan.metadata.upload(plan.host);
         return pool.commitDevice(layer, plan, e);
@@ -244,7 +304,19 @@ pub const Pool = struct {
         const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (segment.rows > 1 or keep.rows == 0) break true;
         } else false;
-        if (replays) {
+        if (pool.fold) {
+            // a depth-one round's kept rows wait in the stash, as its round `fold_rounds`, for the verifies that follow
+            e.setPipeline(pool.kernels.stash);
+            gdn.bind(e, .{ try pool.layerSpan(.key, layer), try pool.layerSpan(.value, layer), try pool.layerSpan(.decay, layer), try pool.layerSpan(.mixing, layer) }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 4);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 5);
+            e.setValue(p, 6);
+            (try pool.stashSpan(layer)).bind(e, 7);
+            e.setValue(pool.fold_rounds, 8);
+            e.dispatchThreads(.{ .width = 256, .height = 2 }, .{ .width = 256 });
+        } else if (replays) {
+            // a replay starts from the state with the stashed rounds in it
+            try pool.flushFold(e);
             e.setPipeline(pool.kernels.pipelines.replay);
             e.setBuffer(m.segments.buffer, m.segments.offset, 9);
             ((try pool.beforeSpan(layer, plan.host, pool.advances(plan.host))) orelse state).bind(e, 10);
@@ -281,6 +353,7 @@ pub const Pool = struct {
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
+        if (pool.fold_slot == slot) pool.fold_rounds = 0;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
         const p = try pool.budget.shape.params(1, pool.budget.slots, k);
         e.setPipeline(pool.kernels.clear);
