@@ -178,6 +178,22 @@ pub const Round = struct {
         r.gate(e, post_rows);
     }
 
+    /// Two live states; each four-column SIMD group preserves each original four-channel partial.
+    pub fn forwardPacked(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside) !void {
+        if (!r.usesSlots() or r.slot_kernel != 1 or r.p.dv % 4 != 0) return r.forward(e, post_rows, beside);
+        e.setPipeline(pair);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+        e.setValue(r.p, 8);
+        bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
+        r.b.slot_steps.bind(e, 11);
+        r.b.state.bind(e, 12);
+        (r.b.before orelse r.b.state).bind(e, 13);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 4, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        if (beside) |b| try b.encode(b.ptr, e);
+        e.barrier();
+        r.gate(e, post_rows);
+    }
+
     /// `post_rows`: tf_delta_gdn_post_rows, as `gate` takes it.
     pub fn forward(r: Round, e: metal.ComputeEncoder, post_rows: metal.Pipeline, beside: ?Beside) !void {
         e.setPipeline(if (r.usesSlots()) r.pipelines.tree_slots[r.slot_kernel] else r.pipelines.tree);

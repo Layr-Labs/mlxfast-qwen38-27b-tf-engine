@@ -159,7 +159,11 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.slot_kernel == 1) {
+            try prepared.forwardPacked(scan.encoder, pool.kernels.packed_tree, pool.kernels.post_rows, beside);
+        } else {
+            try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        }
         try scan.end();
     }
 
@@ -250,7 +254,8 @@ pub const Pool = struct {
             if (segment.rows > 1 or keep.rows == 0) break true;
         } else false;
         if (replays) {
-            e.setPipeline(pool.kernels.pipelines.replay);
+            const use_packed = p.dk == 128 and p.dv % 4 == 0;
+            e.setPipeline(if (use_packed) pool.kernels.packed_replay else pool.kernels.pipelines.replay);
             e.setBuffer(m.segments.buffer, m.segments.offset, 9);
             ((try pool.beforeSpan(layer, plan.host, pool.advances(plan.host))) orelse state).bind(e, 10);
             gdn.bind(e, .{ try pool.layerSpan(.key, layer), try pool.layerSpan(.value, layer), try pool.layerSpan(.decay, layer), try pool.layerSpan(.mixing, layer), state }, 0);
@@ -258,7 +263,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
-            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
+            e.dispatchThreads(.{ .width = 32, .height = if (use_packed) p.dv / 4 else p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
         }
         e.setPipeline(pool.kernels.pipelines.conv_commit);
         gdn.bind(e, .{ history, try pool.layerSpan(.qkv, layer) }, 0);

@@ -128,3 +128,143 @@ TF_TREE_SLOTS(2)
 TF_TREE_SLOTS(4)
 TF_TREE_SLOTS(8)
 TF_TREE_SLOTS(16)
+
+// Packed reduction layout: Apple mlx-lm a63e24c389382619eb6d9af656e3b46024be217a.
+// License: LICENSES/MLX-LM-MIT.txt. Original four-channel dot order is retained.
+// Standalone prototype. Reduction packing follows Apple mlx-lm gated_delta.py,
+// commit a63e24c389382619eb6d9af656e3b46024be217a (MIT, Copyright Apple Inc.).
+// Each original four-channel dot remains sequential; only the reduction placement changes.
+template <uint LANES>
+inline float tf_gdn_packed_reduce(thread float* parts) {
+  constexpr uint PARTS = 32 / LANES;
+  _Pragma("clang loop unroll(full)")
+  for (uint stride = 1; stride < PARTS; stride *= 2) {
+    _Pragma("clang loop unroll(full)")
+    for (uint j = 0; j < PARTS; j += 2 * stride) parts[j] = parts[j] + parts[j + stride];
+  }
+  float sum = parts[0];
+  _Pragma("clang loop unroll(full)")
+  for (uint stride = 1; stride < LANES; stride *= 2) sum = sum + simd_shuffle_xor(sum, stride);
+  return sum;
+}
+template <uint LANES>
+kernel void tf_delta_gdn_packed_slots2(device const bfloat* query [[buffer(0)]],
+ device const bfloat* key [[buffer(1)]], device const bfloat* value [[buffer(2)]],
+ device const float* decay [[buffer(3)]], device const bfloat* mixing [[buffer(4)]],
+ device const float* committed [[buffer(5)]], device const int* parents [[buffer(6)]],
+ device const TfDeltaSegment* segments [[buffer(7)]], constant TfDeltaParams& p [[buffer(8)]],
+ device bfloat* output [[buffer(9)]], device float* snapshots [[buffer(10)]],
+ device const TfDeltaSlotStep* steps [[buffer(11)]], device float* advanced [[buffer(12)]],
+ device float* before [[buffer(13)]], uint3 position [[thread_position_in_grid]],
+ uint lane [[thread_index_in_simdgroup]]) {
+ constexpr uint VALUES = 128 / LANES, PARTS = VALUES / 4, COLUMNS = 32 / LANES;
+ const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+ const uint sub = lane % LANES, dimension = position.y * COLUMNS + lane / LANES;
+ const uint key_head = head / (p.nv / p.nk);
+ const TfDeltaSegment span = segments[segment_index];
+ const uint state_stride = p.nv * p.dv * p.dk;
+ const uint column = (head * p.dv + dimension) * p.dk + sub * VALUES;
+ float root[VALUES], kept0[VALUES], kept1[VALUES], last[VALUES];
+ _Pragma("clang loop unroll(full)")
+ for (uint j = 0; j < VALUES; ++j) {
+  root[j] = committed[span.state_slot * state_stride + column + j];
+  kept0[j] = 0.0f; kept1[j] = 0.0f; last[j] = root[j];
+ }
+ for (uint at = 0; at < span.rows; ++at) {
+  const TfDeltaSlotStep step = steps[span.first + at];
+  float state[VALUES], partial[PARTS];
+  _Pragma("clang loop unroll(full)")
+  for (uint j = 0; j < VALUES; ++j) state[j] = step.read_slot == 0 ? kept0[j] : step.read_slot == 1 ? kept1[j] : root[j];
+  const uint row = step.row, rh = row * p.nv + head;
+  const device bfloat* k = key + (row * p.nk + key_head) * p.dk + sub * VALUES;
+  const device bfloat* q = query + (row * p.nk + key_head) * p.dk + sub * VALUES;
+  const float forget = decay[rh];
+  _Pragma("clang loop unroll(full)")
+  for (uint pb = 0; pb < PARTS; ++pb) {
+   float acc = 0.0f;
+   _Pragma("clang loop unroll(full)")
+   for (uint j = 0; j < 4; ++j) {
+    const uint i = 4 * pb + j;
+    state[i] = state[i] * forget;
+    acc += state[i] * float(k[i]);
+   }
+   partial[pb] = acc;
+  }
+  const float remembered = tf_gdn_packed_reduce<LANES>(partial);
+  const float correction = (float(value[rh * p.dv + dimension]) - remembered) * float(mixing[rh]);
+  _Pragma("clang loop unroll(full)")
+  for (uint j = 0; j < VALUES; ++j) state[j] = state[j] + float(k[j]) * correction;
+  _Pragma("clang loop unroll(full)")
+  for (uint pb = 0; pb < PARTS; ++pb) {
+   float acc = 0.0f;
+   _Pragma("clang loop unroll(full)")
+   for (uint j = 0; j < 4; ++j) { const uint i = 4 * pb + j; acc += state[i] * float(q[i]); }
+   partial[pb] = acc;
+  }
+  const float result = tf_gdn_packed_reduce<LANES>(partial);
+  if (sub == 0) output[rh * p.dv + dimension] = bfloat(result);
+  _Pragma("clang loop unroll(full)")
+  for (uint j = 0; j < VALUES; ++j) {
+   if (step.write_slot == 0) kept0[j] = state[j];
+   if (step.write_slot == 1) kept1[j] = state[j];
+   last[j] = state[j];
+  }
+ }
+ if (p.advance != 0 && span.rows == 1) {
+  _Pragma("clang loop unroll(full)")
+  for (uint j = 0; j < VALUES; ++j) {
+   const uint at = span.state_slot * state_stride + column + j;
+   before[at] = root[j]; advanced[at] = last[j];
+  }
+ }
+}
+#define TF_GDN_PACKED(L) template [[host_name("tf_delta_gdn_packed_slots2_" #L)]] kernel void tf_delta_gdn_packed_slots2<L>(device const bfloat*,device const bfloat*,device const bfloat*,device const float*,device const bfloat*,device const float*,device const int*,device const TfDeltaSegment*,constant TfDeltaParams&,device bfloat*,device float*,device const TfDeltaSlotStep*,device float*,device float*,uint3,uint);
+TF_GDN_PACKED(8)
+
+template <uint LANES>
+kernel void tf_delta_gdn_packed_replay(device const bfloat* key [[buffer(0)]],
+ device const bfloat* value [[buffer(1)]], device const float* decay [[buffer(2)]],
+ device const bfloat* mixing [[buffer(3)]], device const float* committed [[buffer(4)]],
+ device const uint* kept_rows [[buffer(5)]], device const TfDeltaKeep* keeps [[buffer(6)]],
+ constant TfDeltaParams& p [[buffer(7)]], device float* next [[buffer(8)]],
+ device const TfDeltaSegment* segments [[buffer(9)]], device const float* before [[buffer(10)]],
+ uint3 position [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+ constexpr uint VALUES = 128 / LANES, PARTS = VALUES / 4, COLUMNS = 32 / LANES;
+ const uint segment = position.z / p.nv, head = position.z % p.nv;
+ const uint sub = lane % LANES, dimension = position.y * COLUMNS + lane / LANES;
+ const uint key_head = head / (p.nv / p.nk), state_stride = p.nv * p.dv * p.dk;
+ const uint column = (head * p.dv + dimension) * p.dk + sub * VALUES;
+ const TfDeltaKeep keep = keeps[segment];
+ if (p.advance != 0 && segments[segment].rows == 1) {
+  if (keep.rows == 0) {
+   _Pragma("clang loop unroll(full)")
+   for (uint j = 0; j < VALUES; ++j) next[keep.next_slot * state_stride + column + j] = before[keep.state_slot * state_stride + column + j];
+  }
+  return;
+ }
+ float state[VALUES], partial[PARTS];
+ _Pragma("clang loop unroll(full)")
+ for (uint j = 0; j < VALUES; ++j) state[j] = committed[keep.state_slot * state_stride + column + j];
+ for (uint step = 0; step < keep.rows; ++step) {
+  const uint row = kept_rows[keep.first + step], at = row * p.nv + head;
+  const device bfloat* k = key + (row * p.nk + key_head) * p.dk + sub * VALUES;
+  const float forget = decay[at];
+  _Pragma("clang loop unroll(full)")
+  for (uint pb = 0; pb < PARTS; ++pb) {
+   float acc = 0.0f;
+   _Pragma("clang loop unroll(full)")
+   for (uint j = 0; j < 4; ++j) {
+    const uint i = pb * 4 + j; state[i] = state[i] * forget; acc += state[i] * float(k[i]);
+   }
+   partial[pb] = acc;
+  }
+  const float remembered = tf_gdn_packed_reduce<LANES>(partial);
+  const float correction = (float(value[at * p.dv + dimension]) - remembered) * float(mixing[at]);
+  _Pragma("clang loop unroll(full)")
+  for (uint j = 0; j < VALUES; ++j) state[j] = state[j] + float(k[j]) * correction;
+ }
+ _Pragma("clang loop unroll(full)")
+ for (uint j = 0; j < VALUES; ++j) next[keep.next_slot * state_stride + column + j] = state[j];
+}
+#define TF_GDN_REPLAY_PACKED(L) template [[host_name("tf_delta_gdn_packed_replay_" #L)]] kernel void tf_delta_gdn_packed_replay<L>(device const bfloat*,device const bfloat*,device const float*,device const bfloat*,device const float*,device const uint*,device const TfDeltaKeep*,constant TfDeltaParams&,device float*,device const TfDeltaSegment*,device const float*,uint3,uint);
+TF_GDN_REPLAY_PACKED(8)
