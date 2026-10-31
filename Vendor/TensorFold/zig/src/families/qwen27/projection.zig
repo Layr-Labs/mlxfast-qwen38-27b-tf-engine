@@ -99,29 +99,52 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
     return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index };
 }
 
-/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
-/// first-seen order, then each group's u16 index. Null (nothing kept) past lane_projection.sb_table distinct pairs.
+/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words, most
+/// used first (ties in first-seen order), then each group's u16 index. Null (nothing kept) past lane_projection.sb_table
+/// distinct pairs. Every index still names its group's own word, so the kernel reads the same values; the hot words only
+/// share fewer cache lines, so a decode group's eight table lookups mostly hit lines already in cache.
 fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
     const cap = lane.sb_table;
     var seen = std.AutoHashMap(u32, u16).init(allocator);
     defer seen.deinit();
     try seen.ensureTotalCapacity(2 * cap);
+    const firsts = try allocator.alloc(u32, cap);
+    defer allocator.free(firsts);
+    const counts = try allocator.alloc(u32, cap);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    const keys = try allocator.alloc(u64, cap);
+    defer allocator.free(keys);
+    const rank = try allocator.alloc(u16, cap);
+    defer allocator.free(rank);
     const sb = try device.buffer(lane.indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     var keep = false;
     defer if (!keep) sb.deinit();
     const table = sb.slice(u32, cap);
     @memset(table, 0);
     const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
+    // first pass: first-seen ids and their use counts
     for (index, 0..) |*at, i| {
         const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
         const got = seen.getOrPutAssumeCapacity(word);
         if (!got.found_existing) {
             if (seen.count() > cap) return null;
             got.value_ptr.* = @intCast(seen.count() - 1);
-            table[got.value_ptr.*] = word;
+            firsts[got.value_ptr.*] = word;
         }
+        counts[got.value_ptr.*] += 1;
         at.* = got.value_ptr.*;
     }
+    // most used first, ties by first-seen id: key = (max - count) << 16 | id, ascending
+    const distinct = seen.count();
+    for (0..distinct) |id| keys[id] = (@as(u64, std.math.maxInt(u32) - counts[id]) << 16) | @as(u64, id);
+    std.mem.sort(u64, keys[0..distinct], {}, std.sort.asc(u64));
+    for (keys[0..distinct], 0..) |key, r| {
+        const id: usize = @intCast(key & 0xFFFF);
+        rank[id] = @intCast(r);
+        table[r] = firsts[id];
+    }
+    for (index) |*at| at.* = rank[at.*];
     try owned.append(allocator, sb);
     keep = true;
     return sb;
