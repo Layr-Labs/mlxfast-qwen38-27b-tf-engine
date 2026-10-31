@@ -93,6 +93,9 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
+        // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
+        try target.kernels.prepareDecode(head.linear, 1);
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue }, .caches = caches };
     }
@@ -167,7 +170,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.initWithSmall(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o, true);
             try @import("../residency.zig").putPrepared(b, key, adapter);
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
@@ -211,7 +214,7 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.initWithSmall(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order, true);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }

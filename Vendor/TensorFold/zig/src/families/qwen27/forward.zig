@@ -147,6 +147,10 @@ pub const Stages = struct {
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
     }
+    /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
+    pub fn polls(s: *const Stages) bool {
+        return s.rows <= 16;
+    }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
     }
