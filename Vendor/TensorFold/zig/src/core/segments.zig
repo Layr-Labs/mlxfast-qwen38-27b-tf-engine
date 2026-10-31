@@ -46,13 +46,7 @@ var n_unchecked: usize = 0;
 pub fn checkUnchecked() !void {
     var failed = false;
     for (unchecked[0..n_unchecked]) |cb| {
-        // a polled pass signals behind its last command and returns with its earlier chunks retained: the queue ran
-        // them before the command the poll waited for, so a chunk that already reports completion needs no blocking
-        // wait, only its failure check (Metal reports failure once a command buffer has completed)
-        switch (cb.status()) {
-            .completed, .@"error" => {},
-            else => cb.wait(),
-        }
+        cb.wait();
         if (cb.failure()) |msg| {
             std.log.err("command buffer failed: {s}", .{msg});
             failed = true;

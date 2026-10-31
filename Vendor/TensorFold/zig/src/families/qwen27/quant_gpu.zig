@@ -149,9 +149,7 @@ pub const Kernels = struct {
     /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
-        // prompt rows: the gate/up projection on two tiles a SIMD group (promptTiles), then the activation pass, measured
-        // faster than the fused one-tile SwiGLU epilogue (gateUpActivatedPrompt) on an M5 Max
-        if (k.prompt) return false;
+        if (k.prompt) return false; // prompt rows: the two-tile projection, then the activation pass
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
@@ -314,7 +312,8 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi, .indexed12 = key.sbi12 });
+            const tn = promptTiles(key, p.n, skip);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -534,12 +533,12 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// 5120-deep inputs (attention query+gate, GDN qkv, MLP gate/up) and the split-K MLP down and attention output, one elsewhere.
+/// split-K 5120-wide projections (MLP down, attention output) and for the 5120-deep inputs (MLP gate/up, GDN qkv,
+/// attention query+gate), one elsewhere. A two-tile launch runs its K splits as SIMD groups of one threadgroup, so the
+/// query+gate's prompt rows leave the serial split-K kernel for it.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
-    if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2()) return 1;
-    // the 5120-deep inputs (attention query+gate, GDN qkv, MLP gate/up): two tiles a SIMD group share each activation load
-    if (key.k == 5120 and (n == 12288 or n == 10240 or n == 34816) and key.batch % 2 == 0) return 2;
-    if (key.slices != 2 or n != 5120) return 1;
+    if (!key.prompt_sr or skip != 0 or key.range[1] != 0) return 1;
     if (key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
-    return if (key.k == 17408 or key.k == 6144) 2 else 1;
+    if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) return 2;
+    return if (key.k == 5120 and (n == 34816 or n == 10240 or n == 12288)) 2 else 1;
 }
