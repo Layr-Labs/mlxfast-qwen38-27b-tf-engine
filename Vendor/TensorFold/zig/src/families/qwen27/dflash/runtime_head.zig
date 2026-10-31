@@ -21,9 +21,31 @@ pub const Head = struct {
         const input_words = if (source.raw) |raw| raw.w else source.words.buffer;
         const input_offset = if (source.raw) |raw| raw.w_off else source.words.offset;
         const groups = k / source.group;
-        const words = try head.allocate(device, width * row);
+        // The borrowed head's rows land in a copy of their own, and a draft round's one row reads it once a round: it is
+        // the largest decode matrix left in the unbatched order, so its code blocks are stored in the same eight-tile
+        // interleave every other decoded shape reads (projection.prepareForced) — whole tiles of one group at a time, a
+        // block a tile's 32 lanes of one group's codes. The raw (row-major) copy keeps its rows.
+        const lane_layout = source.raw == null;
+        const batch: usize = if (lane_layout) 8 else 1;
+        const sb: usize = source.batch;
+        const block = @as(usize, source.tile) * 8 * 4;
+        const stored = if (lane_layout) projection.storedColumns(width, @intCast(batch)) else width;
+        const words = try head.allocate(device, stored * row);
         var destination: usize = 0;
-        for (spans) |span| {
+        if (lane_layout) {
+            var at: usize = 0; // the copy's own tile index, in span order
+            for (spans) |span| {
+                for (0..(span[1] - span[0]) / source.tile) |i| {
+                    const st: usize = span[0] / source.tile + i;
+                    for (0..groups) |g| {
+                        const from = input_offset + (((st / sb) * groups + g) * sb + st % sb) * block;
+                        const to = (((at / batch) * groups + g) * batch + at % batch) * block;
+                        @memcpy(words.contents()[to..][0..block], input_words.contents()[from..][0..block]);
+                    }
+                    at += 1;
+                }
+            }
+        } else for (spans) |span| {
             const rows = span[1] - span[0];
             const first = input_offset + @as(usize, span[0]) * row;
             @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
@@ -31,6 +53,8 @@ pub const Head = struct {
         }
         head.linear.n = width;
         head.linear.index = null;
+        head.linear.batch = @intCast(batch);
+        head.linear.pairs32 = null; // the source's f32 pairs cover its full width, not the spans
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
@@ -68,7 +92,7 @@ pub const Head = struct {
             head.linear.pairs = .{ .buffer = pairs };
             // the source's indexed copy, trimmed to the spans' columns: the same table, each group's indices in span order
             if (source.index) |index| {
-                const table = lane.sb_table * 4;
+                const table = lane.sb_table * lane.sb_entry;
                 const trimmed = try head.allocate(device, lane.indexedBytes(width, k, source.group));
                 @memcpy(trimmed.contents()[0..table], index.buffer.contents()[index.offset..][0..table]);
                 for (0..groups) |g| {

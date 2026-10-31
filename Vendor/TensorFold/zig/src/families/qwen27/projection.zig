@@ -7,7 +7,8 @@ const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+/// `pairs32`: prompt rows' f32 copy of `pairs` (lane_projection.pairs32_layout).
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false, pairs32: ?Ref = null };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -95,7 +96,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
             const at = (base + r) / tile;
             const to = ((at / batch * (k / 64) + g) * batch + at % batch) * tile * 8 + ((base + r) % tile) * 8;
             @memcpy(dst[to..][0..8], words[src..][0..8]);
-            pair[(g * n + base + r) * 2] = scales[r * (k / 64) + g];
+            pair[(g * n + base + r) * 2] = try lane.foldScale(scales[r * (k / 64) + g]); // reg scales carry 2^24
             pair[(g * n + base + r) * 2 + 1] = biases[r * (k / 64) + g];
         };
         base += rows;
@@ -106,7 +107,17 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         return err;
     };
     const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+    // prompt rows read the pairs as f32 multipliers; a forced copy serves decoded rows only and takes none
+    var pairs32: ?Ref = null;
+    if (forced == null) {
+        const p32 = try lane.pairs32(device, pair, n, k);
+        owned.append(allocator, p32) catch |err| {
+            p32.deinit();
+            return err;
+        };
+        pairs32 = .{ .buffer = p32 };
+    }
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false, .pairs32 = pairs32 };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {
