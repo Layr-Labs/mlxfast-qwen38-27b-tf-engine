@@ -15,6 +15,9 @@ pub const Mixer = struct {
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
 
+/// Bytes of a projection's leading weights a decode forward reads into cache beside the norm before it (Kernels.warm).
+const warm_bytes: usize = 2 << 20;
+
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
 pub const Head = enum { all, last, none };
 /// Work a round encodes behind the head in the forward's last command buffer (its greedy picks): no buffer of its own.
@@ -68,6 +71,17 @@ pub const Stages = struct {
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
         try m.kernels.norm(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        // decoded rows: the mixer's input projections' leading weights stream in beside the norm (reads only)
+        switch (layer.mixer) {
+            .linear => |g| {
+                try m.kernels.warm(e, g.qkv, warm_bytes);
+                try m.kernels.warm(e, g.zba, warm_bytes);
+            },
+            .attention => |a| {
+                try m.kernels.warm(e, a.q, warm_bytes);
+                try m.kernels.warm(e, a.kv, warm_bytes);
+            },
+        }
         e.barrier();
         if (s.pending != null) {
             std.mem.swap(Ref, &s.hidden, &s.residual);
@@ -107,6 +121,7 @@ pub const Stages = struct {
         try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        try m.kernels.warm(e, layer.gu, warm_bytes); // decoded rows: gate/up's leading weights beside the norm (reads only)
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);

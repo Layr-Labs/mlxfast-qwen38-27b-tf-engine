@@ -71,6 +71,9 @@ pub const Kernels = struct {
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
+    /// q27_warm and the word it may write (never read): see `warm`.
+    warm_pipe: ?mtl.Pipeline = null,
+    warm_sink: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -99,6 +102,50 @@ pub const Kernels = struct {
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+        if (k.warm_pipe) |p| p.deinit();
+        if (k.warm_sink) |b| b.deinit();
+    }
+
+    /// Decoded rows: reads `p`'s leading weight blocks (the first groups of each K chain that starts with the launch, every
+    /// tile batch) and those groups' scale/bias rows, about `budget` bytes, so `p`'s launch begins on cached lines. Encoded
+    /// beside a small kernel (a norm) ahead of the barrier before `p`: it overlaps the norm and the barrier's drain, reads
+    /// only immutable weights and writes nothing anything reads, so no float changes.
+    pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, budget: usize) !void {
+        if (k.prompt or budget == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64) return;
+        if (p.n % 32 != 0 or p.k % 64 != 0 or p.batch == 0 or p.slices == 0) return;
+        const groups: usize = p.k / 64;
+        const batch: usize = p.batch;
+        const batches: usize = (p.n / 32 + batch - 1) / batch;
+        // a serial split runs its second chain after the first: only the first starts with the launch
+        const serial = (Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices }).serialSk2();
+        const splits: usize = if (serial) 1 else p.slices;
+        if (splits > groups) return;
+        const per_group = splits * (batches * batch * 1024 + @as(usize, p.n) * 4);
+        const lead = std.math.clamp(budget / per_group, 1, groups / splits);
+        const dims = [8]u32{
+            @intCast(lead * batch * 64), // uint4 a chain's leading run in one tile batch
+            @intCast(groups * batch * 64), // uint4 a tile batch
+            @intCast(groups),
+            @intCast(splits),
+            @intCast(batches),
+            @intCast(lead * p.n / 4), // uint4 of a chain's leading scale/bias rows
+            @intCast(p.n / 4), // uint4 a group's scale/bias row
+            @intCast(p.slices), // the K split the chains' starts follow
+        };
+        const total = batches * splits * dims[0] + splits * dims[5];
+        if (k.warm_pipe == null) {
+            const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            k.warm_pipe = try mtl.Pipeline.init(k.device, library, "q27_warm", false);
+        }
+        if (k.warm_sink == null) k.warm_sink = try k.device.buffer(256 * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        e.setPipeline(k.warm_pipe.?);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
+        e.setBuffer(p.pairs.buffer, p.pairs.offset, 1);
+        e.setBuffer(k.warm_sink.?, 0, 2);
+        e.setValue(dims, 3);
+        const threads = @min(total, 65536);
+        e.dispatchThreads(mtl.Size.of(threads, 1, 1), mtl.Size.of(@min(threads, 256), 1, 1));
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -295,7 +342,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip) });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -497,10 +544,41 @@ pub const Kernels = struct {
     }
 };
 
+/// Reads weight words into cache (see Kernels.warm). Chain s of S starts at group (s * G) / S, as tf_lane_reg's chains do.
+const warm_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\struct q27_warm_dims { uint run, batch, groups, splits, batches, meta, n4, sk; };
+    \\kernel void q27_warm(const device uint4* W [[buffer(0)]], const device uint4* SB [[buffer(1)]], device uint* sink [[buffer(2)]],
+    \\    constant q27_warm_dims& d [[buffer(3)]], uint i [[thread_position_in_grid]], uint count [[threads_per_grid]]) {
+    \\  const uint code = d.batches * d.splits * d.run, total = code + d.splits * d.meta, step = d.batch / d.groups;
+    \\  uint acc = 0;
+    \\  for (uint at = i; at < total; at += count) {
+    \\    uint4 v;
+    \\    if (at < code) {
+    \\      const uint r = at / d.run, b = r / d.splits, s = r % d.splits;
+    \\      v = W[(size_t)b * d.batch + (size_t)((s * d.groups) / d.sk) * step + at % d.run];
+    \\    } else {
+    \\      const uint m = at - code, s = m / d.meta;
+    \\      v = SB[(size_t)((s * d.groups) / d.sk) * d.n4 + m % d.meta];
+    \\    }
+    \\    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    \\  }
+    \\  if (acc == 0x9E3779B9u) sink[i & 255] = acc;
+    \\}
+;
+
 pub fn padded(rows: u32) u32 {
     return 16 * ((rows + 15) / 16);
 }
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+}
+
+/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
+/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+fn promptTiles(key: Key, n: u32, skip: u32) usize {
+    if (!key.prompt_sr or skip != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
+    return if (key.k == 17408 or key.k == 6144) 2 else 1;
 }
