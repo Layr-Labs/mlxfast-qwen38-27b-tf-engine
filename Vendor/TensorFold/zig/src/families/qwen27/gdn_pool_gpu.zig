@@ -209,7 +209,7 @@ pub const Pool = struct {
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(prepared.p, 2);
         gdn.bind(e, .{prepared.b.history}, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
         e.barrier();
         try publication.end();
     }
@@ -261,7 +261,7 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.setBuffer(next_history.buffer, next_history.offset, 6);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
     }
 
     /// After commitScan's fence: the new conv window into place, unfenced.
@@ -275,7 +275,7 @@ pub const Pool = struct {
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 });
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {

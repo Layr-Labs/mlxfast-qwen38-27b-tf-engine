@@ -17,10 +17,7 @@ fn begin(ptr: *anyopaque) !u64 {
 }
 fn release(ptr: *anyopaque, epoch: u64) void {
     const b = backend(ptr);
-    if (epoch != b.frame.epoch) return;
-    // a frame abandoned before finish (an error path) now runs, and its context appends may overwrite ring rows
-    if (b.frame.active and !b.frame.completed) b.failed = true;
-    b.frame.release();
+    if (epoch == b.frame.epoch) b.frame.release();
 }
 fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode) !op.View {
     const b = backend(ptr);
@@ -59,8 +56,7 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         if (b.input_sums) |s| {
             try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
         } else {
-            // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
-            const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
+            const step: u32 = if (p.reg) @intCast(@import("core").lane_projection.reg_rows) else 16;
             var first: u32 = 0;
             while (first < x.rows) : (first += step) {
                 try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));

@@ -1,6 +1,7 @@
 //! Only completed committed-tap transactions advance the drafter's absolute rolling context.
 const std = @import("std");
 const op = @import("operators.zig");
+const append_plan = @import("append_plan.zig");
 const Backend = @import("runtime_backend.zig").Backend;
 const Ref = @import("runtime_backend.zig").Ref;
 fn cast(ptr: *anyopaque) *Backend {
@@ -39,6 +40,24 @@ pub fn streamAppend(ptr: *anyopaque, epoch: u64, stream: u32, layer: u32, keys: 
 fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("runtime_backend.zig").Cache, keys: op.View, values: op.View, positions: []const u64) !void {
     const k = try b.frame.ref(keys);
     const v = try b.frame.ref(values);
+    // Long sequential prompt appends occupy one or two disjoint runs of the ring.
+    // Keep the scatter path for short, repeated, non-contiguous or oversized inputs.
+    if (append_plan.contiguous(positions, b.config.window)) |plan| {
+        if (k.buf.id != cache.keys.id and k.buf.id != cache.values.id and
+            v.buf.id != cache.keys.id and v.buf.id != cache.values.id and cache.keys.id != cache.values.id)
+        {
+            const width = b.config.kvWidth();
+            const bytes_per_row = @as(usize, width) * 2;
+            try b.copy(e, k, .{ .buf = cache.keys, .off = @as(usize, plan.slot) * bytes_per_row }, plan.first, width, keys.stride);
+            try b.copy(e, v, .{ .buf = cache.values, .off = @as(usize, plan.slot) * bytes_per_row }, plan.first, width, values.stride);
+            if (plan.second != 0) {
+                try b.copy(e, .{ .buf = k.buf, .off = k.off + @as(usize, plan.first) * keys.stride * 2 }, .{ .buf = cache.keys }, plan.second, width, keys.stride);
+                try b.copy(e, .{ .buf = v.buf, .off = v.off + @as(usize, plan.first) * values.stride * 2 }, .{ .buf = cache.values }, plan.second, width, values.stride);
+            }
+            e.barrier();
+            return;
+        }
+    }
     var first: usize = 0;
     while (first < positions.len) : (first += 16) {
         const count = @min(positions.len - first, 16);

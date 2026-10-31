@@ -217,7 +217,7 @@ pub const Round = struct {
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
-        e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 32 });
         e.barrier();
     }
 
@@ -234,7 +234,7 @@ pub const Round = struct {
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
-        e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments, .depth = 1 }, .{ .width = 256, .height = 1, .depth = 1 });
+        e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments, .depth = 1 }, .{ .width = 32, .height = 1, .depth = 1 });
         e.barrier();
     }
 
