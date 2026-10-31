@@ -226,12 +226,11 @@ pub const Pool = struct {
         return pool.commitDevice(layer, plan, e);
     }
 
-    /// Caller-generated keep descriptors remain on the GPU while the admitted host plan fixes dispatch bounds.
+    /// Caller-generated keep descriptors remain on the GPU while the admitted host plan fixes dispatch bounds. The
+    /// history a keep owns is written where it lies: the replay and the window land in the one launch conv_keep makes,
+    /// so a layer's keep is a dispatch and no fence, not a dispatch, a fence and a publish.
     pub fn commitDevice(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitScan(layer, plan, e);
-        e.barrier();
-        try pool.commitPublish(layer, plan, e);
-        e.barrier();
+        return pool.commitKeep(layer, plan, e);
     }
 
     /// A commit's replay, in place, and its conv window, unfenced.
