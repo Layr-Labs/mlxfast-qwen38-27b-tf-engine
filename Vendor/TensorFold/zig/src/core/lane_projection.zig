@@ -174,8 +174,8 @@ pub const Layout = struct {
     reg_lean: bool = false,
     /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
     tile_batch: usize = 1,
-    /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's four tiles are 64 gate columns and their up
-    /// columns; it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
+    /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's two SIMD groups each run a gate tile then its up
+    /// tile (64 columns); it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
@@ -420,7 +420,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -471,7 +471,7 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
-        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(128, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(if (p.rows8) 64 else 128, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
