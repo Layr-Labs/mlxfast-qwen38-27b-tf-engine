@@ -46,6 +46,8 @@ pub const Frame = struct {
     small: bool = false,
     /// A GDN block's gate wrote its out projection's group sums into `.sums` (read and cleared by that projection).
     mixer_sums: bool = false,
+    /// The layer's mixer left its output's group sums in `.sums`, for the output projection.
+    out_sums: bool = false,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;
