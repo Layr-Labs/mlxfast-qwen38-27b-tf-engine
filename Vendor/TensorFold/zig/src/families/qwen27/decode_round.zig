@@ -48,6 +48,8 @@ pub const Runner = struct {
     failed: bool = false,
     capture_taps: bool = false,
     accepted_chain: bool = false,
+    /// A device keep left its attention rows to the host's kept path (keepRows), read after the verify.
+    rows_keep: bool = false,
     last_gpu_seconds: f64 = 0,
     current_round: ?*const Round = null,
     /// Encoded after the head of the next verify, in its last command buffer.
@@ -317,8 +319,6 @@ pub const Runner = struct {
         if (r.failed or round.windows.len != 1 or round.ids.len > @import("core").tree_round.max_rows or !std.mem.eql(u8, &active, &fingerprint(round))) return error.RoundNotReady;
         var recurrent = try round.recurrent(try r.params(round.ids.len), &.{&.{}});
         defer recurrent.deinit();
-        var attention_plan = try r.attentionPlan(round);
-        defer attention_plan.deinit();
         const m = r.metadata();
         try m.upload(recurrent);
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
@@ -334,20 +334,45 @@ pub const Runner = struct {
         // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
         // copy every kept row onto itself
         if (chainWindow(round.windows[0].parents)) return;
+        // so is a tree's in most rounds (the root alone, or with its first child): the host moves the attention rows only
+        // when the path it reads after the verify is not a prefix (keepRows)
+        r.rows_keep = true;
+    }
+
+    /// A device keep's attention rows, once the host has read the kept path. A prefix of the round's rows already stands
+    /// at its positions; another path's rows move in their own command buffer, committed behind the keep, not waited.
+    pub fn keepRows(r: *Runner, round: *const Round, path: []const u32) !?mtl.CommandBuffer {
+        if (!r.rows_keep) return null;
+        r.rows_keep = false;
+        for (path, 0..) |row, i| {
+            if (row != i) break;
+        } else return null;
+        var attention_plan = try r.attentionPlan(round);
+        defer attention_plan.deinit();
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = r.model.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        // an encoded buffer always goes to the queue: one left uncommitted holds a queue slot for good
+        errdefer {
+            e.end();
+            cb.commit();
+            r.failed = true;
+        }
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
             .attention => {
                 var views: [attn.planning.max_streams]attn.Cache = undefined;
                 const caches = r.layerCaches(ai, round, &views);
-                try r.bindings[ai].admitDeviceKeep(attention_plan, caches, p.rows);
-                const map = r.bindings[ai].get(.keep_map);
-                try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
-                e.barrier();
-                try r.attention.keep(e, &r.scratch, &r.bindings[ai], p.rows, caches);
+                const kept = try r.bindings[ai].uploadKeep(attention_plan, caches, &.{path});
+                try r.attention.keep(e, &r.scratch, &r.bindings[ai], kept, caches);
                 ai += 1;
             },
         };
+        e.end();
+        cb.commit();
+        return cb.retain();
     }
 
     /// Whether every row's parent is the row before it (a chain), so any kept path is a prefix of the rows.
@@ -367,6 +392,7 @@ pub const Runner = struct {
     pub fn recover(r: *Runner) void {
         r.failed = false;
         r.active = null;
+        r.rows_keep = false;
     }
 
     /// An idle or newly lone host may drop scratch only after the previous verify has been kept.

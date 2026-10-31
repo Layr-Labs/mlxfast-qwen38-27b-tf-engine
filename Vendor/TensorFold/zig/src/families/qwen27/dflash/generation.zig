@@ -26,6 +26,7 @@ pub const Generation = struct {
     matcher: @import("round_gpu.zig").Matcher,
     commit: @import("core").tree_commit_gpu.Ops,
     keep: ?mtl.CommandBuffer = null, // the last round's cache and state commit, running behind the drafter
+    keep_rows: ?mtl.CommandBuffer = null, // its attention row moves, when the kept path was not a prefix of the rows
     picked: ?@import("core").segments.Fence = null, // updated behind a verify's picks; its keep waits on it
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
@@ -45,6 +46,10 @@ pub const Generation = struct {
     }
     pub fn deinit(g: Generation) void {
         if (g.keep) |cb| {
+            cb.wait();
+            cb.release();
+        }
+        if (g.keep_rows) |cb| {
             cb.wait();
             cb.release();
         }
@@ -149,8 +154,12 @@ pub const Generation = struct {
         const cb = g.keep orelse return;
         g.keep = null;
         defer cb.release();
+        const rows = g.keep_rows;
+        g.keep_rows = null;
+        defer if (rows) |moved| moved.release();
         cb.wait();
-        if (gpuFailed(cb, "a draft round's keep")) {
+        if (rows) |moved| moved.wait();
+        if (gpuFailed(cb, "a draft round's keep") or (if (rows) |moved| gpuFailed(moved, "a draft round's attention rows") else false)) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
         }
@@ -214,6 +223,7 @@ pub const Generation = struct {
         const shape = picks.shape orelse return error.DraftKeepGpuFailure;
         if (g.keep == null) return error.DraftKeepGpuFailure;
         const accepted = try g.matcher.read(shape);
+        g.keep_rows = try g.runner.keepRows(round, accepted.path);
         try g.runner.completeDeviceKeep(round, accepted.path);
         try g.draft.absorb(.{ .buf = g.taps }, @intCast(accepted.path.len));
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
