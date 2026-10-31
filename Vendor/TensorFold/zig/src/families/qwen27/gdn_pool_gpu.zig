@@ -51,7 +51,8 @@ pub const Scalars = struct {
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0 };
+/// sums: the gate also writes the out projection's group sums there (decode rows; forward.outSums).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?Ref = null };
 
 pub const Pool = struct {
     budget: Budget,
@@ -334,6 +335,10 @@ pub const Pool = struct {
         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
         result.tree_mode = pool.tree_mode;
         result.p.advance = @intFromBool(pool.advances(plan));
+        if (refs.sums) |s| {
+            if (p.dv != 128 or p.rows > 16) return error.BadGdnSums;
+            result.out_sums = try refSpan(s, pool.budget.shape.value / 64 * 16 * 4);
+        }
         return result;
     }
 
