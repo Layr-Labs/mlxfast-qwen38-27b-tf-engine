@@ -161,6 +161,25 @@ pub const Round = struct {
     }
 
     /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
+    /// prepareRows and forwardPair in one launch (tf_delta_gdn_tree_pair_fused), when both would run; false otherwise.
+    pub fn forwardPairFused(r: Round, e: metal.ComputeEncoder, fused: metal.Pipeline, post_rows: metal.Pipeline) bool {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return false;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return false;
+        if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return false;
+        e.setPipeline(fused);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+        e.setValue(r.p, 8);
+        bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
+        r.b.slot_steps.bind(e, 11);
+        r.b.state.bind(e, 12);
+        (r.b.before orelse r.b.state).bind(e, 13);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 14);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.barrier();
+        r.gate(e, post_rows);
+        return true;
+    }
+
     pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
         if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
         e.setPipeline(pair);

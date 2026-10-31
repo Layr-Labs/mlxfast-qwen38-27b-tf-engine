@@ -154,12 +154,16 @@ pub const Pool = struct {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
+        var scan = profile.begin(pool.profiler, e, .gdn_scan);
+        // a verify's prepare folds into its scan when both kernels apply (one dispatch and barrier fewer a layer)
+        if (prepared.forwardPairFused(scan.encoder, pool.kernels.tree_pair_fused, pool.kernels.post_rows)) return scan.end();
+        scan.cancel();
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
-        var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
-        try scan.end();
+        var scan2 = profile.begin(pool.profiler, e, .gdn_scan);
+        prepared.forwardPair(scan2.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
+        try scan2.end();
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
