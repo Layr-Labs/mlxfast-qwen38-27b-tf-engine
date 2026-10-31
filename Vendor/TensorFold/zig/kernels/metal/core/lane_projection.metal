@@ -358,7 +358,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
 #if defined(TF_REG_LEAN)
-    if (g + 1 < last) { nw0 = wl[(size_t)(g + 1) * 64]; nw1 = wl[(size_t)(g + 1) * 64 + 32]; }
+    // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
+    { const size_t gn = (size_t)min(g + 1, last - 1) * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
