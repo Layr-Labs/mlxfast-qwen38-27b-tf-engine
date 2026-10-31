@@ -274,6 +274,11 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 #endif
 
 #if TF_BITS == 4 && defined(TF_REG)
+#ifdef TF_REG_SMALL_ROWS
+#define TF_REG_ACC 8
+#else
+#define TF_REG_ACC 16
+#endif
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
@@ -306,15 +311,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* wl = W + (size_t)tile * KG * 64 + lane;
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
-  float C[16];
+  float C[TF_REG_ACC];
 #if defined(TF_SERIAL_SK2)
-  float C0[16];
+  float C0[TF_REG_ACC];
   for (int split = 0; split < TF_SK; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
 #endif
-  for (int i = 0; i < 16; i++) C[i] = 0.0f;
+  for (int i = 0; i < TF_REG_ACC; i++) C[i] = 0.0f;
   tf_reg_load next = {};
   if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
   for (int g = first; g < last; g++) {
@@ -335,26 +340,34 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       const float s0 = as_type<float>(cur.q0[j] << 16), b0 = as_type<float>(cur.q0[j] & 0xFFFF0000u);
       const float s1 = as_type<float>(cur.q1[j] << 16), b1 = as_type<float>(cur.q1[j] & 0xFFFF0000u);
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
+#ifdef TF_REG_SMALL_ROWS
+      C[4 + j] = fma(s1, P[8 + j], fma(b1, cur.x0, C[4 + j]));
+#else
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
       C[8 + j] = fma(s1, P[8 + j], fma(b1, cur.x0, C[8 + j]));
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
+#endif
     }
   }
 #if defined(TF_SERIAL_SK2)
-    if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+    if (split == 0) for (int i = 0; i < TF_REG_ACC; i++) C0[i] = C[i];
   }
-  for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+  for (int i = 0; i < TF_REG_ACC; i++) C[i] = C0[i] + C[i];
 #else
-  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_REG_ACC * 32];
   if (TF_SK > 1) {
-    if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
+    if (ks > 0) for (int i = 0; i < TF_REG_ACC; i++) part[((ks - 1) * TF_REG_ACC + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < TF_REG_ACC; i++) C[i] += part[((s2 - 1) * TF_REG_ACC + i) * 32 + lane];
   }
 #endif
   if (ks == 0)
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < TF_REG_ACC; i++) {
+#ifdef TF_REG_SMALL_ROWS
+      const int m = mb, n = n0 + nb + 16 * (i >> 2) + (i & 3);
+#else
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
+#endif
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
     }
 }
