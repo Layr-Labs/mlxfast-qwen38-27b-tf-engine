@@ -85,6 +85,10 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        // `lattice` in two halves: the top-k encoded and the frame committed without a wait (the picks view back),
+        // then the wait and the readback of those picks; null: only the one-call form
+        lattice_begin: ?*const fn (*anyopaque, u64, Head, View, Config) anyerror!View = null,
+        lattice_end: ?*const fn (*anyopaque, u64, View, Head, View, Config) anyerror!Lattice = null,
     };
 };
 

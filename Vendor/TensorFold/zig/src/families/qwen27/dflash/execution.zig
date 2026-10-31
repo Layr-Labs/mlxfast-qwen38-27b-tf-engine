@@ -114,6 +114,36 @@ pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, 
     return lattice;
 }
 
+/// appendBlock in two halves (an adapter with lattice_begin and lattice_end): everything encoded and the frame
+/// committed by `appendBlockBegin`, nothing waited for; `appendBlockEnd` waits, reads the lattice and releases the
+/// frame. Between the two, the host is free while the drafter runs. Null: the adapter has only the one-call form.
+pub const Started = struct { frame: u64, transaction: u64, output: Output, picks: op.View };
+pub fn appendBlockBegin(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !?Started {
+    const lattice_begin = ops.vtable.lattice_begin orelse return null;
+    if (ops.vtable.lattice_end == null) return null;
+    if (block < 2 or block > 16) return error.BadRuntimeBlock;
+    try checkAppend(g, preparation, context, taps, positions, next);
+    if (anchor >= g.config.vocab or next.end - next.begin > g.config.window - 1) return error.BadDraftContext;
+    const frame = try ops.vtable.begin(ops.ptr);
+    errdefer ops.vtable.release(ops.ptr, frame);
+    const transaction = try ops.vtable.context_begin(ops.ptr, context);
+    errdefer ops.vtable.context_abort(ops.ptr, transaction);
+    try encodeAppend(ops, g, preparation, taps, positions, frame, transaction);
+    try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
+    const output = try encode(ops, g, preparation, next, anchor, frame, block, &.{});
+    const picks = try lattice_begin(ops.ptr, frame, output.head, output.projected, g.config);
+    return .{ .frame = frame, .transaction = transaction, .output = output, .picks = picks };
+}
+pub fn appendBlockEnd(ops: op.Ops, g: *const w.Graph, s: Started) !op.Lattice {
+    defer ops.vtable.release(ops.ptr, s.frame);
+    errdefer ops.vtable.context_abort(ops.ptr, s.transaction);
+    var lattice = try (ops.vtable.lattice_end orelse return error.DraftOperatorShape)(ops.ptr, s.frame, s.picks, s.output.head, s.output.projected, g.config);
+    errdefer lattice.deinit();
+    try lattice.check(g.config);
+    ops.vtable.context_abort(ops.ptr, s.transaction); // completed: clears the stage mark
+    return lattice;
+}
+
 pub const Output = struct { head: op.Head, projected: op.View };
 pub const Consumer = struct { ptr: *anyopaque, call: *const fn (*anyopaque, u64, Output, Config) anyerror!void };
 fn start(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32) !u64 {

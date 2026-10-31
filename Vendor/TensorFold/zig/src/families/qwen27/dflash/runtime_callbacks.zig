@@ -58,7 +58,7 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         const ys = try b.span(y);
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
-        const p = adapter.projection;
+        const p = adapter.forRows(x.rows);
         const cacheable = p.reg and p.sums_pipe != null and p.sums_buffer != null and
             x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
             x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
@@ -188,6 +188,38 @@ fn lattice(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Confi
     };
     return @import("runtime_lattice.zig").read(b.allocator, &b.frame, output, projected, c, h);
 }
+/// `lattice`'s first half: the top-k (and a frame's pick behind it) encoded and the frame's last command buffer
+/// committed, nothing waited for.
+fn latticeBegin(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Config) !op.View {
+    const b = backend(ptr);
+    _ = try b.encoder(epoch);
+    const output = try b.frame.alloc(h.logits.rows, @sizeOf(@import("core").bf16_topk.Row), .u8);
+    const logits = try b.frame.ref(h.logits);
+    const out = try b.frame.ref(output);
+    b.access(b.frame.encoder, &.{try b.span(h.logits)}, &.{ try b.span(output), Span.whole(b.topk.part) });
+    try b.topk.encode(b.frame.encoder, .{ .buf = logits.buf, .off = logits.off }, .{ .buf = out.buf, .off = out.off }, .{ .rows = h.logits.rows, .vocab = h.logits.width, .k = c.topk, .stride = h.logits.stride });
+    if (b.frame.pick) |pick| {
+        b.frame.pick = null;
+        // the pick reads the top-k rows and the projected row: everything before it ends first
+        b.barrier(b.frame.encoder);
+        try pick.encode(pick.ptr, b.frame.encoder, out, if (h.token_ids) |ids| try b.frame.ref(ids) else null, h.logits.width, try b.frame.ref(projected));
+    }
+    b.frame.commitLast() catch |err| {
+        b.failed = true;
+        return err;
+    };
+    return output;
+}
+/// `lattice`'s second half: the frame waited for and the picks of `latticeBegin` read back.
+fn latticeEnd(ptr: *anyopaque, epoch: u64, output: op.View, h: op.Head, projected: op.View, c: Config) !op.Lattice {
+    const b = backend(ptr);
+    if (!b.frame.active or b.frame.epoch != epoch) return error.DraftFrameNotActive;
+    b.frame.waitAll() catch |err| {
+        b.failed = true;
+        return err;
+    };
+    return @import("runtime_lattice.zig").read(b.allocator, &b.frame, output, projected, c, h);
+}
 /// Rows [first, first + rows) of `x`, an alias in the frame.
 fn rowsOf(b: *Backend, x: op.View, first: u32, rows: u32) !op.View {
     if (first > x.rows or rows > x.rows - first) return error.DraftOperatorShape;
@@ -221,4 +253,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
         made += 1;
     }
 }
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
