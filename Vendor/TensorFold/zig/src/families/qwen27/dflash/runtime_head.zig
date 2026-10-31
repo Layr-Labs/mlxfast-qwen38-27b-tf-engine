@@ -29,7 +29,8 @@ pub const Head = struct {
             destination += rows;
         }
         head.linear.n = width;
-        head.linear.index = null; // the spans' columns keep the pairs layout
+        head.linear.index = null; // set below from the spans' own pairs
+        head.linear.index12 = false;
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
@@ -65,6 +66,12 @@ pub const Head = struct {
                 }
             }
             head.linear.pairs = .{ .buffer = pairs };
+            // decoded rows read the spans' (scale, bias) pairs through their own index, as the target head's do
+            const groups_n = @as(usize, width) * groups;
+            if (try projection.indexPairs(device, a, &head.owned, @as([*]const u16, @ptrCast(@alignCast(pairs.contents())))[0 .. 2 * groups_n], width, k)) |x| {
+                head.linear.index = .{ .buffer = x.buffer };
+                head.linear.index12 = x.twelve;
+            }
         }
         head.ids = try head.allocate(device, width * 4);
         const ids = head.ids.?.slice(u32, width);
