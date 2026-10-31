@@ -295,7 +295,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .indexed = key.sbi });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = promptTiles(key, p.n, skip), .indexed = key.sbi });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -511,4 +511,11 @@ pub fn padded(rows: u32) u32 {
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+}
+
+/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
+/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+fn promptTiles(key: Key, n: u32, skip: u32) usize {
+    if (!key.prompt_sr or skip != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
+    return if (key.k == 17408 or key.k == 6144) 2 else 1;
 }
