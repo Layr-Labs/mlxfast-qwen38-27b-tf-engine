@@ -100,61 +100,102 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
     return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = packed12 != null };
 }
 
-/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
-/// first-seen order, then each group's u16 index. Null (nothing kept) past lane_projection.sb_table distinct pairs.
-fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
-    const cap = lane.sb_table;
+/// The distinct (scale | bias << 16) words of packed pairs ([K/64][N][scale, bias]), most used first (ties in first-seen
+/// order), and each group's rank among them. Every rank still
+/// names its group's own word, so a kernel reads the same values; the hot words only share fewer cache lines, so a decoded
+/// group's table lookups mostly hit lines already in cache. Null past `cap` distinct words.
+const Ranked = struct {
+    words: []u32,
+    ranks: []u16,
+    fn deinit(r: Ranked, allocator: std.mem.Allocator) void {
+        allocator.free(r.words);
+        allocator.free(r.ranks);
+    }
+};
+fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap: usize) !?Ranked {
     var seen = std.AutoHashMap(u32, u16).init(allocator);
     defer seen.deinit();
-    try seen.ensureTotalCapacity(2 * cap);
+    try seen.ensureTotalCapacity(@intCast(2 * cap));
+    const firsts = try allocator.alloc(u32, cap);
+    defer allocator.free(firsts);
+    const counts = try allocator.alloc(u32, cap);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    const ranks = try allocator.alloc(u16, groups);
+    errdefer allocator.free(ranks);
+    for (ranks, 0..) |*at, i| {
+        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
+        const got = seen.getOrPutAssumeCapacity(word);
+        if (!got.found_existing) {
+            if (seen.count() > cap) {
+                allocator.free(ranks);
+                return null;
+            }
+            got.value_ptr.* = @intCast(seen.count() - 1);
+            firsts[got.value_ptr.*] = word;
+        }
+        counts[got.value_ptr.*] += 1;
+        at.* = got.value_ptr.*;
+    }
+    // most used first, ties by first-seen id: key = (max - count) << 16 | id, ascending
+    const distinct = seen.count();
+    const keys = try allocator.alloc(u64, distinct);
+    defer allocator.free(keys);
+    for (keys, 0..) |*key, id| key.* = (@as(u64, std.math.maxInt(u32) - counts[id]) << 16) | @as(u64, id);
+    std.mem.sort(u64, keys, {}, std.sort.asc(u64));
+    const rank = try allocator.alloc(u16, distinct);
+    defer allocator.free(rank);
+    const words = try allocator.alloc(u32, distinct);
+    errdefer allocator.free(words);
+    for (keys, 0..) |key, r| {
+        const id: usize = @intCast(key & 0xFFFF);
+        rank[id] = @intCast(r);
+        words[r] = firsts[id];
+    }
+    for (ranks) |*at| at.* = rank[at.*];
+    return .{ .words = words, .ranks = ranks };
+}
+
+/// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): rankPairs' words, then each group's u16 rank.
+/// Null (nothing kept) past lane_projection.sb_table distinct pairs.
+fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+    const cap = lane.sb_table;
+    const ranked = (try rankPairs(allocator, pair, n * (k / 64), cap)) orelse return null;
+    defer ranked.deinit(allocator);
     const sb = try device.buffer(lane.indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     var keep = false;
     defer if (!keep) sb.deinit();
     const table = sb.slice(u32, cap);
     @memset(table, 0);
+    @memcpy(table[0..ranked.words.len], ranked.words);
     const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
-    for (index, 0..) |*at, i| {
-        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
-        const got = seen.getOrPutAssumeCapacity(word);
-        if (!got.found_existing) {
-            if (seen.count() > cap) return null;
-            got.value_ptr.* = @intCast(seen.count() - 1);
-            table[got.value_ptr.*] = word;
-        }
-        at.* = got.value_ptr.*;
-    }
+    @memcpy(index, ranked.ranks);
     try owned.append(allocator, sb);
     keep = true;
     return sb;
 }
 
-/// lane_projection.indexed12_layout of packed pairs; null (nothing kept) past lane_projection.sb_table12 distinct pairs.
+/// lane_projection.indexed12_layout of packed pairs, with rankPairs' order; null (nothing kept) past
+/// lane_projection.sb_table12 distinct pairs.
 fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
     const cap = lane.sb_table12;
-    var seen = std.AutoHashMap(u32, u16).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(2 * cap);
+    const groups = k / 64;
+    const ranked = (try rankPairs(allocator, pair, groups * n, cap)) orelse return null;
+    defer ranked.deinit(allocator);
     const sb = try device.buffer(lane.indexed12Bytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     var keep = false;
     defer if (!keep) sb.deinit();
     const table = sb.slice(u32, cap);
     @memset(table, 0);
-    const groups = k / 64;
+    @memcpy(table[0..ranked.words.len], ranked.words);
     const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
     @memset(out, 0);
     for (0..groups) |g| for (0..n) |c| {
         const i = g * n + c;
-        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
-        const got = seen.getOrPutAssumeCapacity(word);
-        if (!got.found_existing) {
-            if (seen.count() > cap) return null;
-            got.value_ptr.* = @intCast(seen.count() - 1);
-            table[got.value_ptr.*] = word;
-        }
         const x = c % 32;
         const bit = 12 * ((x / 16) * 4 + x % 4);
         const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
-        const ix: u64 = @as(u64, got.value_ptr.*) << @intCast(bit % 32);
+        const ix: u64 = @as(u64, ranked.ranks[i]) << @intCast(bit % 32);
         out[at] |= @truncate(ix);
         if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
     };

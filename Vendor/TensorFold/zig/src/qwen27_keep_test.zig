@@ -42,6 +42,9 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
         pool.kernels = undefined;
         pool.kernels.pipelines = .{ .pre = .{ .id = 0 }, .tree = .{ .id = 1 }, .replay = .{ .id = 2 }, .post = .{ .id = 3 }, .conv_commit = .{ .id = 4 }, .tree_slots = .{ .{ .id = 10 }, .{ .id = 11 }, .{ .id = 12 }, .{ .id = 13 }, .{ .id = 14 } } };
         pool.kernels.publish_conv = .{ .id = 8 };
+        // The paired tree has the same state/rollback bindings as tree_slots<1>.
+        pool.kernels.tree_pair = .{ .id = 10 };
+        pool.kernels.post_rows = .{ .id = 3 };
         const bytes = 2 * shape.state * 4;
         var metadata: gpu.Metadata = undefined;
         inline for (@typeInfo(gpu.Metadata).@"struct".field_names, 0..) |field, i| {
