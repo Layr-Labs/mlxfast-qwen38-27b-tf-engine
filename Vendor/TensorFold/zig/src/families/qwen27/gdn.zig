@@ -48,6 +48,8 @@ pub const Buffers = struct {
     output: Span,
     next_state: Span,
     before: ?Span = null,
+    /// The layer's stash of earlier depth-one rounds' kept rows (Round.fold: the slot kernels apply it).
+    stash: ?Span = null,
     next_history: Span,
     parents: Span,
     windows: Span,
@@ -112,6 +114,8 @@ pub const Round = struct {
     sums: ?Sums = null,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
+    /// The slot kernels apply the first `fold & 255` rounds of `b.stash` to the root state; fold & 256: and write it back.
+    fold: u32 = 0,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -170,6 +174,8 @@ pub const Round = struct {
         r.b.slot_steps.bind(e, 11);
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
+        (r.b.stash orelse r.b.state).bind(e, 14);
+        e.setValue(r.fold, 15);
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         e.barrier();
         r.gate(e, post_rows);
@@ -185,6 +191,8 @@ pub const Round = struct {
             r.b.slot_steps.bind(e, 11);
             r.b.state.bind(e, 12);
             (r.b.before orelse r.b.state).bind(e, 13);
+            (r.b.stash orelse r.b.state).bind(e, 14);
+            e.setValue(r.fold, 15);
         }
         r.stateGrid(e);
         e.barrier();
