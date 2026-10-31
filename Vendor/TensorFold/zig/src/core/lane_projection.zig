@@ -10,7 +10,7 @@ pub const metadata_layout = "bf16[K/group][N][scale,bias]";
 /// Lean decode-row reg launches may take the metadata indexed: u32[sb_table] distinct (scale | bias << 16) words, then u16[K/group][N]
 /// indices into them. A group's words are the pair it names, so its arithmetic is unchanged.
 pub const indexed_layout = "u32[sb_table] then u16[K/group][N]";
-pub const sb_table = 8192;
+pub const sb_table = 65536;
 
 pub fn indexedBytes(n: usize, k: usize, group: usize) usize {
     return sb_table * 4 + n * (k / group) * 2;
