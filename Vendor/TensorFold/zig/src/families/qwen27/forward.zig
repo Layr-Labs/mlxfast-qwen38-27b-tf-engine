@@ -13,7 +13,19 @@ pub const Mixer = struct {
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+    /// A split GDN layer's stages (Stages.splitLinear), each without a barrier; `begin` answers whether the layer splits.
+    gdn_stage: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32, GdnStage) anyerror!bool = null,
 };
+
+/// Rows [first, first + rows) of a pass.
+pub const Half = struct { first: u32, rows: u32 };
+pub const GdnStage = union(enum) { begin: u32, project: Half, prepare: Half, scan: Half, gate: Half, publish };
+
+/// Where a prompt pass of `rows` rows splits its GDN layers (Stages.split_first): a multiple of the 128-row prompt
+/// launches, so each half's projections are launches the whole pass makes; 0 below two launches.
+pub fn splitRow(rows: u32) u32 {
+    return if (rows < 256) 0 else 128 * (rows / 256);
+}
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
 pub const Head = enum { all, last, none };
@@ -44,9 +56,22 @@ pub const Stages = struct {
     compact: bool = false,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
+    /// Nonzero: GDN layers run as row halves [0, split_first) and [split_first, rows) (splitLinear).
+    split_first: u32 = 0,
+    /// The layer's post stage ran inside its split mixer.
+    post_done: bool = false,
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
         const m = s.model;
         if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
+        if (s.split_first >= s.rows) s.split_first = 0;
+        if (s.split_first != 0) {
+            // the halves' post-norm row counts beside the pass's (dims words 2-5; frame.setRows writes 0 and 1)
+            const dims = m.frame.get(.dims).buffer.slice(i32, 8);
+            dims[2] = @intCast(s.split_first);
+            dims[3] = dims[1];
+            dims[4] = @intCast(s.rows - s.split_first);
+            dims[5] = dims[1];
+        }
         s.hidden = m.frame.get(.hidden);
         s.residual = m.frame.get(.residual);
         if (s.lead) |t| try t.encode(t.ptr, lane.enc);
@@ -77,11 +102,103 @@ pub const Stages = struct {
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
-            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
+            .linear => |g| {
+                if (try s.splits(lane.enc, index, g)) return s.splitLinear(lane.enc, index, g);
+                try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows);
+            },
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
         }
     }
+
+    fn splits(s: *Stages, e: mtl.ComputeEncoder, index: usize, g: wts.Gdn) !bool {
+        if (s.split_first == 0) return false;
+        const stage = s.hooks.gdn_stage orelse return false;
+        const m = s.model;
+        if (s.terminal_rows and index + 1 == m.config.layers) return false;
+        if (!@import("quant_gpu.zig").Kernels.fusesPromptGateUp(m.weights.layers[index].gu)) return false;
+        return stage(s.hooks.ptr, e, index, g, &m.frame, s.rows, .{ .begin = s.split_first });
+    }
+
+    /// A GDN layer as row halves A [0, split_first) and B [split_first, rows): each barrier interval holds a stage of
+    /// each half, so A's scan runs beside B's projections, B's scan beside A's out projection and A's gate/up beside B's
+    /// out projection. Each stage is `mixer`'s or `post`'s over its half's rows: a projection's 128-row launches are the
+    /// whole pass's (split_first is a multiple of 128), B's scan continues A's state, and the per-row kernels see the same
+    /// words, so every row's output is the unsplit layer's.
+    fn splitLinear(s: *Stages, e: mtl.ComputeEncoder, index: usize, g: wts.Gdn) !void {
+        const m = s.model;
+        const f = &m.frame;
+        const stage = s.hooks.gdn_stage.?;
+        const ptr = s.hooks.ptr;
+        const layer = m.weights.layers[index];
+        const a = Half{ .first = 0, .rows = s.split_first };
+        const b = Half{ .first = s.split_first, .rows = s.rows - s.split_first };
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .project = a });
+        e.barrier();
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .prepare = a });
+        e.barrier();
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .scan = a });
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .project = b });
+        e.barrier();
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .gate = a });
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .prepare = b });
+        e.barrier();
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .scan = b });
+        try s.outHalf(e, g, a);
+        e.barrier();
+        _ = try stage(ptr, e, index, g, f, s.rows, .{ .gate = b });
+        try s.normHalf(e, layer, a);
+        e.barrier();
+        try s.gateUpHalf(e, layer, a);
+        try s.outHalf(e, g, b);
+        _ = try stage(ptr, e, index, g, f, s.rows, .publish);
+        e.barrier();
+        try s.downHalf(e, layer, a);
+        try s.normHalf(e, layer, b);
+        e.barrier();
+        try s.gateUpHalf(e, layer, b);
+        e.barrier();
+        try s.downHalf(e, layer, b);
+        e.barrier();
+        std.mem.swap(Ref, &s.hidden, &s.residual);
+        s.pending = f.get(.output);
+        f.mixer_sums = false;
+        s.post_done = true;
+    }
+
+    /// `post`'s out projection over half `h`, reading the group sums its gate wrote.
+    fn outHalf(s: *Stages, e: mtl.ComputeEncoder, g: wts.Gdn, h: Half) !void {
+        const f = &s.model.frame;
+        try s.model.kernels.quant(e, g.out, rowsAt(f.get(.mixer_out), h.first, g.out.k), sumsAt(f, .sums, s.rows, h.first), f.get(.dims), rowsAt(f.get(.output), h.first, g.out.n), h.rows);
+    }
+
+    /// `post`'s norm over half `h`: its rows of hidden + output into residual, input and group sums.
+    fn normHalf(s: *Stages, e: mtl.ComputeEncoder, layer: wts.Layer, h: Half) !void {
+        const m = s.model;
+        const f = &m.frame;
+        const width: u32 = @intCast(m.config.hidden);
+        const dims = Ref{ .buffer = f.get(.dims).buffer, .offset = if (h.first == 0) 8 else 16 }; // begin's words
+        var xs = f.get(.sums);
+        xs.offset += @as(usize, h.first) * 4;
+        try m.kernels.norm(e, rowsAt(s.hidden, h.first, width), rowsAt(f.get(.output), h.first, width), wts.ref(layer.post_norm), f.get(.eps), dims, rowsAt(s.residual, h.first, width), rowsAt(f.get(.input), h.first, width), xs, width, h.rows);
+    }
+
+    fn gateUpHalf(s: *Stages, e: mtl.ComputeEncoder, layer: wts.Layer, h: Half) !void {
+        const f = &s.model.frame;
+        var act_sums = f.get(.act_sums);
+        act_sums.offset += @as(usize, h.first) * 4;
+        if (!try s.model.kernels.gateUpActivated(e, layer.gu, rowsAt(f.get(.input), h.first, layer.gu.k), sumsAt(f, .sums, s.rows, h.first), rowsAt(f.get(.activated), h.first, layer.gu.n / 2), act_sums, h.rows)) return error.BadSplitLayer;
+    }
+
+    fn downHalf(s: *Stages, e: mtl.ComputeEncoder, layer: wts.Layer, h: Half) !void {
+        const f = &s.model.frame;
+        try s.model.kernels.quant(e, layer.down, rowsAt(f.get(.activated), h.first, layer.down.k), sumsAt(f, .act_sums, s.rows, h.first), f.get(.dims), rowsAt(f.get(.output), h.first, layer.down.n), h.rows);
+    }
+
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        if (s.post_done) {
+            s.post_done = false;
+            return;
+        }
         const m = s.model;
         const f = &m.frame;
         const e = lane.enc;
@@ -192,4 +309,16 @@ pub fn encode(m: *Model, e: mtl.ComputeEncoder, rows: u32, mixer: Mixer) !void {
 /// A norm's or the MLP gate's group sums for the frame's padded rows.
 pub fn sums(f: *Frame, field: @import("gpu_frame.zig").Field, rows: u32) @import("quant_gpu.zig").Sums {
     return .{ .ref = f.get(field), .stride = @import("quant_gpu.zig").padded(rows) };
+}
+
+/// `sums` from row `first` on: the same stride, so row i of a launch there is the pass's row first + i.
+fn sumsAt(f: *Frame, field: @import("gpu_frame.zig").Field, rows: u32, first: u32) @import("quant_gpu.zig").Sums {
+    var at = sums(f, field, rows);
+    at.ref.offset += @as(usize, first) * 4;
+    return at;
+}
+
+/// bf16 rows of `width` values from row `first` on.
+fn rowsAt(r: Ref, first: u32, width: usize) Ref {
+    return .{ .buffer = r.buffer, .offset = r.offset + @as(usize, first) * width * 2 };
 }

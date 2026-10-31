@@ -68,6 +68,8 @@ pub const Runner = struct {
     images: ?image_rows.Images = null,
     /// A kept state's blit still reading a slot, by slot: the slot's next write waits for it (settleSlot).
     reading: [attn.planning.max_streams]?mtl.CommandBuffer = @splat(null),
+    /// The GDN layer a split prompt pass is encoding (forward.Stages.split_first), from its `begin` stage on.
+    split_halves: ?@import("gdn_pool_gpu.zig").Halves = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -258,7 +260,11 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        // a prompt chain's GDN layers run as two row halves whose stages interleave (forward.Stages.split_first)
+        // (a profiler's spans commit their own command buffers ahead of the lane's: the halves' order would not hold)
+        const split = accepted and r.model.kernels.prompt and r.model.ane == null and r.gdn.marks == null and r.tail == null and r.after == null and r.lead == null and !r.profiling();
+        defer r.split_halves = null;
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .gdn_stage = gdnStage }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images, .split_first = if (split) forward.splitRow(@intCast(round.ids.len)) else 0 };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -472,6 +478,36 @@ pub const Runner = struct {
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
+    /// Whether a GPU profile is attached: its spans run in command buffers of their own.
+    fn profiling(r: *const Runner) bool {
+        return r.model.kernels.profiler != null or r.model.glue.profiler != null or r.gdn.profiler != null or r.attention.profiler != null;
+    }
+
+    /// A split prompt layer's stages (forward.Stages.splitLinear), each without a barrier.
+    fn gdnStage(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32, stage: forward.GdnStage) !bool {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain };
+        switch (stage) {
+            .begin => |first| {
+                r.split_halves = try GdnHook.halves(&hook, block, weights, frame, rows, first);
+                return r.split_halves != null;
+            },
+            .project => |h| try GdnHook.project(&hook, e, block, weights, frame, rows, h.first, h.rows),
+            .prepare => |h| (r.split_halves orelse return error.RoundNotReady).prepare(e, which(h)),
+            .scan => |h| (r.split_halves orelse return error.RoundNotReady).scan(e, which(h)),
+            .gate => |h| (r.split_halves orelse return error.RoundNotReady).gate(e, which(h)),
+            .publish => {
+                (r.split_halves orelse return error.RoundNotReady).publish(e);
+                r.split_halves = null;
+            },
+        }
+        return true;
+    }
+
+    fn which(h: forward.Half) u1 {
+        return @intFromBool(h.first != 0);
+    }
+
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         const plan = (r.current_attention orelse return error.RoundNotReady).*;
@@ -481,6 +517,10 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
+        // a prompt pass projects each head's query here and its gate beside the partials pass (LateGate)
+        const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
+        const head_tiles = if (prepacked and dead == 0 and !r.profiling()) gateTiles(weights.q, r.geometry) else 0;
+        var gate = LateGate{ .quant = &r.model.kernels, .q = weights.q, .frame = f, .sums = forward.sums(f, .sums, rows), .rows = rows, .tiles = head_tiles };
         if (dead < rows) {
             var input = f.get(.input);
             input.offset += @as(usize, dead) * weights.q.k * 2;
@@ -488,7 +528,7 @@ pub const Runner = struct {
             query_sums.ref.offset += @as(usize, dead) * 4;
             var query = f.get(.q_gate);
             query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            if (head_tiles > 0) try r.model.kernels.quantPeriodic(e, weights.q, input, query_sums, f.get(.dims), query, rows, .{ 0, head_tiles }, 2 * head_tiles) else try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
         }
         try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
         e.barrier();
@@ -498,9 +538,31 @@ pub const Runner = struct {
         var value = mixed;
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
-        const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (head_tiles > 0) .{ .ptr = &gate, .encode = LateGate.encode } else null);
+    }
+
+    /// Each head's gate tiles of the query+gate rows, encoded beside the prompt partials pass: they read the norm's rows
+    /// and sums, which nothing writes before the out projection, and write only the gate columns, which only the gating
+    /// after the merge reads (the preprocess read the query columns before).
+    const LateGate = struct {
+        quant: *@import("quant_gpu.zig").Kernels,
+        q: @import("projection.zig").Linear,
+        frame: *Frame,
+        sums: @import("quant_gpu.zig").Sums,
+        rows: u32,
+        tiles: u32,
+        fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+            const g: *LateGate = @ptrCast(@alignCast(ptr));
+            try g.quant.quantPeriodic(e, g.q, g.frame.get(.input), g.sums, g.frame.get(.dims), g.frame.get(.q_gate), g.rows, .{ g.tiles, g.tiles }, 2 * g.tiles);
+        }
+    };
+
+    /// A head's query (and gate) 32-column tiles in the head-interleaved query+gate rows ([query | gate] a head), or 0
+    /// where the projection keeps one launch.
+    fn gateTiles(q: @import("projection.zig").Linear, g: attn.planning.Geometry) u32 {
+        if (!@import("quant_gpu.zig").Kernels.ranged(q) or g.dim % 32 != 0 or q.n != 2 * g.heads * g.dim) return 0;
+        return g.dim / 32;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
