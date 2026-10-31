@@ -34,7 +34,31 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
 }
 
 /// `runCommitting` whose first commit comes after `first` layers, so the GPU starts while the CPU encodes the rest.
+/// A polled single-lane pass signals `poll_event` behind its last command and the host returns once the GPU reaches it,
+/// tens of microseconds before the command buffers report themselves completed. Their waits and failure checks run at
+/// the start of the next pass (`checkUnchecked`); the GPU has finished their work by then, so no buffer is reused early.
+var poll_event: ?mtl.SharedEvent = null;
+var poll_value: u64 = 0;
+var unchecked: [17]mtl.CommandBuffer = undefined;
+var n_unchecked: usize = 0;
+
+/// Waits for and checks the command buffers a polled pass returned before they reported completion.
+pub fn checkUnchecked() !void {
+    var failed = false;
+    for (unchecked[0..n_unchecked]) |cb| {
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.err("command buffer failed: {s}", .{msg});
+            failed = true;
+        }
+        cb.release();
+    }
+    n_unchecked = 0;
+    if (failed) return error.GpuFailed;
+}
+
 pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize) !f64 {
+    try checkUnchecked();
     const n = queues.len;
     if (n == 0 or n > MAX) return error.Segments;
     var evs: [MAX - 1]mtl.Event = undefined;
@@ -115,11 +139,33 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         return err;
     };
     for (lanes[0..n]) |l| l.enc.end();
+    const polled = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "polls")) fam.polls() else false;
+    // one polled lane signals the event behind its last command (see poll_event)
+    if (polled and n == 1 and poll_event == null) poll_event = device.sharedEvent() catch null;
+    const signalled = polled and n == 1 and poll_event != null;
+    if (signalled) {
+        poll_value += 1;
+        lanes[0].cb.signal(poll_event.?, poll_value);
+    }
     for (lanes[0..n]) |l| l.cb.commit();
     // work the family queues behind the last chunk before the host waits on it (a round's keep)
     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
+    if (signalled) {
+        const ev = poll_event.?;
+        while (ev.value() < poll_value and lanes[0].cb.status() != .@"error") std.atomic.spinLoopHint();
+        if (lanes[0].cb.status() != .@"error") {
+            for (done[0..n_done]) |cb| {
+                unchecked[n_unchecked] = cb.retain();
+                n_unchecked += 1;
+            }
+            unchecked[n_unchecked] = lanes[0].cb.retain();
+            n_unchecked += 1;
+            try queued;
+            return 0;
+        }
+    }
     // a family that polls (decoded rows) spins on its last chunks' status rather than sleeping until the completion wakes it
-    if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "polls")) if (fam.polls()) for (lanes[0..n]) |l| while (true) switch (l.cb.status()) {
+    if (polled) for (lanes[0..n]) |l| while (true) switch (l.cb.status()) {
         .completed, .@"error" => break,
         else => std.atomic.spinLoopHint(),
     };

@@ -50,6 +50,8 @@ pub const Layout = struct {
     swiglu: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
+    /// Prompt-row reg launches: 2 puts two adjacent tiles in a SIMD group, sharing each group's activation registers.
+    prompt_tn: usize = 1,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -69,6 +71,8 @@ pub const Layout = struct {
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
+        if (l.prompt_tn != 1 and (!l.prompt_sr or l.swiglu or l.serial_sk2 or l.ranges.len != 0 or
+            l.prompt_tn != 2 or l.tileCount() % l.prompt_tn != 0)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -99,7 +103,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
-        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * 16 * 32 * @sizeOf(f32);
+        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
     }
 
     pub fn weightWords(l: Layout) usize {
@@ -143,6 +147,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
+    if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -286,7 +291,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
     }
 
     pub fn deinit(p: Projection) void {
