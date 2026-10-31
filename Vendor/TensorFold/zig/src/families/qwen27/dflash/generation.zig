@@ -194,6 +194,9 @@ pub const Generation = struct {
             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
             keep_cb.commit();
             g.keep = keep_cb.retain();
+            // the round's keep is the last GPU work the host knows of: a spin behind it ends at the next proposal's
+            // first encoder, which then starts on a busy GPU rather than after the host's read, tree and encodes
+            g.draft.backend.frame.launchAfter();
         }
     };
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once.

@@ -73,6 +73,20 @@ pub const Bridge = struct {
         cb.commit();
         b.open = true;
     }
+    /// A spin in its own command buffer, behind everything the queue has already taken (no fence: the queue's own
+    /// order is the dependency), ended by the next frame's first encoder.
+    fn launchHere(b: *Bridge, queue: mtl.Queue) void {
+        b.epoch +%= 1;
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(b.spin);
+        e.setBuffer(b.flag, 0, 0);
+        e.setValue([2]u32{ bound, b.epoch }, 1);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(32, 1, 1));
+        e.end();
+        cb.commit();
+        b.open = true;
+    }
     /// First in the verify's first encoder, beside its own work: ends the open spin once the verify runs.
     fn end(b: *Bridge, e: mtl.ComputeEncoder) void {
         if (!b.open) return;
@@ -112,6 +126,8 @@ pub const Frame = struct {
     poll_value: u64 = 0,
     unchecked: [9]mtl.CommandBuffer = undefined,
     n_unchecked: usize = 0,
+    /// A bridge spin this frame's first encoder must end (launchAfter, behind a round's keep).
+    spin_after: bool = false,
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -168,6 +184,11 @@ pub const Frame = struct {
         f.entries.clearRetainingCapacity();
         f.cb = f.queue.commandBuffer();
         f.encoder = f.cb.compute(.concurrent);
+        // the spin launched behind the round's keep ends here: this frame's first encoder is the GPU's next work
+        if (f.spin_after) {
+            f.spin_after = false;
+            if (f.bridge) |*b| b.end(f.encoder);
+        }
         f.active = true;
         f.completed = false;
         f.part_count = 0;
@@ -198,6 +219,15 @@ pub const Frame = struct {
     pub fn endBridge(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
         const f: *Frame = @ptrCast(@alignCast(ptr));
         if (f.bridge) |*b| b.end(e);
+    }
+    /// Leaves a bridge spin running behind the verifies that follow a round's keep, so this frame's first command
+    /// buffer starts on a busy GPU instead of a few hundred microseconds after its commit; `begin` ends it.
+    pub fn launchAfter(f: *Frame) void {
+        if (f.active or f.spin_after) return;
+        if (f.bridge) |*b| {
+            b.launchHere(f.queue);
+            f.spin_after = true;
+        }
     }
     fn finishWith(f: *Frame, bridged: bool) !void {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
