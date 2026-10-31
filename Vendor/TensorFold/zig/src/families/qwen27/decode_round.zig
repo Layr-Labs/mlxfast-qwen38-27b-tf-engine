@@ -54,8 +54,11 @@ pub const Runner = struct {
     tail: ?forward.Tail = null,
     /// Committed right after the next verify's last command buffer, then cleared by its caller.
     after: ?forward.Hook = null,
+    /// Encoded first in the next verify's first command buffer, then cleared by its caller.
+    lead: ?forward.Tail = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
+    terminal_head: forward.Head = .all,
     current_placed: image_rows.Placed = .{},
     /// Each slot's rows' M-RoPE layout from its stream's images (empty: text, plain rope at the cache row).
     rope: [attn.planning.max_streams]mrope.Layout = @splat(.{}),
@@ -249,7 +252,11 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .after = r.after, .images = placed.images };
+        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.model.ane == null and
+            (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
+        r.terminal_head = if (terminal_rows) head else .all;
+        defer r.terminal_head = .all;
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -437,7 +444,17 @@ pub const Runner = struct {
         var views: [attn.planning.max_streams]attn.Cache = undefined;
         const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
         try r.bindings[layer].upload(plan, caches);
-        try r.model.kernels.quant(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.q_gate), rows);
+        // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
+        const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
+        if (dead < rows) {
+            var input = f.get(.input);
+            input.offset += @as(usize, dead) * weights.q.k * 2;
+            var query_sums = forward.sums(f, .sums, rows);
+            query_sums.ref.offset += @as(usize, dead) * 4;
+            var query = f.get(.q_gate);
+            query.offset += @as(usize, dead) * weights.q.n * 2;
+            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        }
         try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
         e.barrier();
         // keys and values read in place from the [key | value] rows
