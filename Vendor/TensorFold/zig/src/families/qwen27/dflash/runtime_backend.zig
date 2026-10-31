@@ -135,6 +135,8 @@ pub const Backend = struct {
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
+    /// The frame's last attention mask and its (context rows, query rows): every drafter layer of a frame attends with the same one.
+    mask: ?struct { view: op.View, context_rows: u32, rows: u32 } = null,
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
