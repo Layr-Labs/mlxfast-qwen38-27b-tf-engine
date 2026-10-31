@@ -67,6 +67,7 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
+        f.out_sums = false;
         try m.kernels.norm(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
         if (s.pending != null) {
@@ -103,8 +104,9 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        // a GDN gate's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
-        try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
+        // a GDN gate's or an attention merge's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass
+        const given: ?@import("quant_gpu.zig").Sums = if ((gated or f.out_sums) and !s.compact) sums(f, .sums, s.rows) else null;
+        try m.kernels.quant(e, out, mixer_out, given, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();

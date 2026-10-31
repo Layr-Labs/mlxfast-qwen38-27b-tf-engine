@@ -24,6 +24,16 @@ fn release(ptr: *anyopaque, epoch: u64) void {
     if (b.frame.active and !b.frame.completed) b.failed = true;
     b.frame.release();
 }
+/// Whether a producer writes its output's group sums itself (draft_ops' sums variants), so the prepared projection
+/// that reads the output starts on them: no sums dispatch and no barrier in between.
+fn producesSums(b: *Backend, rows: u32, width: u32) bool {
+    return b.simd == null and b.tiled.count() == 0 and b.fused_count > 0 and rows >= 1 and rows <= 16 and width % 256 == 0;
+}
+/// The frame buffer a sums variant writes (group * 16 + row), and the sums a projection of `y` then reads.
+fn sumsOf(b: *Backend, y: op.View) !struct { view: op.View, ref: Ref } {
+    const view = try b.frame.alloc(y.width / 64, 16, .f32);
+    return .{ .view = view, .ref = try b.frame.ref(view) };
+}
 fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode) !op.View {
     const b = backend(ptr);
     errdefer b.input_sums = null;
@@ -107,9 +117,54 @@ fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
+    if (p.heads == 1 and x.width <= 5120 and producesSums(b, x.rows, x.width) and x.width % 64 == 0) {
+        const sums = try sumsOf(b, y);
+        b.access(e, &.{try b.span(x)}, &.{ try b.span(y), try b.span(sums.view) });
+        try b.primitives.normSums(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), sums.ref, .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
+        b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sums.ref.buf, .off = sums.ref.off }, .stride = 16 } };
+        return y;
+    }
     b.access(e, &.{try b.span(x)}, &.{try b.span(y)});
     try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
     return y;
+}
+fn normRope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm, r: op.Rotary, sink: ?op.KeySink) !op.View {
+    const b = backend(ptr);
+    const e = try b.encoder(epoch);
+    const positions = try b.frame.alloc(x.rows, 1, .u64);
+    const pr = try b.frame.ref(positions);
+    @memcpy(pr.buf.slice(u64, r.positions.len), r.positions);
+    // key rows go straight into the cache ring when the attention will read the ring in place (see attendRows)
+    var y: op.View = undefined;
+    var in_ring = false;
+    if (sink) |k| if (b.transaction == null and b.batch.len == 0 and std.meta.eql(k.context, b.context) and k.layer < b.config.layers and x.width == b.config.kvWidth()) {
+        const context_rows: u32 = @intCast(k.context.end - k.context.begin);
+        const at: u32 = @intCast(k.context.begin % b.config.window);
+        if (at + context_rows + x.rows <= b.config.window) {
+            y = try b.frame.add(.{ .buf = b.caches[k.layer].keys, .off = (@as(usize, at) + context_rows) * b.config.kvWidth() * 2 }, x.rows, x.width, x.width, .bf16);
+            in_ring = true;
+        }
+    };
+    if (!in_ring) y = try b.frame.alloc(x.rows, x.width, .bf16);
+    b.access(e, &.{ try b.span(x), try b.span(positions) }, &.{try b.span(y)});
+    try b.primitives.normRope(e, try b.frame.ref(x), try b.weight(p.weight), pr, try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = x.width, .eps = p.eps }, .{ .rows = x.rows, .heads = r.heads, .dim = r.dim, .x_stride = x.width, .y_stride = x.width, .theta = @floatCast(r.theta) });
+    return y;
+}
+fn convNorm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv, n: op.Norm) !op.ConvNorm {
+    const b = backend(ptr);
+    if (p.residual != null and p.branch == 1 and n.heads == 1 and x.width <= 5120 and producesSums(b, x.rows, x.width)) {
+        const e = try b.encoder(epoch);
+        const r = p.residual.?;
+        const hidden = try b.frame.alloc(x.rows, x.width, .bf16);
+        const y = try b.frame.alloc(x.rows, x.width, .bf16);
+        const sums = try sumsOf(b, y);
+        b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(r) }, &.{ try b.span(hidden), try b.span(y), try b.span(sums.view) });
+        try b.primitives.convNormSums(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), try b.frame.ref(r), try b.weight(n.weight), try b.frame.ref(hidden), try b.frame.ref(y), sums.ref, .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = 1, .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = hidden.stride }, .{ .rows = x.rows, .heads = 1, .dim = n.head_dim, .x_stride = hidden.stride, .y_stride = y.stride, .eps = n.eps });
+        b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sums.ref.buf, .off = sums.ref.off }, .stride = 16 } };
+        return .{ .hidden = hidden, .normed = y };
+    }
+    const hidden = try conv(ptr, epoch, x, p);
+    return .{ .hidden = hidden, .normed = try norm(ptr, epoch, hidden, n) };
 }
 fn embed(ptr: *anyopaque, epoch: u64, _: ck.Linear, ids: []const u32) !op.View {
     const b = backend(ptr);
@@ -127,6 +182,13 @@ fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
+    if (p.branch == 0 and p.residual == null and producesSums(b, x.rows, x.width)) {
+        const sums = try sumsOf(b, y);
+        b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{ try b.span(y), try b.span(sums.view) });
+        try b.primitives.convSums(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), null, try b.frame.ref(y), sums.ref, .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = 0, .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
+        b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sums.ref.buf, .off = sums.ref.off }, .stride = 16 } };
+        return y;
+    }
     if (p.residual) |r| b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(r) }, &.{try b.span(y)}) else b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{try b.span(y)});
     try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
     return y;
@@ -146,6 +208,13 @@ fn swiglu(ptr: *anyopaque, epoch: u64, g: op.View, u: op.View) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(g.rows, g.width, .bf16);
+    if (producesSums(b, g.rows, g.width)) {
+        const sums = try sumsOf(b, y);
+        b.access(e, &.{ try b.span(g), try b.span(u) }, &.{ try b.span(y), try b.span(sums.view) });
+        try b.primitives.swigluSums(e, try b.frame.ref(g), try b.frame.ref(u), try b.frame.ref(y), sums.ref, .{ .rows = g.rows, .width = g.width, .gate_stride = g.stride, .up_stride = u.stride, .y_stride = y.stride });
+        b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sums.ref.buf, .off = sums.ref.off }, .stride = 16 } };
+        return y;
+    }
     b.access(e, &.{ try b.span(g), try b.span(u) }, &.{try b.span(y)});
     try b.primitives.swiglu(e, try b.frame.ref(g), try b.frame.ref(u), try b.frame.ref(y), .{ .rows = g.rows, .width = g.width, .gate_stride = g.stride, .up_stride = u.stride, .y_stride = y.stride });
     return y;
@@ -221,4 +290,5 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
         made += 1;
     }
 }
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .norm_rope = normRope, .conv_norm = convNorm };
+
