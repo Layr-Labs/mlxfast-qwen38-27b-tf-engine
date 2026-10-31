@@ -375,19 +375,19 @@ inline void tf_delta_gdn_replay_body(device const bfloat* key,
   for (uint part = 0; part < count; ++part) next[keep.next_slot * state_stride + column + part] = state[part];
 }
 
-kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
-                           device const bfloat* value [[buffer(1)]],
-                           device const float* decay [[buffer(2)]],
-                           device const bfloat* mixing [[buffer(3)]],
-                           device const float* committed [[buffer(4)]],
-                           device const uint* kept_rows [[buffer(5)]],
-                           device const TfDeltaKeep* keeps [[buffer(6)]],
-                           constant TfDeltaParams& p [[buffer(7)]],
-                           device float* next [[buffer(8)]],
-                           device const TfDeltaSegment* segments [[buffer(9)]],
-                           device const float* before [[buffer(10)]],
-                           uint3 position [[thread_position_in_grid]],
-                           uint lane [[thread_index_in_simdgroup]]) {
+inline void tf_delta_gdn_replay_at(device const bfloat* key,
+    device const bfloat* value,
+    device const float* decay,
+    device const bfloat* mixing,
+    device const float* committed,
+    device const uint* kept_rows,
+    device const TfDeltaKeep* keeps,
+    constant TfDeltaParams& p,
+    device float* next,
+    device const TfDeltaSegment* segments,
+    device const float* before,
+    uint3 position,
+    uint lane) {
   const uint segment = position.z / p.nv;
   if (p.advance != 0 && segments[segment].rows == 1) {
     const TfDeltaKeep keep = keeps[segment];
@@ -401,6 +401,48 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   }
   if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
+}
+
+kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
+                           device const bfloat* value [[buffer(1)]],
+                           device const float* decay [[buffer(2)]],
+                           device const bfloat* mixing [[buffer(3)]],
+                           device const float* committed [[buffer(4)]],
+                           device const uint* kept_rows [[buffer(5)]],
+                           device const TfDeltaKeep* keeps [[buffer(6)]],
+                           constant TfDeltaParams& p [[buffer(7)]],
+                           device float* next [[buffer(8)]],
+                           device const TfDeltaSegment* segments [[buffer(9)]],
+                           device const float* before [[buffer(10)]],
+                           uint3 position [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  tf_delta_gdn_replay_at(key, value, decay, mixing, committed, kept_rows, keeps, p, next, segments, before, position, lane);
+}
+
+struct TfDeltaLayerStrides {
+  ulong key, value, decay, mixing, state, before, history, qkv, next_history;
+  uint per_layer, pad;
+};
+
+kernel void tf_delta_gdn_replay_layers(device const bfloat* key [[buffer(0)]],
+                                  device const bfloat* value [[buffer(1)]],
+                                  device const float* decay [[buffer(2)]],
+                                  device const bfloat* mixing [[buffer(3)]],
+                                  device const float* committed [[buffer(4)]],
+                                  device const uint* kept_rows [[buffer(5)]],
+                                  device const TfDeltaKeep* keeps [[buffer(6)]],
+                                  constant TfDeltaParams& p [[buffer(7)]],
+                                  device float* next [[buffer(8)]],
+                                  device const TfDeltaSegment* segments [[buffer(9)]],
+                                  device const float* before [[buffer(10)]],
+                                  constant TfDeltaLayerStrides& s [[buffer(11)]],
+                                  uint3 grid [[thread_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  const uint layer = grid.z / s.per_layer;
+  const ulong l = layer;
+  const uint3 position = uint3(grid.x, grid.y, grid.z - layer * s.per_layer);
+  tf_delta_gdn_replay_at(key + l * s.key, value + l * s.value, decay + l * s.decay, mixing + l * s.mixing, committed + l * s.state,
+      kept_rows, keeps, p, next + l * s.state, segments, before + l * s.before, position, lane);
 }
 
 // Accepted chains keep the tree path's delta update and sum order; a prompt chunk differs only in trip count.
@@ -640,14 +682,14 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
-kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]],
-                                device const bfloat* projection [[buffer(1)]],
-                                device const uint* kept_rows [[buffer(2)]],
-                                device const TfDeltaKeep* keeps [[buffer(3)]],
-                                device const uint* windows [[buffer(4)]],
-                                constant TfDeltaParams& p [[buffer(5)]],
-                                device bfloat* next [[buffer(6)]],
-                                uint3 position [[thread_position_in_grid]]) {
+inline void tf_delta_gdn_conv_commit_at(device const bfloat* committed,
+    device const bfloat* projection,
+    device const uint* kept_rows,
+    device const TfDeltaKeep* keeps,
+    device const uint* windows,
+    constant TfDeltaParams& p,
+    device bfloat* next,
+    uint3 position) {
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
   const uint width = (p.taps - 1) * channels, item = position.x;
   const TfDeltaKeep keep = keeps[position.y];
@@ -659,6 +701,30 @@ kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]
   const uint row = kept_rows[keep.first + keep.rows - 1];
   const uint source = windows[row * p.taps + item / channels + 1];
   next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
+}
+
+kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]],
+                                device const bfloat* projection [[buffer(1)]],
+                                device const uint* kept_rows [[buffer(2)]],
+                                device const TfDeltaKeep* keeps [[buffer(3)]],
+                                device const uint* windows [[buffer(4)]],
+                                constant TfDeltaParams& p [[buffer(5)]],
+                                device bfloat* next [[buffer(6)]],
+                                uint3 position [[thread_position_in_grid]]) {
+  tf_delta_gdn_conv_commit_at(committed, projection, kept_rows, keeps, windows, p, next, position);
+}
+
+kernel void tf_delta_gdn_conv_commit_layers(device const bfloat* committed [[buffer(0)]],
+                                       device const bfloat* projection [[buffer(1)]],
+                                       device const uint* kept_rows [[buffer(2)]],
+                                       device const TfDeltaKeep* keeps [[buffer(3)]],
+                                       device const uint* windows [[buffer(4)]],
+                                       constant TfDeltaParams& p [[buffer(5)]],
+                                       device bfloat* next [[buffer(6)]],
+                                       constant TfDeltaLayerStrides& s [[buffer(7)]],
+                                       uint3 position [[thread_position_in_grid]]) {
+  const ulong l = position.z;
+  tf_delta_gdn_conv_commit_at(committed + l * s.history, projection + l * s.qkv, kept_rows, keeps, windows, p, next + l * s.next_history, position);
 }
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
@@ -685,6 +751,18 @@ kernel void tf_delta_gdn_publish_conv(device const ushort* next_conv [[buffer(0)
   const uint conv_width = (p.taps - 1) * (2 * p.nk * p.dk + p.nv * p.dv);
   const uint slot = keeps[at.y].next_slot;
   if (at.x < conv_width) conv[slot * conv_width + at.x] = next_conv[slot * conv_width + at.x];
+}
+
+kernel void tf_delta_gdn_publish_conv_layers(device const ushort* next_conv [[buffer(0)]],
+                                        device const TfDeltaKeep* keeps [[buffer(1)]],
+                                        constant TfDeltaParams& p [[buffer(2)]],
+                                        device ushort* conv [[buffer(3)]],
+                                        constant TfDeltaLayerStrides& s [[buffer(4)]],
+                                        uint3 at [[thread_position_in_grid]]) {
+  const uint conv_width = (p.taps - 1) * (2 * p.nk * p.dk + p.nv * p.dv);
+  const uint slot = keeps[at.y].next_slot;
+  const ulong l = at.z;
+  if (at.x < conv_width) conv[l * s.history + slot * conv_width + at.x] = next_conv[l * s.next_history + slot * conv_width + at.x];
 }
 
 kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],

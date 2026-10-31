@@ -278,6 +278,103 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
+    /// commitScan for every layer: one replay and one conv-window launch, each layer at its pool stride.
+    pub fn commitScanAll(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        const s = (try pool.layerStrides(plan.host)) orelse {
+            for (0..pool.budget.layers) |layer| try pool.commitScan(layer, plan, e);
+            return;
+        };
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        p.advance = @intFromBool(pool.advances(plan.host));
+        const layers = pool.budget.layers;
+        const keeps = plan.host.keeps.len;
+        const state = try pool.layerSpan(.state, 0);
+        const m = plan.metadata;
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        if (replays) {
+            e.setPipeline(pool.kernels.replay_layers);
+            e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+            ((try pool.beforeSpan(0, plan.host, pool.advances(plan.host))) orelse state).bind(e, 10);
+            gdn.bind(e, .{ try pool.layerSpan(.key, 0), try pool.layerSpan(.value, 0), try pool.layerSpan(.decay, 0), try pool.layerSpan(.mixing, 0), state }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+            e.setValue(p, 7);
+            e.setBuffer(state.buffer, state.offset, 8);
+            e.setValue(s, 11);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * keeps * layers }, .{ .width = 32, .height = 4 });
+        }
+        e.setPipeline(pool.kernels.conv_commit_layers);
+        gdn.bind(e, .{ try pool.layerSpan(.history, 0), try pool.layerSpan(.qkv, 0) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        const next_history = try pool.layerSpan(.next_history, 0);
+        e.setBuffer(next_history.buffer, next_history.offset, 6);
+        e.setValue(s, 7);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = keeps, .depth = layers }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// commitPublish for every layer in one launch, after commitScanAll's fence.
+    pub fn commitPublishAll(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        const s = (try pool.layerStrides(plan.host)) orelse {
+            for (0..pool.budget.layers) |layer| try pool.commitPublish(layer, plan, e);
+            return;
+        };
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
+        const history = try pool.layerSpan(.history, 0);
+        e.setPipeline(pool.kernels.publish_conv_layers);
+        gdn.bind(e, .{try pool.layerSpan(.next_history, 0)}, 0);
+        e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
+        e.setValue(p, 2);
+        e.setBuffer(history.buffer, history.offset, 3);
+        e.setValue(s, 4);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len, .depth = pool.budget.layers }, .{ .width = 256 }); // a word a thread
+    }
+
+    /// Element strides between layers, or null when a buffer's per-layer bytes do not split into whole elements.
+    fn layerStrides(pool: *const Pool, plan: Plan) !?LayerStrides {
+        const state = try pool.layerSpan(.state, 0);
+        const before = (try pool.beforeSpan(0, plan, pool.advances(plan))) orelse state;
+        const spans = [_]struct { bytes: usize, size: usize }{
+            .{ .bytes = (try pool.layerSpan(.key, 0)).bytes, .size = 2 },
+            .{ .bytes = (try pool.layerSpan(.value, 0)).bytes, .size = 2 },
+            .{ .bytes = (try pool.layerSpan(.decay, 0)).bytes, .size = 4 },
+            .{ .bytes = (try pool.layerSpan(.mixing, 0)).bytes, .size = 2 },
+            .{ .bytes = state.bytes, .size = 4 },
+            .{ .bytes = before.bytes, .size = 4 },
+            .{ .bytes = (try pool.layerSpan(.history, 0)).bytes, .size = 2 },
+            .{ .bytes = (try pool.layerSpan(.qkv, 0)).bytes, .size = 2 },
+            .{ .bytes = (try pool.layerSpan(.next_history, 0)).bytes, .size = 2 },
+        };
+        var strides: [spans.len]u64 = undefined;
+        for (spans, &strides) |span, *stride| {
+            if (span.bytes % span.size != 0) return null;
+            stride.* = span.bytes / span.size;
+        }
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(plan.parents.len, pool.budget.slots, kinds);
+        return .{
+            .key = strides[0],
+            .value = strides[1],
+            .decay = strides[2],
+            .mixing = strides[3],
+            .state = strides[4],
+            .before = strides[5],
+            .history = strides[6],
+            .qkv = strides[7],
+            .next_history = strides[8],
+            .per_layer = std.math.cast(u32, @as(usize, p.nv) * plan.keeps.len) orelse return null,
+        };
+    }
+
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
@@ -361,6 +458,21 @@ pub const Pool = struct {
         const bytes = buffer.length() / pool.budget.layers;
         return .{ .buffer = buffer, .offset = layer * bytes, .bytes = bytes };
     }
+};
+
+/// tf_delta_gdn_*_layers' TfDeltaLayerStrides: element strides between consecutive layers.
+const LayerStrides = extern struct {
+    key: u64,
+    value: u64,
+    decay: u64,
+    mixing: u64,
+    state: u64,
+    before: u64,
+    history: u64,
+    qkv: u64,
+    next_history: u64,
+    per_layer: u32,
+    pad: u32 = 0,
 };
 
 fn tensorSpan(t: Tensor) gdn.Span {

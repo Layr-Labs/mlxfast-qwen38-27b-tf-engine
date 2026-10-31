@@ -348,9 +348,10 @@ pub const Runner = struct {
         }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
+        // every GDN layer's replay and conv window in two launches, then every publish in one
+        try r.gdn.commitScanAll(plan, e);
         e.barrier();
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+        try r.gdn.commitPublishAll(plan, e);
         // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;
@@ -365,19 +366,23 @@ pub const Runner = struct {
             break :made buffer;
         };
         e.useResource(lanes, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        // every layer gathers into its own lanes under one barrier, then every layer scatters under one more
+        // every layer gathers into its own lanes in one launch under one barrier, then every layer scatters in one more
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
             .attention => {
                 var views: [attn.planning.max_streams]attn.Cache = undefined;
                 const caches = r.layerCaches(ai, round, &views);
-                try r.attention.keepGather(e, &r.bindings[ai], p.rows, caches, .{ .buffer = lanes, .offset = 2 * ai * lane }, .{ .buffer = lanes, .offset = (2 * ai + 1) * lane });
+                try attn.Attention.keepUse(e, &r.bindings[ai], p.rows, caches);
                 ai += 1;
             },
         };
+        var table: [attn.max_keep_layers]attn.KeepLayer = undefined;
+        if (ai > table.len) return error.AttentionKeep;
+        const words: u32 = @intCast(lane / 2);
+        try r.attention.keepGatherLayers(e, r.bindings[0..ai], p.rows, table[0..ai], lanes, words);
         e.barrier();
-        for (r.bindings[0..ai], 0..) |*binding, i| r.attention.keepScatter(e, binding, p.rows, .{ .buffer = lanes, .offset = 2 * i * lane }, .{ .buffer = lanes, .offset = (2 * i + 1) * lane });
+        r.attention.keepScatterLayers(e, g, p.rows, table[0..ai], lanes, words);
         e.barrier();
     }
 
