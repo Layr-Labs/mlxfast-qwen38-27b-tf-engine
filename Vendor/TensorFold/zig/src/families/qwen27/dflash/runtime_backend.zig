@@ -58,6 +58,62 @@ pub const group_gu = 3;
 const part_ops = 40;
 /// The first part is short, so the GPU starts while the rest is still being encoded.
 const first_part_ops = 6;
+
+/// Bytes [lo, hi) of one Metal buffer that a frame dispatch reads or writes.
+pub const Span = struct {
+    buf: usize,
+    lo: usize,
+    hi: usize,
+    pub fn of(r: Ref, bytes: usize) Span {
+        return .{ .buf = @intFromPtr(r.buf.id), .lo = r.off, .hi = r.off + bytes };
+    }
+    pub fn whole(buf: mtl.Buffer) Span {
+        return .{ .buf = @intFromPtr(buf.id), .lo = 0, .hi = std.math.maxInt(usize) };
+    }
+    fn meets(a: Span, b: Span) bool {
+        return a.buf == b.buf and a.lo < b.hi and b.lo < a.hi;
+    }
+};
+
+/// What the frame's concurrent encoder ran since its last barrier: a dispatch that reads what one of them writes, or
+/// writes what one of them reads or writes, waits behind a barrier; every other dispatch runs beside them.
+pub const Hazards = struct {
+    writes: [96]Span = undefined,
+    reads: [192]Span = undefined,
+    n_writes: usize = 0,
+    n_reads: usize = 0,
+    pub fn clear(h: *Hazards) void {
+        h.n_writes = 0;
+        h.n_reads = 0;
+    }
+    fn any(list: []const Span, x: Span) bool {
+        for (list) |y| if (y.meets(x)) return true;
+        return false;
+    }
+    /// Barrier when `reads`/`writes` conflict with the open set, then add them to it.
+    pub fn order(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span) void {
+        var conflict = h.n_writes + writes.len > h.writes.len or h.n_reads + reads.len > h.reads.len;
+        if (!conflict) for (reads) |x| if (any(h.writes[0..h.n_writes], x)) {
+            conflict = true;
+            break;
+        };
+        if (!conflict) for (writes) |x| if (any(h.writes[0..h.n_writes], x) or any(h.reads[0..h.n_reads], x)) {
+            conflict = true;
+            break;
+        };
+        if (conflict) h.barrier(e);
+        @memcpy(h.reads[h.n_reads..][0..reads.len], reads);
+        h.n_reads += reads.len;
+        @memcpy(h.writes[h.n_writes..][0..writes.len], writes);
+        h.n_writes += writes.len;
+    }
+    /// Everything encoded so far completes before anything encoded next.
+    pub fn barrier(h: *Hazards, e: mtl.ComputeEncoder) void {
+        e.barrier();
+        h.clear();
+    }
+};
+
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -83,6 +139,7 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
+    hazards: Hazards = .{},
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -93,8 +150,11 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
+        // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
+        try target.kernels.prepareDecode(head.linear, 1);
         const caches = try newCaches(a, target.device, c, c.layers);
-        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue }, .caches = caches };
+        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -254,8 +314,22 @@ pub const Backend = struct {
         if (b.failed) return error.DraftBackendFailed;
         try b.frame.require(epoch);
         b.frame.ops += 1;
-        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) try b.frame.part();
+        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) {
+            const parts = b.frame.part_count;
+            try b.frame.part();
+            if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
+        }
         return b.frame.encoder;
+    }
+    /// A frame view's bytes, for hazard tracking.
+    pub fn span(b: *Backend, v: op.View) !Span {
+        return Span.of(try b.frame.ref(v), (@as(usize, v.rows - 1) * v.stride + v.width) * v.dtype.size());
+    }
+    pub fn access(b: *Backend, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span) void {
+        b.hazards.order(e, reads, writes);
+    }
+    pub fn barrier(b: *Backend, e: mtl.ComputeEncoder) void {
+        b.hazards.barrier(e);
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32, stride: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
