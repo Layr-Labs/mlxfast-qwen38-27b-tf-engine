@@ -390,6 +390,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     sp += TF_N / 4;
     xp += stride;
 #else
+#if defined(TF_FOLD_D4)
+  // Arm D: both streaming chains two groups deep. Stage A holds group g's eight code words and its metadata index,
+  // stage B holds g+1's; each iteration promotes B into A and refills B from a pointer that already stands on g+2.
+  // The index chain is the co-critical one: one stage deep it holds the pair at one latency, so deepening the codes
+  // alone (fold2, scouts/wave9/fold_layout.md:213-217) could not move the rate (scouts/wave10/decode.md:131-146).
+#if !defined(TF_SBI12) || !defined(TF_ROWS8)
+#error TF_FOLD_D4 needs TF_SBI12 and TF_ROWS8
+#endif
+  uint4 nw0 = 0, nw1 = 0; // group g
+  uint4 pw0 = 0, pw1 = 0; // group g+1
+  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+  if (first + 1 < last) { pw0 = wl[(size_t)(first + 1) * TF_TB * 64]; pw1 = wl[(size_t)(first + 1) * TF_TB * 64 + 32]; }
+  const device uint* tab = (const device uint*)SB;
+  const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
+  uint3 ni = 0, pi = 0;
+  if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+  if (first + 1 < last) pi = ixs[(size_t)(first + 1) * (TF_N / 8)];
+  const device uint4* wp = wl + (size_t)min(first + 2, last - 1) * TF_TB * 64;
+  const device packed_uint3* ip = ixs + (size_t)min(first + 2, last - 1) * (TF_N / 8);
+#else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
 #if defined(TF_SBI12)
@@ -404,6 +424,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+#endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
     const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
@@ -425,14 +446,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const tf_reg_load cur = next;
 #endif
     for (int w = 0; w < 8; w++) {
-      // codes as fp16 subnormals (bits = code, value code * 2^-24): products are the usual ones scaled by 2^-24 exactly, and
-      // the scales below carry the 2^24 back
-      const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
+      // 1024 + code as fp16 bits, codes (0,4) (1,5) (2,6) (3,7) of a word; subtracting 1024 is exact
+      const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu;
       const int e = 16 * (w & 1) + 2 * (w >> 1);
-      b2[e] = as_type<half2>(word & 0x000F000Fu);
-      b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
-      b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
-      b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
+      b2[e] = as_type<half2>((lo & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 1] = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+      b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
@@ -441,11 +461,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = cp[32];
 #else
+#if defined(TF_FOLD_D4)
+    // A takes g+1 from B, then B takes g+2: the stages are one promotion apart, so every load has two groups of
+    // cover and no group is loaded twice. Past the last group both pointers hold at last-1, whose words nothing reads.
+    { nw0 = pw0; nw1 = pw1; ni = pi; }
+    pw0 = wp[0]; pw1 = wp[32];
+    wp += g + 3 < last ? TF_TB * 64 : 0;
+    pi = ip[0];
+    ip += g + 3 < last ? TF_N / 8 : 0;
+#else
     { const int stay = int(g + 1 >= last); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, last - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
     { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#endif
 #endif
 #endif
 #else
@@ -465,7 +495,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
-      const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
@@ -590,13 +620,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       thread half2* b2h = (thread half2*)&CB##h[0]; \
       TF_UNROLL \
       for (int w = 0; w < 8; w++) { \
-        const uint word = w < 4 ? nw0[t][w] : nw1[t][w - 4]; \
+        const uint word = w < 4 ? nw0[t][w] : nw1[t][w - 4], lo = word & 0x0F0F0F0Fu, hi = (word >> 4) & 0x0F0F0F0Fu; \
         thread half2* b2 = (w & 1) ? b2h : b2l; \
         const int e = 2 * (w >> 1); \
-        b2[e] = as_type<half2>(word & 0x000F000Fu); \
-        b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu); \
-        b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu); \
-        b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu); \
+        b2[e] = as_type<half2>((lo & 0x00FF00FFu) | 0x64006400u) - bias; \
+        b2[e + 1] = as_type<half2>((hi & 0x00FF00FFu) | 0x64006400u) - bias; \
+        b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
+        b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias; \
       } \
       nw0[t] = cp[(t) * TF_TN_CODES]; \
       nw1[t] = cp[(t) * TF_TN_CODES + 32]; \
@@ -605,7 +635,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
-        const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
         C[t][j] = fma(s0, PP[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, PP[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, PP[8 + j], fma(b1, x0, C[t][8 + j])); \

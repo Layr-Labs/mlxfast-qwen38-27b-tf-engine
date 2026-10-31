@@ -163,9 +163,7 @@ pub const Stages = struct {
                 input.offset += @as(usize, s.rows - 1) * m.config.hidden * 2;
                 head_sums.ref.offset += @as(usize, s.rows - 1) * 4;
             }
-            // a decoded round's rows read the copy whose eight adjacent tiles interleave; a prompt's last row the unbatched one
-            const head = if (s.head == .all) m.weights.head_decode else m.weights.head;
-            try m.kernels.quant(e, head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
+            try m.kernels.quant(e, m.weights.head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);

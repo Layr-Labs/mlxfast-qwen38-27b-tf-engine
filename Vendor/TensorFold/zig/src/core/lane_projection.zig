@@ -179,6 +179,8 @@ pub const Layout = struct {
     swiglu: bool = false,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
+    /// Reg decode-row launches with both streaming chains (codes and the indexed metadata) two groups deep.
+    fold_d4: bool = false,
     /// `indexed` as lane_projection.indexed12_layout.
     indexed12: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
@@ -201,6 +203,8 @@ pub const Layout = struct {
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
+        // arm D refills both chains two ahead: one K split a chain, indexed12 metadata, decoded rows, no prompt
+        if (l.fold_d4 and (!l.reg_lean or !l.rows8 or l.prompt_sr or !l.indexed12 or l.swiglu or !l.serial_sk2)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
@@ -285,6 +289,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
+    if (l.fold_d4) try text.appendSlice(a, "#define TF_FOLD_D4 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
