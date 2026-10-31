@@ -58,6 +58,7 @@ test {
     _ = model;
     _ = round_plan;
     _ = attention;
+    _ = @import("attention_memory.zig");
     _ = prompt_glue;
     _ = prompt_state;
     _ = prompt_marks;

@@ -52,7 +52,8 @@ pub const Scalars = struct {
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
+/// `row`: rows of the pool's row scratch (a scan's outputs, conv tails) before this pass's: a split chunk's later segment's.
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, row: u32 = 0 };
 
 pub const Pool = struct {
     budget: Budget,
@@ -323,9 +324,9 @@ pub const Pool = struct {
             .value = try pool.layerSpan(.value, layer),
             .decay = try pool.layerSpan(.decay, layer),
             .mixing = try pool.layerSpan(.mixing, layer),
-            .tails = try refSpan(.{ .buffer = pool.get(.tails) }, bytes.tails),
-            .snapshots = try refSpan(.{ .buffer = pool.get(.snapshots) }, bytes.snapshots),
-            .recurrent = try refSpan(.{ .buffer = pool.get(.recurrent) }, bytes.value),
+            .tails = try refSpan(.{ .buffer = pool.get(.tails), .offset = @as(usize, refs.row) * pool.budget.shape.conv * 2 }, bytes.tails),
+            .snapshots = try refSpan(.{ .buffer = pool.get(.snapshots) }, bytes.snapshots), // one pass's trees at a time; a chain keeps none
+            .recurrent = try refSpan(.{ .buffer = pool.get(.recurrent), .offset = @as(usize, refs.row) * pool.budget.shape.value * 2 }, bytes.value),
             .output = try refSpan(refs.output, bytes.value),
             .next_state = if (inPlace(plan)) try pool.layerSpan(.state, layer) else return error.GdnSlotMoves,
             .next_history = try pool.layerSpan(.next_history, layer),

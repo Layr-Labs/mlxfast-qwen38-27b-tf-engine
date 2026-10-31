@@ -7,6 +7,8 @@ pub fn appendRunner(r: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.B
     try fields.append(a, list, &r.gdn);
     try fields.append(a, list, &r.scratch);
     for (r.bindings) |*binding| try fields.append(a, list, binding);
+    if (r.side_bindings) |side| for (side) |*binding| try fields.append(a, list, binding);
+    if (r.side_dims) |b| try list.append(a, b);
     try fields.append(a, list, &r.taps);
     try r.readyBuffers(a, list);
 }
@@ -14,6 +16,8 @@ pub fn appendRunner(r: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.B
 fn runnerBuffers(r: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.apply(&r.scratch, hook, joining);
     for (r.bindings) |*binding| fields.apply(binding, hook, joining);
+    if (r.side_bindings) |side| for (side) |*binding| fields.apply(binding, hook, joining);
+    if (r.side_dims) |b| fields.one(b, hook, joining);
     fields.apply(&r.taps, hook, joining);
     for (r.owned.items) |b| fields.one(b, hook, joining);
 }
@@ -152,6 +156,7 @@ pub fn hold(h: anytype, io: std.Io) !void {
         h.runner.setResident(r.follow());
         setBack(h.back, r.follow());
         if (h.draft) |d| d.model.backend.setResident(r.follow());
+        (try h.model.sideQueue()).addResidencySet(r.held.set); // a split prompt chunk's second lane sees the set as the model's queue does
     }
     h.warm = if (h.resident) |*r| r.target() else .{ .queue = h.model.queue };
 }
@@ -161,7 +166,10 @@ pub fn drop(h: anytype) void {
     h.runner.setResident(null);
     setBack(h.back, null);
     if (h.draft) |d| d.model.backend.setResident(null);
-    if (h.resident) |*r| r.deinit();
+    if (h.resident) |*r| {
+        if (h.model.side) |q| q.removeResidencySet(r.held.set);
+        r.deinit();
+    }
     h.resident = null;
     h.warm = .{ .queue = h.model.queue };
 }

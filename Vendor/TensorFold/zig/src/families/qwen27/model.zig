@@ -24,6 +24,8 @@ pub const Model = struct {
     kernels: quant.Kernels,
     glue: glue.Kernels,
     frame: Frame,
+    /// A second queue, a split prompt chunk's second segment's, made at its first use (sideQueue).
+    side: ?mtl.Queue = null,
     /// The Neural Engine's share of prompt-chunk MLPs, when it loaded.
     ane: ?*ane_mlp.Share = null,
     /// A deferred share still needs the checkpoint mappings, until loadShare decides and closes them.
@@ -137,8 +139,17 @@ pub const Model = struct {
         return if (m.ane) |share| share.cacheBytes(m.config) else 0;
     }
 
+    /// The second queue, made once; a served host adds its residency set to it as to `queue`.
+    pub fn sideQueue(m: *Model) !mtl.Queue {
+        if (m.side) |q| return q;
+        const q = try m.device.queue();
+        m.side = q;
+        return q;
+    }
+
     pub fn deinit(m: *Model) void {
         if (m.ane) |share| share.deinit();
+        if (m.side) |q| q.deinit();
         m.frame.deinit();
         m.glue.deinit();
         m.kernels.deinit();

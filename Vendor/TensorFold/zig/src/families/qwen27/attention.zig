@@ -117,7 +117,6 @@ pub const Scratch = struct {
     tiles: u32,
     chunks: u32,
     tail_chunks: u32,
-    uploaded: ?[32]u8 = null,
     pub fn init(device: mtl.Device, limits: Limits) !Scratch {
         try validLimits(limits);
         const layout = @import("attention_memory.zig").Layout.init(limits);
@@ -143,17 +142,31 @@ pub const Scratch = struct {
         for (s.buffers) |buffer| total += buffer.length();
         return total;
     }
-    pub fn upload(s: *Scratch, plan: Plan) !void {
-        if (plan.rows > s.limits.rows or plan.streams > s.limits.streams or plan.tiles > s.tiles or plan.prefix_chunks > s.chunks or plan.tail_chunks > s.tail_chunks or plan.geometry.shared_prefix != s.limits.shared_prefix or !plan.geometry.sameShape(s.limits.geometry)) return error.AttentionLimits;
-        @memcpy(s.get(.tile_stream).buffer.slice(i32, plan.tile_stream.len), plan.tile_stream);
-        @memcpy(s.get(.q_rows).buffer.slice(i32, plan.q_rows.len), plan.q_rows);
-        @memcpy(s.get(.nodes).buffer.slice(i32, plan.nodes.len), plan.nodes);
-        @memcpy(s.get(.paths).buffer.slice(i32, plan.paths.len), plan.paths);
-        @memcpy(s.get(.positions).buffer.slice(i32, plan.positions.len), plan.positions);
-        s.uploaded = fingerprint(plan);
+};
+/// One pass's rows in a scratch, behind `rows` rows and `tiles` tiles of another pass's (a split prompt chunk's second
+/// segment behind its first): its plan words, packed query and partials start there.
+pub const Region = struct {
+    scratch: *const Scratch,
+    rows: u32 = 0,
+    tiles: u32 = 0,
+    uploaded: ?[32]u8 = null,
+    pub fn get(r: *const Region, field: Field) Ref {
+        const s = r.scratch;
+        const at = @import("attention_memory.zig").offsets(s.limits, s.chunks, s.tail_chunks, r.rows, r.tiles);
+        return .{ .buffer = s.buffers[@backingInt(field)], .offset = at[@backingInt(field)] };
     }
-    pub fn check(s: *const Scratch, plan: Plan) !void {
-        const uploaded = s.uploaded orelse return error.AttentionNotUploaded;
+    pub fn upload(r: *Region, plan: Plan) !void {
+        const s = r.scratch;
+        if (plan.rows > s.limits.rows - @min(r.rows, s.limits.rows) or plan.streams > s.limits.streams or plan.tiles > s.tiles - @min(r.tiles, s.tiles) or plan.prefix_chunks > s.chunks or plan.tail_chunks > s.tail_chunks or plan.geometry.shared_prefix != s.limits.shared_prefix or !plan.geometry.sameShape(s.limits.geometry)) return error.AttentionLimits;
+        inline for (.{ .tile_stream, .q_rows, .nodes, .paths, .positions }, .{ plan.tile_stream, plan.q_rows, plan.nodes, plan.paths, plan.positions }) |field, words| {
+            const at = r.get(field);
+            const bytes = std.mem.sliceAsBytes(words);
+            @memcpy(at.buffer.contents()[at.offset..][0..bytes.len], bytes);
+        }
+        r.uploaded = fingerprint(plan);
+    }
+    pub fn check(r: *const Region, plan: Plan) !void {
+        const uploaded = r.uploaded orelse return error.AttentionNotUploaded;
         if (!std.mem.eql(u8, &uploaded, &fingerprint(plan))) return error.AttentionNotUploaded;
     }
 };
@@ -313,8 +326,9 @@ pub const Attention = struct {
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only. `sums` (decoded rows only): the merge also writes the out
-    /// projection's group sums of `out` there, so that projection dispatches no sums pass of its own.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
+    /// projection's group sums of `out` there, so that projection dispatches no sums pass of its own. `region`: the
+    /// pass's rows in the scratch, its plan uploaded there.
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, region: *const Region, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
@@ -325,7 +339,7 @@ pub const Attention = struct {
         errdefer timing.cancel();
         const e = timing.encoder;
 
-        try scratch.check(plan);
+        try region.check(plan);
         try binding.check(plan, caches);
         try spanAligned(q, q_bytes, 16);
         try span(k, kv_bytes);
@@ -344,7 +358,7 @@ pub const Attention = struct {
             try disjoint(cache.keys, cacheBytes(cache, true, plan.geometry), operand.ref, operand.bytes);
             try disjoint(cache.values, cacheBytes(cache, false, plan.geometry), operand.ref, operand.bytes);
         };
-        for (scratch.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        for (region.scratch.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
         for (binding.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
         for (caches) |cache| {
             e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
@@ -352,18 +366,18 @@ pub const Attention = struct {
         }
         const args = PackArgs{ .rows = plan.rows, .packed_rows = plan.tiles * 16, .heads = g.heads, .kv_heads = g.kv_heads, .dim = g.dim, .group = g.group(), .v_stride = v_stride };
         e.setPipeline(a.io[2]);
-        bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
+        bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), region.get(.nodes) });
         e.setValue(args, 5);
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 4, 1));
         if (!prepacked) {
             e.setPipeline(a.io[0]);
-            bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
+            bind(e, .{ q, region.get(.q_rows), region.get(.qa) });
             e.setValue(args, 3);
             e.dispatchThreads(mtl.Size.of(g.dim, args.packed_rows, g.kv_heads), mtl.Size.of(32, 4, 1));
         }
         if (a.promptPath(plan, prompt)) {
             e.barrier();
-            try a.promptRows(e, scratch, binding, plan, out);
+            try a.promptRows(e, region, binding, plan, out);
             if (raw_gate) |gate| {
                 e.setPipeline(a.io[9]);
                 bind(e, .{ out, gate });
@@ -372,42 +386,44 @@ pub const Attention = struct {
                 e.dispatchThreads(mtl.Size.of(g.dim, g.heads, plan.rows), mtl.Size.of(32, 1, 1));
                 e.barrier();
             }
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
+        } else try a.treeRows(e, region, binding, plan, q, out, raw_gate, args, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
-    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, out: Ref) !void {
+    fn promptRows(a: *const Attention, e: mtl.ComputeEncoder, region: *const Region, binding: *const Binding, plan: Plan, out: Ref) !void {
         const g = plan.geometry;
+        const scratch = region.scratch;
         const start: i32 = plan.meta[planning.global_words + 4];
         for (plan.positions, 0..) |position, i| if (position != start + @as(i32, @intCast(i))) return error.PromptRowsNotChain; // the kernel places row i at start + i
         const chunks: u32 = @intCast(@divFloor(start + @as(i32, @intCast(plan.rows)) + planning.chunk - 1, planning.chunk));
-        if (chunks > scratch.chunks or plan.tiles > scratch.tiles) return error.AttentionLimits;
+        if (chunks > scratch.chunks or region.tiles + plan.tiles > scratch.tiles) return error.AttentionLimits;
         // before M5 (no shared prefix) the partials take the tail's buffers, which hold every chunk's packed rows
         const parts = if (g.shared_prefix) [3]Field{ .poa, .pma, .pla } else [3]Field{ .pob, .pmb, .plb };
         if (!g.shared_prefix and @as(usize, chunks) * plan.tiles * 16 > @as(usize, scratch.tail_chunks) * scratch.limits.rows * 16) return error.AttentionLimits;
         const args = PromptArgs{ .start = start, .rows = @intCast(plan.rows), .chunks = @intCast(chunks), .rp = @intCast(plan.tiles * 16), .key_stride = @intCast(binding.strides[0][0]), .value_stride = @intCast(binding.strides[0][1]), .scale2 = 0.0625 * std.math.log2e };
         const pairs = prompt_threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
         e.setPipeline(a.prompt.?[0]);
-        bind(e, .{ scratch.get(.qa), binding.get(.caches) });
+        bind(e, .{ region.get(.qa), binding.get(.caches) });
         e.setValue(args, 2);
-        e.setBuffer(scratch.get(parts[0]).buffer, 0, 3);
-        e.setBuffer(scratch.get(parts[1]).buffer, 0, 4);
-        e.setBuffer(scratch.get(parts[2]).buffer, 0, 5);
+        for (parts, 3..) |part, i| {
+            const r = region.get(part);
+            e.setBuffer(r.buffer, r.offset, i);
+        }
         e.dispatchGroups(mtl.Size.of(g.kv_heads, chunks, (plan.tiles + pairs - 1) / pairs), mtl.Size.of(prompt_threads, 1, 1));
         e.barrier();
         e.setPipeline(a.prompt.?[1]);
-        bind(e, .{ scratch.get(parts[0]), scratch.get(parts[1]), scratch.get(parts[2]) });
+        bind(e, .{ region.get(parts[0]), region.get(parts[1]), region.get(parts[2]) });
         e.setValue(args, 3);
         e.setBuffer(out.buffer, out.offset, 4);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, region: *const Region, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
         const g = plan.geometry;
         if (!plan.fused) {
             e.setPipeline(a.io[1]);
-            bind(e, .{ q, scratch.get(.qb) });
+            bind(e, .{ q, region.get(.qb) });
             e.setValue(args, 2);
             e.dispatchThreads(mtl.Size.of(g.dim, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1));
         }
@@ -418,31 +434,30 @@ pub const Attention = struct {
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
             e.setPipeline(a.prefix[sg - 1]);
-            bind(e, .{ scratch.get(.qa), binding.get(.caches) });
+            bind(e, .{ region.get(.qa), binding.get(.caches) });
             e.setValue(scale, 2);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
-            e.setBuffer(scratch.get(.tile_stream).buffer, 0, 4);
-            e.setBuffer(scratch.get(.poa).buffer, 0, 5);
-            e.setBuffer(scratch.get(.pma).buffer, 0, 6);
-            e.setBuffer(scratch.get(.pla).buffer, 0, 7);
-            e.setBuffer(scratch.get(.nodes).buffer, 0, 8);
+            for ([_]Field{ .tile_stream, .poa, .pma, .pla, .nodes }, 4..) |field, i| {
+                const r = region.get(field);
+                e.setBuffer(r.buffer, r.offset, i);
+            }
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(64 * sg, 1, 1));
             e.barrier();
         }
         if (!plan.fused) {
             e.setPipeline(a.io[3]);
-            bind(e, .{ scratch.get(.qb), binding.get(.caches) });
+            bind(e, .{ region.get(.qb), binding.get(.caches) });
             e.setValue(scale, 2);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
             for ([_]Field{ .paths, .nodes, .poa, .pma, .pla, .pob, .pmb, .plb }, 4..) |field, i| {
-                const r = scratch.get(field);
-                e.setBuffer(r.buffer, 0, i);
+                const r = region.get(field);
+                e.setBuffer(r.buffer, r.offset, i);
             }
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
             e.barrier();
         }
         e.setPipeline(a.io[4]);
-        bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
+        bind(e, .{ region.get(.poa), region.get(.pma), region.get(.pla), region.get(.pob), region.get(.pmb), region.get(.plb), binding.get(.meta), region.get(.nodes), out, raw_gate orelse out });
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 10);
         const xs = if (sums) |s| s.ref else out;
         e.setBuffer(xs.buffer, xs.offset, 11);

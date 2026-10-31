@@ -40,6 +40,59 @@ test "qwen27 bank: narrow rounds bind narrow activations without changing the wi
     try std.testing.expectEqual(last, frame.get(.mixed).buffer.id);
 }
 
+test "qwen27 bank: a split chunk's views take disjoint rows, group-sum regions and descriptor slots of one frame" {
+    var allocations: metal.Allocations = .{};
+    const device = metal.Device{ .allocations = &allocations };
+    var frame = try gpu.Frame.init(device, config(), 2048);
+    defer frame.deinit();
+    const ids: [1065]u32 = @splat(0);
+    const pos: [1065]i32 = @splat(0);
+    try frame.setRows(&ids, &pos);
+    const dims = try device.buffer(64, 0);
+    defer dims.deinit();
+    const first = gpu.View.init(&frame, 0, 512, .{ .buffer = dims }, 0, 0);
+    const second = gpu.View.init(&frame, 512, 553, .{ .buffer = dims, .offset = 32 }, 512, 1);
+    first.setDims();
+    second.setDims();
+    try std.testing.expectEqualSlices(i32, &.{ 512, 512, 0, 0, 0, 0, 0, 0, 553, 560 }, dims.slice(i32, 10));
+    const whole = frame.whole(1065);
+    for (std.enums.values(gpu.Field)) |field| {
+        const w = whole.get(field);
+        try std.testing.expectEqual(frame.get(field).buffer.id, w.buffer.id);
+        try std.testing.expectEqual(@as(usize, 0), w.offset);
+        const a = first.get(field);
+        const b = second.get(field);
+        try std.testing.expectEqual(a.buffer.id, b.buffer.id);
+        switch (field) {
+            .dims => {
+                try std.testing.expectEqual(dims.id, a.buffer.id);
+                try std.testing.expectEqual(@as(usize, 32), b.offset - a.offset);
+            },
+            .eps, .logits, .last_dims => try std.testing.expectEqual(a.offset, b.offset), // read-only, or the last segment's
+            else => {
+                const rb = first.row_bytes[@backingInt(field)];
+                const unit: usize = switch (field) {
+                    .sums, .act_sums => rb / 16,
+                    .segments, .keeps => 16,
+                    else => rb,
+                };
+                const a_rows: usize = switch (field) {
+                    .segments, .keeps => 1,
+                    else => 512,
+                };
+                const b_rows: usize = switch (field) {
+                    .sums, .act_sums => 560,
+                    .segments, .keeps => 1,
+                    else => 553,
+                };
+                try std.testing.expectEqual(@as(usize, 0), a.offset);
+                try std.testing.expectEqual(a_rows * unit, b.offset);
+                try std.testing.expect(b.offset + b_rows * unit <= b.buffer.length());
+            },
+        }
+    }
+}
+
 test "qwen27 bank: both activation banks are inventoried once and every failed allocation unwinds" {
     var count: usize = 0;
     {

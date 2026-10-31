@@ -93,6 +93,11 @@ pub const Frame = struct {
         return .{ .buffer = frame.buffers[@backingInt(field)] };
     }
 
+    /// The frame's first `rows` rows as one pass sees them, on the frame's own dims.
+    pub fn whole(frame: *Frame, rows: u32) View {
+        return View.init(frame, 0, rows, frame.get(.dims), 0, 0);
+    }
+
     /// Called between completed rounds; metadata, position planes and outputs retain their original owners.
     pub fn setRows(frame: *Frame, ids: []const u32, positions: []const i32) !void {
         if (ids.len == 0 or ids.len > frame.capacity or positions.len != ids.len) return error.BadFrameRows;
@@ -108,5 +113,51 @@ pub const Frame = struct {
         @memset(frame.get(.dims).buffer.slice(i32, 8), 0);
         frame.get(.dims).buffer.slice(i32, 8)[0] = @intCast(ids.len);
         frame.get(.dims).buffer.slice(i32, 8)[1] = @intCast(16 * ((ids.len + 15) / 16));
+    }
+};
+
+/// Rows [start, start + rows) of a frame as one pass over them sees them: every row field from its first row, the
+/// group sums (XS[group * stride + row], `stride` its padded rows) in a region of their own, dims of their own and the
+/// window descriptors of its part. A split prompt chunk's segments run on two views of one frame at once.
+pub const View = struct {
+    frame: *Frame,
+    start: u32,
+    rows: u32,
+    /// [rows, padded rows, 0...] as setRows writes the frame's.
+    dims: Ref,
+    /// Padded rows before this view's group-sums region.
+    sums_row: u32,
+    /// Whose segment and keep descriptors (16 bytes each) the view's plan uploads.
+    part: u32,
+    row_bytes: [std.enums.values(Field).len]usize,
+    /// A GDN block's gate or a decoded-row attention merge wrote its out projection's group sums into `.sums` (read
+    /// and cleared by that projection).
+    mixer_sums: bool = false,
+
+    pub fn init(frame: *Frame, start: u32, rows: u32, dims: Ref, sums_row: u32, part: u32) View {
+        var row_bytes = allocationSizes(frame.config, 1); // one row of each row field
+        row_bytes[@backingInt(Field.positions)] = 4; // three planes `capacity` rows apart: the first plane's row
+        return .{ .frame = frame, .start = start, .rows = rows, .dims = dims, .sums_row = sums_row, .part = part, .row_bytes = row_bytes };
+    }
+
+    pub fn get(v: *const View, field: Field) Ref {
+        var r = v.frame.get(field);
+        r.offset += switch (field) {
+            .dims => return v.dims,
+            .eps, .logits, .last_dims => 0,
+            // group-major: a group's 16 padded rows at capacity 1
+            .sums, .act_sums => @as(usize, v.sums_row) * (v.row_bytes[@backingInt(field)] / 16),
+            .segments, .keeps => @as(usize, v.part) * 16,
+            else => @as(usize, v.start) * v.row_bytes[@backingInt(field)],
+        };
+        return r;
+    }
+
+    /// The view's dims, written where `dims` points.
+    pub fn setDims(v: *const View) void {
+        const words = @as([*]i32, @ptrCast(@alignCast(v.dims.buffer.contents() + v.dims.offset)))[0..8];
+        @memset(words, 0);
+        words[0] = @intCast(v.rows);
+        words[1] = @intCast(16 * ((v.rows + 15) / 16));
     }
 };

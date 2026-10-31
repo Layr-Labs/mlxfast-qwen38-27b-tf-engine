@@ -74,18 +74,18 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence };
         n_lanes += 1;
     }
-    var done: [16]mtl.CommandBuffer = undefined;
+    var done: [40]mtl.CommandBuffer = undefined;
     var n_done: usize = 0;
     const X = struct {
         fam: @TypeOf(fam),
         lanes: []Lane,
         evs: []const mtl.Event,
         mode: mtl.DispatchType,
-        queue: mtl.Queue,
+        queues: []const mtl.Queue,
         every: usize,
         layers: usize,
         first: usize,
-        done: *[16]mtl.CommandBuffer,
+        done: *[40]mtl.CommandBuffer,
         n_done: *usize,
 
         /// Ends the lane's encoder, waits for (or signals) `value` between its encoders, and opens the next behind the fence.
@@ -117,14 +117,16 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
-            if (x.every == 0 or x.lanes.len != 1 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
+            // each lane commits on its own queue at the same layers, so the GPU starts while the CPU encodes the rest;
+            // a lane's event waits sit in whichever of its buffers is open, after its earlier buffers in queue order
+            if (x.every == 0 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
             const l = &x.lanes[k];
             l.fence.update(l.enc);
             l.enc.end();
             l.cb.commit();
             x.done[x.n_done.*] = l.cb;
             x.n_done.* += 1;
-            l.cb = x.queue.commandBuffer();
+            l.cb = x.queues[k].commandBuffer();
             l.enc = l.cb.compute(x.mode);
             l.fence.wait(l.enc);
         }
@@ -132,7 +134,7 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
             try x.fam.finish(&x.lanes[k]);
         }
     };
-    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queue = queues[0], .every = every, .layers = layers, .first = first, .done = &done, .n_done = &n_done };
+    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queues = queues, .every = every, .layers = layers, .first = first, .done = &done, .n_done = &n_done };
     stagger.drive(n, layers, &x) catch |err| { // close the open encoders, drop the open command buffers, let committed chunks finish
         for (lanes[0..n]) |l| l.enc.end();
         for (done[0..n_done]) |cb| cb.wait();

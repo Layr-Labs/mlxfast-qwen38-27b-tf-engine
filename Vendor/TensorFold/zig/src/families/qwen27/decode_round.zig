@@ -3,6 +3,8 @@ const std = @import("std");
 const mtl = @import("metal");
 const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
+const View = @import("gpu_frame.zig").View;
+const segments = @import("core").segments;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
@@ -49,19 +51,16 @@ pub const Runner = struct {
     capture_taps: bool = false,
     /// Each attention layer's own keep K/V lanes, made at the first moving keep: the 16 gathers then run side by side.
     keep_lanes: ?mtl.Buffer = null,
-    accepted_chain: bool = false,
     last_gpu_seconds: f64 = 0,
-    current_round: ?*const Round = null,
     /// Encoded after the head of the next verify, in its last command buffer.
     tail: ?forward.Tail = null,
     /// Committed right after the next verify's last command buffer, then cleared by its caller.
     after: ?forward.Hook = null,
     /// Encoded first in the next verify's first command buffer, then cleared by its caller.
     lead: ?forward.Tail = null,
-    current_gdn: ?*const GdnPlan = null,
-    current_attention: ?*const attn.Plan = null,
-    terminal_head: forward.Head = .all,
-    current_placed: image_rows.Placed = .{},
+    /// A split prompt chunk's second segment's own attention bindings and dims (32 bytes a segment), made at its first.
+    side_bindings: ?[]attn.Binding = null,
+    side_dims: ?mtl.Buffer = null,
     /// Each slot's rows' M-RoPE layout from its stream's images (empty: text, plain rope at the cache row).
     rope: [attn.planning.max_streams]mrope.Layout = @splat(.{}),
     /// A prompt pass's image rows, while it runs.
@@ -183,6 +182,11 @@ pub const Runner = struct {
         r.attention.deinit();
         r.scratch.deinit();
         for (r.bindings) |*b| b.deinit();
+        if (r.side_bindings) |side| {
+            for (side) |*b| b.deinit();
+            r.allocator.free(side);
+        }
+        if (r.side_dims) |b| b.deinit();
         for (r.owned.items) |b| b.deinit();
         r.owned.deinit(r.allocator);
         r.allocator.free(r.bindings);
@@ -227,8 +231,6 @@ pub const Runner = struct {
             }
             path.* = accepted_rows[first..][0..window.parents.len];
         };
-        r.accepted_chain = accepted;
-        defer r.accepted_chain = false;
         var recurrent = try round.recurrent(try r.params(round.ids.len), paths);
         defer recurrent.deinit();
         if (r.gdn.marks) |m| {
@@ -240,28 +242,19 @@ pub const Runner = struct {
         try r.gdn.prepare(r.model.device, recurrent, accepted);
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
-        try r.scratch.upload(attention_plan);
-        r.current_round = round;
-        r.current_gdn = &recurrent;
-        r.current_attention = &attention_plan;
-        r.current_placed = placed;
-        defer {
-            r.current_round = null;
-            r.current_gdn = null;
-            r.current_attention = null;
-            r.current_placed = .{};
-        }
-        if (r.capture_taps) r.taps.begin();
+        if (r.segmentRows(round, head, accepted, placed)) |rows| return r.advanceSegments(round, head, rows);
+        var region = attn.Region{ .scratch = &r.scratch };
+        try region.upload(attention_plan);
+        var view = Frame.whole(&r.model.frame, @intCast(round.ids.len));
+        if (r.capture_taps) try r.taps.begin(view.rows, 1);
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.model.ane == null and
-            (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
-        r.terminal_head = if (terminal_rows) head else .all;
-        defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        const terminal_rows = r.terminalRows(head, accepted);
+        var pass = Pass{ .runner = r, .round = round, .gdn = &recurrent, .attention = &attention_plan, .view = &view, .region = &region, .bindings = r.bindings, .placed = placed, .terminal_head = if (terminal_rows) head else .all, .accepted_chain = accepted };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .view = &view, .rows = view.rows, .hooks = pass.hooks(), .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
-        r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
+        r.last_gpu_seconds = segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -466,52 +459,218 @@ pub const Runner = struct {
         return views[0..round.slots.len];
     }
 
-    fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
-        const r: *Runner = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain };
-        try GdnHook.forward(&hook, e, block, weights, frame, rows);
+    /// Whether a pass of `head` needs nothing of its final block's other rows past its cache updates.
+    fn terminalRows(r: *const Runner, head: forward.Head, accepted: bool) bool {
+        return accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.model.ane == null and
+            (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
     }
 
-    fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
-        const r: *Runner = @ptrCast(@alignCast(ptr));
-        const plan = (r.current_attention orelse return error.RoundNotReady).*;
-        const layer = r.attention_index[block];
-        var views: [attn.planning.max_streams]attn.Cache = undefined;
-        const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
-        try r.bindings[layer].upload(plan, caches);
-        // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
-        const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
-        if (dead < rows) {
-            var input = f.get(.input);
-            input.offset += @as(usize, dead) * weights.q.k * 2;
-            var query_sums = forward.sums(f, .sums, rows);
-            query_sums.ref.offset += @as(usize, dead) * 4;
-            var query = f.get(.q_gate);
-            query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+    /// The first segment's rows when a prompt chunk runs as two staggered segments (advanceSegments), else null: an
+    /// accepted chain of prompt rows on tensor units, 512 rows or more, with nothing that wants one pass (marks, the
+    /// Neural Engine's share, image rows or M-RoPE planes, a tail, lead or after hook, every row's logits).
+    fn segmentRows(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool, placed: image_rows.Placed) ?u32 {
+        const rows = round.ids.len;
+        if (!accepted or !r.model.kernels.prompt or !r.model.device.tensorUnits() or rows < 512 or round.windows.len != 1 or head == .all) return null;
+        if (r.gdn.marks != null or r.model.ane != null or r.images != null or placed.images != null or placed.h_end != 0 or placed.w_end != 0 or r.tail != null or r.after != null or r.lead != null) return null;
+        return @intCast(rows / 2 / 128 * 128); // the first segment's projections take whole 128-row blocks
+    }
+
+    /// The chunk as two staggered segments on two queues (core/segments.zig), each the serial chunk of its rows: the
+    /// second waits at every layer's mixer for the first's states and keys, its projections run beside the first's
+    /// scans, and the bits are the serial chunks'.
+    fn advanceSegments(r: *Runner, round: *const Round, head: forward.Head, first_rows: u32) !void {
+        const side = try r.sideLane();
+        const rows: u32 = @intCast(round.ids.len);
+        var segs: [2]Seg = undefined;
+        var made: usize = 0;
+        defer for (segs[0..made]) |*s| s.deinit();
+        for (&segs, 0..) |*s, k| {
+            const start: u32 = if (k == 0) 0 else first_rows;
+            const tiles: u32 = if (k == 0) 0 else segs[0].attention.tiles;
+            s.* = try r.segment(round, @intCast(k), start, if (k == 0) first_rows else rows - first_rows, if (k == 0) .none else head, .{ .buffer = side.dims, .offset = 32 * k }, tiles);
+            made += 1;
         }
-        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-        e.barrier();
-        // keys and values read in place from the [key | value] rows
-        const kv: u32 = @intCast(r.model.config.kvDim());
-        const mixed = f.get(.mixed);
-        var value = mixed;
-        value.offset += @as(usize, kv) * 2;
-        // a prompt plan's query goes straight to the prompt kernel's packed rows
-        const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        // decoded rows: the merge writes the out projection's group sums into `.sums` (read and cleared by forward.post)
-        const out_sums = !prepacked and !r.attention.promptPath(plan, r.model.kernels.prompt);
-        const xs = forward.sums(f, .sums, rows);
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
-        f.mixer_sums = out_sums;
+        if (r.capture_taps) try r.taps.begin(rows, 2);
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        for (&segs) |*s| s.wire(r, if (s.view.part == 0) r.bindings else side.bindings);
+        var hooks = Segmented{ .segs = &segs };
+        r.last_gpu_seconds = segments.runCommittingFrom(r.model.device, &.{ r.model.queue, side.queue }, r.model.config.layers, .concurrent, &hooks, first_commit, commit_every) catch |err| {
+            r.failed = true;
+            return err;
+        };
+        if (r.capture_taps) try r.taps.complete();
+        r.offsets[round.slots[0]] = round.windows[0].start + rows;
     }
 
-    fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
-        const r: *Runner = @ptrCast(@alignCast(ptr));
-        try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    /// Segment `k` of `round`: rows [start, start + rows) as the serial chunk at that place, its plans uploaded to its
+    /// own regions, `tiles` tiles of the segments before it in the attention scratch.
+    fn segment(r: *Runner, round: *const Round, k: u32, start: u32, rows: u32, head: forward.Head, dims: @import("projection.zig").Ref, tiles: u32) !Seg {
+        const window = round.windows[0];
+        var own = try Round.init(r.allocator, &.{.{ .slot = round.slots[0], .start = window.start + start, .capacity = r.capacity, .ids = round.ids[start..][0..rows] }}, @intCast(r.model.config.conv_kernel), r.slots, @intCast(r.model.config.vocab));
+        errdefer own.deinit();
+        var path: [@import("gpu_frame.zig").max_rows]u32 = undefined;
+        for (path[0..rows], 0..) |*p, i| p.* = @intCast(i);
+        var gdn = try own.recurrent(try r.params(rows), &.{path[0..rows]});
+        errdefer gdn.deinit();
+        try r.gdn.prepare(r.model.device, gdn, true);
+        var attention = try r.attentionPlan(&own);
+        errdefer attention.deinit();
+        var region = attn.Region{ .scratch = &r.scratch, .rows = start, .tiles = tiles };
+        try region.upload(attention);
+        const view = View.init(&r.model.frame, start, rows, dims, 16 * ((start + 15) / 16), k);
+        view.setDims();
+        return .{ .round = own, .gdn = gdn, .attention = attention, .view = view, .region = region, .head = head };
+    }
+
+    /// The second lane's own queue, attention bindings and dims, made at the first split chunk.
+    fn sideLane(r: *Runner) !Side {
+        if (r.side_bindings == null) {
+            const bindings = try r.allocator.alloc(attn.Binding, r.bindings.len);
+            var made: usize = 0;
+            errdefer {
+                for (bindings[0..made]) |*b| b.deinit();
+                r.allocator.free(bindings);
+            }
+            for (bindings) |*b| {
+                b.* = try attn.Binding.init(r.model.device, r.scratch.limits);
+                made += 1;
+            }
+            const dims = try r.model.device.buffer(64, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            if (r.residency) |f| {
+                for (bindings) |*b| mtl.resident.fields.apply(b, f, true);
+                f.join(f.ctx, dims);
+            }
+            r.side_bindings = bindings;
+            r.side_dims = dims;
+        }
+        return .{ .queue = try r.model.sideQueue(), .bindings = r.side_bindings.?, .dims = r.side_dims.? };
     }
 };
+
+/// What one pass's mixer hooks read: its rows' round and plans, its view of the frame, its attention scratch region
+/// and bindings. A round is one pass; a split prompt chunk is one a segment.
+const Pass = struct {
+    runner: *Runner,
+    round: *const Round,
+    gdn: *const GdnPlan,
+    attention: *const attn.Plan,
+    view: *View,
+    region: *attn.Region,
+    bindings: []attn.Binding,
+    placed: image_rows.Placed = .{},
+    terminal_head: forward.Head = .all,
+    accepted_chain: bool = false,
+
+    fn hooks(p: *Pass) forward.Mixer {
+        return .{ .ptr = p, .gdn = gdnForward, .attention = attentionForward, .tap = if (p.runner.capture_taps) tap else null };
+    }
+};
+
+/// The second lane's own queue, bindings and dims (the first lane's are the runner's).
+const Side = struct { queue: mtl.Queue, bindings: []attn.Binding, dims: mtl.Buffer };
+
+/// One segment of a split prompt chunk: the serial chunk of its rows, on a lane of its own.
+const Seg = struct {
+    round: Round,
+    gdn: GdnPlan,
+    attention: attn.Plan,
+    view: View,
+    region: attn.Region,
+    head: forward.Head,
+    pass: Pass = undefined,
+    stages: forward.Stages = undefined,
+
+    fn deinit(s: *Seg) void {
+        s.attention.deinit();
+        s.gdn.deinit();
+        s.round.deinit();
+    }
+
+    /// The pass and stages over this segment, once it stands where it stays.
+    fn wire(s: *Seg, r: *Runner, bindings: []attn.Binding) void {
+        const terminal_rows = r.terminalRows(s.head, true);
+        s.pass = .{ .runner = r, .round = &s.round, .gdn = &s.gdn, .attention = &s.attention, .view = &s.view, .region = &s.region, .bindings = bindings, .terminal_head = if (terminal_rows) s.head else .all, .accepted_chain = true };
+        s.stages = .{ .terminal_rows = terminal_rows, .model = r.model, .view = &s.view, .rows = s.view.rows, .hooks = s.pass.hooks(), .head = s.head, .own_sums = true };
+    }
+};
+
+/// A split chunk's hooks (core/segments.zig): lane k runs segment k's stages, waiting at the mixer for the lane before.
+const Segmented = struct {
+    segs: []Seg,
+
+    pub fn begin(h: *Segmented, lane: *segments.Lane) !void {
+        return h.segs[lane.k].stages.begin(lane);
+    }
+    pub fn wait(_: *Segmented, _: usize) segments.Wait {
+        return .mixer;
+    }
+    pub fn handoff(_: *Segmented, _: *segments.Lane, _: usize) !void {}
+    pub fn pre(h: *Segmented, lane: *segments.Lane, index: usize) !void {
+        return h.segs[lane.k].stages.pre(lane, index);
+    }
+    pub fn mixer(h: *Segmented, lane: *segments.Lane, index: usize) !void {
+        return h.segs[lane.k].stages.mixer(lane, index);
+    }
+    pub fn post(h: *Segmented, lane: *segments.Lane, index: usize) !void {
+        return h.segs[lane.k].stages.post(lane, index);
+    }
+    pub fn finish(h: *Segmented, lane: *segments.Lane) !void {
+        return h.segs[lane.k].stages.finish(lane);
+    }
+    pub fn polls(_: *const Segmented) bool {
+        return false;
+    }
+    pub fn committed(_: *Segmented) !void {}
+};
+
+fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, view: *View, rows: u32) !void {
+    const p: *Pass = @ptrCast(@alignCast(ptr));
+    const r = p.runner;
+    var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = p.gdn, .linear_index = r.linear_index, .accepted_chain = p.accepted_chain, .row = view.start };
+    try GdnHook.forward(&hook, e, block, weights, view, rows);
+}
+
+fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *View, rows: u32) !void {
+    const p: *Pass = @ptrCast(@alignCast(ptr));
+    const r = p.runner;
+    const plan = p.attention.*;
+    const layer = r.attention_index[block];
+    var views: [attn.planning.max_streams]attn.Cache = undefined;
+    const caches = r.layerCaches(layer, p.round, &views);
+    try p.bindings[layer].upload(plan, caches);
+    // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
+    const dead = if (p.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (p.terminal_head == .last) rows - 1 else rows) else 0;
+    if (dead < rows) {
+        var input = f.get(.input);
+        input.offset += @as(usize, dead) * weights.q.k * 2;
+        var query_sums = forward.sums(f, .sums, rows);
+        query_sums.ref.offset += @as(usize, dead) * 4;
+        var query = f.get(.q_gate);
+        query.offset += @as(usize, dead) * weights.q.n * 2;
+        try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+    }
+    try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+    e.barrier();
+    // keys and values read in place from the [key | value] rows
+    const kv: u32 = @intCast(r.model.config.kvDim());
+    const mixed = f.get(.mixed);
+    var value = mixed;
+    value.offset += @as(usize, kv) * 2;
+    // a prompt plan's query goes straight to the prompt kernel's packed rows
+    const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
+    try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) p.region.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = p.placed.h_end, .w_end = p.placed.w_end, .plane = f.frame.capacity, .geometry = r.geometry });
+    // decoded rows: the merge writes the out projection's group sums into `.sums` (read and cleared by forward.post)
+    const out_sums = !prepacked and !r.attention.promptPath(plan, r.model.kernels.prompt);
+    const xs = forward.sums(f, .sums, rows);
+    try r.attention.encode(e, p.region, &p.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
+    f.mixer_sums = out_sums;
+}
+
+fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
+    const p: *Pass = @ptrCast(@alignCast(ptr));
+    try p.runner.taps.record(p.runner.model.glue, e, layer, hidden, p.view.start, rows, @intCast(p.view.part));
+}
 
 fn slotCache(a: std.mem.Allocator, m: *Model, owned: *std.ArrayList(mtl.Buffer), capacity: u32) !attn.Cache {
     const bytes = @as(usize, capacity) * m.config.kvDim() * 2;
