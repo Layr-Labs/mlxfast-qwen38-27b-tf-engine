@@ -37,8 +37,8 @@ test "compact GDN schedules isolate unequal streams and overflow keeps the snaps
     defer plan.deinit();
     try std.testing.expect(plan.compact);
     try @import("gdn_pool.zig").validatePlan(shape, 4, 64, plan);
-    try slots.validate(&parents, plan.slot_steps[0..33], 0, 16);
-    try slots.validate(chain.parents, plan.slot_steps[33..], 33, 16);
+    try slots.validateForOutputs(&parents, plan.slot_steps[0..33], 0, 16);
+    try slots.validateForOutputs(chain.parents, plan.slot_steps[33..], 33, 16);
     try std.testing.expectEqual(@as(i32, -1), plan.slot_steps[33].read_slot);
     const saved = plan.slot_steps[1];
     plan.slot_steps[1].read_slot = 15;
@@ -222,8 +222,8 @@ test "depth one siblings keep none first or second draft with matching state and
         var recurrent = try plan_mod.Plan.init(a, try shape.params(3, 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = accepted.path }});
         defer recurrent.deinit();
         try std.testing.expectEqualSlices(u32, want_path, recurrent.kept_rows);
-        try std.testing.expectEqual(@as(usize, 2), recurrent.slot_peak);
-        try @import("core").tree_slots.validate(&parents, recurrent.slot_steps, 0, 2);
+        try std.testing.expectEqual(@as(usize, 1), recurrent.slot_peak);
+        try @import("core").tree_slots.validateForOutputs(&parents, recurrent.slot_steps, 0, 1);
         const kept = try window.keep(accepted.path);
         try std.testing.expectEqual(@as(u32, @intCast(10 + want_path.len)), kept.length);
         try std.testing.expectEqual(@as(?u32, want_path[want_path.len - 1]), kept.conv_tail_row);
@@ -263,4 +263,63 @@ test "depth one sibling terminal and remaining-one commits retain only the root 
         try std.testing.expectEqualSlices(u32, &.{0}, plan.kept_rows);
         try std.testing.expectEqual(@as(u32, 11), (try window.keep(accepted.path)).length);
     };
+}
+
+test "depth one siblings keep every alternative at widths three four and seven without changing depth or audit maps" {
+    const a = std.testing.allocator;
+    const matcher = @import("core").tree_round;
+    const audit = @import("dflash/audit.zig");
+    const shape = try abi.Shape.init(config());
+    const all_parents = [_]i32{ -1, 0, 0, 0, 0, 0, 0, 0 };
+    const all_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    for ([_]u32{ 3, 4, 7 }) |width| {
+        const rows = width + 1;
+        const parents = all_parents[0..rows];
+        const tokens = all_tokens[0..rows];
+        var window = try Window.init(a, 10, parents, 4, 64);
+        defer window.deinit();
+        var attention = try @import("attention_plan.zig").Plan.init(a, &.{.{ .parents = parents, .start = 10, .capacity = 64 }}, .{});
+        defer attention.deinit();
+        for (attention.positions, 0..) |position, row| try std.testing.expectEqual(@as(i32, if (row == 0) 10 else 11), position);
+        for (0..rows) |which| for ([_]u32{ 1, 2 }) |budget| for ([_]bool{ false, true }) |terminal| {
+            var picks: [8]matcher.Pick = undefined;
+            for (&picks, 0..) |*pick, row| pick.* = .{ .token = @intCast(20 + row) };
+            const root_pick: u32 = if (which == 0) 99 else tokens[which];
+            picks[0].token = root_pick;
+            const stop = [_]u32{root_pick};
+            const eos: []const u32 = if (terminal) &stop else &.{};
+            const match = matcher.Match{ .rows = rows, .vocab = 128, .budget = budget, .eos_count = @intCast(eos.len) };
+            const raw = try matcher.oracle(match, tokens, parents, picks[0..rows], eos);
+            const accepted = try matcher.decode(&raw, match);
+            const kept: usize = if (which != 0 and budget == 2 and !terminal) 2 else 1;
+            const path = [_]u32{ 0, @intCast(which) };
+            try std.testing.expectEqualSlices(u32, path[0..kept], accepted.path);
+            try std.testing.expectEqual(kept, accepted.tokens.len);
+            try std.testing.expectEqual(root_pick, accepted.tokens[0]);
+            if (kept == 2) try std.testing.expectEqual(picks[which].token, accepted.tokens[1]);
+            var recurrent = try plan_mod.Plan.init(a, try shape.params(rows, 1, native), &.{.{ .window = window, .state_slot = 0, .next_slot = 0, .path = accepted.path }});
+            defer recurrent.deinit();
+            try std.testing.expectEqualSlices(u32, accepted.path, recurrent.kept_rows);
+            try std.testing.expectEqual(@as(usize, 1), recurrent.slot_peak);
+            try @import("core").tree_slots.validateForOutputs(parents, recurrent.slot_steps, 0, 1);
+            const state = try window.keep(accepted.path);
+            try std.testing.expectEqual(@as(u32, @intCast(10 + kept)), state.length);
+            try std.testing.expectEqual(@as(?u32, accepted.path[kept - 1]), state.conv_tail_row);
+            const map = try attention.keepRows(a, &.{accepted.path});
+            defer a.free(map);
+            var cache = [_]u32{ 101, 202, 303, 404, 505, 606, 707, 808 };
+            var gathered: [2]u32 = undefined;
+            for (map) |row| gathered[row.row] = cache[row.source];
+            for (map) |row| cache[row.destination] = gathered[row.row];
+            try std.testing.expectEqual(@as(u32, 101), cache[0]);
+            if (kept == 2) try std.testing.expectEqual(@as(u32, @intCast(101 * (which + 1))), cache[1]);
+            var journal: audit.Journal = .{};
+            defer journal.deinit(a);
+            try journal.record(a, .{ .committed = @intCast(accepted.tokens.len), .drafted = width, .accepted = accepted.matched });
+            try std.testing.expectEqual(@as(u64, width), journal.drafted_total);
+            try std.testing.expectEqual(@as(u64, kept), journal.committed_total);
+            try std.testing.expect(journal.accepted_total <= 1);
+            try std.testing.expect(journal.committed_total <= 2);
+        };
+    }
 }

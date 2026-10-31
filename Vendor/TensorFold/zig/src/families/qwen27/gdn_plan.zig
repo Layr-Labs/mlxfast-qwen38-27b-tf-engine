@@ -16,7 +16,7 @@ pub const Plan = struct {
     kept_rows: []u32,
     slot_steps: []tree_slots.Step = &.{},
     compact: bool = false,
-    slot_peak: usize = 0, // the most register slots any window's schedule holds live
+    slot_peak: usize = 0, // retained parent-register bound; nonempty output scans keep the kernel minimum of one
 
     pub fn init(gpa: std.mem.Allocator, p: abi.Params, inputs: []const Input) !Plan {
         return initSlots(gpa, p, inputs, tree_slots.max_slots);
@@ -59,7 +59,7 @@ pub const Plan = struct {
         for (inputs, 0..) |input, segment| {
             const n: u32 = @intCast(input.window.parents.len);
             @memcpy(parents[first..][0..n], input.window.parents);
-            slot_peak = @max(slot_peak, tree_slots.build(gpa, input.window.parents, slot_steps[first..][0..n], first, slot_limit) catch |err| switch (err) {
+            slot_peak = @max(slot_peak, tree_slots.buildForOutputs(gpa, input.window.parents, slot_steps[first..][0..n], first, slot_limit) catch |err| switch (err) {
                 error.SlotOverflow => blk: {
                     compact = false;
                     break :blk 0;

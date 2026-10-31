@@ -115,7 +115,7 @@ pub const Round = struct {
         inline for (.{ pipelines.tree, pipelines.replay }) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 128) return error.UnsupportedGdnPipeline;
         for (pipelines.tree_slots) |pipeline| if (pipeline.simdWidth() != 32 or pipeline.maxThreads() < 128) return error.UnsupportedGdnPipeline;
         const slots = @import("core_delta").slotKernel(plan.slot_peak);
-        if (plan.compact) for (plan.segments) |segment| try @import("core").tree_slots.validate(plan.parents[segment.first..][0..segment.rows], plan.slot_steps[segment.first..][0..segment.rows], segment.first, @import("core_delta").slot_kernels[slots]);
+        if (plan.compact) for (plan.segments) |segment| try @import("core").tree_slots.validateForOutputs(plan.parents[segment.first..][0..segment.rows], plan.slot_steps[segment.first..][0..segment.rows], segment.first, @import("core_delta").slot_kernels[slots]);
         return .{ .slot_kernel = slots, .compact = plan.compact, .p = p, .b = b, .pipelines = pipelines, .segments = plan.segments.len, .conv_width = shape.conv };
     }
 
@@ -155,7 +155,7 @@ pub const Round = struct {
         return r.p.dk == 128 and r.compact and r.tree_mode != .snapshot;
     }
 
-    /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
+    /// A one-retained-slot scan takes two value columns per SIMD group, including output-only stars.
     pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
         if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
         e.setPipeline(pair);

@@ -34,7 +34,7 @@ pub fn validatePlan(shape: abi.Shape, slots: usize, capacity: usize, plan: Plan)
             if (global < first or global >= first + segment.rows or plan.parents[global] != parent) return error.BadGdnPoolPlan;
             parent = @intCast(global - first);
         }
-        if (plan.compact) @import("core").tree_slots.validate(plan.parents[first..][0..segment.rows], plan.slot_steps[first..][0..segment.rows], segment.first, 16) catch return error.BadGdnPoolPlan;
+        if (plan.compact) @import("core").tree_slots.validateForOutputs(plan.parents[first..][0..segment.rows], plan.slot_steps[first..][0..segment.rows], segment.first, 16) catch return error.BadGdnPoolPlan;
         first += segment.rows;
         kept += keep.rows;
     }

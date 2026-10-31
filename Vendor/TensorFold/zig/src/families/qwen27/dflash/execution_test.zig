@@ -420,3 +420,44 @@ test "width seven depth one offers the seven best siblings of one future head ro
     try std.testing.expectEqual(@as(usize, 4), four.tokens.len);
     try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width, .children = 17 }));
 }
+
+test "depth one breadth uses one future position for three four or seven genuine sibling alternatives" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    // The ordinary fixture has two candidates; use the full scored lattice here.
+    graph.config.topk = 16;
+    const all_parents = [_]i32{ -1, -1, -1, -1, -1, -1, -1 };
+    const verified = [_]i32{ -1, 0, 0, 0, 0, 0, 0, 0 };
+    for ([_]u32{ 3, 4, 7 }) |width| for ([_]bool{ false, true }) |merged| {
+        const policy = selector.Policy{ .nodes = width, .children = width, .max_depth = 1 };
+        const block = try policy.block(16);
+        try std.testing.expectEqual(@as(u32, 2), block);
+        var fake = Fake{};
+        var state = try session.Session.init(graph.config, 1, 0);
+        const preparation = op.Preparation{ .mode = .bf16_reference };
+        try state.absorb(fake.ops(), &graph, preparation, batch());
+        fake.appends = 0;
+        const more = session.Batch{ .values = batch().values, .positions = &.{ 2, 3 }, .layers = cfg.tap_ids, .target_end = 4 };
+        if (!merged) try state.absorb(fake.ops(), &graph, preparation, more);
+        var tree = if (merged)
+            try state.absorbTreeBlock(a, fake.ops(), &graph, preparation, more, 5, block, .{ .nodes = width, .children = width })
+        else
+            try state.treeBlock(a, fake.ops(), &graph, preparation, 5, try state.firstDraw(), block, .{ .nodes = width, .children = width });
+        defer tree.deinit();
+        try std.testing.expectEqual(@as(u32, 2), fake.embedded_rows);
+        try std.testing.expectEqual(@as(u32, 1), fake.lattice_rows);
+        try policy.checkTree(tree.parents);
+        try std.testing.expectEqual(@as(usize, width), tree.tokens.len);
+        try std.testing.expectEqualSlices(i32, all_parents[0..width], tree.parents);
+        const parents = try tree.verifyParents(a);
+        defer a.free(parents);
+        try std.testing.expectEqualSlices(i32, verified[0 .. width + 1], parents);
+        try std.testing.expectEqualSlices(u32, &.{ 5, fixtures.toy.mask }, fake.ids[0..2]);
+        try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, fake.positions[0..2]);
+        try std.testing.expectEqual(@as(u32, 2), policy.budget(128));
+        try std.testing.expectEqual(@as(u32, 1), policy.budget(1));
+    };
+}
