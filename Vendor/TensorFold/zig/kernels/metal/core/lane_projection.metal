@@ -297,29 +297,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU)
-[[max_total_threads_per_threadgroup(128)]]
-#elif defined(TF_SERIAL_SK2)
+#if defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
-#if defined(TF_SWIGLU)
-    device float* HS [[buffer(6)]],
-#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
   Y += (size_t)r0 * TF_YS;
   XS += r0;
-#if defined(TF_SWIGLU)
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
-#else
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = tf_tile(int(tg.x)), n0 = tile * NT;
-#endif
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
@@ -409,31 +400,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
-#if defined(TF_SWIGLU)
-  threadgroup bfloat gu[4 * 8 * 32];
-  threadgroup bfloat hb[8 * 64];
-  for (int i = 0; i < 16; i++) {
-    if (!TF_LIVE(i)) continue;
-    gu[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int t = ks * 32 + lane;
-  for (int at = t; at < 8 * 64; at += 128) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu[((c >> 5) * 8 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb[at] = h;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int m = t; m < stride; m += 128) {
-    float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
-    HS[int(tg.x) * stride + m] = acc;
-  }
-#elif defined(TF_ROWS8)
+#if defined(TF_ROWS8)
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
       if (!TF_LIVE(i)) continue;

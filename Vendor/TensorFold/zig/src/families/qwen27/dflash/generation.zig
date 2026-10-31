@@ -252,15 +252,17 @@ pub const Generation = struct {
         var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.proposePolicy(pending, offered_policy);
         defer tree.deinit();
         try offered_policy.checkTree(tree.parents);
-        const drafted = try tree.verifyParents(g.allocator);
+        const selected_count = try offered_policy.offerCount(tree.tokens.len, tree.scores);
+        const selected_tokens = tree.tokens[0..selected_count];
+        const drafted = try tree.verifyPrefixParents(g.allocator, selected_count);
         defer g.allocator.free(drafted);
         // a copy from the root shares the tree's nodes while they agree, and its rest hangs below the last shared one
-        const room = @min(extra, @as(u32, @intCast(@import("core").tree_round.max_rows - drafted.len)), available - 1 - @as(u32, @intCast(tree.tokens.len)));
-        const copy: []const u32 = if (extend) |x| (if (room > 0) try x.call(x.ptr, &.{pending}, room + @as(u32, @intCast(tree.tokens.len))) else &.{}) else &.{};
+        const room = @min(extra, @as(u32, @intCast(@import("core").tree_round.max_rows - drafted.len)), available - 1 - @as(u32, @intCast(selected_tokens.len)));
+        const copy: []const u32 = if (extend) |x| (if (room > 0) try x.call(x.ptr, &.{pending}, room + @as(u32, @intCast(selected_tokens.len))) else &.{}) else &.{};
         var last: i32 = 0;
         var shared: usize = 0;
         follow: for (copy) |token| {
-            for (drafted[1..], tree.tokens, 1..) |parent, drafted_token, row| if (parent == last and drafted_token == token) {
+            for (drafted[1..], selected_tokens, 1..) |parent, drafted_token, row| if (parent == last and drafted_token == token) {
                 last = @intCast(row);
                 shared += 1;
                 continue :follow;
@@ -275,7 +277,7 @@ pub const Generation = struct {
         const ids = try g.allocator.alloc(u32, parents.len);
         defer g.allocator.free(ids);
         ids[0] = pending;
-        @memcpy(ids[1..drafted.len], tree.tokens);
+        @memcpy(ids[1..drafted.len], selected_tokens);
         @memcpy(ids[drafted.len..], copied);
         var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
         defer round.deinit();
