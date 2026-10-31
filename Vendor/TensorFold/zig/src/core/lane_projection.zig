@@ -40,6 +40,8 @@ pub const Layout = struct {
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
     reg_lean: bool = false,
+    /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
+    tile_batch: usize = 1,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -55,6 +57,7 @@ pub const Layout = struct {
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
+        if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -126,6 +129,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
+    if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);

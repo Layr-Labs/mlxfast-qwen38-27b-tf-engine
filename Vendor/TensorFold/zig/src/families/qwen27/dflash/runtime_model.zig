@@ -214,11 +214,11 @@ pub const Model = struct {
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
-            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children });
+            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
         }
         try m.flush();
         const first = try m.session.firstDraw();
-        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children });
+        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
     }
 };
 /// A stream's own drafter state, parked while another stream drafts: its taps ring, rolling K/V and session.
