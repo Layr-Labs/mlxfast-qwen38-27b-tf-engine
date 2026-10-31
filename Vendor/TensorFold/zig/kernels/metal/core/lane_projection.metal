@@ -346,6 +346,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
   // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
+#if defined(TF_PROMPT_SR)
+  // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
+  // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
+  // multiples of 4), without the per-group 64-bit index arithmetic
+  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+  const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
+  const device float* xp = XS + first * stride + mb;
+  uint4 nw0 = 0, nw1 = 0;
+  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+  for (int g = first; g < last; g++) {
+    const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
+    sp += TF_N / 4;
+    xp += stride;
+#else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
   for (int g = first; g < last; g++) {
@@ -353,6 +367,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
 #else
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+#endif
 #endif
 #else
   tf_reg_load next = {};
@@ -371,7 +386,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
+#if defined(TF_PROMPT_SR)
+    cp += g + 1 < last ? TF_TB * 64 : 0;
+    nw0 = cp[0];
+    nw1 = cp[32];
+#else
     { const size_t gn = (size_t)min(g + 1, last - 1) * TF_TB * 64; nw0 = wl[gn]; nw1 = wl[gn + 32]; }
+#endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
