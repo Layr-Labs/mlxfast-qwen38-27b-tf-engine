@@ -95,6 +95,7 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or x.lanes.len != 1 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
             const l = &x.lanes[k];
+            if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "beforeCommit")) try x.fam.beforeCommit(l);
             l.fence.update(l.enc);
             l.enc.end();
             l.cb.commit();

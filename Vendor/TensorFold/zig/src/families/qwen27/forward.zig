@@ -39,6 +39,9 @@ pub const Stages = struct {
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
     after: ?Hook = null,
+    /// Run once with the first chunk's open encoder, just before it is committed (segments.runCommittingFrom): a
+    /// verify encoded ahead of its draft takes the draft here, before any of its words reach the GPU.
+    hold: ?Tail = null,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -56,6 +59,11 @@ pub const Stages = struct {
             m.glue.imageRows(lane.enc, s.hidden, rows, m.frame.get(.takes), @intCast(m.config.hidden), s.rows);
             lane.enc.barrier();
         }
+    }
+    pub fn beforeCommit(s: *Stages, lane: *@import("core").segments.Lane) !void {
+        const t = s.hold orelse return;
+        s.hold = null;
+        try t.encode(t.ptr, lane.enc);
     }
     pub fn wait(_: *Stages, _: usize) @import("core").segments.Wait {
         return .mixer;
@@ -91,6 +99,9 @@ pub const Stages = struct {
             .linear => |g| g.out,
             .attention => |a| a.out,
         };
+        // read and cleared before any return: a stale flag must never reach the next layer's output projection
+        const own_sums = f.out_sums;
+        f.out_sums = false;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -100,7 +111,8 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        try m.kernels.quant(e, out, mixer_out, null, dims, f.get(.output), s.rows);
+        // an attention merge over decoded rows wrote mixer_out's group sums into act_sums (Frame.out_sums)
+        try m.kernels.quant(e, out, mixer_out, if (own_sums and layer.mixer == .attention and !s.compact) sums(f, .act_sums, s.rows) else null, dims, f.get(.output), s.rows);
         e.barrier();
         try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();

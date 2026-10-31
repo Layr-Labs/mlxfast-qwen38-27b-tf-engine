@@ -56,6 +56,8 @@ pub const Runner = struct {
     after: ?forward.Hook = null,
     /// Encoded first in the next verify's first command buffer, then cleared by its caller.
     lead: ?forward.Tail = null,
+    /// forward.Stages.hold for the next verify: called once just before its first command buffer is committed.
+    hold: ?forward.Tail = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     terminal_head: forward.Head = .all,
@@ -252,11 +254,11 @@ pub const Runner = struct {
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.model.ane == null and
+        const terminal_rows = accepted and r.model.kernels.prompt and head != .all and r.tail == null and r.after == null and r.lead == null and r.hold == null and r.model.ane == null and
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .hold = r.hold, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -334,6 +336,25 @@ pub const Runner = struct {
         // a chain's kept path is a prefix of its rows, which already stand at their positions: the attention keep would
         // copy every kept row onto itself
         if (chainWindow(round.windows[0].parents)) return;
+        // every attention layer's map in one pass, then all gathers, then all scatters: three barriers for the round
+        // instead of three a layer, each layer's rows in its own slab of the keep scratch
+        const layers: u32 = @intCast(r.bindings.len);
+        if (@as(u64, layers) * p.rows <= r.scratch.limits.rows) {
+            var views: [attn.planning.max_streams]attn.Cache = undefined;
+            for (0..layers) |layer| {
+                const caches = r.layerCaches(layer, round, &views);
+                try r.bindings[layer].admitDeviceKeep(attention_plan, caches, p.rows);
+                const map = r.bindings[layer].get(.keep_map);
+                try ops.metadata(e, result, keep_ref, rows, .{ .buf = map.buffer, .off = map.offset }, p);
+                r.attention.keepResources(e, &r.scratch, &r.bindings[layer], caches);
+            }
+            e.barrier();
+            for (0..layers) |layer| try r.attention.keepGather(e, &r.scratch, &r.bindings[layer], p.rows, r.layerCaches(layer, round, &views), @intCast(layer * p.rows));
+            e.barrier();
+            for (0..layers) |layer| try r.attention.keepScatter(e, &r.scratch, &r.bindings[layer], p.rows, r.layerCaches(layer, round, &views), @intCast(layer * p.rows));
+            e.barrier();
+            return;
+        }
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {},
@@ -465,7 +486,10 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked);
+        // decoded rows: the merge writes mixer_out's group sums, so the output projection runs no sums pass of its own
+        const out_sums: ?@import("projection.zig").Ref = if (!prepacked and rows <= 16 and plan.rows == rows) f.get(.act_sums) else null;
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, out_sums);
+        f.out_sums = out_sums != null;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
@@ -488,6 +512,11 @@ fn allocation(a: std.mem.Allocator, device: mtl.Device, owned: *std.ArrayList(mt
         return err;
     };
     return b;
+}
+
+/// A verify encoded ahead of its draft (Runner.hold) rewrote a row's token before commit: the keep's fingerprint follows.
+pub fn refreshActive(r: *Runner, round: *const Round) void {
+    if (r.active != null) r.active = fingerprint(round);
 }
 
 fn fingerprint(round: *const Round) [32]u8 {
