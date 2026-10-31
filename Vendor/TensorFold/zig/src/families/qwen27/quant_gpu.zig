@@ -531,9 +531,11 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
 
-/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K row projections where it measured faster on an M5 Pro (MLP down, attention output), one elsewhere.
+/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: four for the MLP
+/// down, whose 17408-wide activation rows are the prompt's worst X traffic, two for the attention output, one elsewhere.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.range[1] != 0 or key.serialSk2() or key.slices != 2 or n != 5120) return 1;
+    if (key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
+    if (key.k == 17408 and key.batch % 4 == 0) return 4;
     return if (key.k == 17408 or key.k == 6144) 2 else 1;
 }
