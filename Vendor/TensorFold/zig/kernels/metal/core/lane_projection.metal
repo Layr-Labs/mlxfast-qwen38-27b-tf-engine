@@ -371,11 +371,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+#if defined(TF_REG_LEAN2)
+  // two groups' codes in flight: the group after next's codes load before this group's unpack
+  uint4 aw0 = 0, aw1 = 0;
+  if (first + 1 < last) { aw0 = wl[(size_t)(first + 1) * TF_TB * 64]; aw1 = wl[(size_t)(first + 1) * TF_TB * 64 + 32]; }
+#endif
   for (int g = first; g < last; g++) {
 #if defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], 0.0f};
 #else
     const tf_reg_load cur = {nw0, nw1, sbv[((size_t)g * TF_N + n0 + nb) / 4], sbv[((size_t)g * TF_N + n0 + nb + 16) / 4], XS[g * stride + mb], XS[g * stride + mb + 8]};
+#endif
+#if defined(TF_REG_LEAN2)
+    nw0 = aw0;
+    nw1 = aw1;
+    if (g + 2 < last) { aw0 = wl[(size_t)(g + 2) * TF_TB * 64]; aw1 = wl[(size_t)(g + 2) * TF_TB * 64 + 32]; }
 #endif
 #endif
 #else
@@ -393,7 +403,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       b2[e + 8] = as_type<half2>(((lo >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
       b2[e + 9] = as_type<half2>(((hi >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
     }
-#if defined(TF_REG_LEAN)
+#if defined(TF_REG_LEAN2)
+#elif defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
     cp += g + 1 < last ? TF_TB * 64 : 0;
