@@ -35,6 +35,7 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
     while (adapters.next()) |adapter| {
         try fields.append(a, list, adapter);
         try fields.append(a, list, &adapter.projection);
+        if (adapter.small) |*p| try fields.append(a, list, p);
     }
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| try fields.append(a, list, t);
@@ -54,6 +55,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
 pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.apply(adapter, hook, joining);
     fields.apply(&adapter.projection, hook, joining);
+    if (adapter.small) |*p| fields.apply(p, hook, joining);
 }
 
 pub fn putPrepared(b: anytype, key: usize, adapter: anytype) !void {
