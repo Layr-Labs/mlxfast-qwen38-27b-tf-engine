@@ -206,8 +206,6 @@ pub const Generation = struct {
         defer g.runner.tail = null;
         g.runner.after = .{ .ptr = &picks, .run = Picks.keep };
         defer g.runner.after = null;
-        g.runner.lead = .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge };
-        defer g.runner.lead = null;
         try g.runner.verifyHead(round, .all);
         errdefer g.runner.failed = true;
         try g.runner.taps.complete();
