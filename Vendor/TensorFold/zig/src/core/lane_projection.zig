@@ -36,6 +36,8 @@ pub const Layout = struct {
     reg: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
+    /// Run four logical reg chains in one SIMD group, retaining the original ordered reduction.
+    serial_sk4: bool = false,
     /// Elements between output rows (default N): a member of a fused stack writes its columns of the fused rows.
     y_stride: ?usize = null,
 
@@ -49,6 +51,7 @@ pub const Layout = struct {
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
+        if (l.serial_sk4 and (!l.reg or l.sk != 4)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -118,6 +121,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
+    if (l.serial_sk4) try text.appendSlice(a, "#define TF_SERIAL_SK4 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     return text.toOwnedSlice(a);
@@ -248,7 +252,7 @@ pub const Projection = struct {
         defer lib.deinit();
         const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
-        const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
+        const physical_sk: usize = if (l.serial_sk2 or l.serial_sk4) 1 else l.sk;
         if (p.simdWidth() != 32 or p.maxThreads() < physical_sk * (if (l.cooperative) @as(usize, 64) else 32)) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
@@ -331,6 +335,36 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "serial SK4 keeps the original four-chain layout and rejects other schedules" {
+    const original = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4, .reg = true, .precompute_sums = true };
+    try std.testing.expect(!original.serial_sk4);
+    var serial = original;
+    serial.serial_sk4 = true;
+    try serial.validate();
+    try std.testing.expectEqual(original.weightWords(), serial.weightWords());
+    try std.testing.expectEqual(original.metadataElements(), serial.metadataElements());
+    try std.testing.expectEqual(original.tiles(), serial.tiles());
+    try std.testing.expectEqual([2]usize{ 0, 272 }, serial.groupCut());
+    const text = try source(std.testing.allocator, serial);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SK 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SERIAL_SK4 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SERIAL_SK2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_OUT bfloat\n") != null);
+    var bad = serial;
+    bad.sk = 2;
+    try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    bad = serial;
+    bad.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    bad = serial;
+    bad.serial_sk2 = true;
+    try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    bad = serial;
+    bad.format.bits = 8;
+    try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
 }
 
 fn checkRef(r: Ref, need: usize, alignment: usize) !void {
