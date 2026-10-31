@@ -36,6 +36,8 @@ pub const Layout = struct {
     reg: bool = false,
     /// Run the two logical reg chains in one SIMD group, then add chain 1 to chain 0.
     serial_sk2: bool = false,
+    /// Reg prompt launches: the 16-row blocks are the grid's x and the tiles its y (each tile's blocks dispatched together).
+    rows_first: bool = false,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
@@ -56,6 +58,7 @@ pub const Layout = struct {
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
         if (l.serial_sk2 and (!l.reg or l.sk != 2)) return error.InvalidSchedule;
+        if (l.rows_first and (!l.reg or l.swiglu)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.swiglu and (!l.rows8 or !l.serial_sk2 or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
@@ -128,6 +131,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
+    if (l.rows_first) try text.appendSlice(a, "#define TF_ROWS_FIRST 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
@@ -248,6 +252,7 @@ pub const Projection = struct {
     sums_pipe: ?mtl.Pipeline = null,
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
+    rows_first: bool = false,
     reg: bool = false,
     /// Built with Layout.rows8: launches take at most 8 rows.
     rows8: bool = false,
@@ -274,7 +279,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles(), .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .rows_first = l.rows_first };
     }
 
     pub fn deinit(p: Projection) void {
@@ -360,7 +365,7 @@ pub const Projection = struct {
         e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        e.dispatchGroups(if (p.rows_first) mtl.Size.of(blocks, p.tile_count, 1) else mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };

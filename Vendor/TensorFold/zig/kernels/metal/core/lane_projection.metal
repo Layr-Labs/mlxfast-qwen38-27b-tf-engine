@@ -309,7 +309,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tgp [[threadgroup_position_in_grid]]) {
+#if defined(TF_ROWS_FIRST)
+  // prompt rows: a tile's 16-row blocks are the grid's fastest dimension, so the threadgroups that read one tile's codes
+  // run together and the codes come from DRAM once per chunk instead of once per row block
+  const uint2 tg = uint2(tgp.y, tgp.x);
+#else
+  const uint2 tg = tgp;
+#endif
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
