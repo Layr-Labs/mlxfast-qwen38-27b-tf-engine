@@ -127,9 +127,11 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
+  const int g0 = int(tg.z) * (SG / 2) * 16, glast = min(args.rows * PG, g0 + (SG / 2) * 16) - 1;
+  const int kstop = glast < g0 ? kbeg : min(kend, args.start + glast / PG + 1);
   int kt = kbeg;
-  for (; kt + PTK <= kend; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
-  if (kt < kend) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
   if (!live) return;
   const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
   _Pragma("clang loop unroll(full)")
