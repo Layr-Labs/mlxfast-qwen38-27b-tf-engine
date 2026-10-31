@@ -10,7 +10,7 @@ pub const metadata_layout = "bf16[K/group][N][scale,bias]";
 /// Lean decode-row reg launches may take the metadata indexed: u32[sb_table] distinct (scale | bias << 16) words, then u16[K/group][N]
 /// indices into them. A group's words are the pair it names, so its arithmetic is unchanged.
 pub const indexed_layout = "u32[sb_table] then u16[K/group][N]";
-pub const sb_table = 8192;
+pub const sb_table = 65536;
 
 pub fn indexedBytes(n: usize, k: usize, group: usize) usize {
     return sb_table * 4 + n * (k / group) * 2;
@@ -23,6 +23,119 @@ pub const sb_table12 = 4096;
 pub fn indexed12Bytes(n: usize, k: usize, group: usize) usize {
     return sb_table12 * 4 + (k / group) * (n / 32) * 48;
 }
+/// The distinct (scale | bias << 16) words of packed pairs ([K/64][N][scale, bias]), most used first (ties in first-seen
+/// order, as fkiene's d2bb6335 and terrapinelf's d81c8214 order them), and each group's rank among them. Every rank still
+/// names its group's own word, so a kernel reads the same values; the hot words only share fewer cache lines, so a decoded
+/// group's table lookups mostly hit lines already in cache. Null past `cap` distinct words.
+const Ranked = struct {
+    words: []u32,
+    ranks: []u16,
+    fn deinit(r: Ranked, allocator: std.mem.Allocator) void {
+        allocator.free(r.words);
+        allocator.free(r.ranks);
+    }
+};
+fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap: usize) !?Ranked {
+    var seen = std.AutoHashMap(u32, u16).init(allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(@intCast(2 * cap));
+    const firsts = try allocator.alloc(u32, cap);
+    defer allocator.free(firsts);
+    const counts = try allocator.alloc(u32, cap);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    const ranks = try allocator.alloc(u16, groups);
+    errdefer allocator.free(ranks);
+    for (ranks, 0..) |*at, i| {
+        const word = @as(u32, pair[2 * i]) | (@as(u32, pair[2 * i + 1]) << 16);
+        const got = seen.getOrPutAssumeCapacity(word);
+        if (!got.found_existing) {
+            if (seen.count() > cap) {
+                allocator.free(ranks);
+                return null;
+            }
+            got.value_ptr.* = @intCast(seen.count() - 1);
+            firsts[got.value_ptr.*] = word;
+        }
+        counts[got.value_ptr.*] += 1;
+        at.* = got.value_ptr.*;
+    }
+    // most used first, ties by first-seen id: key = (max - count) << 16 | id, ascending
+    const distinct = seen.count();
+    const keys = try allocator.alloc(u64, distinct);
+    defer allocator.free(keys);
+    for (keys, 0..) |*key, id| key.* = (@as(u64, std.math.maxInt(u32) - counts[id]) << 16) | @as(u64, id);
+    std.mem.sort(u64, keys, {}, std.sort.asc(u64));
+    const rank = try allocator.alloc(u16, distinct);
+    defer allocator.free(rank);
+    const words = try allocator.alloc(u32, distinct);
+    errdefer allocator.free(words);
+    for (keys, 0..) |key, r| {
+        const id: usize = @intCast(key & 0xFFFF);
+        rank[id] = @intCast(r);
+        words[r] = firsts[id];
+    }
+    for (ranks) |*at| at.* = rank[at.*];
+    return .{ .words = words, .ranks = ranks };
+}
+
+/// indexed_layout of packed pairs ([K/64][N][scale, bias]): rankPairs' words, then each group's u16 rank.
+/// Null (nothing kept) past sb_table distinct pairs.
+fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+    const cap = sb_table;
+    const ranked = (try rankPairs(allocator, pair, n * (k / 64), cap)) orelse return null;
+    defer ranked.deinit(allocator);
+    const sb = try device.buffer(indexedBytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    var keep = false;
+    defer if (!keep) sb.deinit();
+    const table = sb.slice(u32, cap);
+    @memset(table, 0);
+    @memcpy(table[0..ranked.words.len], ranked.words);
+    const index = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. n * (k / 64)];
+    @memcpy(index, ranked.ranks);
+    keep = true;
+    return sb;
+}
+
+/// indexed12_layout of packed pairs, with rankPairs' order; null (nothing kept) past
+/// sb_table12 distinct pairs.
+fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+    const cap = sb_table12;
+    const groups = k / 64;
+    const ranked = (try rankPairs(allocator, pair, groups * n, cap)) orelse return null;
+    defer ranked.deinit(allocator);
+    const sb = try device.buffer(indexed12Bytes(n, k, 64), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    var keep = false;
+    defer if (!keep) sb.deinit();
+    const table = sb.slice(u32, cap);
+    @memset(table, 0);
+    @memcpy(table[0..ranked.words.len], ranked.words);
+    const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
+    @memset(out, 0);
+    for (0..groups) |g| for (0..n) |c| {
+        const i = g * n + c;
+        const x = c % 32;
+        const bit = 12 * ((x / 16) * 4 + x % 4);
+        const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
+        const ix: u64 = @as(u64, ranked.ranks[i]) << @intCast(bit % 32);
+        out[at] |= @truncate(ix);
+        if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
+    };
+    keep = true;
+    return sb;
+}
+
+/// An indexed copy of packed pairs and its form.
+pub const Indexed = struct { buffer: mtl.Buffer, twelve: bool };
+
+/// Packed pairs ([K/64][N][scale, bias]) as indexed12_layout when at most sb_table12 distinct pairs and N/32 tiles allow
+/// it, else indexed_layout, else null; tables most used first (rankPairs). The caller owns the buffer.
+pub fn indexMetadata(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?Indexed {
+    if (n % 32 == 0) if (try indexPairs12(device, allocator, pair, n, k)) |b| return .{ .buffer = b, .twelve = true };
+    if (try indexPairs(device, allocator, pair, n, k)) |b| return .{ .buffer = b, .twelve = false };
+    return null;
+}
+
 pub const Output = enum { bf16, f32 };
 
 pub const Format = struct {
