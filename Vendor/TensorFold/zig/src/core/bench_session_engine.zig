@@ -226,9 +226,8 @@ pub const EngineDflashBinding = struct {
     }
 };
 
-/// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
-/// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
-pub const dflash_width = 7;
+/// Depth-one siblings a bench round drafts: with the pending row they fill one 8-row decode launch.
+const dflash_width = 7;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {

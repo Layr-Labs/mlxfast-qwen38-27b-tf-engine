@@ -95,9 +95,9 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
 /// Layers a stage-by-stage append holds at once.
 const max_layers = 16;
 
-/// append then forwardBlock in one frame: one commit and one wait for the committed taps and the block that reads them.
-pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !op.Lattice {
-    if (block < 2 or block > 16) return error.BadRuntimeBlock;
+/// append then forwardHeads in one frame: one commit and one wait for the committed taps and the block that reads them.
+pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32, heads: u32) !op.Lattice {
+    if (block < 2 or block > 16 or heads == 0 or heads >= block) return error.BadRuntimeBlock;
     try checkAppend(g, preparation, context, taps, positions, next);
     if (anchor >= g.config.vocab or next.end - next.begin > g.config.window - 1) return error.BadDraftContext;
     const frame = try ops.vtable.begin(ops.ptr);
@@ -106,7 +106,7 @@ pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, 
     errdefer ops.vtable.context_abort(ops.ptr, transaction);
     try encodeAppend(ops, g, preparation, taps, positions, frame, transaction);
     try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
-    const output = try encode(ops, g, preparation, next, anchor, frame, block, &.{});
+    const output = try encode(ops, g, preparation, next, anchor, frame, block, heads, &.{});
     var lattice = try ops.vtable.lattice(ops.ptr, frame, output.head, output.projected, g.config);
     errdefer lattice.deinit();
     try lattice.check(g.config);
@@ -122,19 +122,20 @@ fn start(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: o
     if (anchor >= g.config.vocab or context.cache == 0 or context.begin > context.end or context.end - context.begin > g.config.window - 1) return error.BadDraftContext;
     return ops.vtable.begin(ops.ptr);
 }
-fn encode(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, frame: u64, block: u32, given: []const u32) !Output {
-    return encodeStreams(ops, g, preparation, &.{.{ .context = context, .anchor = anchor }}, frame, block, given);
+/// `heads`: the leading mask rows the head reads (the lattice's depth); the rest of the block only conditions them.
+fn encode(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, frame: u64, block: u32, heads: u32, given: []const u32) !Output {
+    return encodeStreams(ops, g, preparation, &.{.{ .context = context, .anchor = anchor }}, frame, block, heads, given);
 }
 
 /// A stream of a batched block pass: its context and anchor (its caches are the backend's batch, in stream order).
 pub const Stream = struct { context: op.Context, anchor: u32 };
 
 /// Every stream's block stacked in one pass, weights read once; each stream attends to its own context.
-fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, streams: []const Stream, frame: u64, block: u32, given: []const u32) !Output {
+fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, streams: []const Stream, frame: u64, block: u32, heads: u32, given: []const u32) !Output {
     const c = g.config;
     const n: u32 = @intCast(streams.len);
     const rows = n * block;
-    if (n == 0 or rows > 128 or (n > 1 and given.len > 0)) return error.BadRuntimeBlock;
+    if (n == 0 or rows > 128 or (n > 1 and given.len > 0) or heads == 0 or heads >= block) return error.BadRuntimeBlock;
     var ids: [128]u32 = @splat(c.mask);
     var positions: [128]u64 = undefined;
     var contexts: [8]op.Context = undefined;
@@ -189,9 +190,9 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         try activated.check(rows, c.intermediate, .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }
-    // one stream heads only its mask rows; a batch heads every row and each stream's lattice skips its anchor
-    const masks = if (n == 1) try ops.vtable.mask_rows(ops.ptr, frame, hidden, 1, block - 1) else hidden;
-    const headed = if (n == 1) block - 1 else rows;
+    // one stream heads only its first `heads` mask rows; a batch heads every row and each stream's lattice skips its anchor
+    const masks = if (n == 1) try ops.vtable.mask_rows(ops.ptr, frame, hidden, 1, heads) else hidden;
+    const headed = if (n == 1) heads else rows;
     try masks.check(headed, c.hidden, .bf16);
     const final = try norm(ops, frame, masks, g.norm, c.eps, 1, c.hidden);
     // the small projection first: the head then reads the group sums of `final` it leaves behind
@@ -214,7 +215,7 @@ pub fn absorbBlocks(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation,
         try x.taps.check(@intCast(x.positions.len), g.config.tapWidth(), .bf16);
         try encodeAppendTo(ops, g, preparation, x.taps, x.positions, frame, .{ .stream = @intCast(k) });
     };
-    const output = try encodeStreams(ops, g, preparation, streams, frame, block, &.{});
+    const output = try encodeStreams(ops, g, preparation, streams, frame, block, block - 1, &.{});
     try ops.vtable.lattices(ops.ptr, frame, output.head, output.projected, g.config, block, out);
     for (out) |l| try l.check(g.config);
 }
@@ -223,17 +224,21 @@ pub fn forwardToBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparatio
     if (block < 2 or block > 16) return error.BadRuntimeBlock;
     const frame = try start(ops, g, preparation, context, anchor);
     defer ops.vtable.release(ops.ptr, frame);
-    const output = try encode(ops, g, preparation, context, anchor, frame, block, &.{});
+    const output = try encode(ops, g, preparation, context, anchor, frame, block, block - 1, &.{});
     try consumer.call(consumer.ptr, frame, output, g.config);
 }
 pub fn forwardTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, consumer: Consumer) !void {
     return forwardToBlock(ops, g, preparation, context, anchor, g.config.block, consumer);
 }
 pub fn forwardBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, block: u32) !op.Lattice {
-    if (block < 2 or block > 16) return error.BadRuntimeBlock;
+    return forwardHeads(ops, g, preparation, context, anchor, block, block -| 1);
+}
+/// forwardBlock whose lattice holds only the first `heads` mask rows.
+pub fn forwardHeads(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, block: u32, heads: u32) !op.Lattice {
+    if (block < 2 or block > 16 or heads == 0 or heads >= block) return error.BadRuntimeBlock;
     const frame = try start(ops, g, preparation, context, anchor);
     defer ops.vtable.release(ops.ptr, frame);
-    const output = try encode(ops, g, preparation, context, anchor, frame, block, &.{});
+    const output = try encode(ops, g, preparation, context, anchor, frame, block, heads, &.{});
     var lattice = try ops.vtable.lattice(ops.ptr, frame, output.head, output.projected, g.config);
     errdefer lattice.deinit();
     try lattice.check(g.config);
@@ -244,7 +249,7 @@ pub fn forwardGiven(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation,
     if (block < 2 or block > 16 or given.len + 1 >= block) return error.BadRuntimeBlock;
     const frame = try start(ops, g, preparation, context, anchor);
     defer ops.vtable.release(ops.ptr, frame);
-    const output = try encode(ops, g, preparation, context, anchor, frame, block, given);
+    const output = try encode(ops, g, preparation, context, anchor, frame, block, block - 1, given);
     var lattice = try ops.vtable.lattice(ops.ptr, frame, output.head, output.projected, g.config);
     errdefer lattice.deinit();
     try lattice.check(g.config);

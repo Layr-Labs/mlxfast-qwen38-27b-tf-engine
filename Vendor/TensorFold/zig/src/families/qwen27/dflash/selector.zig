@@ -8,13 +8,22 @@ pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5,
 pub const Policy = struct {
     nodes: usize,
     max_depth: ?u32 = null,
-    /// Siblings a node may offer (Options.children): a depth-one tree of `nodes` drafts needs as many.
+    /// Children a node offers, at most the lattice's top-k.
     children: u32 = 4,
 
     pub fn block(p: Policy, cap: u32) !u32 {
         if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
         if (p.max_depth) |depth| if (depth == 0 or depth > 15) return error.BadDraftDepth;
         return @min(cap, @min(@as(u32, @intCast(p.nodes)) + 1, (p.max_depth orelse 15) + 1));
+    }
+
+    /// Drafter rows of a proposal whose head reads `block` - 1 mask rows. A depth-bounded proposal runs the
+    /// checkpoint's trained block (its bidirectional block attention sees the masks it was trained with) and
+    /// still heads only the mask rows of `block`, so no draft sits deeper than `max_depth`.
+    pub fn rows(p: Policy, cap: u32, trained: u32) !u32 {
+        const headed = try p.block(cap);
+        if (p.max_depth == null or headed < 2) return headed;
+        return @max(headed, @min(cap, trained));
     }
 
     pub fn checkTree(p: Policy, parents: []const i32) !void {
@@ -163,4 +172,13 @@ test "proposal width and parent depth have separate bounds" {
     try std.testing.expectError(error.BadDraftDepth, (Policy{ .nodes = 2, .max_depth = 0 }).block(16));
     try std.testing.expectEqual(@as(u32, 2), p.budget(128));
     try std.testing.expectEqual(@as(u32, 1), p.budget(1));
+}
+
+test "a depth-bounded proposal runs the trained block and an unbounded one its own" {
+    const p = Policy{ .nodes = 4, .max_depth = 1 };
+    try std.testing.expectEqual(@as(u32, 8), try p.rows(16, 8));
+    try std.testing.expectEqual(@as(u32, 4), try p.rows(4, 8));
+    try std.testing.expectEqual(@as(u32, 3), try (Policy{ .nodes = 2 }).rows(16, 8));
+    try std.testing.expectEqual(@as(u32, 16), try (Policy{ .nodes = 15, .max_depth = 15 }).rows(16, 8));
+    try std.testing.expectEqual(@as(u32, 1), try (Policy{ .nodes = 0, .max_depth = 1 }).rows(16, 8));
 }

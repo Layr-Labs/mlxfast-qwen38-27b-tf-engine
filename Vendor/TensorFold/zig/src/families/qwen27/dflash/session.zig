@@ -32,10 +32,11 @@ pub const Session = struct {
         s.ready = true;
     }
     /// absorb and treeBlock in one drafter frame.
-    pub fn absorbTreeBlock(s: *Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, batch: Batch, pending: u32, block: u32, options: selector.Options) !selector.Tree {
+    /// `heads`: the leading mask rows of the `block` drafted rows that propose candidates.
+    pub fn absorbTreeBlock(s: *Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, batch: Batch, pending: u32, block: u32, heads: u32, options: selector.Options) !selector.Tree {
         if (!std.meta.eql(s.config, graph.config) or !s.ready) return error.BadDraftContext;
         const next = try s.admit(batch);
-        var lattice = try execution.appendBlock(ops, graph, preparation, s.context, batch.values, batch.positions, next, pending, block);
+        var lattice = try execution.appendBlock(ops, graph, preparation, s.context, batch.values, batch.positions, next, pending, block, heads);
         defer lattice.deinit();
         s.context = next;
         return selector.propose(gpa, graph, lattice, pending, try std.math.add(u64, next.end, 1), options);
@@ -48,9 +49,9 @@ pub const Session = struct {
         if (!std.meta.eql(s.config, graph.config) or first_draw != try s.firstDraw()) return error.BadDraftPosition;
         return execution.forward(ops, graph, preparation, s.context, pending);
     }
-    pub fn treeBlock(s: Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, pending: u32, first_draw: u64, block: u32, options: selector.Options) !selector.Tree {
+    pub fn treeBlock(s: Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, pending: u32, first_draw: u64, block: u32, heads: u32, options: selector.Options) !selector.Tree {
         if (!std.meta.eql(s.config, graph.config) or first_draw != try s.firstDraw()) return error.BadDraftPosition;
-        var lattice = try execution.forwardBlock(ops, graph, preparation, s.context, pending, block);
+        var lattice = try execution.forwardHeads(ops, graph, preparation, s.context, pending, block, heads);
         defer lattice.deinit();
         return selector.propose(gpa, graph, lattice, pending, first_draw, options);
     }

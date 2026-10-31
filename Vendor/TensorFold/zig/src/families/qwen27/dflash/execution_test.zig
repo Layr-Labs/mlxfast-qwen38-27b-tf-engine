@@ -94,7 +94,7 @@ const Fake = struct {
         return self(ptr).view(a.rows, a.width);
     }
     fn mask(ptr: *anyopaque, _: u64, x: op.View, first: u32, count: u32) !op.View {
-        if (first != 1 or count != x.rows - 1) return error.FakeAnchorShift;
+        if (first != 1 or count == 0 or count > x.rows - 1) return error.FakeAnchorShift;
         self(ptr).mask_first = first;
         return self(ptr).view(count, x.width);
     }
@@ -189,9 +189,9 @@ test "taps absorbed in the block's frame give the separate path's tree, one stag
     split.appends = 0; // the fake checks layer order within one transaction
     merged.appends = 0;
     try first.absorb(split.ops(), &g, p, more);
-    var want = try first.treeBlock(a, split.ops(), &g, p, 5, try first.firstDraw(), 8, .{});
+    var want = try first.treeBlock(a, split.ops(), &g, p, 5, try first.firstDraw(), 8, 7, .{});
     defer want.deinit();
-    var got = try second.absorbTreeBlock(a, merged.ops(), &g, p, more, 5, 8, .{});
+    var got = try second.absorbTreeBlock(a, merged.ops(), &g, p, more, 5, 8, 7, .{});
     defer got.deinit();
     try std.testing.expectEqualSlices(u32, want.tokens, got.tokens);
     try std.testing.expectEqualSlices(i32, want.parents, got.parents);
@@ -333,6 +333,32 @@ test "tiny conditional score differences collapse before sibling selection" {
     try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1 }, tree.parents);
 }
 
+test "width seven depth one takes seven siblings of the one headed row and the stock cap stays four" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    graph.config.topk = 16;
+    var fake = Fake{};
+    var lattice = try Fake.lattice(&fake, 1, undefined, .{ .handle = 1, .rows = 1, .width = graph.config.rank, .stride = graph.config.rank, .dtype = .bf16 }, graph.config);
+    defer lattice.deinit();
+    for (lattice.candidates, 0..) |*id, i| id.* = @intCast(i);
+    const policy = selector.Policy{ .nodes = 7, .children = 7, .max_depth = 1 };
+    var wide = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = policy.children });
+    defer wide.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, wide.tokens);
+    try policy.checkTree(wide.parents);
+    const parents = try wide.verifyParents(a);
+    defer a.free(parents);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0, 0, 0, 0, 0, 0 }, parents);
+    try std.testing.expectEqual(@as(u32, 2), policy.budget(128));
+    var stock = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = (selector.Policy{ .nodes = 7 }).children });
+    defer stock.deinit();
+    try std.testing.expectEqual(@as(usize, 4), stock.tokens.len);
+    try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .children = 17 }));
+}
+
 test "fused draft groups preserve projection shapes across absorb and tree" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
@@ -351,14 +377,17 @@ test "fused draft groups preserve projection shapes across absorb and tree" {
     try std.testing.expectEqual(@as(u32, 5), fake.appends);
 }
 
-test "width two depth one uses one genuine future head row and sibling parents" {
+test "width two depth one drafts the trained block, heads one future row and gives sibling parents" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
     defer store.deinit();
     var graph = try store.graph(a);
     defer graph.deinit();
     const policy = selector.Policy{ .nodes = 2, .max_depth = 1 };
-    const block = try policy.block(16);
+    const block = try policy.rows(16, graph.config.block);
+    const heads = try policy.block(16) - 1;
+    try std.testing.expectEqual(@as(u32, 8), block);
+    try std.testing.expectEqual(@as(u32, 1), heads);
     for ([_]bool{ false, true }) |merged| {
         var fake = Fake{};
         var state = try session.Session.init(fixtures.toy, 1, 0);
@@ -368,11 +397,12 @@ test "width two depth one uses one genuine future head row and sibling parents" 
         const more = session.Batch{ .values = batch().values, .positions = &.{ 2, 3 }, .layers = cfg.tap_ids, .target_end = 4 };
         if (!merged) try state.absorb(fake.ops(), &graph, preparation, more);
         var tree = if (merged)
-            try state.absorbTreeBlock(a, fake.ops(), &graph, preparation, more, 5, block, .{ .nodes = 2 })
+            try state.absorbTreeBlock(a, fake.ops(), &graph, preparation, more, 5, block, heads, .{ .nodes = 2 })
         else
-            try state.treeBlock(a, fake.ops(), &graph, preparation, 5, try state.firstDraw(), block, .{ .nodes = 2 });
+            try state.treeBlock(a, fake.ops(), &graph, preparation, 5, try state.firstDraw(), block, heads, .{ .nodes = 2 });
         defer tree.deinit();
-        try std.testing.expectEqual(@as(u32, 2), fake.embedded_rows);
+        try std.testing.expectEqual(@as(u32, 8), fake.embedded_rows);
+        try std.testing.expectEqual(@as(u32, 1), fake.mask_first);
         try std.testing.expectEqual(@as(u32, 1), fake.lattice_rows);
         try policy.checkTree(tree.parents);
         try std.testing.expectEqual(@as(usize, 2), tree.tokens.len);
@@ -380,43 +410,8 @@ test "width two depth one uses one genuine future head row and sibling parents" 
         const parents = try tree.verifyParents(a);
         defer a.free(parents);
         try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, parents);
-        try std.testing.expectEqualSlices(u32, &.{ 5, fixtures.toy.mask }, fake.ids[0..2]);
-        try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, fake.positions[0..2]);
+        const m = fixtures.toy.mask;
+        try std.testing.expectEqualSlices(u32, &.{ 5, m, m, m, m, m, m, m }, fake.ids[0..8]);
+        try std.testing.expectEqualSlices(u64, &.{ 4, 5, 6, 7, 8, 9, 10, 11 }, fake.positions[0..8]);
     }
-}
-
-test "width seven depth one offers the seven best siblings of one future head row" {
-    const a = std.testing.allocator;
-    var store = try fixtures.Store.init(a);
-    defer store.deinit();
-    var graph = try store.graph(a);
-    defer graph.deinit();
-    graph.config.topk = 16;
-    var fake = Fake{};
-    var lattice = try Fake.lattice(&fake, 1, undefined, .{ .handle = 1, .rows = 1, .width = graph.config.rank, .stride = graph.config.rank, .dtype = .bf16 }, graph.config);
-    defer lattice.deinit();
-    // candidates 0..15 with unary scores falling by rank, so the siblings come out in candidate order
-    for (lattice.candidates, lattice.unary, 0..) |*id, *score, i| {
-        id.* = @intCast(i);
-        score.* = -@as(f32, @floatFromInt(i));
-    }
-    const width = 7; // bench_session_engine.dflash_width
-    const policy = selector.Policy{ .nodes = width, .max_depth = 1, .children = width };
-    try std.testing.expectEqual(@as(u32, 2), try policy.block(16));
-    var tree = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width, .children = policy.children });
-    defer tree.deinit();
-    try policy.checkTree(tree.parents);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, tree.tokens);
-    try std.testing.expectEqualSlices(i32, &.{ -1, -1, -1, -1, -1, -1, -1 }, tree.parents);
-    const parents = try tree.verifyParents(a);
-    defer a.free(parents);
-    // the pending row and its seven drafts: eight verify rows, the rows8 decode projections' limit
-    try std.testing.expectEqual(@as(usize, 8), parents.len);
-    for (parents[1..]) |parent| try std.testing.expectEqual(@as(i32, 0), parent);
-    try std.testing.expectEqual(@as(u32, 2), policy.budget(128));
-    // the stock cap of four children still yields four siblings, and a cap past the lattice's 16 is refused
-    var four = try selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width });
-    defer four.deinit();
-    try std.testing.expectEqual(@as(usize, 4), four.tokens.len);
-    try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = width, .children = 17 }));
 }

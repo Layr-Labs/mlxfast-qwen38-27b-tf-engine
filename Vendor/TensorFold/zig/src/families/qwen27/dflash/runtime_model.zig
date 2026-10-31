@@ -200,11 +200,12 @@ pub const Model = struct {
         return m.proposePolicy(pending, .{ .nodes = nodes });
     }
     pub fn proposePolicy(m: *Model, pending: u32, policy: @import("selector.zig").Policy) !@import("selector.zig").Tree {
-        const block = try policy.block(m.tree_block);
+        const block = try policy.rows(m.tree_block, m.graph.config.block);
+        const heads = try policy.block(m.tree_block) -| 1;
         const nodes: u32 = @intCast(policy.nodes);
         if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab) return error.BadDraftOptions;
         if (m.committed_end == 0) return error.DraftContextNotReady;
-        if (block < 2) return .{ .gpa = m.allocator, .tokens = &.{}, .parents = &.{}, .scores = &.{} };
+        if (heads == 0) return .{ .gpa = m.allocator, .tokens = &.{}, .parents = &.{}, .scores = &.{} };
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;
         const slot: u32 = @intCast(m.session.context.end % window);
@@ -214,11 +215,11 @@ pub const Model = struct {
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
-            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children });
+            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, heads, .{ .nodes = nodes, .children = policy.children });
         }
         try m.flush();
         const first = try m.session.firstDraw();
-        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children });
+        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, heads, .{ .nodes = nodes, .children = policy.children });
     }
 };
 /// A stream's own drafter state, parked while another stream drafts: its taps ring, rolling K/V and session.

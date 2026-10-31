@@ -139,7 +139,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     test_step.dependOn(&qwen_tests.step);
     const qwen_test_step = b.step("test-qwen27", "CPU Qwen config, affine and complete tensor graph contracts");
     qwen_test_step.dependOn(&qwen_tests.step);
-    const width_tests = b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{ "proposal width and parent depth", "width two depth one uses", "depth one siblings keep", "depth one sibling terminal", "width seven depth one" } }));
+    const width_tests = b.addRunArtifact(b.addTest(.{ .root_module = qwen27, .filters = &.{ "proposal width and parent depth", "width two depth one drafts", "a depth-bounded proposal runs", "width seven depth one", "depth one siblings keep", "depth one sibling terminal" } }));
     b.step("test-qwen27-width2-host", "Depth-one sibling topology and keep maps without a GPU").dependOn(&width_tests.step);
     const header_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true }) }));
     qwen_test_step.dependOn(&header_tests.step);
