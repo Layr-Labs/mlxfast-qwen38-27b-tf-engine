@@ -202,16 +202,8 @@ pub const Kernels = struct {
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
-        const half = p.n / 64;
-        const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
-            k.joined(entry.value_ptr);
-        }
+        const entry = try k.laneEntry(p, sk, skip, cut, rows);
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
@@ -222,6 +214,58 @@ pub const Kernels = struct {
             if (sums) |s| try entry.value_ptr.encodeSums(e, xr, w, sb, .{ .ref = .{ .buf = s.ref.buffer, .off = s.ref.offset + @as(usize, first) * 4 }, .stride = s.stride }, yr, @min(rows - first, step)) else try entry.value_ptr.encode(e, xr, w, sb, yr, @min(rows - first, step));
         }
         try span.end();
+    }
+
+    /// The lane projection a reg or lane launch of `p` takes, compiled and cached on first request.
+    fn laneEntry(
+        k: *Kernels,
+        p: projection.Linear,
+        sk: u32,
+        skip: u32,
+        cut: [2]u32,
+        rows: u32,
+    ) !std.AutoHashMapUnmanaged(Key, lane.Projection).GetOrPutResult {
+        const reg = p.bits == 4 and p.group == 64;
+        const key = Key{
+            .kind = .projection,
+            .n = p.n,
+            .k = p.k,
+            .slices = if (reg) sk else p.slices,
+            // tmr 8: a reg window of at most 8 rows (decode, a verify's rows) on the 8-row accumulator kernel
+            .tmr = if (reg and rows <= 8) 8 else 0,
+            .skip = skip,
+            .cut = cut,
+            .bits = p.bits,
+            .group = p.group,
+        };
+        const half = p.n / 64;
+        const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = key.slices,
+                .ranges = if (skip > 0) &ranges else &.{},
+                .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null,
+                .output = if (cut[1] > 0) .f32 else .bf16,
+                .precompute_sums = reg,
+                .reg = reg,
+                .serial_sk2 = key.serialSk2(),
+                .reg_m = if (key.tmr == 8) 8 else 16,
+            });
+            k.joined(entry.value_ptr);
+        }
+        return entry;
+    }
+
+    /// Compiles, at load, the decode-row pipeline a later `quant` of `p` takes (no rows encoded): a shape only
+    /// one caller uses, such as the drafter's trimmed head, would otherwise compile on its first timed launch.
+    pub fn prepareDecode(k: *Kernels, p: projection.Linear) !void {
+        if (p.runs.len > 0 or p.raw != null or p.tile != 32) return;
+        _ = try k.laneEntry(p, p.slices, 0, .{ 0, 0 }, 1); // decode rows: the same tmr-8 key the timed launch takes
     }
 
     /// A mixed stack: each member its own product into its columns; row kernels write the fused rows at a stride.

@@ -82,6 +82,17 @@ pub const CommandBuffer = struct {
         objc.msg(void, self.id, "waitUntilCompleted", .{});
     }
 
+    /// `wait`, with the host spinning on `status` until the GPU ends the buffer instead of sleeping until Metal's
+    /// completion wakes it: the thread that encodes the next work is already running when it lands.
+    pub fn poll(self: CommandBuffer) void {
+        while (true) {
+            const s = self.status();
+            if (s == .completed or s == .@"error") break;
+            std.atomic.spinLoopHint();
+        }
+        self.wait();
+    }
+
     pub fn status(self: CommandBuffer) types.CommandBufferStatus {
         return @fromBackingInt(@intCast(objc.msg(usize, self.id, "status", .{})));
     }

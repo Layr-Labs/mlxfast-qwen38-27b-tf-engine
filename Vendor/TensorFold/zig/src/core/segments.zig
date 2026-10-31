@@ -118,7 +118,7 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
     for (lanes[0..n]) |l| l.cb.commit();
     // work the family queues behind the last chunk before the host waits on it (a round's keep)
     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
-    for (lanes[0..n]) |l| l.cb.wait(); // every segment ends before a failure returns and its buffers are reused
+    for (lanes[0..n]) |l| l.cb.poll(); // every segment ends before a failure returns and its buffers are reused
     var gpu: f64 = 0;
     for (done[0..n_done]) |cb| {
         cb.wait();

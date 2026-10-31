@@ -97,7 +97,7 @@ pub const Frame = struct {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
         f.encoder.end();
         f.cb.commit();
-        f.cb.wait();
+        f.cb.poll(); // the host reads the draft and encodes the verify the moment the frame lands
         f.completed = true;
         for (f.parts[0..f.part_count]) |cb| {
             cb.wait();
