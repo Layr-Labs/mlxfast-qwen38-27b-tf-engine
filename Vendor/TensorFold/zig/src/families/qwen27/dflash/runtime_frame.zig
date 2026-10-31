@@ -13,6 +13,77 @@ fn failed(cb: mtl.CommandBuffer) bool {
     return true;
 }
 
+/// Keeps the GPU busy from a proposal's last command buffer until the verify behind it starts. The host reads the
+/// proposal before it encodes the verify, and a GPU left idle meanwhile starts the verify's first command buffer a few
+/// hundred microseconds after its commit; a busy one starts it within a few tens. One 32-thread group spins behind the
+/// proposal until the verify's first encoder stores the spin's epoch (`end`), or for `bound` iterations (a few
+/// milliseconds) when no verify follows. It reads and writes nothing else, so no result depends on it.
+pub const Bridge = struct {
+    spin: mtl.Pipeline,
+    stop: mtl.Pipeline,
+    /// [0]: the epoch of the last stop; [1]: a sink the spin never writes in practice (keeps its loop alive).
+    flag: mtl.Buffer,
+    epoch: u32 = 0,
+    open: bool = false,
+    const bound: u32 = 50_000;
+    const source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\kernel void tf_bridge_spin(device atomic_uint* flag [[buffer(0)]], constant uint2& p [[buffer(1)]],
+        \\                           uint tid [[thread_position_in_grid]]) {
+        \\  uint x = tid + 0x9e3779b9u;
+        \\  for (uint i = 0; i < p.x; ++i) {
+        \\    if ((i & 31u) == 0u && int(atomic_load_explicit(flag, memory_order_relaxed) - p.y) >= 0) break;
+        \\    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        \\  }
+        \\  if (x == 0x12345678u) atomic_store_explicit(flag + 1, x, memory_order_relaxed);
+        \\}
+        \\kernel void tf_bridge_stop(device atomic_uint* flag [[buffer(0)]], constant uint& epoch [[buffer(1)]]) {
+        \\  atomic_store_explicit(flag, epoch, memory_order_relaxed);
+        \\}
+    ;
+    pub fn init(device: mtl.Device) !Bridge {
+        const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
+        defer lib.deinit();
+        const spin = try mtl.Pipeline.init(device, lib, "tf_bridge_spin", false);
+        errdefer spin.deinit();
+        const stop = try mtl.Pipeline.init(device, lib, "tf_bridge_stop", false);
+        errdefer stop.deinit();
+        // untracked: the verify's stop must not wait for the spin it ends
+        const flag = try device.buffer(16, options);
+        @memset(flag.slice(u32, 4), 0);
+        return .{ .spin = spin, .stop = stop, .flag = flag };
+    }
+    pub fn deinit(b: *Bridge) void {
+        b.spin.deinit();
+        b.stop.deinit();
+        b.flag.deinit();
+    }
+    /// A spin in its own command buffer, started when `fence` (updated by the proposal's last encoder) is reached.
+    fn launch(b: *Bridge, queue: mtl.Queue, fence: mtl.objc.Id) void {
+        b.epoch +%= 1;
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        mtl.objc.msg(void, e.id, "waitForFence:", .{fence});
+        e.setPipeline(b.spin);
+        e.setBuffer(b.flag, 0, 0);
+        e.setValue([2]u32{ bound, b.epoch }, 1);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(32, 1, 1));
+        e.end();
+        cb.commit();
+        b.open = true;
+    }
+    /// First in the verify's first encoder, beside its own work: ends the open spin once the verify runs.
+    fn end(b: *Bridge, e: mtl.ComputeEncoder) void {
+        if (!b.open) return;
+        b.open = false;
+        e.setPipeline(b.stop);
+        e.setBuffer(b.flag, 0, 0);
+        e.setValue(b.epoch, 1);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
+    }
+};
+
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     device: mtl.Device,
@@ -33,6 +104,8 @@ pub const Frame = struct {
     part_count: usize = 0,
     ops: u32 = 0,
     residency: ?mtl.ResidencySet.Follow = null,
+    /// Bridges a proposal's frame to the verify behind it (finishBridged, endBridge); none if it failed to build.
+    bridge: ?Bridge = null,
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -44,6 +117,7 @@ pub const Frame = struct {
         f.release();
         f.setResident(null);
         if (f.fence) |fence| mtl.objc.release(fence);
+        if (f.bridge) |*b| b.deinit();
         for (f.pool.items) |buffer| buffer.deinit();
         f.pool.deinit(f.allocator);
         f.entries.deinit(f.allocator);
@@ -73,7 +147,7 @@ pub const Frame = struct {
         f.cursor = 0;
         f.entries.clearRetainingCapacity();
         f.cb = f.queue.commandBuffer();
-        f.encoder = f.cb.compute(.serial);
+        f.encoder = f.cb.compute(.concurrent);
         f.active = true;
         f.completed = false;
         f.part_count = 0;
@@ -90,13 +164,34 @@ pub const Frame = struct {
         f.parts[f.part_count] = f.cb;
         f.part_count += 1;
         f.cb = f.queue.commandBuffer();
-        f.encoder = f.cb.compute(.serial);
+        f.encoder = f.cb.compute(.concurrent);
         mtl.objc.msg(void, f.encoder.id, "waitForFence:", .{f.fence.?});
     }
     pub fn finish(f: *Frame) !void {
+        return f.finishWith(false);
+    }
+    /// finish, leaving the bridge's spin running behind the frame for the verify that follows a proposal.
+    pub fn finishBridged(f: *Frame) !void {
+        return f.finishWith(f.bridge != null);
+    }
+    /// Ends a bridge's open spin from the verify's first encoder (a forward.Tail on the frame).
+    pub fn endBridge(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const f: *Frame = @ptrCast(@alignCast(ptr));
+        if (f.bridge) |*b| b.end(e);
+    }
+    fn finishWith(f: *Frame, bridged: bool) !void {
         if (!f.active or f.completed) return error.DraftFrameNotActive;
+        if (bridged and f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
+        if (bridged) mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
         f.encoder.end();
         f.cb.commit();
+        if (bridged) f.bridge.?.launch(f.queue, f.fence.?);
+        // the frame's tokens gate the next verify's encode: poll its status rather than sleep until the completion
+        // handler wakes this thread, then wait() returns at once
+        while (true) switch (f.cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         f.cb.wait();
         f.completed = true;
         for (f.parts[0..f.part_count]) |cb| {
