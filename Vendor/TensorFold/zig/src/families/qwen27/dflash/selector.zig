@@ -8,6 +8,8 @@ pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5,
 pub const Policy = struct {
     nodes: usize,
     max_depth: ?u32 = null,
+    /// Siblings a node may offer (Options.children): a depth-one tree of `nodes` drafts needs as many.
+    children: u32 = 4,
 
     pub fn block(p: Policy, cap: u32) !u32 {
         if (p.nodes > 15 or cap == 0 or cap > 16) return error.BadDraftOptions;
@@ -109,7 +111,7 @@ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Latt
     try g.config.check();
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
-    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 4 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0) return error.BadDraftSelector;
+    if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0) return error.BadDraftSelector;
     var frontier: std.ArrayList(Node) = .empty;
     defer frontier.deinit(lattice.gpa);
     const tokens = try gpa.alloc(u32, options.nodes);
