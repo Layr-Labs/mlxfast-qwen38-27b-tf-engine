@@ -6,6 +6,7 @@ const row = @import("core").row_projection;
 const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
+const prompt_policy = @import("prompt_policy.zig");
 pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
@@ -71,6 +72,10 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    /// Cached once from the Metal device name when the model is opened.
+    wide_prompt: bool = false,
+    /// Counted decoded norms are enabled only for qualified device classes.
+    counted_norm: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -218,15 +223,17 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
+                .wide_given = k.wide_prompt,
                 // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
                 .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
             });
             k.joined(entry.value_ptr);
         }
         const half = p.n / 2;
+        const step: u32 = if (k.wide_prompt) lane.max_reg_rows else lane.reg_rows;
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        while (first < rows) : (first += step) {
+            const n = @min(rows - first, step);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
@@ -256,12 +263,13 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true, .wide_given = k.wide_prompt });
             k.joined(entry.value_ptr);
         }
+        const step: u32 = if (prompt_policy.mayWiden(k.wide_prompt, true, true, xs != null)) lane.max_reg_rows else lane.reg_rows;
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        while (first < rows) : (first += step) {
+            const n = @min(rows - first, step);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const hr = lane.Ref{ .buf = hidden.buffer, .off = hidden.offset + @as(usize, first) * p.n * 2 };
@@ -355,10 +363,10 @@ pub const Kernels = struct {
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
             const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12, .wide_given = key.prompt_sr and k.wide_prompt });
             k.joined(entry.value_ptr);
         }
-        const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+        const step: u32 = if (!entry.value_ptr.reg) 16 else if (prompt_policy.mayWiden(k.wide_prompt, key.prompt_sr, entry.value_ptr.reg, sums != null)) lane.max_reg_rows else lane.reg_rows;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };

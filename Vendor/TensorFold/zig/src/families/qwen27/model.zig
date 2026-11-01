@@ -82,7 +82,10 @@ pub const Model = struct {
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
         m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
         errdefer m.weights.deinit();
-        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
+        const tensor_units = m.device.tensorUnits();
+        const device_name = std.mem.span(m.device.name());
+        const prompt_policy = @import("prompt_policy.zig");
+        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !tensor_units, .wide_prompt = prompt_policy.wideForDeviceName(device_name), .counted_norm = prompt_policy.countedForDeviceName(device_name, tensor_units) };
         errdefer m.kernels.deinit();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();

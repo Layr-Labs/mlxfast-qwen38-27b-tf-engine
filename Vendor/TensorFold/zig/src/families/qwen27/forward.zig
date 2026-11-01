@@ -118,7 +118,7 @@ pub const Stages = struct {
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+        } else if (if (m.kernels.counted_norm and gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
             try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
         } else {
@@ -162,7 +162,7 @@ pub const Stages = struct {
         lane.enc.barrier();
         if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
-        } else if (if (!s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+        } else if (if (m.kernels.counted_norm and !s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             s.norm_wait = counted;
         } else try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), dims, f.get(.output), s.rows);
         // a counted down shares its barrier interval with the norm that waits on it
