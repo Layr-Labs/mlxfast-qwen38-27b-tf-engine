@@ -26,27 +26,32 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
-  if (int(m) == 0) {
-    const int pad = MP - M;
-    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
-  }
   if (int(m) >= M) return;
   // wait_for above 0: this norm shares its barrier interval with the projection that writes R, whose threadgroups count
   // themselves on NC[0] past a device-scope fence; a row's threadgroup reads R once the count reaches wait_for (bounded),
   // past its own fence, and the last row's threadgroup leaves both words zero for the next pair
   if (wait_for != 0u) {
-    threadgroup uint arrived;
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      arrived = atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed);
-      if (arrived + 1u == uint(M)) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == uint(M)) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
+  }
+  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  if (int(m) == 0) {
+    const int pad = MP - M;
+    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
   const int base = int(m) * K + int(t) * E;
   // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's

@@ -236,15 +236,22 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
   if (wait_for != 0u) { \
+    threadgroup uint dependency_ready; \
     if (t == 0) { \
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed); \
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for); \
+      if (dependency_ready == 0u) { \
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed); \
+      } else { \
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed); \
+        } \
       } \
     } \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (dependency_ready == 0u) return; \
   } \
   q27_head_norm_rope_rows<PACK, false>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
 }
@@ -267,15 +274,22 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
                  uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   q27_head_norm_rope_rows<false, true>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane, QA, caches, meta, nodes, V, v_stride);
   if (count_out != 0u) {

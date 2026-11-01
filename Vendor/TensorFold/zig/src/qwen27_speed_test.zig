@@ -117,3 +117,48 @@ test "qwen27 speed: every cache buffer failure frees the complete CPU allocation
         try std.testing.expectEqual(a.allocated, a.freed);
     }
 }
+
+
+test "qwen27 speed: incomplete counted normalization cannot reach host token selection" {
+    const guard = @import("families/qwen27/counted_norm_status.zig");
+    const Mock = struct {
+        picked: bool = false,
+        fn finish(m: *@This(), completed_failure_word: u32) !void {
+            try guard.check(completed_failure_word);
+            m.picked = true;
+        }
+    };
+    var ready = Mock{};
+    try ready.finish(0);
+    try std.testing.expect(ready.picked);
+    for ([_]u32{ 1, 2, 0xffffffff }) |failed| {
+        var incomplete = Mock{};
+        try std.testing.expectError(error.QwenNormDependencyIncomplete, incomplete.finish(failed));
+        try std.testing.expect(!incomplete.picked);
+    }
+}
+
+test "qwen27 speed: all counted dependency records are checked before host picks" {
+    const guard = @import("families/qwen27/counted_norm_status.zig");
+    const Mock = struct {
+        picked: bool = false,
+        fn finish(m: *@This(), norm: []const u32, gu: []const u32, attention: []const u32, scan: []const u32) !void {
+            for ([_][]const u32{ norm, gu, attention, scan }) |bank| try guard.checkBank(bank);
+            m.picked = true;
+        }
+    };
+    var good: [6 * 4]u32 = @splat(0);
+    good[0] = 99; good[1] = 1; good[3] = 7; // producer, arrival and reserved words are not failure flags
+    var ready = Mock{};
+    try ready.finish(good[0..4], good[4..8], good[8..20], good[20..24]);
+    try std.testing.expect(ready.picked);
+    for (0..6) |record| {
+        var words = good;
+        words[4 * record + 2] = 1;
+        var bad = Mock{};
+        try std.testing.expectError(error.QwenNormDependencyIncomplete, bad.finish(words[0..4], words[4..8], words[8..20], words[20..24]));
+        try std.testing.expect(!bad.picked);
+    }
+    try std.testing.expectError(error.BadQwenCountedStatus, guard.checkBank(&.{}));
+    try std.testing.expectError(error.BadQwenCountedStatus, guard.checkBank(&.{0,0,0}));
+}

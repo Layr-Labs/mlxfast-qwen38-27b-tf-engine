@@ -584,7 +584,7 @@ pub const Projection = struct {
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        try checkRef(waited, 8, 4);
+        try checkRef(waited, 12, 4);
         e.setBuffer(waited.buf, waited.off, 9);
         e.setValue(wait_for, 10);
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
