@@ -154,14 +154,23 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         r.b.qkv.bind(e, 15); // never read: wait_for 0
         e.setValue(@as(u32, 0), 16);
+        r.b.qkv.bind(e, 17); // never written: flow 0
+        e.setValue(@as(u32, 0), 18);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
+    }
+    /// The groups tf_delta_gdn_pre_rows runs for this round (what a chained scan waits for).
+    pub fn prepareGroups(r: Round) u32 {
+        return (2 * r.p.nk + r.p.nv) * ((r.p.rows + 15) / 16);
     }
 
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
     /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
     /// so any other shape is refused rather than run unsynchronised.
-    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) !void {
+    /// `chain` (the star scan's words, `flow` bit 0): every group counts itself on its third word once its rows are stored,
+    /// and the scan behind it waits on that count in the same barrier interval (forwardStar's `pre_wait`) instead of a
+    /// barrier. `flow` bit 1: the groups arrive on `counter` at their end (no thread waits on that round trip first).
+    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32, chain: ?metal.Buffer, flow: u32) !void {
         if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return error.BadGdnPrepare;
         inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return error.BadGdnPrepare;
         e.setPipeline(rows);
@@ -170,8 +179,11 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         e.setBuffer(counter, 0, 15);
         e.setValue(wait, 16);
+        if (chain) |words| e.setBuffer(words, 8, 17) else r.b.qkv.bind(e, 17); // never written without the chain
+        const chained = chain != null and flow & 1 != 0;
+        e.setValue(if (chained) flow else flow & 2, 18);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
-        e.barrier();
+        if (!chained) e.barrier();
     }
 
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.
@@ -227,7 +239,10 @@ pub const Round = struct {
     /// `counter` (two words, left zero): with nothing beside the scan and the gate on post_rows, the scan counts its
     /// threadgroups once their rows are stored and the gate waits on that count in the same barrier interval.
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
-    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending) !void {
+    /// `pre_wait` above 0 (the prepare counted on `counter`'s third word, prepareRowsAfter's `chain`): every scan group
+    /// waits for that many prepare groups after reading its state, before it reads the prepared rows.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, pre_wait: u32) !void {
+        if (pre_wait != 0 and counter == null) return error.BadGdnPlan;
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
@@ -241,6 +256,8 @@ pub const Round = struct {
             bind(e, .{ q.key, q.value, q.decay, q.mixing }, 12);
             e.setValue(q.use, 16);
         }
+        if (pre_wait != 0) e.setBuffer(counter.?, 8, 17) else r.b.recurrent.bind(e, 17); // never read: wait_for 0
+        e.setValue(pre_wait, 18);
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 8) * r.p.nv * r.segments));
@@ -253,13 +270,13 @@ pub const Round = struct {
         r.gate(e, post_rows);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 16 value columns a simdgroup (prompt chunks, dk = 128).
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 32 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, beside: ?Beside) !void {
         e.setPipeline(chain);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 32, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
@@ -288,6 +305,7 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
+        e.setValue(@as(u32, 2), 9); // the groups arrive on `counter` at their end
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
         e.barrier();
     }
@@ -308,6 +326,7 @@ pub const Round = struct {
         if (wide) {
             r.b.output.bind(e, 7); // never read: wait_for 0
             e.setValue(@as(u32, 0), 8);
+            e.setValue(@as(u32, 0), 9);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();

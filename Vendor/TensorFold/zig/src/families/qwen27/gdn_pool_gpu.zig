@@ -90,8 +90,9 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..8], 0);
+        // the scan's count and its gate's arrivals, then the prepare's count and its scan's arrivals (forwardAfter)
+        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..16], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -179,16 +180,22 @@ pub const Pool = struct {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
+        // a decoded star behind counted projections: the prepare counts its groups and the scan waits on that count in the
+        // same barrier interval (the prepare's groups are encoded first), so the scan reads its state during the prepare
+        // flow bit 1: the prepare's groups arrive on the projections' counter at their end
+        const chain = after != null and prepared.star and prepared.usesSlots() and pool.profiler == null and pool.scan_words != null and (deferred == null or deferred.?.rows <= pending_rows);
+        const flow: u32 = (if (chain) @as(u32, 1) else 0) | 2;
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait, if (chain) pool.scan_words else null, flow) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
+        const pre_wait: u32 = if (chain) prepared.prepareGroups() else 0;
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         if (prepared.star and prepared.usesSlots()) {
             if (deferred) |d| {
                 if (d.rows > pending_rows) return error.BadGdnPending;
                 const pending = gdn.Pending{ .key = try pool.layerSpan(.pending_key, layer), .value = try pool.layerSpan(.pending_value, layer), .decay = try pool.layerSpan(.pending_decay, layer), .mixing = try pool.layerSpan(.pending_mixing, layer), .use = d };
-                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending);
-            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null);
+                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending, pre_wait);
+            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, pre_wait);
         } else if (deferred != null) {
             return error.BadGdnPlan;
         } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
@@ -224,7 +231,7 @@ pub const Pool = struct {
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
-        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 16 == 0;
+        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 32 == 0;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);

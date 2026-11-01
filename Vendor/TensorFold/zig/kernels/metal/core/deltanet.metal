@@ -205,6 +205,8 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* mixing [[buffer(14)]],
                         device atomic_uint* NC [[buffer(15)]],
                         constant uint& wait_for [[buffer(16)]],
+                        device atomic_uint* DC [[buffer(17)]],
+                        constant uint& flow [[buffer(18)]],
                         uint3 group [[threadgroup_position_in_grid]],
                         uint3 groups [[threadgroups_per_grid]],
                         uint t [[thread_index_in_threadgroup]],
@@ -212,13 +214,15 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         uint lane [[thread_index_in_simdgroup]]) {
   // wait_for above 0: this prepare shares its barrier interval with the decoded qkv and zba projections it reads, whose
   // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
-  // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
+  // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair.
+  // flow bit 1: a group arrives on NC[1] at its end instead, so no thread waits on that round trip before the rows.
+  const uint total = groups.x * groups.y * groups.z;
+  const bool late = (flow & 2u) != 0u;
   if (wait_for != 0u) {
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+      if (!late && atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
         atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
       }
@@ -226,6 +230,19 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+  // flow bit 0: the star scan behind this prepare shares its barrier interval and waits on DC[0], which every group counts
+  // once its rows are stored (past a device-scope fence), as the scan counts itself for the gate
+  if ((flow & 1u) != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&DC[0], 1u, memory_order_relaxed);
+    }
+  }
+  if (wait_for != 0u && late && t == 0 && atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+    atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+    atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+  }
 }
 
 // tf_delta_gdn_pre_body<4, true> over 4 simdgroups a head; each lane's 4 squares summed in order before simd_sum.
@@ -538,7 +555,7 @@ kernel void tf_delta_gdn_chain(device const bfloat* query [[buffer(0)]],
   if (p.dk == 128) tf_delta_gdn_chain_body<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
   else tf_delta_gdn_chain_body<0>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
-// Prompt chains (may differ in bits from decode): 8 lanes a set of CC value columns (4 unmarked, 2 marked), 16 key
+// Prompt chains (may differ in bits from decode): 8 lanes a set of CC value columns (8 unmarked, 2 marked), 16 key
 // channels of each; dk = 128. Every column keeps its own arithmetic and order whatever CC is.
 // Each column keeps its in-order 16-channel sums and xor 1, 2, 4 tree; the pair shares k and q, converted once a row.
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
@@ -615,7 +632,7 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_body<false, 4>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
+  tf_delta_gdn_chain_wide_body<false, 8>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
                                       uint4(0), next_state, position, lane);
 }
 
@@ -699,36 +716,9 @@ kernel void tf_delta_gdn_post(device const bfloat* recurrence [[buffer(0)]],
   else tf_delta_gdn_post_body<0>(recurrence, gate, norm, p, output, group, lane);
 }
 
-// tf_delta_gdn_post_body<4> on bfloat4 rows: a simdgroup a row, 4 rows a group of 128.
-kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]],
-                         device const bfloat* gate [[buffer(1)]],
-                         device const void* norm [[buffer(2)]],
-                         constant TfDeltaParams& p [[buffer(3)]],
-                         device bfloat* output [[buffer(4)]],
-                         device float* sums [[buffer(5)]],
-                         constant uint& sums_stride [[buffer(6)]],
-                         device atomic_uint* NC [[buffer(7)]],
-                         constant uint& wait_for [[buffer(8)]],
-                         uint3 group [[threadgroup_position_in_grid]],
-                         uint3 groups [[threadgroups_per_grid]],
-                         uint t [[thread_index_in_threadgroup]],
-                         uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-  // wait_for above 0: this gate shares its barrier interval with the star scan that writes `recurrence`, whose threadgroups
-  // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
-  // its own fence, and the last group leaves both words zero for the next pair
-  if (wait_for != 0u) {
-    if (t == 0) {
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
+// tf_delta_gdn_post_rows' rows: a simdgroup a row (tf_delta_gdn_post_body<4> on bfloat4 rows).
+inline void tf_delta_gdn_post_rows4(device const bfloat* recurrence, device const bfloat* gate, device const void* norm,
+    constant TfDeltaParams& p, device bfloat* output, device float* sums, constant uint& sums_stride, uint3 group, uint sg, uint lane) {
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
@@ -756,6 +746,45 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
       for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
       sums[g * int(sums_stride) + int(row)] = acc;
     }
+  }
+}
+// tf_delta_gdn_post_body<4> on bfloat4 rows: a simdgroup a row, 4 rows a group of 128.
+kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]],
+                         device const bfloat* gate [[buffer(1)]],
+                         device const void* norm [[buffer(2)]],
+                         constant TfDeltaParams& p [[buffer(3)]],
+                         device bfloat* output [[buffer(4)]],
+                         device float* sums [[buffer(5)]],
+                         constant uint& sums_stride [[buffer(6)]],
+                         device atomic_uint* NC [[buffer(7)]],
+                         constant uint& wait_for [[buffer(8)]],
+                         constant uint& flow [[buffer(9)]],
+                         uint3 group [[threadgroup_position_in_grid]],
+                         uint3 groups [[threadgroups_per_grid]],
+                         uint t [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this gate shares its barrier interval with the star scan that writes `recurrence`, whose threadgroups
+  // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
+  // its own fence, and the last group leaves both words zero for the next pair.
+  // flow bit 1: a group arrives on NC[1] at its end instead, so no thread waits on that round trip before the rows.
+  const uint total = groups.x * groups.y * groups.z;
+  const bool late = (flow & 2u) != 0u;
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (!late && atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  tf_delta_gdn_post_rows4(recurrence, gate, norm, p, output, sums, sums_stride, group, sg, lane);
+  if (wait_for != 0u && late && t == 0 && atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+    atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+    atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
   }
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
@@ -837,3 +866,4 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+// kshitij-hash's 48e03ec7 with two additions measured on top of it; this entry's own pieces are named in its note.

@@ -343,7 +343,7 @@ pub const Backend = struct {
     }
     /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
     /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
-    /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
+    /// other linear q4. In the per-linear acceptance runs of 48d75d22 q/k/v and the conv projections cost
     /// acceptance at 2 bits, and the down's 2-bit copy costs about as many extra rounds as its bytes save, so it stays
     /// q4; the head's 2-bit copy only picks tiles for its q4 scores (head_bits).
     pub const mlp_bits: u8 = 2;

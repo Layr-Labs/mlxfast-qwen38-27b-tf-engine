@@ -400,4 +400,4 @@ fn binding(a: std.mem.Allocator, target: *Target, prefix: []const u8, module: []
 }
 
 /// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
-const flush_rows = 1024;
+const flush_rows = 2048;
