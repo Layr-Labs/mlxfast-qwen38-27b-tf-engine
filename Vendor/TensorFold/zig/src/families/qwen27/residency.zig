@@ -12,6 +12,7 @@ pub fn appendRunner(r: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.B
 }
 
 fn runnerBuffers(r: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
+    if (r.second) |*second| second.follow(hook, joining);
     fields.apply(&r.scratch, hook, joining);
     for (r.bindings) |*binding| fields.apply(binding, hook, joining);
     fields.apply(&r.taps, hook, joining);
@@ -161,6 +162,7 @@ pub fn hold(h: anytype, io: std.Io) !void {
     if (h.resident) |*r| {
         h.model.kernels.setResident(r.follow());
         h.runner.setResident(r.follow());
+        h.runner.resident_set = r.held.set;
         setBack(h.back, r.follow());
         if (h.draft) |d| d.model.backend.setResident(r.follow());
     }
@@ -170,6 +172,8 @@ pub fn hold(h: anytype, io: std.Io) !void {
 pub fn drop(h: anytype) void {
     h.model.kernels.setResident(null);
     h.runner.setResident(null);
+    if (h.runner.resident_set) |set| if (h.runner.second) |second| second.queue.removeResidencySet(set);
+    h.runner.resident_set = null;
     setBack(h.back, null);
     if (h.draft) |d| d.model.backend.setResident(null);
     if (h.resident) |*r| r.deinit();
