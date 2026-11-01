@@ -28,7 +28,15 @@ pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 fn chunksOf(keys: usize, chunk: usize) usize {
     return (keys + chunk - 1) / chunk;
 }
-const Args = extern struct { rows: u32, keys: u32 = 0, mask_stride: u32 = 0, heads: u32 = 0, scale_bits: u32 = 0 };
+pub const Args = extern struct { rows: u32, keys: u32 = 0, mask_stride: u32 = 0, heads: u32 = 0, scale_bits: u32 = 0 };
+/// A dispatch's Args: the host's, or the words an earlier dispatch wrote at a Ref.
+const Bound = union(enum) { value: Args, at: Ref };
+fn bindArgs(e: mtl.ComputeEncoder, args: Bound, index: usize) void {
+    switch (args) {
+        .value => |a| e.setValue(a, index),
+        .at => |r| e.setBuffer(r.buf, r.off, index),
+    }
+}
 
 pub fn source(a: std.mem.Allocator, s: Shape) ![]u8 {
     try s.validate();
@@ -46,6 +54,7 @@ pub const Attention = struct {
     append_strided: mtl.Pipeline,
     split: mtl.Pipeline,
     merge: mtl.Pipeline,
+    merge_xs: mtl.Pipeline,
     /// encodeSplit's chunk partials: [16 rows][kv heads][chunks][query heads a kv head][head_dim + 2] fp32.
     part: mtl.Buffer,
 
@@ -68,9 +77,11 @@ pub const Attention = struct {
         errdefer split.deinit();
         const merge = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge", false);
         errdefer merge.deinit();
+        const merge_xs = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge_xs", false);
+        errdefer merge_xs.deinit();
         if (attend.simdWidth() != 32 or attend.maxThreads() < 32 or split.simdWidth() != 32 or merge.simdWidth() != 32) return error.UnsupportedAttentionPipeline;
         const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity, s.split_chunk) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .append_strided = append_strided, .split = split, .merge = merge, .part = part };
+        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .append_strided = append_strided, .split = split, .merge = merge, .merge_xs = merge_xs, .part = part };
     }
     pub fn deinit(p: Attention) void {
         p.attend.deinit();
@@ -80,38 +91,96 @@ pub const Attention = struct {
         p.append_strided.deinit();
         p.split.deinit();
         p.merge.deinit();
+        p.merge_xs.deinit();
         p.part.deinit();
     }
 
     /// Encode key chunks and merge their fp32 partials in chunk order.
     pub fn encodeSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
-        if (rows == 0 or rows > 16 or keys == 0 or keys > p.shape.capacity or stride < keys or stride > std.math.maxInt(u32) or
-            !std.math.isFinite(scale)) return error.InvalidAttentionView;
-        try check(q, rows * p.shape.query_heads * p.shape.head_dim * 2, 2);
-        try check(out, rows * p.shape.query_heads * p.shape.head_dim * p.outputBytes(), p.outputBytes());
-        try check(k, keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
-        try check(v, keys * p.shape.kv_heads * p.shape.head_dim * 2, 2);
-        try check(mask, try std.math.mul(usize, rows, stride), 1);
-        try disjoint(out, q);
-        try disjoint(out, k);
-        try disjoint(out, v);
-        try disjoint(out, mask);
-        const args = Args{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) };
+        try p.checkViews(rows, keys, stride, scale, q, k, v, mask, out);
+        p.dispatchSplit(e, rows, keys, .{ .value = .{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) } }, q, k, v, mask, out, null, null);
+    }
+
+    /// encodeSplit on the Args an earlier dispatch wrote at `args`: at most `rows` rows, `keys` keys and a mask stride of
+    /// at most `stride`, which bound the views and the grid (chunks past the Args' keys exit at once).
+    pub fn encodeSplitAt(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, args: Ref, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
+        try p.checkViews(rows, keys, stride, 1, q, k, v, mask, out);
+        try check(args, @sizeOf(Args), 4);
+        p.dispatchSplit(e, rows, keys, .{ .at = args }, q, k, v, mask, out, null, null);
+    }
+
+    /// Group sums of a bf16 output for a q4 projection that reads it: f32 [query heads * head_dim / 64][stride].
+    pub const Sums = struct { ref: Ref, stride: u32 };
+    /// The last `rows` keys (of the Args' keys) read from `k`/`v` rows at their own strides (elements), not from the
+    /// cache views: the block's own rows where their producers left them.
+    pub const Own = struct { k: Ref, v: Ref, rows: u32, k_stride: u32, v_stride: u32 };
+    /// encodeSplit (on the host's Args, or with `args_at` on the words an earlier dispatch wrote, as encodeSplitAt) whose
+    /// merge also writes the bf16 output's group sums: each group's 64 values added in column order, rows past the Args'
+    /// rows zero. With `own`, the K/V views hold only the keys before the own rows.
+    pub fn encodeSplitSums(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, args_at: ?Ref, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: Sums, own: ?Own) !void {
+        if (p.shape.output != .bf16 or p.shape.head_dim % 64 != 0 or xs.stride < rows or xs.stride > 64) return error.InvalidAttentionView;
+        try check(xs.ref, p.shape.query_heads * p.shape.head_dim / 64 * @as(usize, xs.stride) * 4, 4);
+        const own_rows: usize = if (own) |o| o.rows else 0;
+        if (own_rows >= keys) return error.InvalidAttentionView;
+        try p.checkViews(rows, keys, stride, if (args_at != null) 1 else scale, q, k, v, mask, out);
+        if (args_at) |r| try check(r, @sizeOf(Args), 4);
+        if (own) |o| {
+            const kv_width = p.shape.kv_heads * p.shape.head_dim;
+            if (o.k_stride < kv_width or o.v_stride < kv_width) return error.InvalidAttentionView;
+            if (o.rows > 0) {
+                try check(o.k, ((o.rows - 1) * @as(usize, o.k_stride) + kv_width) * 2, 2);
+                try check(o.v, ((o.rows - 1) * @as(usize, o.v_stride) + kv_width) * 2, 2);
+            }
+        }
+        const args: Bound = if (args_at) |r| .{ .at = r } else .{ .value = .{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) } };
+        p.dispatchSplit(e, rows, keys, args, q, k, v, mask, out, xs, own);
+    }
+
+    fn dispatchSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: ?Sums, own: ?Own) void {
         e.setPipeline(p.split);
         for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
-        e.setValue(args, 4);
+        bindArgs(e, args, 4);
         e.setBuffer(p.part, 0, 5);
-        e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
+        const kv_width: u32 = @intCast(p.shape.kv_heads * p.shape.head_dim);
+        const o = own orelse Own{ .k = k, .v = v, .rows = 0, .k_stride = kv_width, .v_stride = kv_width };
+        e.setBuffer(o.k.buf, o.k.off, 6);
+        e.setBuffer(o.v.buf, o.v.off, 7);
+        e.setValue([3]u32{ o.rows, o.k_stride, o.v_stride }, 8);
+        e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
         e.barrier();
-        e.setPipeline(p.merge);
+        e.setPipeline(if (xs != null) p.merge_xs else p.merge);
         e.setBuffer(p.part, 0, 0);
-        e.setValue(args, 1);
+        bindArgs(e, args, 1);
         e.setBuffer(out.buf, out.off, 2);
+        if (xs) |s| {
+            e.setBuffer(s.ref.buf, s.ref.off, 3);
+            e.setValue(s.stride, 4);
+        }
         e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, 1), mtl.Size.of(32, 1, 1));
     }
 
     /// Q is rotated, cached K was rotated at append; no causal mask is inferred: mask[row*stride+key] decides.
     pub fn encode(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
+        try p.checkViews(rows, keys, stride, scale, q, k, v, mask, out);
+        p.dispatchAttend(e, rows, .{ .value = .{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) } }, q, k, v, mask, out);
+    }
+
+    /// encode on the Args an earlier dispatch wrote at `args`, bounded as encodeSplitAt's.
+    pub fn encodeAt(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, stride: usize, args: Ref, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
+        try p.checkViews(rows, keys, stride, 1, q, k, v, mask, out);
+        try check(args, @sizeOf(Args), 4);
+        p.dispatchAttend(e, rows, .{ .at = args }, q, k, v, mask, out);
+    }
+
+    fn dispatchAttend(p: Attention, e: mtl.ComputeEncoder, rows: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) void {
+        e.setPipeline(p.attend);
+        for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
+        bindArgs(e, args, 4);
+        e.setBuffer(out.buf, out.off, 5);
+        e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, 1), mtl.Size.of(32, 1, 1));
+    }
+
+    fn checkViews(p: Attention, rows: usize, keys: usize, stride: usize, scale: f32, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) !void {
         if (rows == 0 or rows > 16 or keys == 0 or keys > p.shape.capacity or stride < keys or stride > std.math.maxInt(u32) or
             !std.math.isFinite(scale)) return error.InvalidAttentionView;
         try check(q, rows * p.shape.query_heads * p.shape.head_dim * 2, 2);
@@ -123,11 +192,6 @@ pub const Attention = struct {
         try disjoint(out, k);
         try disjoint(out, v);
         try disjoint(out, mask);
-        e.setPipeline(p.attend);
-        for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
-        e.setValue(Args{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) }, 4);
-        e.setBuffer(out.buf, out.off, 5);
-        e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, 1), mtl.Size.of(32, 1, 1));
     }
 
     fn outputBytes(p: Attention) usize {
@@ -173,36 +237,58 @@ pub const Attention = struct {
     /// Prepared K and unmodified V go directly to unique physical slots; caller orders subsequent attention.
     /// appendKv from row-strided sources (element strides), no overlap checks beyond the cache's.
     pub fn appendKvStrided(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, k_stride: u32, v_stride: u32) !void {
-        if (slots.len == 0 or slots.len > 16) return error.InvalidAppendView;
-        for (slots, 0..) |slot, i| {
-            if (slot >= p.shape.capacity) return error.InvalidAppendSlot;
-            for (slots[0..i]) |prior| if (prior == slot) return error.DuplicateAppendSlot;
-        }
-        const width = p.shape.kv_heads * p.shape.head_dim;
-        if (k_stride < width or v_stride < width) return error.InvalidAppendView;
-        try check(k, ((slots.len - 1) * k_stride + width) * 2, 2);
-        try check(v, ((slots.len - 1) * v_stride + width) * 2, 2);
-        try check(cache_k, p.shape.capacity * width * 2, 2);
-        try check(cache_v, p.shape.capacity * width * 2, 2);
-        e.setPipeline(p.append_strided);
-        e.setBuffer(k.buf, k.off, 0);
-        e.setBuffer(v.buf, v.off, 1);
-        e.setBytes(std.mem.sliceAsBytes(slots), 2);
-        e.setValue(Args{ .rows = @intCast(slots.len) }, 3);
-        e.setBuffer(cache_k.buf, cache_k.off, 4);
-        e.setBuffer(cache_v.buf, cache_v.off, 5);
-        e.setValue([2]u32{ k_stride, v_stride }, 6);
-        e.dispatchThreads(mtl.Size.of(slots.len * width, 1, 1), mtl.Size.of(128, 1, 1));
+        try p.checkSlots(slots);
+        try p.stridedViews(slots.len, k, v, cache_k, cache_v, k_stride, v_stride);
+        p.dispatchAppend(e, p.append_strided, slots.len, .{ .host = slots }, .{ .value = .{ .rows = @intCast(slots.len) } }, k, v, cache_k, cache_v, .{ k_stride, v_stride });
+    }
+    /// appendKvStrided taking its row count from the Args an earlier dispatch wrote at `rows` (at most slots.len):
+    /// rows past it are not written.
+    pub fn appendKvStridedRows(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, k_stride: u32, v_stride: u32, rows: Ref) !void {
+        try p.checkSlots(slots);
+        try p.stridedViews(slots.len, k, v, cache_k, cache_v, k_stride, v_stride);
+        try check(rows, @sizeOf(Args), 4);
+        p.dispatchAppend(e, p.append_strided, slots.len, .{ .host = slots }, .{ .at = rows }, k, v, cache_k, cache_v, .{ k_stride, v_stride });
+    }
+    /// appendKvStrided of `count` rows to the u32 slots an earlier dispatch wrote at `slots`, which the writer keeps
+    /// distinct and inside the cache.
+    pub fn appendKvStridedAt(p: Attention, e: mtl.ComputeEncoder, count: usize, slots: Ref, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, k_stride: u32, v_stride: u32) !void {
+        if (count == 0 or count > 16) return error.InvalidAppendView;
+        try p.stridedViews(count, k, v, cache_k, cache_v, k_stride, v_stride);
+        try check(slots, count * 4, 4);
+        p.dispatchAppend(e, p.append_strided, count, .{ .at = slots }, .{ .value = .{ .rows = @intCast(count) } }, k, v, cache_k, cache_v, .{ k_stride, v_stride });
     }
     pub fn appendKv(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref) !void {
+        try p.checkSlots(slots);
+        try p.packedViews(slots.len, k, v, cache_k, cache_v);
+        p.dispatchAppend(e, p.append, slots.len, .{ .host = slots }, .{ .value = .{ .rows = @intCast(slots.len) } }, k, v, cache_k, cache_v, null);
+    }
+    /// appendKv taking its row count from the Args an earlier dispatch wrote at `rows` (at most slots.len).
+    pub fn appendKvRows(p: Attention, e: mtl.ComputeEncoder, slots: []const u32, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, rows: Ref) !void {
+        try p.checkSlots(slots);
+        try p.packedViews(slots.len, k, v, cache_k, cache_v);
+        try check(rows, @sizeOf(Args), 4);
+        p.dispatchAppend(e, p.append, slots.len, .{ .host = slots }, .{ .at = rows }, k, v, cache_k, cache_v, null);
+    }
+
+    fn checkSlots(p: Attention, slots: []const u32) !void {
         if (slots.len == 0 or slots.len > 16) return error.InvalidAppendView;
         for (slots, 0..) |slot, i| {
             if (slot >= p.shape.capacity) return error.InvalidAppendSlot;
             for (slots[0..i]) |prior| if (prior == slot) return error.DuplicateAppendSlot;
         }
+    }
+    fn stridedViews(p: Attention, count: usize, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, k_stride: u32, v_stride: u32) !void {
         const width = p.shape.kv_heads * p.shape.head_dim;
-        try check(k, slots.len * width * 2, 2);
-        try check(v, slots.len * width * 2, 2);
+        if (k_stride < width or v_stride < width) return error.InvalidAppendView;
+        try check(k, ((count - 1) * k_stride + width) * 2, 2);
+        try check(v, ((count - 1) * v_stride + width) * 2, 2);
+        try check(cache_k, p.shape.capacity * width * 2, 2);
+        try check(cache_v, p.shape.capacity * width * 2, 2);
+    }
+    fn packedViews(p: Attention, count: usize, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref) !void {
+        const width = p.shape.kv_heads * p.shape.head_dim;
+        try check(k, count * width * 2, 2);
+        try check(v, count * width * 2, 2);
         try check(cache_k, p.shape.capacity * width * 2, 2);
         try check(cache_v, p.shape.capacity * width * 2, 2);
         try disjoint(k, cache_k);
@@ -210,14 +296,22 @@ pub const Attention = struct {
         try disjoint(k, cache_v);
         try disjoint(v, cache_v);
         try disjoint(cache_k, cache_v);
-        e.setPipeline(p.append);
+    }
+    /// One append dispatch of `count` rows' threads; the kernel writes the rows its Args name.
+    fn dispatchAppend(p: Attention, e: mtl.ComputeEncoder, pipeline: mtl.Pipeline, count: usize, slots: union(enum) { host: []const u32, at: Ref }, args: Bound, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, strides: ?[2]u32) void {
+        const width = p.shape.kv_heads * p.shape.head_dim;
+        e.setPipeline(pipeline);
         e.setBuffer(k.buf, k.off, 0);
         e.setBuffer(v.buf, v.off, 1);
-        e.setBytes(std.mem.sliceAsBytes(slots), 2);
-        e.setValue(Args{ .rows = @intCast(slots.len) }, 3);
+        switch (slots) {
+            .host => |s| e.setBytes(std.mem.sliceAsBytes(s), 2),
+            .at => |r| e.setBuffer(r.buf, r.off, 2),
+        }
+        bindArgs(e, args, 3);
         e.setBuffer(cache_k.buf, cache_k.off, 4);
         e.setBuffer(cache_v.buf, cache_v.off, 5);
-        e.dispatchThreads(mtl.Size.of(slots.len * width, 1, 1), mtl.Size.of(128, 1, 1));
+        if (strides) |s| e.setValue(s, 6);
+        e.dispatchThreads(mtl.Size.of(count * width, 1, 1), mtl.Size.of(128, 1, 1));
     }
 };
 

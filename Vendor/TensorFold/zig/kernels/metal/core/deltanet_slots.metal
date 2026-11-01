@@ -190,7 +190,10 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const TfDeltaSegment* segments [[buffer(7)]],
                                    constant TfDeltaParams& p [[buffer(8)]],
                                    device bfloat* output [[buffer(9)]],
+                                   device atomic_uint* SC [[buffer(10)]],
+                                   constant uint& count_out [[buffer(11)]],
                                    uint3 position [[thread_position_in_grid]],
+                                   uint t [[thread_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
   const uint d0 = 2 * position.y, key_head = head / (p.nv / p.nk);
@@ -205,5 +208,74 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
   for (uint c = 1; c < span.rows; ++c) {
     float4 c0 = r0, c1 = r1; // node 0's states
     tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
+  }
+  // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&SC[0], 1u, memory_order_relaxed);
+    }
+  }
+}
+// A deferred replay's rows for the star (tf_delta_gdn_stash's, in keep order) and whether it writes the state back.
+struct TfDeltaPending { uint rows, persist; };
+// tf_delta_gdn_star_pair from the state the deferred keeps' replays would have left: before node 0 each column's lane
+// words take the pending rows, in keep order, by tf_delta_delta_update with the arguments tf_delta_gdn_replay_body<4>
+// gives a kept row (the same products, sums and simd_sum), so node 0 and its children see that kernel's state words.
+// pending.persist writes them back over the committed words each lane read (its simdgroup's own two columns), before
+// node 0 and so before the threadgroup counts itself.
+kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
+                                      device const bfloat* key [[buffer(1)]],
+                                      device const bfloat* value [[buffer(2)]],
+                                      device const float* decay [[buffer(3)]],
+                                      device const bfloat* mixing [[buffer(4)]],
+                                      device float* committed [[buffer(5)]],
+                                      device const TfDeltaSegment* segments [[buffer(7)]],
+                                      constant TfDeltaParams& p [[buffer(8)]],
+                                      device bfloat* output [[buffer(9)]],
+                                      device atomic_uint* SC [[buffer(10)]],
+                                      constant uint& count_out [[buffer(11)]],
+                                      device const bfloat* pending_key [[buffer(12)]],
+                                      device const bfloat* pending_value [[buffer(13)]],
+                                      device const float* pending_decay [[buffer(14)]],
+                                      device const bfloat* pending_mixing [[buffer(15)]],
+                                      constant TfDeltaPending& pending [[buffer(16)]],
+                                      uint3 position [[thread_position_in_grid]],
+                                      uint t [[thread_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+  const uint d0 = 2 * position.y, key_head = head / (p.nv / p.nk);
+  const TfDeltaSegment span = segments[segment_index];
+  const uint column = (head * p.dv + d0) * p.dk + lane * 4, base = span.state_slot * p.nv * p.dv * p.dk;
+  float a[4], b[4]; // columns d0 and d0 + 1, as tf_delta_gdn_replay_body<4> holds a column's state
+  for (uint part = 0; part < 4; ++part) {
+    a[part] = committed[base + column + part];
+    b[part] = committed[base + column + p.dk + part];
+  }
+  for (uint row = 0; row < pending.rows; ++row) {
+    const uint at = row * p.nv + head;
+    device const bfloat* k = pending_key + (row * p.nk + key_head) * p.dk;
+    tf_delta_delta_update(a, k, pending_decay[at], float(pending_value[at * p.dv + d0]), float(pending_mixing[at]), lane, 4);
+    tf_delta_delta_update(b, k, pending_decay[at], float(pending_value[at * p.dv + d0 + 1]), float(pending_mixing[at]), lane, 4);
+  }
+  if (pending.persist != 0u)
+    for (uint part = 0; part < 4; ++part) {
+      committed[base + column + part] = a[part];
+      committed[base + column + p.dk + part] = b[part];
+    }
+  float4 r0 = float4(a[0], a[1], a[2], a[3]), r1 = float4(b[0], b[1], b[2], b[3]);
+  tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
+  for (uint c = 1; c < span.rows; ++c) {
+    float4 c0 = r0, c1 = r1; // node 0's states
+    tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
+  }
+  // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&SC[0], 1u, memory_order_relaxed);
+    }
   }
 }

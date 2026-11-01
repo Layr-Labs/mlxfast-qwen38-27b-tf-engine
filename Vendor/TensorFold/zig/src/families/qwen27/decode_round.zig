@@ -6,14 +6,16 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
-/// Layers a verify encodes before its first commit: the idle GPU starts after two layers' encode.
-const first_commit = 2;
+/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
+/// encode, and the host encodes the next chunk's layers while the GPU runs that one.
+const first_commit = 1;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
 const GdnPool = @import("gdn_pool_gpu.zig").Pool;
 const GdnHook = @import("gdn_hook.zig").Hook;
 const GdnPlan = @import("gdn_plan.zig").Plan;
+const gdn_pool = @import("gdn_pool.zig");
 const Round = @import("round_plan.zig").Round;
 const Taps = @import("taps.zig").Taps;
 const image_rows = @import("image_rows.zig");
@@ -68,6 +70,11 @@ pub const Runner = struct {
     images: ?image_rows.Images = null,
     /// A kept state's blit still reading a slot, by slot: the slot's next write waits for it (settleSlot).
     reading: [attn.planning.max_streams]?mtl.CommandBuffer = @splat(null),
+    /// The next verify's keep is keepDevice's, committed behind it (Generation's depth-one rounds): a lone depth-one star
+    /// verify then defers its GDN replay (deferGdn).
+    defer_gdn: bool = false,
+    /// The GDN replay the last verify deferred: its scans applied the pending rows, and its keep stashes its own behind them.
+    deferred: ?abi.Deferred = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -235,6 +242,7 @@ pub const Runner = struct {
             if (!accepted or !r.model.kernels.prompt or r.capture_taps) return error.BadPromptMarks;
             try m.check(recurrent);
         }
+        const deferred = try r.deferGdn(round, recurrent, accepted);
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
         try r.gdn.prepare(r.model.device, recurrent, accepted);
@@ -259,9 +267,17 @@ pub const Runner = struct {
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
         var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        r.deferred = deferred;
+        // a write-back lands every pending row: the keep stashes this round's from the first
+        if (deferred) |d| if (d.persist != 0) {
+            r.gdn.pending.rows = 0;
+            r.gdn.pending.rounds = 0;
+        };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
-        r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
+        // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
+        const early = round.ids.len > 16;
+        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -279,6 +295,9 @@ pub const Runner = struct {
     pub fn keep(r: *Runner, round: *const Round, paths: []const []const u32) !void {
         const active = r.active orelse return error.RoundNotReady;
         if (r.failed or !std.mem.eql(u8, &active, &fingerprint(round))) return error.RoundNotReady;
+        // the replays below read the committed states: rows still pending land there first
+        try r.settleGdn();
+        r.deferred = null;
         var recurrent = try round.recurrent(try r.params(round.ids.len), paths);
         defer recurrent.deinit();
         var attention_plan = try r.attentionPlan(round);
@@ -351,8 +370,15 @@ pub const Runner = struct {
         try ops.metadata(e, result, keep_ref, rows, shared_map, p);
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        // Each layer replays its state and copies all conv taps before overwriting that channel's history.
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+        if (r.deferred != null) {
+            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans
+            try r.gdn.stash(plan, e);
+            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
+        } else {
+            if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
+            // Each layer replays its state and copies all conv taps before overwriting that channel's history.
+            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+        }
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;
@@ -396,6 +422,17 @@ pub const Runner = struct {
     pub fn completeDeviceKeep(r: *Runner, round: *const Round, path: []const u32) !void {
         const active = r.active orelse return error.RoundNotReady;
         if (r.failed or round.windows.len != 1 or path.len == 0 or !std.mem.eql(u8, &active, &fingerprint(round))) return error.RoundNotReady;
+        if (r.deferred != null) {
+            // the keep stashed the path's rows behind the pending ones, at most the rows left there (Pool.stash)
+            const pending = &r.gdn.pending;
+            if (pending.rows + path.len > gdn_pool.pending_rows) {
+                r.failed = true;
+                return error.BadGdnPending;
+            }
+            pending.rows += @intCast(path.len);
+            pending.rounds += 1;
+            r.deferred = null;
+        }
         r.offsets[round.slots[0]] = (try round.windows[0].keep(path)).length;
         r.active = null;
     }
@@ -404,6 +441,8 @@ pub const Runner = struct {
     pub fn recover(r: *Runner) void {
         r.failed = false;
         r.active = null;
+        r.deferred = null;
+        r.gdn.pending = .{};
     }
 
     /// An idle or newly lone host may drop scratch only after the previous verify has been kept.
@@ -425,9 +464,48 @@ pub const Runner = struct {
         r.reading[slot] = cb.retain();
     }
 
+    /// The GDN replay a verify defers: a lone depth-one star verify whose keep is keepDevice's (defer_gdn) applies the rows
+    /// earlier keeps stashed in its scans, and every `defer_rounds`-th writes the state they leave back; any other verify
+    /// reads the committed states, so those rows land there first.
+    fn deferGdn(r: *Runner, round: *const Round, plan: GdnPlan, accepted: bool) !?abi.Deferred {
+        const pending = &r.gdn.pending;
+        const star = !accepted and r.defer_gdn and round.windows.len == 1 and r.gdn.starPlan(plan);
+        if (!star or (pending.rows != 0 and pending.slot != round.slots[0])) try r.settleGdn();
+        if (!star) return null;
+        pending.slot = round.slots[0];
+        // the K-th round since the last write-back writes back, or one whose keep might not fit behind the pending rows
+        const persist = pending.rows != 0 and (pending.rounds >= gdn_pool.defer_rounds or pending.rows + gdn_pool.star_kept > gdn_pool.pending_rows);
+        return .{ .rows = pending.rows, .persist = @intFromBool(persist) };
+    }
+
+    /// The rows earlier keeps deferred replayed into their slot's committed states, waited for: before anything but a
+    /// deferred star scan reads those states (another verify, a host keep, a snapshot, a fingerprint).
+    pub fn settleGdn(r: *Runner) !void {
+        if (r.gdn.pending.rows == 0) return;
+        if (r.failed) return error.RoundNotReady;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = r.model.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        r.gdn.unstash(e) catch |err| {
+            e.end();
+            return err;
+        };
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (gpuFailed(cb, "a deferred GDN replay")) {
+            r.failed = true;
+            return error.RoundGpuFailure;
+        }
+        r.gdn.pending.rows = 0;
+        r.gdn.pending.rounds = 0;
+    }
+
     pub fn reset(r: *Runner, slot: u32) !void {
         r.settleSlot(slot);
         if (r.failed or r.active != null or slot >= r.ready) return error.RoundNotReady;
+        if (r.gdn.pending.slot == slot) r.gdn.pending = .{}; // rows deferred for the slot's states, which clear below
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
@@ -470,7 +548,7 @@ pub const Runner = struct {
 
     fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain };
+        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
@@ -483,17 +561,28 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
-        if (dead < rows) {
-            var input = f.get(.input);
-            input.offset += @as(usize, dead) * weights.q.k * 2;
-            var query_sums = forward.sums(f, .sums, rows);
-            query_sums.ref.offset += @as(usize, dead) * 4;
-            var query = f.get(.q_gate);
-            query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
+        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
+        // or neither, so the shared counter always returns to zero
+        var after: ?attn.After = null;
+        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
+        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+            const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
+            const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
+            after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
+        } else {
+            if (dead < rows) {
+                var input = f.get(.input);
+                input.offset += @as(usize, dead) * weights.q.k * 2;
+                var query_sums = forward.sums(f, .sums, rows);
+                query_sums.ref.offset += @as(usize, dead) * 4;
+                var query = f.get(.q_gate);
+                query.offset += @as(usize, dead) * weights.q.n * 2;
+                try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            }
+            try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+            e.barrier();
         }
-        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-        e.barrier();
         // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
         const mixed = f.get(.mixed);
@@ -501,11 +590,17 @@ pub const Runner = struct {
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        // a decoded fused chain (one stream, at most 8 rows, counted projections): the preprocess also packs the prefix's
+        // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
+        const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
+        const decoded: ?attn.Decoded = if (appended) .{ .scratch = &r.scratch, .binding = &r.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
+        var live_plan = plan;
+        live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
 
