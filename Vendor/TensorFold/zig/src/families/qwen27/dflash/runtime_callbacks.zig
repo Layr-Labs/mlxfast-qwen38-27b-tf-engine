@@ -59,17 +59,22 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         s.encodeArgs(e, call, t.matrix(), input.buf, input.off, output.buf, output.off, if (b.admitting()) try simdArgs(b, t, call) else null);
     } else {
         const key = @intFromPtr(w.bytes.ptr);
-        const adapter = (if (readsQ4Copy(b, x.rows)) b.prepared.get(key | Backend.precise_key) else null) orelse b.prepared.get(key) orelse return error.DraftPreparationUnqualified;
+        const adapter = (if (readsQ4Copy(b, x.rows, fusion(b, w))) b.prepared.get(key | Backend.precise_key) else null) orelse b.prepared.get(key) orelse return error.DraftPreparationUnqualified;
         try encodePrepared(b, e, x, y, adapter);
         return y;
     }
     return y;
 }
-/// Whether a launch of `rows` reads a linear's q4 copy where it has one below 4 bits: a precise frame's, and every
+/// Whether a launch of `rows` reads a linear's q4 copy where it has one below 4 bits: a precise frame's, every
 /// prompt-sized launch (a prompt's catch-up, whose fusion projection runs over up to flush_rows taps), since only q4
-/// adapters have the prompt loop (Adapter.prompt) and a copy below 4 bits would take the decode kernel 16 rows a block.
-fn readsQ4Copy(b: *const Backend, rows: u32) bool {
-    return b.precise or rows > 16;
+/// adapters have the prompt loop (Adapter.prompt) and a copy below 4 bits would take the decode kernel 16 rows a block,
+/// and every launch of the fusion projection, so that each context row's keys and values come from the same q4 features.
+fn readsQ4Copy(b: *const Backend, rows: u32, fusion_linear: bool) bool {
+    return b.precise or rows > 16 or fusion_linear;
+}
+/// The fusion projection: the taps' [hidden, 5 x hidden] linear, whose output becomes the context's keys and values.
+fn fusion(b: *const Backend, w: ck.Tensor) bool {
+    return w.rank == 2 and w.shape[1] == b.config.tapWidth();
 }
 /// The words of an early frame's projection `t` launched as `call`: its fusion's or its K/V's simd Args, whose rows the
 /// verify picks; the launch must be the one for one row too.
@@ -125,7 +130,7 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     const b = backend(ptr);
     if (mode == .bf16_reference or b.fused_count == 0) return null;
     const base = @intFromPtr(w.bytes.ptr);
-    const adapter = (if (readsQ4Copy(b, x.rows)) b.prepared.get((base | Backend.precise_key) + kind) else null) orelse b.prepared.get(base + kind) orelse return null;
+    const adapter = (if (readsQ4Copy(b, x.rows, false)) b.prepared.get((base | Backend.precise_key) + kind) else null) orelse b.prepared.get(base + kind) orelse return null;
     errdefer b.input_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
