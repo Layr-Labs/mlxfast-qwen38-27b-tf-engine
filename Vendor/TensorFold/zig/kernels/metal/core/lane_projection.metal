@@ -320,11 +320,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-// TF_GU_TURNS (decoded gate/up rows): a threadgroup is two SIMD groups, one per 32-column tile of its 64-column chunk. Each
-// runs its gate tile's whole chain, then its up tile's, the same chains as four SIMD groups would, so a lane holds a column's
-// gate and up words itself and the activation needs no threadgroup copy of them, nor the barrier after it.
 #if defined(TF_SWIGLU) && defined(TF_ROWS8)
 #define TF_GU_TURNS 1
+#endif
+#if defined(TF_GU_TURNS) && defined(TF_REG_LEAN) && defined(TF_SERIAL_SK2) && !defined(TF_PROMPT_SR)
+#define TF_GU_LOCK 1
 #endif
 #if defined(TF_GU_TURNS)
 [[max_total_threads_per_threadgroup(64)]]
@@ -369,6 +369,113 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
+#if defined(TF_GU_LOCK)
+  float G[16], G0[16], C0[16];
+  const int tile_g = 2 * int(tg.x) + ks, tile_u = tile_g + TF_N / 64;
+  const device uint4* wlg = W + ((size_t)(tile_g / TF_TB) * KG * TF_TB + tile_g % TF_TB) * 64 + lane;
+  const device uint4* wlu = W + ((size_t)(tile_u / TF_TB) * KG * TF_TB + tile_u % TF_TB) * 64 + lane;
+#if defined(TF_SBI12)
+  const device uint* tab = (const device uint*)SB;
+  const device packed_uint3* ixg = (const device packed_uint3*)(tab + TF_SBI) + tile_g * NT / 8 + nb / 4;
+  const device packed_uint3* ixu = (const device packed_uint3*)(tab + TF_SBI) + tile_u * NT / 8 + nb / 4;
+#elif defined(TF_SBI)
+  const device uint* tab = (const device uint*)SB;
+  const device uint2* ixg = (const device uint2*)(tab + TF_SBI) + (tile_g * NT + nb) / 4;
+  const device uint2* ixu = (const device uint2*)(tab + TF_SBI) + (tile_u * NT + nb) / 4;
+#endif
+#define TF_LOCK_UNPACK \
+  for (int w = 0; w < 8; w++) { \
+    const uint word = w < 4 ? nw0[w] : nw1[w - 4]; \
+    const int e = 16 * (w & 1) + 2 * (w >> 1); \
+    b2[e] = as_type<half2>(word & 0x000F000Fu); \
+    b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu); \
+    b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu); \
+    b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu); \
+  }
+#define TF_LOCK_FMA(A) \
+  for (int j = 0; j < 4; j++) { \
+    const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+    const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+    A[j] = fma(s0, P[j], fma(b0, x0, A[j])); \
+    A[8 + j] = fma(s1, P[8 + j], fma(b1, x0, A[8 + j])); \
+  }
+  for (int split = 0; split < TF_SK; split++) {
+    const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
+    for (int i = 0; i < 16; i++) {
+      G[i] = 0.0f;
+      C[i] = 0.0f;
+    }
+    const device uint4* wpg = wlg + (size_t)first * TF_TB * 64;
+    const device uint4* wpu = wlu + (size_t)first * TF_TB * 64;
+    uint4 nw0 = 0, nw1 = 0;
+    if (first < last) { nw0 = wpg[0]; nw1 = wpg[32]; }
+#if defined(TF_SBI12)
+    uint3 nig = 0, niu = 0;
+    if (first < last) { nig = ixg[(size_t)first * (TF_N / 8)]; niu = ixu[(size_t)first * (TF_N / 8)]; }
+#elif defined(TF_SBI)
+    uint2 nig0 = 0, nig1 = 0, niu0 = 0, niu1 = 0;
+    if (first < last) {
+      nig0 = ixg[(size_t)first * (TF_N / 4)];
+      nig1 = ixg[(size_t)first * (TF_N / 4) + 4];
+      niu0 = ixu[(size_t)first * (TF_N / 4)];
+      niu1 = ixu[(size_t)first * (TF_N / 4) + 4];
+    }
+#endif
+    for (int g = first; g < last; g++) {
+      const float x0 = XS[g * stride + mb];
+      const array<int32_t, 2> xstr = {1, TF_K};
+      tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + g * GS, dextents<int32_t, 2>(GS, M), xstr);
+      const int step = int(g + 1 < last) * TF_TB * 64;
+      {
+#if defined(TF_SBI12)
+        const uint4 q0 = tf_look12a(tab, nig), q1 = tf_look12b(tab, nig);
+        nig = ixg[(size_t)min(g + 1, last - 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
+        const uint4 q0 = tf_look(tab, nig0), q1 = tf_look(tab, nig1);
+        { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); nig0 = ixg[gi]; nig1 = ixg[gi + 4]; }
+#else
+        const uint4 q0 = sbv[((size_t)g * TF_N + tile_g * NT + nb) / 4], q1 = sbv[((size_t)g * TF_N + tile_g * NT + nb + 16) / 4];
+#endif
+        TF_LOCK_UNPACK
+        nw0 = wpu[0];
+        nw1 = wpu[32];
+        op.run(x, cb, P);
+        TF_LOCK_FMA(G)
+      }
+      {
+#if defined(TF_SBI12)
+        const uint4 q0 = tf_look12a(tab, niu), q1 = tf_look12b(tab, niu);
+        niu = ixu[(size_t)min(g + 1, last - 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
+        const uint4 q0 = tf_look(tab, niu0), q1 = tf_look(tab, niu1);
+        { const size_t gi = (size_t)min(g + 1, last - 1) * (TF_N / 4); niu0 = ixu[gi]; niu1 = ixu[gi + 4]; }
+#else
+        const uint4 q0 = sbv[((size_t)g * TF_N + tile_u * NT + nb) / 4], q1 = sbv[((size_t)g * TF_N + tile_u * NT + nb + 16) / 4];
+#endif
+        TF_LOCK_UNPACK
+        wpg += step;
+        wpu += step;
+        nw0 = wpg[0];
+        nw1 = wpg[32];
+        op.run(x, cb, P);
+        TF_LOCK_FMA(C)
+      }
+    }
+    if (split == 0)
+      for (int i = 0; i < 16; i++)
+        if (TF_LIVE(i)) {
+          G0[i] = G[i];
+          C0[i] = C[i];
+        }
+  }
+  for (int i = 0; i < 16; i++)
+    if (TF_LIVE(i)) {
+      G[i] = G0[i] + G[i];
+      C[i] = C0[i] + C[i];
+    }
+#undef TF_LOCK_UNPACK
+#undef TF_LOCK_FMA
+#else
 #if defined(TF_GU_TURNS)
   float G[16];
   for (int turn = 0; turn < 2; turn++) {
@@ -480,11 +587,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
-#if defined(TF_SBI)
-      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
-#else
-      const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y);
-#endif
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
@@ -522,6 +625,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) C[i] += part[((s2 - 1) * 16 + i) * 32 + lane];
   }
 #endif
+#endif
 #if defined(TF_SWIGLU) && !defined(TF_ROWS8)
   // prompt rows: 16 a block. Each tile's words round to bf16 as the unfused store does; SwiGLU reads them as the
   // activation kernel reads the gate/up rows, and each 64-column group's sum adds its values in order from zero.
@@ -549,8 +653,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
-  // each lane finishes its own eight columns of its row: gate and up words round to bf16 as the unfused store does, and
-  // each 64-column group's sum adds its values in order from zero
   threadgroup bfloat hb[8 * 64];
   if (mb < M) {
     const int c0 = ks * 32 + nb;
@@ -631,13 +733,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
-        const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
         C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
         C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
 }
+// TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
+// stream's next rows, H + the output, as the norm after it would have formed them.
 // TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
 // group 1 their up tiles TF_N / 64 tiles on, and the threadgroup applies tf_lane_reg's fused prompt epilogue to them.
 #if defined(TF_SWIGLU)
@@ -652,6 +756,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
+#elif defined(TF_RESID)
+    const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
@@ -664,6 +770,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
 #else
   Y += (size_t)r0 * TF_YS;
+#if defined(TF_RESID)
+  H += (size_t)r0 * TF_YS;
+  RO += (size_t)r0 * TF_YS;
+#endif
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
 #endif
   XS += r0;
@@ -774,7 +884,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL
       for (int i = 0; i < 16; i++) {
         const int m = mb + 8 * ((i >> 2) & 1), n = (tile0 + t) * NT + nb + 16 * (i >> 3) + (i & 3);
+#if defined(TF_RESID)
+        // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as q27_norm_xs
+        // adds them (h + r, rounded to bf16); the norm then reads these rows alone
+        if (m < M && n < TF_N) RO[(size_t)m * TF_YS + n] = bfloat(float(H[(size_t)m * TF_YS + n]) + float(static_cast<bfloat>(C[t][i])));
+#else
         if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[t][i]);
+#endif
       }
     }
   }
