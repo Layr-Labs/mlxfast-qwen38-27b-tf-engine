@@ -177,7 +177,7 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
         for (uint l = 0; l < 32; ++l) acc += simd_shuffle(float(y[d]), l);
       const uint group = head * (TF_D / 64) + split;
       if (lane == 0) XS[(size_t)group * xs_stride + row] = acc;
-      if (row == 0 && lane >= 1 && lane <= xs_stride - args.rows) XS[(size_t)group * xs_stride + args.rows + lane - 1] = 0.0f;
+      if (row == 0) for (uint r = args.rows + lane; r < xs_stride; r += 32) XS[(size_t)group * xs_stride + r] = 0.0f;
     }
   }
 }

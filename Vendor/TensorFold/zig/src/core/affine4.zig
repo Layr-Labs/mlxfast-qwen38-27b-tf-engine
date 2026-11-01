@@ -259,3 +259,131 @@ pub fn signature() [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(@embedFile("affine4.zig"), &result, .{});
     return result;
 }
+
+/// Refine only a drafter's runtime Q2 copy; the checkpoint and Q4 preparation stay unchanged.
+/// A fractional zero point still uses the same affine four-code representation.
+pub fn prepareNibblesRefined(a: std.mem.Allocator, weights: []const u16, n: usize, k: usize, bits: u8) !Prepared {
+    var prepared = try prepareNibbles(a, weights, n, k, bits);
+    errdefer prepared.deinit();
+    if (bits != 2) return prepared;
+    const workers = @min(max_workers, std.Thread.getCpuCount() catch 1, @max(1, prepared.scales.len / 4096));
+    const per = (prepared.scales.len + workers - 1) / workers;
+    var results: [max_workers]Error!void = @splat({});
+    var threads: [max_workers]?std.Thread = @splat(null);
+    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, refineRun, .{ &results[w], weights, prepared.words, prepared.scales, prepared.biases, w * per, @min(prepared.scales.len, (w + 1) * per) }) catch null;
+    refineRun(&results[0], weights, prepared.words, prepared.scales, prepared.biases, 0, @min(prepared.scales.len, per));
+    for (1..workers) |w| if (threads[w]) |thread| thread.join() else refineRun(&results[w], weights, prepared.words, prepared.scales, prepared.biases, w * per, @min(prepared.scales.len, (w + 1) * per));
+    for (results[0..workers]) |result| try result;
+    return prepared;
+}
+fn refineRun(out: *Error!void, weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize) void {
+    out.* = refineGroups(weights, words, scales, biases, first, last);
+}
+fn refineGroups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize) Error!void {
+    @setFloatMode(.strict);
+    for (first..last) |group| {
+        const values = weights[group * 64 ..][0..64];
+        const output = words[group * 8 ..][0..8];
+        const initial_scale: f64 = @abs(@as(f64, asFloat(scales[group])));
+        const original_scale: f64 = asFloat(scales[group]);
+        const original_bias: f64 = asFloat(biases[group]);
+        var best_error: f64 = 0;
+        for (values, 0..) |value, i| {
+            const code: f64 = @floatFromInt((output[i / 8] >> @as(u5, @intCast(4 * (i % 8)))) & 15);
+            const delta = @as(f64, asFloat(value)) - (original_bias + original_scale * code);
+            best_error += delta * delta;
+        }
+        if (best_error == 0) continue;
+        // Keep the original quantization unless a representable BF16 grid strictly improves its error.
+        for ([_]f64{ 0, 0.5, 1, 1.5, 2, 2.5, 3 }) |zero| {
+            var scale = initial_scale;
+            for (0..8) |_| {
+                const scale_bits = asBf16(@floatCast(scale));
+                const s = asFloat(scale_bits);
+                const bias_bits = asBf16(@floatCast(-zero * @as(f64, s)));
+                const bias = asFloat(bias_bits);
+                if (s == 0 or !std.math.isFinite(s) or !std.math.isFinite(bias)) break;
+                var code_words: [8]u32 = @splat(0);
+                var err: f64 = 0;
+                var numerator: f64 = 0;
+                var denominator: f64 = 0;
+                for (values, 0..) |value, i| {
+                    const v = asFloat(value);
+                    const q = @min(@as(f32, 3), @max(@as(f32, 0), @round((v - bias) / s)));
+                    const code: u32 = @intFromFloat(q);
+                    code_words[i / 8] |= code << @as(u5, @intCast(4 * (i % 8)));
+                    const delta = @as(f64, v) - (@as(f64, bias) + @as(f64, s) * @as(f64, q));
+                    err += delta * delta;
+                    const level = @as(f64, q) - zero;
+                    numerator += @as(f64, v) * level;
+                    denominator += level * level;
+                }
+                if (!std.math.isFinite(err)) return error.NonFiniteAffineRange;
+                if (err < best_error) {
+                    best_error = err;
+                    scales[group] = scale_bits;
+                    biases[group] = bias_bits;
+                    @memcpy(output, &code_words);
+                }
+                if (denominator == 0) break;
+                scale = @max(numerator / denominator, @as(f64, 1e-7));
+            }
+        }
+    }
+}
+fn refinedSquaredError(values: []const u16, p: Prepared) f64 {
+    @setFloatMode(.strict);
+    var total: f64 = 0;
+    for (values, 0..) |value, i| {
+        const group = i / 64;
+        const code: f64 = @floatFromInt((p.words[i / 8] >> @as(u5, @intCast(4 * (i % 8)))) & 15);
+        const d = @as(f64, asFloat(value)) - (@as(f64, asFloat(p.biases[group])) + @as(f64, asFloat(p.scales[group])) * code);
+        total += d * d;
+    }
+    return total;
+}
+test "fractional zero preserves an exact symmetric four-level BF16 grid" {
+    const a = std.testing.allocator;
+    var w: [64]u16 = undefined;
+    for (&w, 0..) |*value, i| value.* = asBf16(([_]f32{ -1.5, -0.5, 0.5, 1.5 })[i % 4]);
+    var original = try prepareNibbles(a, &w, 1, 64, 2);
+    defer original.deinit();
+    var refined = try prepareNibblesRefined(a, &w, 1, 64, 2);
+    defer refined.deinit();
+    try std.testing.expect(refinedSquaredError(&w, original) > 0);
+    try std.testing.expectEqual(@as(f64, 0), refinedSquaredError(&w, refined));
+}
+test "refined Q2 never increases representable error and leaves Q3 preparation unchanged" {
+    const a = std.testing.allocator;
+    var w: [256 * 64]u16 = undefined;
+    var random: u32 = 0x20261213;
+    for (&w, 0..) |*value, i| {
+        random = random *% 1664525 +% 1013904223;
+        const v = (@as(f32, @floatFromInt(@as(i32, @intCast(random % 20001)) - 10000))) / 8192.0;
+        value.* = asBf16(if (i / 64 == 0) 0 else if (i / 64 == 1) 0.125 else v);
+    }
+    var original = try prepareNibbles(a, &w, 256, 64, 2);
+    defer original.deinit();
+    var refined = try prepareNibblesRefined(a, &w, 256, 64, 2);
+    defer refined.deinit();
+    var repeated = try prepareNibblesRefined(a, &w, 256, 64, 2);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(u32, refined.words, repeated.words);
+    try std.testing.expectEqualSlices(u16, refined.scales, repeated.scales);
+    try std.testing.expectEqualSlices(u16, refined.biases, repeated.biases);
+    for (0..256) |g| {
+        var orig_group = original;
+        orig_group.words = original.words[g * 8 ..][0..8]; orig_group.scales = original.scales[g..][0..1]; orig_group.biases = original.biases[g..][0..1];
+        var new_group = refined;
+        new_group.words = refined.words[g * 8 ..][0..8]; new_group.scales = refined.scales[g..][0..1]; new_group.biases = refined.biases[g..][0..1];
+        try std.testing.expect(refinedSquaredError(w[g * 64 ..][0..64], new_group) <= refinedSquaredError(w[g * 64 ..][0..64], orig_group));
+    }
+    for (refined.words) |word| try std.testing.expect((word & 0xcccccccc) == 0);
+    var three = try prepareNibbles(a, &w, 256, 64, 3);
+    defer three.deinit();
+    var three_refined = try prepareNibblesRefined(a, &w, 256, 64, 3);
+    defer three_refined.deinit();
+    try std.testing.expectEqualSlices(u32, three.words, three_refined.words);
+    try std.testing.expectEqualSlices(u16, three.scales, three_refined.scales);
+    try std.testing.expectEqualSlices(u16, three.biases, three_refined.biases);
+}

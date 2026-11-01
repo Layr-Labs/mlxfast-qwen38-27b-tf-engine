@@ -305,7 +305,7 @@ pub const Backend = struct {
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
         const bits: u8 = if (order != null) draftBits(name) else 4;
-        var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
+        var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibblesRefined(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
         defer prepared_words.deinit();
         if (b.stash) |st| if (shortName(name)) |short| {
             const layer = layerOf(name) orelse return error.DraftTensorCoverage;
