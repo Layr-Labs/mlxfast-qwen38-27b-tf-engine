@@ -10,12 +10,12 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false,
 
     /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
         const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0;
     }
 };
 
@@ -146,128 +146,23 @@ pub const Kernels = struct {
         return k.quantSkip(input_encoder, p, x, xs, dims, y, rows, 0);
     }
 
-    /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
-    /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
-    pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
-        // prompt rows: the fused SwiGLU epilogue with the gate and up pairs on two tiles a SIMD group (gateUpActivatedPrompt)
-        if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
-        if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
-        if (p.bits != 4 or p.group != 64) return false;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
-        if (!key.serialSk2() or p.n != 34816) return false;
-        var span = profile.begin(k.profiler, input_encoder, .dense);
-        span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
-        errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = key.sbi, .indexed12 = key.sbi12 });
-            k.joined(entry.value_ptr);
-        }
-        try entry.value_ptr.encodeSwiglu(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows);
-        try span.end();
-        return true;
-    }
-
-    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch, two
-    /// tiles a SIMD group (the gate pair, then the up pair) where the code batches allow.
-    fn gateUpActivatedPrompt(
-        k: *Kernels,
-        input_encoder: mtl.ComputeEncoder,
-        p: projection.Linear,
-        x: Ref,
-        xs: Sums,
-        out: Ref,
-        out_sums: Ref,
-        rows: u32,
-    ) !bool {
-        if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
-        if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
-        const key = Key{
-            .kind = .projection,
-            .n = p.n,
-            .k = p.k,
-            .slices = 1,
-            .bits = p.bits,
-            .group = p.group,
-            .lean = true,
-            .prompt_sr = true,
-            .batch = p.batch,
-            .swiglu = true,
-        };
-        var span = profile.begin(k.profiler, input_encoder, .dense);
-        span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
-        errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
-                .n = p.n,
-                .k = p.k,
-                .format = .{ .bits = p.bits, .group = p.group },
-                .sk = 1,
-                .precompute_sums = true,
-                .reg = true,
-                .prompt_sr = key.prompt_sr,
-                .tile_batch = key.batch,
-                .reg_lean = true,
-                .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
-                .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
-            });
-            k.joined(entry.value_ptr);
-        }
-        const half = p.n / 2;
-        var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
-            const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
-            const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-            const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
-            const xs_off = xs.ref.offset + @as(usize, first) * 4;
-            const xsr = lane.Sums{ .ref = .{ .buf = xs.ref.buffer, .off = xs_off }, .stride = xs.stride };
-            const hr = lane.Ref{ .buf = out.buffer, .off = out.offset + @as(usize, first) * half * 2 };
-            const hsr = lane.Ref{ .buf = out_sums.buffer, .off = out_sums.offset + @as(usize, first) * 4 };
-            try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
-        }
-        try span.end();
-        return true;
-    }
-
     /// `quant` over input groups [cut[0], cut[0] + cut[1]) only, into fp32 partial sums.
     pub fn quantCut(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, dims: Ref, y: Ref, rows: u32, cut: [2]u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut, .{ 0, 0 });
-    }
-
-    /// `quant` over output tiles [range[0], range[0] + range[1]) only (32 columns a tile), each written at its own
-    /// columns with the full launch's code: the same words there, nothing elsewhere.
-    pub fn quantRange(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, range: [2]u32) !void {
-        if (range[1] == 0) return error.BadCoreProjectionRows;
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, .{ 0, 0 }, range);
-    }
-
-    /// Whether `quantRange` takes `p`: the 4-bit g64 reg path of a plain matrix.
-    pub fn ranged(p: projection.Linear) bool {
-        return p.runs.len == 0 and p.raw == null and p.bits == 4 and p.group == 64 and p.tile == 32;
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, 0, cut);
     }
 
     /// `quant` over a fused two-half projection (the MLP's gate_up) without the first `skip` tiles of each half.
     pub fn quantSkip(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32) !void {
-        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 }, .{ 0, 0 });
+        return k.quantImpl(input_encoder, p, x, xs, dims, y, rows, skip, .{ 0, 0 });
     }
 
-    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
-        if (p.runs.len > 0) {
-            if (range[1] > 0) return error.BadCoreProjectionRows;
-            return k.quantRuns(input_encoder, p, x, xs, dims, y, rows, skip, cut);
-        }
-        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut, range);
+    fn quantImpl(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32) !void {
+        if (p.runs.len > 0) return k.quantRuns(input_encoder, p, x, xs, dims, y, rows, skip, cut);
+        return k.quantOne(input_encoder, p, x, xs, dims, y, rows, skip, cut);
     }
 
-    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) !void {
-        if ((skip > 0 or cut[1] > 0 or range[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
-        if (range[1] > 0 and (skip > 0 or cut[1] > 0 or range[0] + range[1] > (p.n + 31) / 32)) return error.BadCoreProjectionRows;
+    fn quantOne(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32) !void {
+        if ((skip > 0 or cut[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
         if (skip > 0 and (p.raw != null or skip >= p.n / 64)) return error.BadCoreProjectionRows;
         if (p.raw) |raw| if (raw.bits != 4 and k.tiled(raw)) {
             if (rows == 0 or rows > 128 or p.tile != 32) return error.BadCoreProjectionRows;
@@ -306,18 +201,16 @@ pub const Kernels = struct {
             return;
         }
         const reg = p.bits == 4 and p.group == 64;
-        if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
+        if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
-        const tiles = [_][2]usize{.{ range[0], range[1] }};
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2(), .rows8 = key.rows8, .reg_lean = key.lean });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -325,48 +218,11 @@ pub const Kernels = struct {
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-            const sb = metadata(p, key.sbi);
+            const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
             const yr = lane.Ref{ .buf = y.buffer, .off = y.offset + @as(usize, first) * p.n * @as(usize, if (cut[1] > 0) 4 else 2) };
             if (sums) |s| try entry.value_ptr.encodeSums(e, xr, w, sb, .{ .ref = .{ .buf = s.ref.buffer, .off = s.ref.offset + @as(usize, first) * 4 }, .stride = s.stride }, yr, @min(rows - first, step)) else try entry.value_ptr.encode(e, xr, w, sb, yr, @min(rows - first, step));
         }
         try span.end();
-    }
-
-    /// Compiles at load the pipeline a decode-row `quant` of `p` over `rows` takes (for shapes no target layer uses).
-    pub fn prepareDecode(k: *Kernels, p: projection.Linear, rows: u32) !void {
-        if (k.prompt or rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return;
-        const reg = p.bits == 4 and p.group == 64;
-        const key = Key{
-            .kind = .projection,
-            .n = p.n,
-            .k = p.k,
-            .slices = p.slices,
-            .bits = p.bits,
-            .group = p.group,
-            .rows8 = reg and rows <= 8,
-            .lean = reg,
-            .batch = if (reg) p.batch else 1,
-            .sbi = reg and p.index != null,
-            .sbi12 = reg and p.index != null and p.index12,
-        };
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (entry.found_existing) return;
-        errdefer _ = k.lanes.remove(key);
-        entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
-            .n = p.n,
-            .k = p.k,
-            .format = .{ .bits = p.bits, .group = p.group },
-            .sk = key.slices,
-            .output = .bf16,
-            .precompute_sums = reg,
-            .reg = reg,
-            .serial_sk2 = key.serialSk2(),
-            .tile_batch = key.batch,
-            .rows8 = key.rows8,
-            .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
-        });
-        k.joined(entry.value_ptr);
     }
 
     /// A mixed stack: each member its own product into its columns; row kernels write the fused rows at a stride.
@@ -381,7 +237,7 @@ pub const Kernels = struct {
                 const xr = Ref{ .buffer = x.buffer, .offset = x.offset + r * p.k * 2 };
                 const sr: ?Sums = if (xs) |s| .{ .ref = .{ .buffer = s.ref.buffer, .offset = s.ref.offset + r * 4 }, .stride = s.stride } else null;
                 const yr = Ref{ .buffer = y.buffer, .offset = y.offset + (r * p.n + run.first) * 2 };
-                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 }, .{ 0, 0 });
+                try k.quantOne(input_encoder, run.linear, xr, sr, dims, yr, 1, 0, .{ 0, 0 });
             }
         }
     }
@@ -468,7 +324,7 @@ pub const Kernels = struct {
 
         e.setPipeline(try k.get(.{ .kind = if (residual != null) .norm else .input_norm, .k = width }));
         if (residual) |r| bind(e, .{ h, r, weight, eps, dims, combined, out, xs }) else bind(e, .{ h, weight, eps, dims, out, xs });
-        e.dispatchGroups(mtl.Size.of(1, padded(rows), 1), mtl.Size.of(width / 16, 1, 1));
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
     }
 
@@ -522,28 +378,10 @@ pub const Kernels = struct {
     }
 };
 
-/// The metadata a reg launch binds: decoded rows' indexed copy where its key takes it, else the pairs.
-fn metadata(p: projection.Linear, indexed: bool) lane.Ref {
-    if (indexed) if (p.index) |i| return .{ .buf = i.buffer, .off = i.offset };
-    return .{ .buf = p.pairs.buffer, .off = p.pairs.offset };
-}
-
 pub fn padded(rows: u32) u32 {
     return 16 * ((rows + 15) / 16);
 }
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
-}
-
-/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K 5120-wide projections (MLP down, attention output) and for the 5120-deep inputs (attention query+gate, GDN qkv,
-/// the GDN z columns that run beside the scan, MLP gate/up), one elsewhere. A two-tile launch runs its K splits as SIMD
-/// groups of one threadgroup, so the query+gate's prompt rows leave the serial split-K kernel for it.
-fn promptTiles(key: Key, n: u32, skip: u32) usize {
-    if (!key.prompt_sr or skip != 0 or key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
-    // the launch's tiles in whole pairs: a range's first tile and length, or every tile
-    if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
-    if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
-    return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
 }

@@ -41,9 +41,6 @@ pub const Size = struct { width: usize = 1, height: usize = 1, depth: usize = 1 
 pub const Pipeline = struct {
     id: usize,
     pub fn init(_: Device, _: Library, name: []const u8, _: bool) !Pipeline {
-        if (std.mem.endsWith(u8, name, "tree_pair")) return .{ .id = 10 };
-        if (std.mem.endsWith(u8, name, "post_rows")) return .{ .id = 3 };
-        if (std.mem.endsWith(u8, name, "star_pair")) return .{ .id = 12 };
         const names = [_][]const u8{ "pre", "tree", "replay", "post", "conv_commit", "unused5", "unused6", "unused7", "publish_conv", "unused9", "tree_slots_1", "tree_slots_2", "tree_slots_4", "tree_slots_8", "tree_slots_16" };
         for (names, 0..) |suffix, i| if (std.mem.endsWith(u8, name, suffix)) return .{ .id = i };
         return .{ .id = 20 };

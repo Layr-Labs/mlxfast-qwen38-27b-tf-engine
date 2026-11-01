@@ -6,8 +6,8 @@ const row = @import("core").row_projection;
 const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
-/// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+/// A device matrix; `runs` non-empty means fused members of different widths, each its own product into these rows.
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{} };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -26,19 +26,6 @@ fn m5Split(n: usize, k: usize) ?u32 {
     return null;
 }
 
-/// Adjacent tiles whose code blocks interleave by group: tiles running together read neighbouring lines (the weight stream's GB/s).
-pub fn tileBatch(n: usize, k: usize) u32 {
-    // with the four mixer input projections (GDN qkv, GDN z|b|a, attention query+gate, attention k|v), as in fkiene's 8e8e27e2
-    const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 }, .{ 10240, 5120 }, .{ 6240, 5120 }, .{ 12288, 5120 }, .{ 2048, 5120 } };
-    for (table) |t| if (t[0] == n and t[1] == k) return 8;
-    return 1;
-}
-
-/// Tiles a batched matrix stores, padding blocks included.
-pub fn storedColumns(n: usize, batch: u32) usize {
-    return std.mem.alignForward(usize, n, 32 * @as(usize, batch));
-}
-
 /// Prompt-row K splits fastest at 128 rows on an M5; prompt rows may differ in bits from decoded rows.
 pub fn promptSplit(n: usize, k: usize) ?u32 {
     const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 34816, .k = 5120, .sk = 1 }, .{ .n = 10240, .k = 5120, .sk = 1 }, .{ .n = 5120, .k = 17408, .sk = 2 }, .{ .n = 5120, .k = 6144, .sk = 2 }, .{ .n = 12288, .k = 5120, .sk = 2 } };
@@ -47,11 +34,6 @@ pub fn promptSplit(n: usize, k: usize) ?u32 {
 }
 
 pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32) !Linear {
-    return prepareForced(device, allocator, owned, parts, tile, null);
-}
-
-/// The same matrix with `forced` adjacent tiles interleaved instead of `tileBatch`'s count.
-pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32) !Linear {
     if (tile != 32 or parts.len == 0) return error.BadProjectionShape;
     const bits = parts[0].bits;
     const group = parts[0].group;
@@ -69,9 +51,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
     if (!device.tensorUnits() or n % tile != 0) return prepareRows(device, allocator, owned, parts, n, k, tile, slices);
     if (bits != 4 or group != 64) return prepareLanes(device, allocator, owned, parts, n, k, tile, slices);
     slices = m5Split(n, k) orelse slices;
-    const batch: usize = forced orelse tileBatch(n, k);
-    const stored = storedColumns(n, @intCast(batch));
-    const w = try device.buffer(stored * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    const w = try device.buffer(n * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     owned.append(allocator, w) catch |err| {
         w.deinit();
         return err;
@@ -81,8 +61,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         sb.deinit();
         return err;
     };
-    const dst = w.slice(u32, stored * k / 8);
-    @memset(dst, 0);
+    const dst = w.slice(u32, n * k / 8);
     const pair = sb.slice(u16, n * (k / 64) * 2);
     var base: usize = 0;
     for (parts) |p| {
@@ -92,21 +71,14 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         const biases = p.biases.host(u16);
         for (0..rows) |r| for (0..k / 64) |g| {
             const src = r * (k / 8) + g * 8;
-            const at = (base + r) / tile;
-            const to = ((at / batch * (k / 64) + g) * batch + at % batch) * tile * 8 + ((base + r) % tile) * 8;
+            const to = (((base + r) / tile) * (k / 64) + g) * tile * 8 + ((base + r) % tile) * 8;
             @memcpy(dst[to..][0..8], words[src..][0..8]);
             pair[(g * n + base + r) * 2] = scales[r * (k / 64) + g];
             pair[(g * n + base + r) * 2 + 1] = biases[r * (k / 64) + g];
         };
         base += rows;
     }
-    const indexed = try lane.indexMetadata(device, allocator, pair, n, k);
-    if (indexed) |x| owned.append(allocator, x.buffer) catch |err| {
-        x.buffer.deinit();
-        return err;
-    };
-    const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {

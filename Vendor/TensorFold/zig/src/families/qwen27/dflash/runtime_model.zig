@@ -103,9 +103,8 @@ pub const Model = struct {
         while (m.session.context.end < m.committed_end) {
             const first = m.session.context.end;
             const slot: u32 = @intCast(first % m.graph.config.window);
-            // a prompt's taps catch up in passes of up to flush_rows rows: one frame and one wait each
-            const rows: u32 = @intCast(@min(@min(m.committed_end - first, flush_rows), m.graph.config.window - slot));
-            var positions: [flush_rows]u64 = undefined;
+            const rows: u32 = @intCast(@min(@min(m.committed_end - first, 128), m.graph.config.window - slot));
+            var positions: [128]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = first + i;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
@@ -215,11 +214,11 @@ pub const Model = struct {
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
-            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+            return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children });
         }
         try m.flush();
         const first = try m.session.firstDraw();
-        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+        return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children });
     }
 };
 /// A stream's own drafter state, parked while another stream drafts: its taps ring, rolling K/V and session.
@@ -298,6 +297,3 @@ fn binding(a: std.mem.Allocator, target: *Target, prefix: []const u8, module: []
     const b = Backend.cpu(try target.checkpoint.get(try std.mem.concat(a, u8, &.{ stem, ".biases" })));
     return ck.validate(w, s, b, format, target.config.vocab, target.config.hidden);
 }
-
-/// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
-const flush_rows = 1024;

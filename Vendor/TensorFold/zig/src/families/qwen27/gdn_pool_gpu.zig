@@ -51,8 +51,7 @@ pub const Scalars = struct {
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
-/// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0 };
 
 pub const Pool = struct {
     budget: Budget,
@@ -150,8 +149,7 @@ pub const Pool = struct {
         return .{ .buffer = span.buffer, .offset = span.offset };
     }
 
-    /// `beside`: encoded beside the scan, before the barrier that ends it.
-    pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+    pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
@@ -159,12 +157,12 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
         try scan.end();
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
-    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
+    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
@@ -187,11 +185,7 @@ pub const Pool = struct {
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
-            if (beside) |b| {
-                try b.encode(b.ptr, scan.encoder);
-                scan.encoder.barrier();
-            }
-        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, beside);
+        } else prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
@@ -236,43 +230,14 @@ pub const Pool = struct {
 
     /// A commit's replay, in place, and its conv window, unfenced.
     pub fn commitScan(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitReplay(layer, plan, e);
-        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
-        const m = plan.metadata;
-        const next_history = try pool.layerSpan(.next_history, layer);
-        e.setPipeline(pool.kernels.pipelines.conv_commit);
-        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
-        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
-        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
-        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
-        e.setValue(p, 5);
-        e.setBuffer(next_history.buffer, next_history.offset, 6);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
-    }
-
-    /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
-    /// history by tf_delta_gdn_conv_keep (a thread a channel reads every source tap before it writes), so the keep
-    /// needs no next_history staging, no publish_conv launch and no fence between the two.
-    pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitReplay(layer, plan, e);
-        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
-        const m = plan.metadata;
-        e.setPipeline(pool.kernels.conv_keep);
-        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
-        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
-        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
-        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
-        e.setValue(p, 5);
-        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
-    }
-
-    /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
-    fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
-        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
         p.advance = @intFromBool(pool.advances(plan.host));
         const state = try pool.layerSpan(.state, layer);
+        const history = try pool.layerSpan(.history, layer);
+        const next_history = try pool.layerSpan(.next_history, layer);
         const m = plan.metadata;
         // windows the verify stepped in place replay nothing: skip the launch when that is all of them
         const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
@@ -289,12 +254,21 @@ pub const Pool = struct {
             e.setBuffer(state.buffer, state.offset, 8);
             e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
         }
+        e.setPipeline(pool.kernels.pipelines.conv_commit);
+        gdn.bind(e, .{ history, try pool.layerSpan(.qkv, layer) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setBuffer(next_history.buffer, next_history.offset, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
     /// After commitScan's fence: the new conv window into place, unfenced.
     pub fn commitPublish(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
-        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
         const history = try pool.layerSpan(.history, layer);
         e.setPipeline(pool.kernels.publish_conv);
         gdn.bind(e, .{try pool.layerSpan(.next_history, layer)}, 0);
@@ -360,13 +334,6 @@ pub const Pool = struct {
         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
         result.tree_mode = pool.tree_mode;
         result.p.advance = @intFromBool(pool.advances(plan));
-        if (refs.sums) |w| {
-            // one fp32 sum per 64-value group of each row, `stride` rows a group (tf_lane_sums' layout)
-            const groups = pool.budget.shape.value / 64;
-            if (w.stride < p.rows or groups == 0 or pool.budget.shape.value % 64 != 0) return error.BadGdnBuffer;
-            _ = try refSpan(.{ .buffer = w.span.buffer, .offset = w.span.offset }, ((groups - 1) * w.stride + p.rows) * 4);
-            result.sums = w;
-        }
         return result;
     }
 
@@ -417,9 +384,6 @@ fn projectedWindows(plan: Plan, taps: u32) bool {
     }
     return true;
 }
-
-/// The scalar kinds every commit launch states in its params.
-const commit_kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
 
 fn inPlace(plan: Plan) bool {
     for (plan.keeps) |keep| if (keep.state_slot != keep.next_slot) return false;

@@ -48,6 +48,7 @@ fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("r
         for (slots[0..count], 0..) |*slot, i| slot.* = @intCast(positions[first + i] % b.config.window);
         if (values.stride != b.config.kvWidth() or keys.stride != b.config.kvWidth()) {
             try b.attention.appendKvStrided(e, slots[0..count], .{ .buf = k.buf, .off = k.off + first * keys.stride * 2 }, .{ .buf = v.buf, .off = v.off + first * values.stride * 2 }, .{ .buf = cache.keys }, .{ .buf = cache.values }, keys.stride, values.stride);
+            e.barrier();
             continue;
         }
         const off = first * b.config.kvWidth() * 2;
@@ -144,8 +145,9 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
     const v_ref: R = .{ .buf = v.buf, .off = v.off };
-    const mask = try maskOf(b, context_rows, rows);
+    const mask = try b.frame.alloc(rows, keys, .u8);
     const mask_ref = try b.frame.ref(mask);
+    try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
     b.barrier(e);
     if (keys > 1024) b.access(e, &.{}, &.{Span.whole(b.attention.part)}); // encodeSplit's partials: one attention at a time
     const kv_bytes = @as(usize, keys) * b.config.kvWidth() * 2;
@@ -153,17 +155,6 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
     // Long contexts share each 256-key chunk across the query heads of one KV head.
     if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
-}
-
-/// The frame's mask for `rows` queries over `context_rows` cached keys, filled once and read by every layer after.
-fn maskOf(b: *Backend, context_rows: u32, rows: u32) !op.View {
-    if (b.mask) |m| if (m.epoch == b.frame.epoch and m.context_rows == context_rows and m.rows == rows) return m.view;
-    const keys = context_rows + rows;
-    const mask = try b.frame.alloc(rows, keys, .u8);
-    const mask_ref = try b.frame.ref(mask);
-    try fillMask(mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], context_rows, rows, b.config.window, b.config.block);
-    b.mask = .{ .epoch = b.frame.epoch, .context_rows = context_rows, .rows = rows, .view = mask };
-    return mask;
 }
 
 /// Slots before `trained` cannot see later slots, retaining their trained-block mask.

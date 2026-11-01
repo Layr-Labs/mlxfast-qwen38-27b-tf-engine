@@ -152,18 +152,9 @@ Q27_PROMPT(8)
 // A packed row's chunks merged in key order, normalized and written as the row's head output.
 kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device const float* PM [[buffer(1)]], device const float* PL [[buffer(2)]],
     constant Q27PromptArgs& args [[buffer(3)]], device bfloat* OUT [[buffer(4)]],
-    device const bfloat* QG [[buffer(5)]], device float* XS [[buffer(6)]],
-    constant uint& sums_stride [[buffer(7)]], constant uint& gated [[buffer(8)]],
     uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
   const int hk = int(tg.x), r = int(tg.y);
   constexpr int DP = PD / 32;
-  const int node = r / PG, head = hk * PG + r % PG;
-  // Padded sum rows have no attention partial or output address to read.
-  if (node >= args.rows) {
-    if (sums_stride != 0 && uint(node) < sums_stride && (lane & 7) == 0)
-      XS[(int64_t(head) * (PD / 64) + (lane >> 3)) * sums_stride + node] = 0.0f;
-    return;
-  }
   float m = -INFINITY, l = 0.0f, o[DP];
   for (int i = 0; i < DP; i++) o[i] = 0.0f;
   for (int c = 0; c < args.chunks; c++) {
@@ -177,26 +168,6 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
     m = nm;
   }
-  for (int i = 0; i < DP; i++) {
-    const int64_t index = ((int64_t)node * (PG * 4) + head) * PD + lane * DP + i;
-    const bfloat v = static_cast<bfloat>(o[i] / l);
-    bfloat value = v;
-    if (gated) {
-      const float gate = float(QG[((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP + i]);
-      value = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
-    }
-    OUT[index] = value;
-    o[i] = float(value);
-  }
-  if (sums_stride != 0) {
-    // Four independent groups per head. Their eight lanes take turns adding eight BF16 values,
-    // keeping the existing64-value sequential FP32 sum, including the initial positive zero.
-    float sum = 0.0f;
-    for (uint turn = 0; turn < 8; turn++) {
-      if ((lane & 7) == turn) for (int i = 0; i < DP; i++) sum += o[i];
-      sum = simd_shuffle(sum, ushort((lane & ~7u) | turn));
-    }
-    if ((lane & 7) == 0)
-      XS[(int64_t(head) * (PD / 64) + (lane >> 3)) * sums_stride + node] = sum;
-  }
+  const int node = r / PG, head = hk * PG + r % PG;
+  for (int i = 0; i < DP; i++) OUT[((int64_t)node * (PG * 4) + head) * PD + lane * DP + i] = static_cast<bfloat>(o[i] / l);
 }

@@ -140,8 +140,6 @@ pub const Backend = struct {
     stash: ?*Stash = null,
     fused_count: usize = 0,
     hazards: Hazards = .{},
-    /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
-    mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -152,9 +150,6 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
-        // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
-        // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
-        try target.kernels.prepareDecode(head.linear, 1);
         const caches = try newCaches(a, target.device, c, c.layers);
         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches };
     }

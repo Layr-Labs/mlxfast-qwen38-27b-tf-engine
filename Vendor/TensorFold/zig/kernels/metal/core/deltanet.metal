@@ -128,16 +128,15 @@ kernel void tf_delta_gdn_pre(device const bfloat* projection [[buffer(0)]],
   else tf_delta_gdn_pre_body<0, false>(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, tails, group, lane);
 }
 
-// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps up to 4 rows of a head on conv weights read
-// once; bfloat4 rows, and the gates a lane a row. A group's rows split evenly over its four simdgroups (2 each for a
-// verify's 8 rows), so none walks more rows than it must; each row's arithmetic is the same whichever walks it.
+// tf_delta_gdn_pre_body<4, false> for prompt rows (4 taps): a simdgroup steps 4 rows of a head on conv weights read once;
+// bfloat4 rows, and the gates a lane a row.
 inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* windows, device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query,
     device bfloat* key, device bfloat* value, device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
-  if (sg * per >= in_group) return;
-  const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
+  const uint head = group.y, first = (group.z * 4 + sg) * 4;
+  if (first >= p.rows) return;
+  const uint count = metal::min(4u, p.rows - first);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
   const uint keep = p.taps - 1;
   const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
@@ -616,8 +615,6 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device const void* norm [[buffer(2)]],
                          constant TfDeltaParams& p [[buffer(3)]],
                          device bfloat* output [[buffer(4)]],
-                         device float* sums [[buffer(5)]],
-                         constant uint& sums_stride [[buffer(6)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
@@ -640,15 +637,6 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
   }
   *(device bfloat4*)(output + at) = y;
-  if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
-    if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
-      sums[g * int(sums_stride) + int(row)] = acc;
-    }
-  }
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
@@ -671,25 +659,6 @@ kernel void tf_delta_gdn_conv_commit(device const bfloat* committed [[buffer(0)]
   const uint row = kept_rows[keep.first + keep.rows - 1];
   const uint source = windows[row * p.taps + item / channels + 1];
   next[keep.next_slot * width + item] = source < p.taps - 1 ? committed[(keep.state_slot * (p.taps - 1) + source) * channels + item % channels] : projection[(source - (p.taps - 1)) * channels + item % channels];
-}
-kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
-                              device const ushort* projection [[buffer(1)]],
-                              device const uint* kept_rows [[buffer(2)]],
-                              device const TfDeltaKeep* keeps [[buffer(3)]],
-                              device const uint* windows [[buffer(4)]],
-                              constant TfDeltaParams& p [[buffer(5)]],
-                              uint2 position [[thread_position_in_grid]]) {
-  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
-  const TfDeltaKeep keep = keeps[position.y];
-  if (item >= channels || keep.rows == 0) return;
-  const uint row = kept_rows[keep.first + keep.rows - 1];
-  device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;
-  ushort taken[7];
-  for (uint t = 0; t < held; ++t) {
-    const uint source = windows[row * p.taps + t + 1];
-    taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
-  }
-  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
