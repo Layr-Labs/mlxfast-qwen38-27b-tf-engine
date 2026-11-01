@@ -607,10 +607,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -630,10 +629,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t = ks * 32 + lane;
-  for (int m = t; m < stride; m += 64) {
+  // a padded row's sums are read only by rows the lane kernel drops, so only live rows are written
+  for (int m = t; m < M; m += 64) {
     float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
+    for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
     HS[int(tg.x) * stride + m] = acc;
   }
 #elif defined(TF_ROWS8)
@@ -679,7 +678,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
-#if TF_PROMPT_TN == 2
+#if TF_PROMPT_TN == 2 && !defined(TF_NO_STREAM)
 #define TF_STREAM_RIGHT 1
 #else
 #define TF_STREAM_RIGHT 0
@@ -779,14 +778,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_RESID)
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg_in [[threadgroup_position_in_grid]],
-    uint2 tgn [[threadgroups_per_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
-  // bands of RB row blocks, row blocks fastest within a band: a column tile's weights serve the band's rows together
-  constexpr uint RB = 32;
-  const uint tg_linear = tg_in.y * tgn.x + tg_in.x, band = tg_linear / (RB * tgn.x), y0 = band * RB, rb = min(RB, tgn.y - y0);
-  const uint tg_w = tg_linear - band * RB * tgn.x;
-  const uint2 tg = uint2(tg_w / rb, y0 + tg_w % rb);
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
@@ -880,10 +873,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
