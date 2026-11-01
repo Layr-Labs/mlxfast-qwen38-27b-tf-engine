@@ -236,3 +236,110 @@ kernel void tf_bf16_topk_tiles(const device Row* picked [[buffer(0)]], const dev
   for (uint j = lane; j < n; j += TF_TOPK_LANES) list[1 + j] = order[j];
   for (uint at = lane; at < p.slots * 32; at += TF_TOPK_LANES) map[at] = at / 32 < n ? ids[32 * order[at / 32] + at % 32] : 0u;
 }
+
+// Wide rows on more spans: a span's tokens stay in its lanes' registers (at most TF_TOPK_HOLD each), every SIMD group
+// picks its own top k by shuffles, and SIMD group 0 merges the eight sorted lists. The order is the same total order
+// ("before": higher key, then lower token ID), so the entries are the same as the 16-span kernels give.
+#define TF_TOPK_WIDE_SPANS 64
+#define TF_TOPK_HOLD 8
+#define TF_TOPK_GROUPS (TF_TOPK_LANES / 32)
+// The best of a SIMD group's candidates (each lane's `mine`); `taken` is set in the lane whose candidate won.
+inline TfCand tf_simd_pick(TfCand mine, thread bool& taken) {
+  const TfCand w = tf_simd_best(mine);
+  taken = mine.id == w.id && mine.key == w.key && mine.key != 0u;
+  return w;
+}
+kernel void tf_bf16_topk_wide(const device ushort* logits [[buffer(0)]],
+                             device Row* part [[buffer(1)]], constant Params& p [[buffer(2)]],
+                             uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]]) {
+  threadgroup uint masks[TF_TOPK_LANES];
+  threadgroup uint list_key[TF_TOPK_GROUPS][TF_TOPK_MAX_K], list_id[TF_TOPK_GROUPS][TF_TOPK_MAX_K], list_bits[TF_TOPK_GROUPS][TF_TOPK_MAX_K];
+  const ulong width = (ulong(p.vocab) + TF_TOPK_WIDE_SPANS - 1) / TF_TOPK_WIDE_SPANS;
+  const ulong begin = min(ulong(tg.x) * width, ulong(p.vocab)), end = min(begin + width, ulong(p.vocab));
+  const device ushort* row = logits + ulong(tg.y) * p.stride;
+  device Row& out = part[tg.y * TF_TOPK_WIDE_SPANS + tg.x];
+  uint key[TF_TOPK_HOLD], bits[TF_TOPK_HOLD], live = 0, mask = 0;
+  for (uint i = 0; i < TF_TOPK_HOLD; i++) {
+    const ulong token = begin + lane + ulong(i) * TF_TOPK_LANES;
+    key[i] = 0; bits[i] = 0;
+    if (token < end) {
+      const ushort raw = row[token];
+      if ((raw & 0x7f80u) == 0x7f80u) mask |= (raw & 0x7fu) != 0 ? 1u : (raw & 0x8000u) == 0 ? 2u : 4u;
+      else { key[i] = tf_bf16_key(raw); bits[i] = uint(raw) << 16; live |= 1u << i; }
+    }
+  }
+  if (lane == 0) {
+    out.nonfinite = 0; out.count = 0;
+    for (uint i = 0; i < TF_TOPK_MAX_K; i++) out.entries[i] = { 0xffffffffu, 0u };
+  }
+  const uint all = tf_tg_or(mask, lane, masks);
+  if (all != 0) { if (lane == 0) out.nonfinite = all; return; }
+  for (uint rank = 0; rank < TF_TOPK_MAX_K; rank++) {
+    TfCand c = { 0u, 0xffffffffu, 0u };
+    uint slot = TF_TOPK_HOLD;
+    if (rank < p.k) for (uint i = 0; i < TF_TOPK_HOLD; i++) {
+      const uint id = uint(begin + lane + ulong(i) * TF_TOPK_LANES);
+      if (((live >> i) & 1u) != 0 && tf_topk_before(key[i], id, c.key, c.id)) { c = { key[i], id, bits[i] }; slot = i; }
+    }
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) live &= ~(1u << slot);
+    if (sl == 0) { list_key[sg][rank] = w.key; list_id[sg][rank] = w.id; list_bits[sg][rank] = w.bits; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  // lane sl: entries 4 * (sl % 4) .. + 3 of SIMD group sl / 4's sorted list
+  const uint g = sl / 4, first = 4 * (sl % 4);
+  uint cursor = 0;
+  for (uint rank = 0; rank < p.k; rank++) {
+    const uint at = first + cursor;
+    const TfCand c = cursor < 4 ? TfCand{ list_key[g][at], list_id[g][at], list_bits[g][at] } : TfCand{ 0u, 0xffffffffu, 0u };
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) cursor++;
+    if (sl == 0) { out.entries[rank] = { w.id, w.bits }; out.count = rank + 1; }
+  }
+}
+
+// The row's top k from its TF_TOPK_WIDE_SPANS span lists: all of them staged in threadgroup memory, then SIMD group
+// 0 picks rank by rank, lane l taking the heads of lists 2l and 2l + 1.
+kernel void tf_bf16_topk_wide_merge(const device Row* part [[buffer(0)]],
+                                   device Row* output [[buffer(1)]], constant Params& p [[buffer(2)]],
+                                   uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],
+                                   uint sg [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]]) {
+  threadgroup uint masks[TF_TOPK_LANES];
+  threadgroup uint list_key[TF_TOPK_WIDE_SPANS][TF_TOPK_MAX_K], list_id[TF_TOPK_WIDE_SPANS][TF_TOPK_MAX_K], list_bits[TF_TOPK_WIDE_SPANS][TF_TOPK_MAX_K];
+  const device Row* spans = part + row * TF_TOPK_WIDE_SPANS;
+  for (uint e = lane; e < TF_TOPK_WIDE_SPANS * TF_TOPK_MAX_K; e += TF_TOPK_LANES) {
+    const uint span = e / TF_TOPK_MAX_K, at = e % TF_TOPK_MAX_K;
+    uint key = 0, id = 0xffffffffu, bits = 0;
+    if (at < p.k && spans[span].entries[at].token != 0xffffffffu) {
+      bits = spans[span].entries[at].score_bits;
+      key = tf_bf16_key(ushort(bits >> 16)); id = spans[span].entries[at].token;
+    }
+    list_key[span][at] = key; list_id[span][at] = id; list_bits[span][at] = bits;
+  }
+  const uint mask = lane < TF_TOPK_WIDE_SPANS ? spans[lane].nonfinite : 0u;
+  if (lane == 0) {
+    output[row].nonfinite = 0; output[row].count = 0;
+    for (uint i = 0; i < TF_TOPK_MAX_K; i++) output[row].entries[i] = { 0xffffffffu, 0u };
+  }
+  const uint all = tf_tg_or(mask, lane, masks); // its barrier also orders the staged lists
+  if (all != 0) { if (lane == 0) output[row].nonfinite = all; return; }
+  if (sg != 0) return;
+  uint ca = 0, cb = 0;
+  const uint la = 2 * sl, lb = 2 * sl + 1;
+  for (uint rank = 0; rank < p.k; rank++) {
+    const TfCand a = ca < TF_TOPK_MAX_K ? TfCand{ list_key[la][ca], list_id[la][ca], list_bits[la][ca] } : TfCand{ 0u, 0xffffffffu, 0u };
+    const TfCand b = cb < TF_TOPK_MAX_K ? TfCand{ list_key[lb][cb], list_id[lb][cb], list_bits[lb][cb] } : TfCand{ 0u, 0xffffffffu, 0u };
+    const bool first_a = tf_topk_before(a.key, a.id, b.key, b.id) || b.key == 0u;
+    const TfCand c = first_a ? a : b;
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) { if (first_a) ca++; else cb++; }
+    if (sl == 0) { output[row].entries[rank] = { w.id, w.bits }; output[row].count = rank + 1; }
+  }
+}
+
+// Measured again with the drafter's one-pass prompt catch-up added; this entry's own piece is named in its note.
