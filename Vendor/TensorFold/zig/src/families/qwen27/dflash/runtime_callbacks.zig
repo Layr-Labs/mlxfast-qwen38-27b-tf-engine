@@ -160,6 +160,10 @@ fn head(ptr: *anyopaque, epoch: u64, x: op.View) !op.Head {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, b.head.linear.n, .bf16);
+    if (b.head.plain) |adapter| {
+        try encodePrepared(b, e, x, y, adapter);
+        return .{ .logits = y, .token_ids = if (b.head.ids) |ids| try b.frame.add(.{ .buf = ids }, 1, b.head.linear.n, b.head.linear.n, .u32) else null };
+    }
     const input = try b.frame.ref(x);
     const output = try b.frame.ref(y);
     // the group sums of `x` a projection just computed (the same tf_lane_sums values the head's own pass would
