@@ -365,8 +365,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #if defined(TF_WAIT)
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
+#elif defined(TF_PROMPT_SR)
+    uint2 tgn [[threadgroups_per_grid]],
 #endif
+#if defined(TF_PROMPT_SR) && !defined(TF_WAIT)
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg_in [[threadgroup_position_in_grid]]) {
+  // prompt rows: bands of RB row blocks, row blocks fastest within a band, so a column tile's weights serve the band's
+  // rows together (the two-tile prompt kernel's walk); every threadgroup computes the same tile and rows as before
+  constexpr uint RB = 32;
+  const uint tg_linear = tg_in.y * tgn.x + tg_in.x, band = tg_linear / (RB * tgn.x), y0 = band * RB, rb = min(RB, tgn.y - y0);
+  const uint tg_w = tg_linear - band * RB * tgn.x;
+  const uint2 tg = uint2(tg_w / rb, y0 + tg_w % rb);
+#else
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+#endif
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
 #if defined(TF_TILE_LIST)
@@ -607,10 +619,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -630,10 +641,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t = ks * 32 + lane;
-  for (int m = t; m < stride; m += 64) {
+  // a padded row's sums are read only by rows the lane kernel drops, so only live rows are written
+  for (int m = t; m < M; m += 64) {
     float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
+    for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
     HS[int(tg.x) * stride + m] = acc;
   }
 #elif defined(TF_ROWS8)
@@ -880,10 +891,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else

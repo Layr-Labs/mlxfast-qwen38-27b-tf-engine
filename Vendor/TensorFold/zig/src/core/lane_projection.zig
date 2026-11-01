@@ -714,7 +714,7 @@ pub const Projection = struct {
 };
 
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
-pub const reg_rows = 128;
+pub const reg_rows = 256;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
