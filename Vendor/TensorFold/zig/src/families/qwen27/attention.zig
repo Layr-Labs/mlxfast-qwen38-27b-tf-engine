@@ -506,12 +506,13 @@ pub const Attention = struct {
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
-    /// `lanes`, each `lane_words` bf16 words; `layers` receives the per-binding table the scatter reuses.
-    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
+    /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding reads; `layers` receives the
+    /// per-binding table the scatter reuses.
+    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, map: Ref, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
         if (bindings.len == 0 or bindings.len > max_keep_layers or layers.len != bindings.len) return error.AttentionKeep;
         for (bindings, layers) |*binding, *layer| {
             if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
-            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(binding.get(.keep_map)) };
+            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(map) };
         }
         if (kept == 0) return;
         const g = bindings[0].limits.geometry;
