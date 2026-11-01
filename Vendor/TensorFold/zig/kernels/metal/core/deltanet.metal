@@ -205,6 +205,8 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* mixing [[buffer(14)]],
                         device atomic_uint* NC [[buffer(15)]],
                         constant uint& wait_for [[buffer(16)]],
+                        device atomic_uint* PC [[buffer(17)]],
+                        constant uint& count_out [[buffer(18)]],
                         uint3 group [[threadgroup_position_in_grid]],
                         uint3 groups [[threadgroups_per_grid]],
                         uint t [[thread_index_in_threadgroup]],
@@ -226,6 +228,13 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
+    }
+  }
 }
 
 // tf_delta_gdn_pre_body<4, true> over 4 simdgroups a head; each lane's 4 squares summed in order before simd_sum.
