@@ -37,6 +37,8 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
         try fields.append(a, list, &adapter.projection);
         if (adapter.small) |*s| try fields.append(a, list, s);
     }
+    var prompts = b.prompts.map.valueIterator();
+    while (prompts.next()) |p| try fields.append(a, list, p);
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| try fields.append(a, list, t);
 }
@@ -48,6 +50,8 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     for (b.caches) |*c| fields.apply(c, hook, joining);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| prepared(adapter, hook, joining);
+    var prompts = b.prompts.map.valueIterator();
+    while (prompts.next()) |p| fields.apply(p, hook, joining);
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| fields.apply(t, hook, joining);
 }

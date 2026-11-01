@@ -134,6 +134,8 @@ pub const Backend = struct {
     appended_rows: u32 = 0,
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
+    /// The adapters' prompt-row pipelines, used by multi-row absorbs only.
+    prompts: core.affine4_lane.Prompts = .{},
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
@@ -168,6 +170,7 @@ pub const Backend = struct {
         var prepared = b.prepared.valueIterator();
         while (prepared.next()) |adapter| adapter.deinit();
         b.prepared.deinit(b.allocator);
+        b.prompts.deinit(b.allocator);
         var tiled = b.tiled.valueIterator();
         while (tiled.next()) |t| t.deinit();
         b.tiled.deinit(b.allocator);
@@ -213,6 +216,16 @@ pub const Backend = struct {
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
         if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+        if (units) try b.preparePrompts();
+    }
+    /// One prompt-row pipeline per distinct reg adapter layout, compiled here so no absorb compiles one.
+    fn preparePrompts(b: *Backend) !void {
+        var adapters = b.prepared.valueIterator();
+        while (adapters.next()) |adapter| {
+            const before = b.prompts.map.count();
+            try b.prompts.add(b.allocator, b.target.device, adapter.*);
+            if (b.residency) |f| if (b.prompts.map.count() != before) if (b.prompts.get(adapter.*)) |p| mtl.resident.fields.apply(&p, f, true);
+        }
     }
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {

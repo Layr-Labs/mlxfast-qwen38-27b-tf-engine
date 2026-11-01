@@ -95,7 +95,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
             const at = (base + r) / tile;
             const to = ((at / batch * (k / 64) + g) * batch + at % batch) * tile * 8 + ((base + r) % tile) * 8;
             @memcpy(dst[to..][0..8], words[src..][0..8]);
-            pair[(g * n + base + r) * 2] = try lane.foldScale(scales[r * (k / 64) + g]); // reg scales carry 2^24
+            pair[(g * n + base + r) * 2] = scales[r * (k / 64) + g];
             pair[(g * n + base + r) * 2 + 1] = biases[r * (k / 64) + g];
         };
         base += rows;

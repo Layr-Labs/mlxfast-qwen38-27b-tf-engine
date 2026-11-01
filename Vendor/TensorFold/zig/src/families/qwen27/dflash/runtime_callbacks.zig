@@ -75,12 +75,18 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows);
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
-            if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
-            // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
-            const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
+            // a prompt absorb's rows past 16 run on the adapter layout's prompt pipeline where there is one
+            const q = (if (x.rows > 16) b.prompts.get(adapter) else null) orelse p;
+            if (q.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
+            // reg adapters take a prompt absorb's rows max_rows at a time (16-row blocks on the grid, each block's words as alone)
+            const step: u32 = if (q.reg) q.max_rows else 16;
             var first: u32 = 0;
             while (first < x.rows) : (first += step) {
-                try adapter.encode(e, .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 }, .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 }, @min(x.rows - first, step));
+                const n = @min(x.rows - first, step);
+                const xr: @import("core").lane_projection.Ref = .{ .buf = input.buf, .off = input.off + @as(usize, first) * x.stride * 2 };
+                const yr: @import("core").lane_projection.Ref = .{ .buf = output.buf, .off = output.off + @as(usize, first) * y.stride * 2 };
+                // a launch of at most 8 rows keeps the adapter's rows8 build (Adapter.forRows)
+                if (n <= 8) try adapter.encode(e, xr, yr, n) else try adapter.encodeOn(q, e, xr, yr, n);
             }
         }
     }

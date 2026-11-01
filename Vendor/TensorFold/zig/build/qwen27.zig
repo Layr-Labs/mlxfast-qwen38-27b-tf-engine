@@ -69,6 +69,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const lane_imports: []const std.Build.Module.Import = &.{ .{ .name = "metal", .module = metal }, .{ .name = "core_lane", .module = core_lane } };
     _ = program(b, "tf-core-lane-small", "Build bounded synthetic small-width core timing and retained-byte comparison", "zig/tests/core_lane_small.zig", target, false, lane_imports);
     _ = program(b, "tf-core-lane-reg-check", "Build the reg kernel's byte check against the cooperative kernel (M5 GPU)", "zig/tests/core_lane_reg.zig", target, false, lane_imports);
+    _ = program(b, "tf-core-lane-grid-check", "Build the whole-frame prompt reg launches' byte check against 128-row launches (M5 GPU)", "zig/tests/core_lane_grid.zig", target, false, lane_imports);
     const frozen_lane = b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/fn_lane/golden.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "core_lane", .module = core_lane }} });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = frozen_lane })).step);
     const lane_check = program(b, "tf-core-lane-check", "Build the synthetic core projection checks without running a GPU", "zig/tests/core_lane_projection.zig", target, false, lane_imports);
