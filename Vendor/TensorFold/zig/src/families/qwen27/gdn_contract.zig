@@ -52,6 +52,14 @@ pub const Deferred = extern struct { rows: u32, persist: u32 };
 pub const Stash = extern struct { base: u32, room: u32, log_rows: u32, pending_rows: u32 };
 /// tf_delta_gdn_unstash: the pending rows, the slot they extend, the pending rows a layer and a layer's committed words.
 pub const Unstash = extern struct { rows: u32, slot: u32, pending_rows: u32, layer_words: u32 };
+/// tf_delta_gdn_conv_keep_deferred: a layer's history and projection words, each layer's span of the pool's buffers.
+pub const ConvDeferred = extern struct { history_words: u32, projection_words: u32 };
+
+/// Word strides of the pooled history and qkv spans, and the layer count, for a cross-layer conv keep launch.
+pub const LayerStride = extern struct { layers: u32, history: u32, qkv: u32 };
+
+/// Word strides of one GDN layer's replay spans in the pooled buffers, and the layer and keep counts.
+pub const LayerSpans = extern struct { layers: u32, keeps: u32, key: u32, value: u32, decay: u32, mixing: u32, state: u32, before: u32 };
 
 pub const Shape = struct {
     c: Config,

@@ -77,6 +77,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// The decoded pre-norm's count and the waiting qkv and zba launches' arrivals (normAfterCounted / quantCountedAfter):
+    /// two pairs, words 0-1 for qkv and 2-3 for zba, since each waiting launch leaves only its own pair zero.
+    norm_words: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -104,6 +107,7 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.norm_words) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -541,9 +545,18 @@ pub const Kernels = struct {
             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
             bindAt(e, out, 8); // never read: wait_for 0
             e.setValue(@as(u32, 0), 9);
+            bindAt(e, out, 10); // never written: count_out 0
+            e.setValue(@as(u32, 0), 11);
         } else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// Inspect sticky dependency status only after all target GPU work completes, before token selection.
+    pub fn checkCounted(k: *const Kernels) !void {
+        const status = @import("counted_norm_status.zig");
+        if (k.count_words) |words| try status.checkBank(words.slice(u32, 4));
+        if (k.gu_words) |words| try status.checkBank(words.slice(u32, 4));
     }
 
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
@@ -559,8 +572,36 @@ pub const Kernels = struct {
         bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
         e.setBuffer(words, 0, 8);
         e.setValue(wait_for, 9);
+        bindAt(e, out, 10); // never written: count_out 0
+        e.setValue(@as(u32, 0), 11);
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// normAfter whose row threadgroups also count themselves into `norm_words` once their stores are fenced, for the qkv
+    /// and zba launches that read its rows in the same barrier interval (quantCountedAfter). Returns the count those two
+    /// wait on: its threadgroups, one a row. Only the rows and the wait the three were validated with.
+    pub fn normAfterCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !u32 {
+        const words = k.count_words orelse return error.BadCoreProjectionRows;
+        if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
+        try wordAligned(.{ h, residual, weight, combined, out });
+        if (k.norm_words == null) {
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
+            k.norm_words = b;
+        }
+        var span = profile.begin(k.profiler, input_encoder, .norm);
+        errdefer span.cancel();
+        const e = span.encoder;
+        e.setPipeline(try k.get(.{ .kind = .norm, .k = width }));
+        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+        e.setBuffer(words, 0, 8);
+        e.setValue(wait_for, 9);
+        e.setBuffer(k.norm_words.?, 0, 10);
+        e.setValue(@as(u32, 1), 11);
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+        try span.end();
+        return rows;
     }
 
     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
@@ -581,11 +622,17 @@ pub const Kernels = struct {
         return k.countedKey(p, rows, false) != null;
     }
 
+    /// Whether quantCountedAfter takes `p` for `rows` decoded rows: a counted launch that also waits on a producer in its
+    /// own barrier interval (checked before a producer is encoded without the barrier after it).
+    pub fn countableAfter(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.countedKey(p, rows, true) != null;
+    }
+
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.count_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -605,12 +652,11 @@ pub const Kernels = struct {
 
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
-    pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
+    pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32, waited: lane.Ref) !u32 {
         const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
-        const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.count_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -623,7 +669,7 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, waited, wait_for);
         try span.end();
         return @intCast(entry.value_ptr.tile_count);
     }
@@ -638,8 +684,8 @@ pub const Kernels = struct {
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
         if (!key.serialSk2()) return null;
         if (k.gu_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.gu_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);

@@ -204,10 +204,6 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
-    /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
-    /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
-    precise: bool = false,
-    precise_count: usize = 0,
     hazards: Hazards = .{},
     /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
@@ -297,10 +293,8 @@ pub const Backend = struct {
         };
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
-        if ((if (units) b.prepared.count() - b.fused_count - b.precise_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+        if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
     }
-    /// The key bit of a linear's q4 copy beside its copy below 4 bits (no tensor address reaches it).
-    pub const precise_key: usize = 1 << 62;
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
@@ -319,23 +313,6 @@ pub const Backend = struct {
         if (order) |o| {
             const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
-            // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
-            if (bits != 4) {
-                var q4 = try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], 4, 64);
-                defer q4.deinit();
-                if (b.stash) |st| if (shortName(name)) |short| {
-                    const layer = layerOf(name) orelse return error.DraftTensorCoverage;
-                    var buf: [16]u8 = undefined;
-                    const id = try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, std.ascii.toUpper(short[0]) });
-                    const owned = try b.allocator.dupe(u8, id);
-                    errdefer b.allocator.free(owned);
-                    const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
-                    try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
-                };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
-                try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
-                b.precise_count += 1;
-            }
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
@@ -346,7 +323,7 @@ pub const Backend = struct {
     /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
     /// acceptance at 2 bits, and the down's 2-bit copy costs about as many extra rounds as its bytes save, so it stays
     /// q4; the head's 2-bit copy only picks tiles for its q4 scores (head_bits).
-    pub const mlp_bits: u8 = 2;
+    pub const mlp_bits: u8 = 4;
     /// Code width of the draft head's requantized copy of the spans' rows, which heads of at most Head.rescored_rows rows
     /// read first to pick the tiles the q4 head computes (4: no copy, the q4 head alone).
     pub const head_bits: u8 = 2;
@@ -414,13 +391,6 @@ pub const Backend = struct {
             try b.fuse(order, st, layer, "kv", 'k', group_kv);
             try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
             try b.fuse(order, st, layer, "gu", 'g', group_gu);
-            // the q4 copies' gate/up group of a layer drafted below 4 bits (stashed as G and U)
-            const before = b.fused_count;
-            try b.fuse(order, st, layer, "GU", 'G', group_gu);
-            if (b.fused_count != before) {
-                b.fused_count -= 1;
-                b.precise_count += 1;
-            }
         }
     }
     /// The draft's linears: its rank-2 weights, which q4 drafts read only through their prepared copies.

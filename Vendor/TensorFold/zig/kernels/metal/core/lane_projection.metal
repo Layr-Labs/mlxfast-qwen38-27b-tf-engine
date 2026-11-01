@@ -473,15 +473,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  threadgroup uint dependency_ready;
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
-      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
-      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    dependency_ready = uint(atomic_load_explicit(&WC[0], memory_order_relaxed) >= wait_for);
+    if (dependency_ready == 0u) {
+      atomic_store_explicit(&WC[2], 1u, memory_order_relaxed);
+    } else {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+        atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (dependency_ready == 0u) return;
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -679,7 +686,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
-#if TF_PROMPT_TN == 2
+#if TF_PROMPT_TN == 2 && ((TF_N == 34816 && TF_K == 5120 && TF_SK == 1 && defined(TF_SWIGLU)) || (TF_N == 5120 && TF_K == 17408 && TF_SK == 2))
 #define TF_STREAM_RIGHT 1
 #else
 #define TF_STREAM_RIGHT 0
@@ -779,14 +786,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_RESID)
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg_in [[threadgroup_position_in_grid]],
-    uint2 tgn [[threadgroups_per_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
-  // bands of RB row blocks, row blocks fastest within a band: a column tile's weights serve the band's rows together
-  constexpr uint RB = 32;
-  const uint tg_linear = tg_in.y * tgn.x + tg_in.x, band = tg_linear / (RB * tgn.x), y0 = band * RB, rb = min(RB, tgn.y - y0);
-  const uint tg_w = tg_linear - band * RB * tgn.x;
-  const uint2 tg = uint2(tg_w / rb, y0 + tg_w % rb);
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
