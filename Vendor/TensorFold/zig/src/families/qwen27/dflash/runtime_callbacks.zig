@@ -308,6 +308,8 @@ fn head(ptr: *anyopaque, epoch: u64, x: op.View) !op.Head {
     return .{ .logits = y, .token_ids = if (b.head.ids) |ids| try b.frame.add(.{ .buf = ids }, 1, b.head.linear.n, b.head.linear.n, .u32) else null };
 }
 const Head = @import("runtime_head.zig").Head;
+/// The draft head's top k from its 2-bit copy alone (draft numerics only move acceptance): no q4 rescoring pass.
+const approx_only = true;
 const Topk = @import("core").bf16_topk_gpu.Ops;
 /// A head of at most Head.rescored_rows rows read through its 2-bit copy first: each row's top k there names 32-column
 /// tiles, which with tile 0 the q4 head then computes alone (each word the one its full launch writes). The logits are
@@ -318,6 +320,7 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     const k = b.config.topk;
     const approx = try b.frame.alloc(x.rows, width, .bf16);
     try encodePrepared(b, e, x, approx, adapter);
+    if (approx_only) return .{ .logits = approx, .token_ids = try b.frame.add(.{ .buf = ids }, 1, width, width, .u32) };
     const picks = try b.frame.alloc(x.rows, @sizeOf(@import("core").bf16_topk.Row), .u8);
     const approx_ref = try b.frame.ref(approx);
     const picks_ref = try b.frame.ref(picks);
