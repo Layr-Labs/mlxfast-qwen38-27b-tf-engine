@@ -412,18 +412,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
   uint3 ni = 0;
   if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+  // decoded rows look up the next group's table words at the end of each iteration, behind its tensor op and FMAs
+  uint4 cq0 = tf_look12a(tab, ni), cq1 = tf_look12b(tab, ni);
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+  uint4 cq0 = tf_look(tab, ni0), cq1 = tf_look(tab, ni1);
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
   for (int g = first; g < last; g++) {
-#if defined(TF_SBI12)
-    const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
-#elif defined(TF_SBI)
-    const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
+#if defined(TF_SBI12) || defined(TF_SBI)
+    const uint4 q0 = cq0, q1 = cq1;
 #else
     const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
 #endif
@@ -480,11 +481,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
-#if defined(TF_SBI)
-      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
-#else
-      const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y);
-#endif
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
       C[j] = fma(s0, P[j], fma(b0, cur.x0, C[j]));
 #if !defined(TF_ROWS8)
       C[4 + j] = fma(s0, P[4 + j], fma(b0, cur.x1, C[4 + j]));
@@ -494,6 +491,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
 #endif
     }
+#if defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
+#if defined(TF_SBI12)
+    cq0 = tf_look12a(tab, ni);
+    cq1 = tf_look12b(tab, ni);
+#elif defined(TF_SBI)
+    cq0 = tf_look(tab, ni0);
+    cq1 = tf_look(tab, ni1);
+#endif
+#endif
   }
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
     if (split == 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C0[i] = C[i];
@@ -631,13 +637,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
-        const float s0 = float(v0.x) * 16777216.0f, b0 = float(v0.y), s1 = float(v1.x) * 16777216.0f, b1 = float(v1.y); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
         C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
         C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
 }
+// TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
+// stream's next rows, H + the output, as the norm after it would have formed them.
 // TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
 // group 1 their up tiles TF_N / 64 tiles on, and the threadgroup applies tf_lane_reg's fused prompt epilogue to them.
 #if defined(TF_SWIGLU)
@@ -652,6 +660,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
+#elif defined(TF_RESID)
+    const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
@@ -664,6 +674,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
 #else
   Y += (size_t)r0 * TF_YS;
+#if defined(TF_RESID)
+  H += (size_t)r0 * TF_YS;
+  RO += (size_t)r0 * TF_YS;
+#endif
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
 #endif
   XS += r0;
@@ -774,7 +788,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL
       for (int i = 0; i < 16; i++) {
         const int m = mb + 8 * ((i >> 2) & 1), n = (tile0 + t) * NT + nb + 16 * (i >> 3) + (i & 3);
+#if defined(TF_RESID)
+        // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as q27_norm_xs
+        // adds them (h + r, rounded to bf16); the norm then reads these rows alone
+        if (m < M && n < TF_N) RO[(size_t)m * TF_YS + n] = bfloat(float(H[(size_t)m * TF_YS + n]) + float(static_cast<bfloat>(C[t][i])));
+#else
         if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[t][i]);
+#endif
       }
     }
   }
