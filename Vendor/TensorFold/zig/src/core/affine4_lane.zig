@@ -14,9 +14,13 @@ pub const Adapter = struct {
     small: ?lane.Projection = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
+        if (prepared.nibbles) {
+            // codes below 4 bits on the nibble grid: the reg kernel's 2-bit words (halveReg), no other path
+            if (order == null or prepared.bits != 2 or prepared.group != 64) return error.UnsupportedNibbles;
+        } else if (prepared.bits != 4 or prepared.group != 64) return initPlain(a, device, prepared, sk);
         var layout = lane.Layout{ .n = prepared.n, .k = prepared.k, .format = .{ .bits = 4, .group = 64 }, .sk = sk, .precompute_sums = true, .cooperative = order == null, .reg = order != null, .reg_lean = order != null };
         try layout.validate();
-        const words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        var words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         errdefer words.deinit();
         const metadata = try device.buffer(layout.metadataElements() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         errdefer metadata.deinit();
@@ -24,6 +28,19 @@ pub const Adapter = struct {
         if (order) |o| try o.run(&.{.{ .w = .{ .buf = words }, .n = prepared.n, .k = prepared.k }});
         // the reg kernel's scales carry 2^24 (lane.foldScale); the cooperative kernel reads them as packed
         if (order != null) try lane.foldScales(metadata.slice(u16, layout.metadataElements()));
+        if (prepared.nibbles) {
+            var two = layout;
+            two.format.bits = 2;
+            try two.validate();
+            const half = try device.buffer(two.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            lane.halveReg(words.slice(u32, layout.weightWords()), half.slice(u32, two.weightWords())) catch |err| {
+                half.deinit();
+                return err;
+            };
+            words.deinit();
+            words = half;
+            layout = two;
+        }
         // reg adapters read the pairs through an index (the same words, fewer bytes a group) when they fit its table
         var index: ?mtl.Buffer = null;
         errdefer if (index) |b| b.deinit();
@@ -41,6 +58,20 @@ pub const Adapter = struct {
             small = try lane.Projection.init(a, device, l8);
         }
         return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small };
+    }
+    /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
+    fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
+        var layout = lane.Layout{ .n = prepared.n, .k = prepared.k, .format = .{ .bits = prepared.bits, .group = prepared.group }, .sk = sk, .precompute_sums = true };
+        // wider groups take more threadgroup memory a slice: fewer K slices where the split would not fit
+        while (layout.sk > 1 and layout.threadgroupBytes() > 32768) layout.sk /= 2;
+        try layout.validate();
+        const words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer words.deinit();
+        const metadata = try device.buffer(layout.metadataElements() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer metadata.deinit();
+        try lane.pack(layout, prepared.words, prepared.scales, prepared.biases, words.slice(u32, layout.weightWords()), metadata.slice(u16, layout.metadataElements()));
+        const projection = try lane.Projection.init(a, device, layout);
+        return .{ .projection = projection, .words = words, .metadata = metadata };
     }
     /// The projection a launch of `rows` takes: the rows8 build for at most 8 rows where there is one.
     pub fn forRows(adapter: Adapter, rows: u32) lane.Projection {

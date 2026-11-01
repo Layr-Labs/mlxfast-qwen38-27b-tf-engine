@@ -5,17 +5,20 @@ struct Q27CachePtrs { device bfloat* keys; device bfloat* values; };
 struct Q27PackArgs { uint rows, packed_rows, heads, kv_heads, dim, group, v_stride; }; // v_stride: append's V row to row
 struct Q27KeepRow { uint stream, source, destination, row; };
 
+// pack_a and pack_b move eight words (16 bytes) a thread, at.x the word octet: rows are dim words apart from 16-byte aligned
+// bases (Attention.encode checks q; qa and qb are scratch buffers), so a uint4 copies the same bits the words did.
 kernel void q27_attn_pack_a(device const bfloat* Q [[buffer(0)]], device const int* rows [[buffer(1)]],
     device bfloat* QA [[buffer(2)]], constant Q27PackArgs& a [[buffer(3)]], uint3 at [[thread_position_in_grid]]) {
-  if (at.x >= a.dim || at.y >= a.packed_rows || at.z >= a.kv_heads) return;
+  if (at.x >= a.dim / 8 || at.y >= a.packed_rows || at.z >= a.kv_heads) return;
   const uint mapped = uint(rows[at.y]), node = mapped / a.group, head = at.z * a.group + mapped % a.group;
-  QA[(at.z * a.packed_rows + at.y) * a.dim + at.x] = Q[(node * a.heads + head) * a.dim + at.x];
+  ((device uint4*)(QA + (at.z * a.packed_rows + at.y) * a.dim))[at.x] = ((device const uint4*)(Q + (node * a.heads + head) * a.dim))[at.x];
 }
 kernel void q27_attn_pack_b(device const bfloat* Q [[buffer(0)]], device bfloat* QB [[buffer(1)]],
     constant Q27PackArgs& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
-  if (at.x >= a.dim || at.y >= 16 || at.z >= a.kv_heads * a.rows) return;
+  if (at.x >= a.dim / 8 || at.y >= 16 || at.z >= a.kv_heads * a.rows) return;
   const uint hk = at.z / a.rows, node = at.z % a.rows;
-  QB[((hk * a.rows + node) * 16 + at.y) * a.dim + at.x] = at.y < a.group ? Q[(node * a.heads + hk * a.group + at.y) * a.dim + at.x] : bfloat(0.0f);
+  device uint4* qb = (device uint4*)(QB + ((hk * a.rows + node) * 16 + at.y) * a.dim);
+  qb[at.x] = at.y < a.group ? ((device const uint4*)(Q + (node * a.heads + hk * a.group + at.y) * a.dim))[at.x] : uint4(0u);  // bfloat(0.0f) is 0x0000
 }
 kernel void q27_attn_append(device const bfloat* K [[buffer(0)]], device const bfloat* V [[buffer(1)]],
     device const Q27CachePtrs* caches [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* nodes [[buffer(4)]],
