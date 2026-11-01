@@ -69,20 +69,31 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
 }
 fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
     const c = g.config;
-    const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
-    const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
-    // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
-    // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
     var keys: [max_layers]op.View = undefined;
     var values: [max_layers]op.View = undefined;
     if (g.layers.len > max_layers) return error.DraftOperatorShape;
-    for (g.layers, 0..) |layer, i| {
-        if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
-            keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());
-            values[i] = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
-        } else {
-            keys[i] = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
-            values[i] = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
+    const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
+    const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
+    const combined = if (ops.vtable.stacked_kv) |f| try f(ops.ptr, frame, hidden, g.layers[0].attention.k, preparation.mode) else null;
+    if (combined) |kv| {
+        const width = c.kvWidth();
+        try kv.check(taps.rows, 2 * c.layers * width, .bf16);
+        for (0..g.layers.len) |i| {
+            const column: u32 = @intCast(2 * i * width);
+            keys[i] = try cols(ops, frame, kv, column, width);
+            values[i] = try cols(ops, frame, kv, column + width, width);
+        }
+    } else {
+        // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
+        // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
+        for (g.layers, 0..) |layer, i| {
+            if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
+                keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());
+                values[i] = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
+            } else {
+                keys[i] = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
+                values[i] = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
+            }
         }
     }
     for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
