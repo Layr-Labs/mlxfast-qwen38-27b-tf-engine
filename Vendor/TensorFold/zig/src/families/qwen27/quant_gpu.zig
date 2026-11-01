@@ -526,7 +526,8 @@ pub const Kernels = struct {
 
         e.setPipeline(try k.get(.{ .kind = .xsum, .k = width }));
         bind(e, .{ x, dims, xs });
-        e.dispatchThreads(mtl.Size.of(width / 64, padded(rows), 1), mtl.Size.of(@min(width / 64, 256), 1, 1));
+        // a decode pass is at most eight rows: the padding rows' sums are read only by rows the lane kernel drops
+        e.dispatchThreads(mtl.Size.of(width / 64, rows, 1), mtl.Size.of(@min(width / 64, 256), 1, 1));
         try span.end();
     }
 

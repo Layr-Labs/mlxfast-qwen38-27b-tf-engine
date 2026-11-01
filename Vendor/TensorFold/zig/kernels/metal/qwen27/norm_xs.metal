@@ -26,7 +26,9 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does.
+  // Those padding sums are read only by rows the lane kernel drops, so this is the only writer they need;
+  // it is kept identical to the arithmetic the padding threadgroups used to perform (otarkhan 9a194332).
   if (int(m) == 0) {
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
