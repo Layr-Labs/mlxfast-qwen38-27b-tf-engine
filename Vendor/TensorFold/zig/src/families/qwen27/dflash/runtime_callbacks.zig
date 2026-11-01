@@ -129,6 +129,14 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     errdefer b.input_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
+    if (!readsQ4Copy(b, x.rows)) if (b.gate_up_factors) |factors| {
+        if (factors.key == base + kind) {
+            const mid = try b.frame.alloc(x.rows, @import("gate_up_factors.zig").rank, .bf16);
+            try encodePrepared(b, e, x, mid, factors.right);
+            try encodePrepared(b, e, mid, y, factors.left);
+            return y;
+        }
+    };
     try encodePrepared(b, e, x, y, adapter);
     return y;
 }

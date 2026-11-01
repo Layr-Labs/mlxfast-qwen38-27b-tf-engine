@@ -203,6 +203,7 @@ pub const Backend = struct {
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
+    gate_up_factors: ?@import("gate_up_factors.zig").Factors = null,
     fused_count: usize = 0,
     /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
     /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
@@ -249,6 +250,7 @@ pub const Backend = struct {
     pub fn deinit(b: *Backend) void {
         b.setResident(null);
         b.frame.deinit();
+        if (b.gate_up_factors) |*factors| factors.deinit();
         var prepared = b.prepared.valueIterator();
         while (prepared.next()) |adapter| adapter.deinit();
         b.prepared.deinit(b.allocator);
@@ -297,7 +299,26 @@ pub const Backend = struct {
         };
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
+        if (order) |o| if (mlp_bits == 2 and b.config.hidden == 5120 and b.config.intermediate == 17408)
+            try b.prepareGateUp(o);
         if ((if (units) b.prepared.count() - b.fused_count - b.precise_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+    }
+    fn prepareGateUp(b: *Backend, order: core.lane_projection.RegOrder) !void {
+        const names = [_][]const u8{ "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight" };
+        const n = b.config.intermediate;
+        const k = b.config.hidden;
+        const values = try b.allocator.alloc(u16, 2 * n * k);
+        defer b.allocator.free(values);
+        var key: usize = 0;
+        for (names, 0..) |name, i| {
+            const t = try get(b, name);
+            if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != n or t.shape[1] != k) return error.DraftTensorCoverage;
+            if (i == 0) key = @intFromPtr(t.bytes.ptr) + group_gu;
+            const dest = std.mem.sliceAsBytes(values[i * n * k ..][0 .. n * k]);
+            if (b.checkpoint.deferred.contains(name)) try b.checkpoint.read(name, 0, dest) else @memcpy(dest, t.bytes);
+        }
+        if (!b.prepared.contains(key) or b.gate_up_factors != null) return error.DraftTensorCoverage;
+        b.gate_up_factors = try @import("gate_up_factors.zig").Factors.init(b.allocator, b.target.device, order, key, values, 2 * n, k);
     }
     /// The key bit of a linear's q4 copy beside its copy below 4 bits (no tensor address reaches it).
     pub const precise_key: usize = 1 << 62;
