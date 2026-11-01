@@ -7,7 +7,8 @@ const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+/// `pairs32`: the same (scale, bias) pairs as fp32 words (each bf16 widened exactly), for prompt rows' two-tile launches.
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false, pairs32: ?Ref = null };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -100,13 +101,20 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         };
         base += rows;
     }
+    // prompt rows' two-tile launches read fp32 pairs: a bf16 widened to fp32 is exact, and the loop skips the conversions
+    const sb32 = try device.buffer(n * (k / 64) * 8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    owned.append(allocator, sb32) catch |err| {
+        sb32.deinit();
+        return err;
+    };
+    for (pair, sb32.slice(u32, n * (k / 64) * 2)) |h, *f| f.* = @as(u32, h) << 16;
     const indexed = try lane.indexMetadata(device, allocator, pair, n, k);
     if (indexed) |x| owned.append(allocator, x.buffer) catch |err| {
         x.buffer.deinit();
         return err;
     };
     const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false, .pairs32 = .{ .buffer = sb32 } };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {

@@ -53,6 +53,7 @@ pub const Head = struct {
         }
         head.linear.n = width;
         head.linear.index = null;
+        head.linear.pairs32 = null; // the source's covers its whole vocabulary; the copy's pairs are rebuilt below
         head.linear.batch = @intCast(batch);
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {

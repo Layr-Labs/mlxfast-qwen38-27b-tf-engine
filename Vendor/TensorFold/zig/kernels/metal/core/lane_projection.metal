@@ -344,6 +344,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_COUNT)
     device atomic_uint* TC [[buffer(6)]],
 #endif
+#if defined(TF_WAIT)
+    device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
@@ -440,6 +443,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+#endif
+#if defined(TF_WAIT)
+  // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
+  // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
+  // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  if (ks == 0 && lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -633,9 +650,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
+// TF_SB32: the pairs as fp32 words (Linear.pairs32), a quad of columns two float4s, so the FMAs take them as they load; each
+// fp32 is its bf16 widened, so every product and sum is the same.
+#if defined(TF_SB32)
+#define TF_TN_META(t) const float4 qa = sp[0], qb = sp[1], qc = sp[8], qd = sp[9]; \
+      sp += (t) + 1 < TN ? NT / 2 : (TF_N - (TN - 1) * NT) / 2;
+#define TF_TN_PAIR(j) const float4 lo = (j) < 2 ? qa : qb, hi = (j) < 2 ? qc : qd; \
+        const float s0 = ((j) & 1) ? lo.z : lo.x, b0 = ((j) & 1) ? lo.w : lo.y, s1 = ((j) & 1) ? hi.z : hi.x, b1 = ((j) & 1) ? hi.w : hi.y;
+#else
+#define TF_TN_META(t) const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4;
+#define TF_TN_PAIR(j) const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+#endif
 #define TF_TN_TILE(t) { \
-      const uint4 q0 = sp[0], q1 = sp[4]; \
-      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      TF_TN_META(t) \
       thread half2* b2l = (thread half2*)&cbl[0]; \
       thread half2* b2h = (thread half2*)&cbh[0]; \
       TF_UNROLL \
@@ -655,8 +684,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       opa.run(xl1, cbh, P); \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
-        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
-        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        TF_TN_PAIR(j) \
         C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
         C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
         C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
@@ -723,7 +751,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
 #endif
   const device uint4* cp = W + ((size_t)(tile0 / TF_TB) * KG * TF_TB + tile0 % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
+#if defined(TF_SB32)
+  const device float4* sp = (const device float4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 2;
+#else
   const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
+#endif
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   float C[TN][16];
