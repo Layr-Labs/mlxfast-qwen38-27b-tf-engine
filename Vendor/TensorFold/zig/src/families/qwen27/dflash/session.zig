@@ -40,6 +40,13 @@ pub const Session = struct {
         s.context = next;
         return selector.propose(gpa, graph, lattice, pending, try std.math.add(u64, next.end, 1), options);
     }
+    /// absorbTreeBlock's frame, committed before the round that admits `batch`'s taps (at most) is read; the caller completes
+    /// it (execution.completeBlock) and sets the context the round admitted.
+    pub fn prepareTreeBlock(s: *const Session, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, batch: Batch, anchor: u32, block: u32) !execution.Prepared {
+        if (!std.meta.eql(s.config, graph.config) or !s.ready) return error.BadDraftContext;
+        const next = try s.admit(batch);
+        return execution.appendBlockPrepare(ops, graph, preparation, s.context, batch.values, batch.positions, next, anchor, block);
+    }
     pub fn firstDraw(s: Session) !u64 {
         if (!s.ready) return error.DraftContextNotReady;
         return std.math.add(u64, s.context.end, 1);
