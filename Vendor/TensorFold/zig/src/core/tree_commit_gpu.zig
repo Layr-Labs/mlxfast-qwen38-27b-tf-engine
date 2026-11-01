@@ -7,10 +7,13 @@ pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 pub const Meta = extern struct { rows: u32, slot: u32 };
 pub const Taps = extern struct { rows: u32, width: u32, capacity: u32, planes: u32 };
 pub const Head = extern struct { rows: u32, width: u32, stride: u32 };
+/// tf_round_select: `blocks` host blocks of `words` u32 words, the last token at word `token`, the status at `status`.
+pub const Select = extern struct { rows: u32, words: u32, blocks: u32, token: u32, status: u32, fallback: u32 };
 pub const Ops = struct {
     metadata_pipe: mtl.Pipeline,
     taps_pipe: mtl.Pipeline,
     head_pipe: mtl.Pipeline,
+    select_pipe: mtl.Pipeline,
     pub fn init(device: mtl.Device) !Ops {
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -18,12 +21,15 @@ pub const Ops = struct {
         errdefer metadata_pipe.deinit();
         const taps_pipe = try mtl.Pipeline.init(device, lib, "tf_round_keep_taps", false);
         errdefer taps_pipe.deinit();
-        return .{ .metadata_pipe = metadata_pipe, .taps_pipe = taps_pipe, .head_pipe = try mtl.Pipeline.init(device, lib, "tf_round_keep_head", false) };
+        const head_pipe = try mtl.Pipeline.init(device, lib, "tf_round_keep_head", false);
+        errdefer head_pipe.deinit();
+        return .{ .metadata_pipe = metadata_pipe, .taps_pipe = taps_pipe, .head_pipe = head_pipe, .select_pipe = try mtl.Pipeline.init(device, lib, "tf_round_select", false) };
     }
     pub fn deinit(ops: Ops) void {
         ops.metadata_pipe.deinit();
         ops.taps_pipe.deinit();
         ops.head_pipe.deinit();
+        ops.select_pipe.deinit();
     }
     pub fn metadata(ops: Ops, e: mtl.ComputeEncoder, result: Ref, keep: Ref, rows: Ref, map: ?Ref, p: Meta) !void {
         if (p.rows == 0 or p.rows > contract.max_rows or p.slot >= 64) return error.BadCommitShape;
@@ -43,10 +49,14 @@ pub const Ops = struct {
         e.dispatchThreads(mtl.Size.of(p.rows, 1, 1), mtl.Size.of(32, 1, 1));
     }
     pub fn taps(ops: Ops, e: mtl.ComputeEncoder, result: Ref, input: Ref, out: Ref, p: Taps) !void {
-        if (p.rows == 0 or p.rows > contract.max_rows or p.rows > p.capacity or p.width == 0 or p.planes == 0 or p.planes > 8) return error.BadCommitShape;
+        return ops.tapsInto(e, result, input, out, p, p.rows);
+    }
+    /// taps into room for `room` of the round's rows: rows past it are not written, however many the result kept.
+    pub fn tapsInto(ops: Ops, e: mtl.ComputeEncoder, result: Ref, input: Ref, out: Ref, p: Taps, room: u32) !void {
+        if (p.rows == 0 or p.rows > contract.max_rows or p.rows > p.capacity or p.width == 0 or p.planes == 0 or p.planes > 8 or room == 0 or room > p.rows) return error.BadCommitShape;
         const width = try std.math.mul(usize, p.width, p.planes);
         const in_bytes = try std.math.mul(usize, try std.math.mul(usize, p.capacity, width), 2);
-        const out_bytes = try std.math.mul(usize, try std.math.mul(usize, p.rows, width), 2);
+        const out_bytes = try std.math.mul(usize, try std.math.mul(usize, room, width), 2);
         try check(result, @sizeOf(contract.Result), 4);
         try check(input, in_bytes, 2);
         try check(out, out_bytes, 2);
@@ -55,7 +65,7 @@ pub const Ops = struct {
         e.setPipeline(ops.taps_pipe);
         bind(e, .{ result, input, out });
         e.setValue(p, 3);
-        e.dispatchThreads(mtl.Size.of(width, p.rows, 1), mtl.Size.of(256, 1, 1));
+        e.dispatchThreads(mtl.Size.of(width, room, 1), mtl.Size.of(256, 1, 1));
     }
     pub fn head(ops: Ops, e: mtl.ComputeEncoder, result: Ref, logits: Ref, p: Head) !void {
         if (p.rows == 0 or p.rows > contract.max_rows or p.width == 0 or p.stride < p.width) return error.BadCommitShape;
@@ -68,6 +78,19 @@ pub const Ops = struct {
         bind(e, .{ result, logits });
         e.setValue(p, 2);
         e.dispatchThreads(mtl.Size.of(p.width, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+    /// Block `consumed_count` of `p.blocks` (the host's blocks behind block 0 in `blocks`) into block 0, with the result's
+    /// last emitted token at word `p.token` and its status at `p.status` (0 valid; 1: block 1 and `p.fallback` taken).
+    pub fn select(ops: Ops, e: mtl.ComputeEncoder, result: Ref, blocks: Ref, p: Select) !void {
+        if (p.rows == 0 or p.rows > contract.max_rows or p.words == 0 or p.blocks == 0 or p.token >= p.words or p.status >= p.words or p.token == p.status) return error.BadCommitShape;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, p.blocks + 1, p.words), 4);
+        try check(result, @sizeOf(contract.Result), 4);
+        try check(blocks, bytes, 4);
+        try distinct(blocks, bytes, result, @sizeOf(contract.Result));
+        e.setPipeline(ops.select_pipe);
+        bind(e, .{ result, blocks });
+        e.setValue(p, 2);
+        e.dispatchThreads(mtl.Size.of(p.words, 1, 1), mtl.Size.of(256, 1, 1));
     }
 };
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
