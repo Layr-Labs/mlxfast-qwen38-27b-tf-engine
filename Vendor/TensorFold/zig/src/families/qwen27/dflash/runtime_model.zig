@@ -399,5 +399,5 @@ fn binding(a: std.mem.Allocator, target: *Target, prefix: []const u8, module: []
     return ck.validate(w, s, b, format, target.config.vocab, target.config.hidden);
 }
 
-/// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
-const flush_rows = 1024;
+/// Rows one flush pass absorbs; a prompt-sized catch-up (up to the 2048-row window) takes one pass.
+const flush_rows = 2048;
