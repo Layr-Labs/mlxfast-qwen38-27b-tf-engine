@@ -538,7 +538,7 @@ kernel void tf_delta_gdn_chain(device const bfloat* query [[buffer(0)]],
   if (p.dk == 128) tf_delta_gdn_chain_body<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
   else tf_delta_gdn_chain_body<0>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
-// Prompt chains (may differ in bits from decode): 8 lanes a set of CC value columns (4 unmarked, 2 marked), 16 key
+// Prompt chains (may differ in bits from decode): 8 lanes a set of CC value columns (8 unmarked, 2 marked), 16 key
 // channels of each; dk = 128. Every column keeps its own arithmetic and order whatever CC is.
 // Each column keeps its in-order 16-channel sums and xor 1, 2, 4 tree; the pair shares k and q, converted once a row.
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
@@ -615,7 +615,7 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_body<false, 4>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
+  tf_delta_gdn_chain_wide_body<false, 8>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
                                       uint4(0), next_state, position, lane);
 }
 
