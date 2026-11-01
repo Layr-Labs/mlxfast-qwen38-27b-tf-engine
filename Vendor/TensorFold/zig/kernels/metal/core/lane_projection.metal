@@ -473,15 +473,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  threadgroup uint dependency_ready;
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
-      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
-      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    dependency_ready = uint(atomic_load_explicit(&WC[0], memory_order_relaxed) >= wait_for);
+    if (dependency_ready == 0u) {
+      atomic_store_explicit(&WC[2], 1u, memory_order_relaxed);
+    } else {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+        atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (dependency_ready == 0u) return;
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -679,6 +686,56 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
+#if TF_PROMPT_TN == 2 && ((TF_N == 34816 && TF_K == 5120 && TF_SK == 1 && defined(TF_SWIGLU)) || (TF_N == 5120 && TF_K == 17408 && TF_SK == 2))
+#define TF_STREAM_RIGHT 1
+#else
+#define TF_STREAM_RIGHT 0
+#endif
+#if TF_STREAM_RIGHT
+#define TF_STREAM_PF 0
+#if TF_STREAM_PF
+#define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#define TF_STREAM_LATE(t)
+#else
+#define TF_STREAM_EARLY(t)
+#define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#endif
+#define TF_TN_TILE(t) { \
+      const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      const uint4 cur0=nw0,cur1=nw1; \
+      thread half2* b2=(thread half2*)&cbl[0]; \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w]:cur1[2*(w-2)]; const int e=2*w; \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      TF_STREAM_EARLY(t) \
+      opm.run(xl0,cbl,P); \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      TF_STREAM_LATE(t) \
+      opa.run(xl1,cbl,P); \
+      TF_UNROLL \
+      for (int j = 0; j < 4; j++) { \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
+      } \
+}
+#else
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
@@ -709,6 +766,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
 }
+#endif
 // TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
 // stream's next rows, H + the output, as the norm after it would have formed them.
 // TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
@@ -760,7 +818,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
 #define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>()
-  auto cbl = TF_TN_RIGHT; auto cbh = TF_TN_RIGHT;
+  auto cbl = TF_TN_RIGHT;
+#if !TF_STREAM_RIGHT
+  auto cbh = TF_TN_RIGHT;
+#endif
   auto P = TF_TN_DEST;
   const half2 bias = half2(1024.0h);
 #if defined(TF_SWIGLU)

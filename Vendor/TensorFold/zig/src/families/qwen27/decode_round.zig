@@ -5,7 +5,7 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+const commit_every = 16;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
@@ -286,10 +286,21 @@ pub const Runner = struct {
             r.failed = true;
             return err;
         };
+        r.checkCounted() catch |err| {
+            r.failed = true;
+            r.active = null;
+            return err;
+        };
         if (r.capture_taps) try r.taps.complete();
         if (accepted) {
             for (round.slots, round.windows) |slot, window| r.offsets[slot] = window.start + @as(u32, @intCast(window.parents.len));
         } else r.active = fingerprint(round);
+    }
+
+    fn checkCounted(r: *const Runner) !void {
+        try r.model.kernels.checkCounted();
+        try r.attention.checkCounted();
+        try r.gdn.checkCounted();
     }
 
     pub fn keep(r: *Runner, round: *const Round, paths: []const []const u32) !void {
@@ -373,7 +384,7 @@ pub const Runner = struct {
         if (r.deferred != null) {
             // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans
             try r.gdn.stash(plan, e);
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
+            try r.gdn.commitConvKeepLayers(plan, e);
         } else {
             if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
             // Each layer replays its state and copies all conv taps before overwriting that channel's history.
