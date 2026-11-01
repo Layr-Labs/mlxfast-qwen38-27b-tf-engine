@@ -533,10 +533,17 @@ pub const Kernels = struct {
     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
     /// stores are fenced (Layout.count), for a normAfter in the same barrier interval. Returns that norm's wait (the
     /// launch's threadgroups); null: nothing encoded, the caller takes quant.
+    /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
+    pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return false;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch };
+        return key.serialSk2() or p.slices >= 2;
+    }
+
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true };
-        if (key.serialSk2() or p.slices < 2) return null;
+        if (!key.serialSk2() and p.slices < 2) return null; // serial split-K launches count once a threadgroup too
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -548,7 +555,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .serial_sk2 = key.serialSk2() });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };

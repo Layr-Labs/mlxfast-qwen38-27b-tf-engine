@@ -234,7 +234,7 @@ pub const Layout = struct {
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
-        if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.serial_sk2 or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
+        if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
