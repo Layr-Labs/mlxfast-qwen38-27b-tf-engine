@@ -144,8 +144,12 @@ pub const Scratch = struct {
         for (s.buffers) |buffer| total += buffer.length();
         return total;
     }
-    pub fn upload(s: *Scratch, plan: Plan) !void {
+    /// Whether `plan` fits the scratch (upload's check, uploading nothing).
+    pub fn admit(s: *const Scratch, plan: Plan) !void {
         if (plan.rows > s.limits.rows or plan.streams > s.limits.streams or plan.tiles > s.tiles or plan.prefix_chunks > s.chunks or plan.tail_chunks > s.tail_chunks or plan.geometry.shared_prefix != s.limits.shared_prefix or !plan.geometry.sameShape(s.limits.geometry)) return error.AttentionLimits;
+    }
+    pub fn upload(s: *Scratch, plan: Plan) !void {
+        try s.admit(plan);
         @memcpy(s.get(.tile_stream).buffer.slice(i32, plan.tile_stream.len), plan.tile_stream);
         @memcpy(s.get(.q_rows).buffer.slice(i32, plan.q_rows.len), plan.q_rows);
         @memcpy(s.get(.nodes).buffer.slice(i32, plan.nodes.len), plan.nodes);

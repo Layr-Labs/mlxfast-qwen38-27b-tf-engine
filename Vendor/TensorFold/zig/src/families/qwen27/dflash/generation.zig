@@ -156,11 +156,17 @@ pub const Generation = struct {
         try g.finishKeep();
         return drained;
     }
-    /// A round's keep runs behind the drafter; it ends before the next verify and before a run returns.
+    /// A round's keep runs behind the drafter; it ends before the next verify's GPU work and before a run returns.
     fn finishKeep(g: *Generation) !void {
         const cb = g.keep orelse return;
         g.keep = null;
         defer cb.release();
+        // its completion is reported behind the drafter frame's (committed before it), right before the next verify's
+        // first commit (settle): poll its status rather than sleep until the completion wakes this thread
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         cb.wait();
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
@@ -204,6 +210,8 @@ pub const Generation = struct {
         fn keep(ptr: *anyopaque) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;
+            // the last round's keep ended before this verify's first commit (settle): never two keeps pending
+            if (g.keep != null) try g.finishKeep();
             const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
             const keep_cb = g.runner.model.queue.commandBuffer();
             const k = keep_cb.compute(.concurrent);
@@ -248,13 +256,20 @@ pub const Generation = struct {
             try g.commit.select(e, .{ .buf = g.matcher.buffers[4] }, .{ .buf = blocks.buf, .off = blocks.off }, .{ .rows = shape.rows, .words = RoundArgs.words, .blocks = RoundArgs.blocks - 1, .token = RoundArgs.token_word, .status = RoundArgs.status_word, .fallback = g.draft.graph.config.mask });
         }
     };
+    /// A keep left pending (runRound), waited for right before the next verify's first GPU work (Runner.settle).
+    fn settleKeep(ptr: *anyopaque) anyerror!void {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        try g.finishKeep();
+    }
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once. `early`:
     /// the kept taps go to the drafter's ring, and the next round's frame is committed behind the verify, the keep once
     /// the verify ran.
     fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32, early: bool) !@import("core").tree_round.Decoded {
-        // the picks rewrite the matcher's result, which a pending keep still reads
-        std.debug.assert(g.keep == null);
         if (g.picked == null) g.picked = try @import("core").segments.Fence.init(g.runner.model.device);
+        // the picks rewrite the matcher's result, which a pending keep still reads, and the verify's metadata uploads
+        // and launches rewrite what it reads: a pending keep ends right before the verify's first GPU work (settle)
+        g.runner.settle = if (g.keep != null) .{ .ptr = g, .run = settleKeep } else null;
+        defer g.runner.settle = null;
         var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .early = early };
         g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
         defer g.runner.tail = null;
@@ -349,8 +364,10 @@ pub const Generation = struct {
         @memcpy(ids[drafted.len..], copied);
         var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
         defer round.deinit();
+        // the last round's keep (behind its verify, beside this round's frame) is waited for right before this
+        // verify's first commit (verifyAccept): its completion, reported only behind the frame's, overlaps the planning
+        // and encode
         errdefer g.finishKeep() catch {};
-        try g.finishKeep();
         // a depth-one round of the drafter's 2-row block: the next round's frame is committed behind this verify, unless a
         // next round may not follow (its budget may end the run) or either count of kept taps would change its launches
         const early = remaining > 2 and (policy.max_depth orelse 0) == 1 and block == 2 and g.proposer == null and extend == null and extra == 0 and eos.len == 0 and g.draft.canPrepare(block);

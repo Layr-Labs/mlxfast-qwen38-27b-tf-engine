@@ -607,10 +607,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -630,10 +629,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t = ks * 32 + lane;
-  for (int m = t; m < stride; m += 64) {
+  // a padded row's sums are read only by rows the lane kernel drops, so only live rows are written
+  for (int m = t; m < M; m += 64) {
     float acc = 0.0f;
-    if (m < M)
-      for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
+    for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);
     HS[int(tg.x) * stride + m] = acc;
   }
 #elif defined(TF_ROWS8)
@@ -874,10 +873,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < 16) {
+  if (t16 < M) {
     float acc = 0.0f;
-    if (t16 < M)
-      for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else

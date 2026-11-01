@@ -176,10 +176,61 @@ inline void tf_delta_tree_node_pair(thread float4& s0, thread float4& s1, device
   s0 = float4(a[0], a[1], a[2], a[3]);
   s1 = float4(b[0], b[1], b[2], b[3]);
 }
+// W children of a depth-one star's node 0 (rows `row` .. row + W - 1) for two adjacent value columns: each child is
+// tf_delta_tree_node_pair's arithmetic from node 0's states (the same tf_delta_delta_update_words and
+// tf_delta_delta_read_words on the same row words), with all W rows' loads ahead of the group's updates, reads and
+// output stores, so the W children's steps overlap rather than each row's loads waiting on the last row's stores (device
+// stores the compiler must assume may alias them). The unroll is load-bearing: W = 4 without it ran slower than W = 1.
+template <uint W>
+inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
+                                   device const bfloat* value, device const float* decay, device const bfloat* mixing,
+                                   constant TfDeltaParams& p, device bfloat* output, uint row, uint head, uint key_head,
+                                   uint dimension, uint lane) {
+  float kf[W][4], qf[W][4], forget[W], mix[W], incoming0[W], incoming1[W];
+  uint at[W];
+  _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
+    at[w] = (row + w) * p.nv + head;
+    device const bfloat* k = key + ((row + w) * p.nk + key_head) * p.dk + lane * 4;
+    device const bfloat* q = query + ((row + w) * p.nk + key_head) * p.dk + lane * 4;
+    for (uint part = 0; part < 4; ++part) {
+      kf[w][part] = float(k[part]);
+      qf[w][part] = float(q[part]);
+    }
+    forget[w] = decay[at[w]];
+    mix[w] = float(mixing[at[w]]);
+    incoming0[w] = float(value[at[w] * p.dv + dimension]);
+    incoming1[w] = float(value[at[w] * p.dv + dimension + 1]);
+  }
+  float ra[W], rb[W];
+  _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
+    float a[4] = {r0[0], r0[1], r0[2], r0[3]};
+    float b[4] = {r1[0], r1[1], r1[2], r1[3]};
+    tf_delta_delta_update_words(a, kf[w], forget[w], incoming0[w], mix[w]);
+    tf_delta_delta_update_words(b, kf[w], forget[w], incoming1[w], mix[w]);
+    ra[w] = tf_delta_delta_read_words(a, qf[w]);
+    rb[w] = tf_delta_delta_read_words(b, qf[w]);
+  }
+  if (lane == 0)
+    _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
+      output[at[w] * p.dv + dimension] = bfloat(ra[w]);
+      output[at[w] * p.dv + dimension + 1] = bfloat(rb[w]);
+    }
+}
+// Every child of node 0 (rows first + 1 .. first + rows - 1), three at a time: each child once, from node 0's states.
+inline void tf_delta_star_leaves(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
+                                 device const bfloat* value, device const float* decay, device const bfloat* mixing,
+                                 constant TfDeltaParams& p, device bfloat* output, uint first, uint rows, uint head,
+                                 uint key_head, uint dimension, uint lane) {
+  uint c = 1;
+  for (; c + 3 <= rows; c += 3) tf_delta_star_children<3>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+  if (c + 2 == rows) tf_delta_star_children<2>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+  else if (c + 1 == rows) tf_delta_star_children<1>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+}
 // A depth-one star (each segment's node 0, then its other rows as children of node 0) for two adjacent value columns a
 // simdgroup: every node of each column is tf_delta_tree_node's arithmetic from the same parent state as in
 // tf_delta_gdn_tree_slots (tf_delta_tree_node_pair, a row's loads shared by the two columns), so each column's arithmetic
-// is that kernel's; the star needs no slot steps, no parent selects and no kept states.
+// is that kernel's; the star needs no slot steps, no parent selects and no kept states. Node 0's children are independent
+// (each from node 0's states), so they run three at a time (tf_delta_star_leaves).
 // Verify rounds only (no advance): no state is written.
 kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const bfloat* key [[buffer(1)]],
@@ -205,10 +256,7 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
     r1[part] = committed[base + column + p.dk + part];
   }
   tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
-  for (uint c = 1; c < span.rows; ++c) {
-    float4 c0 = r0, c1 = r1; // node 0's states
-    tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
-  }
+  tf_delta_star_leaves(r0, r1, query, key, value, decay, mixing, p, output, span.first, span.rows, head, key_head, d0, lane);
   // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
   if (count_out != 0u) {
     threadgroup_barrier(mem_flags::mem_device);
@@ -220,9 +268,33 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
 }
 // A deferred replay's rows for the star (tf_delta_gdn_stash's, in keep order) and whether it writes the state back.
 struct TfDeltaPending { uint rows, persist; };
+// N pending rows from `first`, in keep order, for two adjacent value columns' lane words (dk = 128): every row's key,
+// decay, value and mixing words loaded ahead of the N rows' updates, which are tf_delta_delta_update_words on the key
+// words in registers: tf_delta_delta_update's statements on the same words (the same products, fused multiply-adds,
+// in-order lane sums and simd_sum).
+template <uint N>
+inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device const bfloat* key, device const bfloat* value,
+                                       device const float* decay, device const bfloat* mixing, constant TfDeltaParams& p,
+                                       uint first, uint head, uint key_head, uint dimension, uint lane) {
+  float kf[N][4], forget[N], mix[N], incoming0[N], incoming1[N];
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < N; ++i) {
+    const uint at = (first + i) * p.nv + head;
+    device const bfloat* k = key + ((first + i) * p.nk + key_head) * p.dk + lane * 4;
+    for (uint part = 0; part < 4; ++part) kf[i][part] = float(k[part]);
+    forget[i] = decay[at];
+    mix[i] = float(mixing[at]);
+    incoming0[i] = float(value[at * p.dv + dimension]);
+    incoming1[i] = float(value[at * p.dv + dimension + 1]);
+  }
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < N; ++i) {
+    tf_delta_delta_update_words(a, kf[i], forget[i], incoming0[i], mix[i]);
+    tf_delta_delta_update_words(b, kf[i], forget[i], incoming1[i], mix[i]);
+  }
+}
 // tf_delta_gdn_star_pair from the state the deferred keeps' replays would have left: before node 0 each column's lane
-// words take the pending rows, in keep order, by tf_delta_delta_update with the arguments tf_delta_gdn_replay_body<4>
-// gives a kept row (the same products, sums and simd_sum), so node 0 and its children see that kernel's state words.
+// words take the pending rows, in keep order, by tf_delta_delta_update's statements (tf_delta_star_pending_rows: up to
+// four rows' words loaded ahead of their updates) with the arguments tf_delta_gdn_replay_body<4> gives a kept row (the
+// same products, sums and simd_sum), so node 0 and its children see that kernel's state words.
 // pending.persist writes them back over the committed words each lane read (its simdgroup's own two columns), before
 // node 0 and so before the threadgroup counts itself.
 kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
@@ -253,12 +325,11 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
     a[part] = committed[base + column + part];
     b[part] = committed[base + column + p.dk + part];
   }
-  for (uint row = 0; row < pending.rows; ++row) {
-    const uint at = row * p.nv + head;
-    device const bfloat* k = pending_key + (row * p.nk + key_head) * p.dk;
-    tf_delta_delta_update(a, k, pending_decay[at], float(pending_value[at * p.dv + d0]), float(pending_mixing[at]), lane, 4);
-    tf_delta_delta_update(b, k, pending_decay[at], float(pending_value[at * p.dv + d0 + 1]), float(pending_mixing[at]), lane, 4);
-  }
+  uint row = 0; // the pending rows four at a time, then the rest
+  for (; row + 4 <= pending.rows; row += 4) tf_delta_star_pending_rows<4>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
+  if (row + 3 == pending.rows) tf_delta_star_pending_rows<3>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
+  else if (row + 2 == pending.rows) tf_delta_star_pending_rows<2>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
+  else if (row + 1 == pending.rows) tf_delta_star_pending_rows<1>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
   if (pending.persist != 0u)
     for (uint part = 0; part < 4; ++part) {
       committed[base + column + part] = a[part];
@@ -266,10 +337,7 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
     }
   float4 r0 = float4(a[0], a[1], a[2], a[3]), r1 = float4(b[0], b[1], b[2], b[3]);
   tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
-  for (uint c = 1; c < span.rows; ++c) {
-    float4 c0 = r0, c1 = r1; // node 0's states
-    tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
-  }
+  tf_delta_star_leaves(r0, r1, query, key, value, decay, mixing, p, output, span.first, span.rows, head, key_head, d0, lane);
   // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
   if (count_out != 0u) {
     threadgroup_barrier(mem_flags::mem_device);
