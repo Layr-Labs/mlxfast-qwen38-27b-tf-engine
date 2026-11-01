@@ -16,7 +16,7 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
-const precise_below: f32 = 0.95;
+const precise_below: f32 = 0.85;
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
@@ -178,7 +178,7 @@ pub const Generation = struct {
         shape: ?@import("core").tree_round.Match = null,
         /// The next round's frame is committed behind the verify (Model.prepareNext), its taps gathered into the ring.
         early: bool = false,
-        /// The keep waits for the verify's end to go to the queue (release), behind the early frame.
+        /// The keep waits until the early frame is scheduled before it goes to the queue, so both can run together.
         held: bool = false,
         fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
@@ -224,6 +224,11 @@ pub const Generation = struct {
                 if (prepared) {
                     g.keep = keep_cb.retain();
                     p.held = true;
+                    // On Apple GPUs, work committed behind a command buffer before that buffer is scheduled can wait for
+                    // it to finish. The early frame is already committed here; wait only until Metal schedules it, then
+                    // queue the keep and bridge while the verify's host thread would otherwise still be polling its tail.
+                    while (@backingInt(g.draft.backend.frame.cb.status()) < @backingInt(mtl.types.CommandBufferStatus.scheduled)) std.atomic.spinLoopHint();
+                    p.release();
                     return;
                 }
             }
@@ -301,6 +306,9 @@ pub const Generation = struct {
             // Seed delivery, not a draft round (rounds = 0): the bench seed token, never journaled, so the
             // journal's committed sum equals the free-run count that follows it.
             try g.draft.drainNext();
+            // the first round's pending token is this one: nothing moves the target before it, so it need not
+            // take the logits' argmax again
+            g.pending = pending;
             const tokens = try g.allocator.alloc(u32, 1);
             tokens[0] = pending;
             return .{ .tokens = tokens, .rounds = 0, .verified = 0, .matched = 0 };
