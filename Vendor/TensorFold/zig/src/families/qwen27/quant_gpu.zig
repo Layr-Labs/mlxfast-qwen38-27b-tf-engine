@@ -510,7 +510,7 @@ pub const Kernels = struct {
             bindAt(e, out, 8); // never read: wait_for 0
             e.setValue(@as(u32, 0), 9);
         } else bind(e, .{ h, weight, eps, dims, out, xs });
-        e.dispatchGroups(mtl.Size.of(1, padded(rows), 1), mtl.Size.of(width / 16, 1, 1));
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
     }
 
@@ -526,7 +526,7 @@ pub const Kernels = struct {
         bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
         e.setBuffer(words, 0, 8);
         e.setValue(wait_for, 9);
-        e.dispatchGroups(mtl.Size.of(1, padded(rows), 1), mtl.Size.of(width / 16, 1, 1));
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
     }
 
