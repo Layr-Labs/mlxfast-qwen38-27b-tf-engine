@@ -5,7 +5,7 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+const commit_every = 16;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
@@ -249,6 +249,10 @@ pub const Runner = struct {
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
         try r.scratch.upload(attention_plan);
+        // One forward of this round's plan: its keeps, kept rows, segments and windows go to the device once here, not
+        // once a layer inside the forward (every layer of the round reads the same descriptors).
+        r.gdn.unstage();
+        try r.gdn.stage(.{ .host = recurrent, .metadata = r.metadata() });
         r.current_round = round;
         r.current_gdn = &recurrent;
         r.current_attention = &attention_plan;
@@ -306,11 +310,16 @@ pub const Runner = struct {
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
         const e = cb.compute(.serial);
+        // One plan admission and one metadata copy for the whole keep: every GDN layer's replay reads the same keeps,
+        // kept rows, segments and windows, so the per-layer commit finds them already on the device (stage).
+        const keep_plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = r.metadata() };
+        r.gdn.unstage();
+        try r.gdn.stage(keep_plan);
         var gi: usize = 0;
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {
-                try r.gdn.commit(gi, .{ .host = recurrent, .metadata = r.metadata() }, e);
+                try r.gdn.commitDevice(gi, keep_plan, e);
                 gi += 1;
             },
             .attention => {
@@ -328,6 +337,8 @@ pub const Runner = struct {
             r.failed = true;
             return error.RoundGpuFailure;
         }
+        // the buffers hold this keep's plan now, not one the next forward was staged with (stage)
+        r.gdn.unstage();
         for (round.slots, round.windows, paths) |slot, window, path| r.offsets[slot] = (try window.keep(path)).length;
         r.active = null;
     }
@@ -342,6 +353,8 @@ pub const Runner = struct {
         defer attention_plan.deinit();
         const m = r.metadata();
         try m.upload(recurrent);
+        // the buffers hold the keep's plan now, not the verify's staged one (stage)
+        r.gdn.unstage();
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
         const rows = @import("core").tree_commit_gpu.Ref{ .buf = m.kept_rows.buffer, .off = m.kept_rows.offset };
