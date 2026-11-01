@@ -214,16 +214,22 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
   // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
   // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
@@ -423,6 +429,33 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   }
   if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
+}
+struct TfDeltaLayerSpans { uint layers; uint keeps; uint key; uint value; uint decay; uint mixing; uint state; uint before; };
+kernel void tf_delta_gdn_replay_layers(device const bfloat* key [[buffer(0)]],
+                                  device const bfloat* value [[buffer(1)]],
+                                  device const float* decay [[buffer(2)]],
+                                  device const bfloat* mixing [[buffer(3)]],
+                                  device const float* committed [[buffer(4)]],
+                                  device const uint* kept_rows [[buffer(5)]],
+                                  device const TfDeltaKeep* keeps [[buffer(6)]],
+                                  constant TfDeltaParams& p [[buffer(7)]],
+                                  device float* next [[buffer(8)]],
+                                  device const TfDeltaSegment* segments [[buffer(9)]],
+                                  device const float* before [[buffer(10)]],
+                                  constant TfDeltaLayerSpans& s [[buffer(11)]],
+                                  uint3 position [[thread_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  const uint span = p.nv * s.keeps, layer = position.z / span;
+  if (layer >= s.layers) return;
+  const uint3 at = uint3(position.x, position.y, position.z - layer * span);
+  device const bfloat* k = key + (size_t)layer * s.key;
+  device const bfloat* v = value + (size_t)layer * s.value;
+  device const float* d = decay + (size_t)layer * s.decay;
+  device const bfloat* m = mixing + (size_t)layer * s.mixing;
+  device const float* st = committed + (size_t)layer * s.state;
+  device float* nx = next + (size_t)layer * s.state;
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
+  else tf_delta_gdn_replay_body<0>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
 }
 
 // A deferred keep's rows: the pending row its first kept row lands at, the rows left after it, and the log's and pending
@@ -716,16 +749,22 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
   // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
   // its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
@@ -797,6 +836,57 @@ kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
   }
   for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }
+struct TfDeltaLayerStride { uint layers; uint history; uint qkv; };
+kernel void tf_delta_gdn_conv_keep_layers(device ushort* committed [[buffer(0)]],
+                                     device const ushort* projection [[buffer(1)]],
+                                     device const uint* kept_rows [[buffer(2)]],
+                                     device const TfDeltaKeep* keeps [[buffer(3)]],
+                                     device const uint* windows [[buffer(4)]],
+                                     constant TfDeltaParams& p [[buffer(5)]],
+                                     constant TfDeltaLayerStride& s [[buffer(6)]],
+                                     uint3 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const uint layer = position.z;
+  if (item >= channels || layer >= s.layers) return;
+  const TfDeltaKeep keep = keeps[position.y];
+  if (keep.rows == 0) return;
+  device ushort* history = committed + (size_t)layer * s.history;
+  device const ushort* qkv = projection + (size_t)layer * s.qkv;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = history + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : qkv[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
+// A layer's history and projection words (tf_delta_gdn_conv_keep_deferred): each layer's span of the pool's buffers.
+struct TfDeltaConvDeferred { uint history_words, projection_words; };
+// tf_delta_gdn_conv_keep for every layer of a lone keep (keeps[0]) in one launch: y is the layer, whose history and
+// projection words start a span further; each thread copies the words tf_delta_gdn_conv_keep copies for its channel.
+kernel void tf_delta_gdn_conv_keep_deferred(device ushort* history [[buffer(0)]],
+                                          device const ushort* projections [[buffer(1)]],
+                                          device const uint* kept_rows [[buffer(2)]],
+                                          device const TfDeltaKeep* keeps [[buffer(3)]],
+                                          device const uint* windows [[buffer(4)]],
+                                          constant TfDeltaParams& p [[buffer(5)]],
+                                          constant TfDeltaConvDeferred& spans [[buffer(6)]],
+                                          uint2 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const TfDeltaKeep keep = keeps[0];
+  if (item >= channels || keep.rows == 0) return;
+  device ushort* committed = history + (size_t)position.y * spans.history_words;
+  device const ushort* projection = projections + (size_t)position.y * spans.projection_words;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
 kernel void tf_delta_gdn_publish(device const uint* next_state [[buffer(0)]],
@@ -835,3 +925,4 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+// Second measurement of terrapinelf's submission 42f3db3b-56ab-4e2f-87f9-ebfc2946aad4; code unchanged.

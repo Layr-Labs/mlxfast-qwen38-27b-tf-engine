@@ -64,6 +64,8 @@ pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) 
     fields.apply(adapter, hook, joining);
     fields.apply(&adapter.projection, hook, joining);
     if (adapter.small) |*s| fields.apply(s, hook, joining);
+    if (adapter.prompt) |*p| fields.apply(p, hook, joining);
+    if (adapter.swiglu) |*s| fields.apply(s, hook, joining);
 }
 
 pub fn putPrepared(b: anytype, key: usize, adapter: anytype) !void {

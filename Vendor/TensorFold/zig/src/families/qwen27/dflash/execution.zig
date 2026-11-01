@@ -280,16 +280,20 @@ fn encodeStreamsZipped(ops: op.Ops, g: *const w.Graph, preparation: op.Preparati
         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
         const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
         const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
-        var gate: op.View = undefined;
-        var up: op.View = undefined;
-        if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
-            gate = try cols(ops, frame, gu, 0, c.intermediate);
-            up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
-        } else {
-            gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
-            up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
-        }
-        const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        // decode blocks: the gate|up projection with the SwiGLU in its epilogue, one launch, where the backend has it
+        const fused: ?op.View = if (ops.vtable.project_swiglu) |f| try f(ops.ptr, frame, mlp_input, layer.mlp.gate, 3, preparation.mode) else null;
+        const activated = if (fused) |a| a else blk: {
+            var gate: op.View = undefined;
+            var up: op.View = undefined;
+            if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
+                gate = try cols(ops, frame, gu, 0, c.intermediate);
+                up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
+            } else {
+                gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
+                up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
+            }
+            break :blk try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        };
         try activated.check(rows, c.intermediate, .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }
