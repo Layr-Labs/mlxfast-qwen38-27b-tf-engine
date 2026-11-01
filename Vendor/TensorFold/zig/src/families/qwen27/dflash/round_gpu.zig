@@ -27,17 +27,33 @@ pub const Matcher = struct {
         for (m.buffers) |buffer| buffer.deinit();
     }
     pub fn encode(m: *Matcher, e: mtl.ComputeEncoder, logits: core.tree_round_gpu.Ref, ids: []const u32, parents: []const i32, vocab: u32, budget: u32, eos: []const u32) !contract.Match {
-        if (ids.len == 0 or ids.len > contract.max_rows or parents.len != ids.len or eos.len > 16) return error.BadRoundShape;
-        @memcpy(m.buffers[0].slice(u32, ids.len), ids);
-        @memcpy(m.buffers[1].slice(i32, parents.len), parents);
-        @memcpy(m.buffers[3].slice(u32, eos.len), eos);
-        const shape = contract.Match{ .rows = @intCast(ids.len), .vocab = vocab, .budget = budget, .eos_count = @intCast(eos.len) };
+        const shape = try m.stage(ids, parents, vocab, budget, eos);
         if (span_picks)
             try m.ops.argmaxSpans(e, logits, .{ .buf = m.buffers[5] }, .{ .buf = m.buffers[2] }, .{ .rows = shape.rows, .vocab = vocab, .stride = vocab })
         else
             try m.ops.argmax(e, logits, .{ .buf = m.buffers[2] }, .{ .rows = shape.rows, .vocab = vocab, .stride = vocab });
         e.barrier();
-        try m.ops.match(e, .{ .buf = m.buffers[0] }, .{ .buf = m.buffers[1] }, .{ .buf = m.buffers[2] }, if (eos.len == 0) null else .{ .buf = m.buffers[3] }, .{ .buf = m.buffers[4] }, shape);
+        return m.matchStaged(e, shape);
+    }
+    /// Matches picks written by a prior dispatch in the same encoder, such as HeadSieve.encode.
+    pub fn encodePicked(m: *Matcher, e: mtl.ComputeEncoder, ids: []const u32, parents: []const i32, vocab: u32, budget: u32, eos: []const u32) !contract.Match {
+        return m.matchStaged(e, try m.stage(ids, parents, vocab, budget, eos));
+    }
+    pub fn picks(m: *const Matcher) mtl.Buffer {
+        return m.buffers[2];
+    }
+    pub fn pickAt(m: *const Matcher, row: u32) contract.Pick {
+        return m.buffers[2].slice(contract.Pick, row + 1)[row];
+    }
+    fn stage(m: *Matcher, ids: []const u32, parents: []const i32, vocab: u32, budget: u32, eos: []const u32) !contract.Match {
+        if (ids.len == 0 or ids.len > contract.max_rows or parents.len != ids.len or eos.len > 16) return error.BadRoundShape;
+        @memcpy(m.buffers[0].slice(u32, ids.len), ids);
+        @memcpy(m.buffers[1].slice(i32, parents.len), parents);
+        @memcpy(m.buffers[3].slice(u32, eos.len), eos);
+        return .{ .rows = @intCast(ids.len), .vocab = vocab, .budget = budget, .eos_count = @intCast(eos.len) };
+    }
+    fn matchStaged(m: *Matcher, e: mtl.ComputeEncoder, shape: contract.Match) !contract.Match {
+        try m.ops.match(e, .{ .buf = m.buffers[0] }, .{ .buf = m.buffers[1] }, .{ .buf = m.buffers[2] }, if (shape.eos_count == 0) null else .{ .buf = m.buffers[3] }, .{ .buf = m.buffers[4] }, shape);
         e.barrier();
         return shape;
     }

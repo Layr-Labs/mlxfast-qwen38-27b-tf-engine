@@ -41,6 +41,8 @@ pub const Stages = struct {
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
+    /// A greedy verify's head runs in its tail through the runner's sieve; the full head is not encoded.
+    sieve: bool = false,
     tail: ?Tail = null,
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
@@ -191,7 +193,7 @@ pub const Stages = struct {
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
         if (s.head == .all and s.rows > @import("gpu_frame.zig").logit_rows) return error.BadFrameRows;
-        if (s.head != .none) {
+        if (s.head != .none and !(s.sieve and s.head == .all)) {
             var input = f.get(.input);
             var head_sums = sums(f, .sums, s.rows);
             if (s.head == .last) {

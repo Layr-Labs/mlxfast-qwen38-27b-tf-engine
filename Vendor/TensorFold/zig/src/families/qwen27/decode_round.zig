@@ -20,6 +20,7 @@ const Round = @import("round_plan.zig").Round;
 const Taps = @import("taps.zig").Taps;
 const image_rows = @import("image_rows.zig");
 const mrope = @import("core").qwen_vl.rope;
+const HeadSieve = @import("head_sieve.zig").HeadSieve;
 
 /// Whether `cb` failed on the GPU; its Metal error (out of memory, a timeout) is logged with `what` it ran.
 pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
@@ -75,6 +76,10 @@ pub const Runner = struct {
     defer_gdn: bool = false,
     /// The GDN replay the last verify deferred: its scans applied the pending rows, and its keep stashes its own behind them.
     deferred: ?abi.Deferred = null,
+    sieve: ?HeadSieve = null,
+    sieve_tried: bool = false,
+    head_sieve: bool = false,
+    head_token: ?u32 = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -182,9 +187,18 @@ pub const Runner = struct {
         @import("residency.zig").setRunner(r, hook);
     }
 
+    pub fn headSieve(r: *Runner) !?*HeadSieve {
+        if (!r.sieve_tried) {
+            r.sieve_tried = true;
+            r.sieve = try HeadSieve.init(r.allocator, r.model, &r.owned, r.residency);
+        }
+        return if (r.sieve) |*s| s else null;
+    }
+
     pub fn deinit(r: *Runner) void {
         for (0..r.slots) |slot| r.settleSlot(@intCast(slot));
         r.setResident(null);
+        if (r.sieve) |*s| s.deinit();
         r.taps.deinit();
         r.gdn.deinit();
         r.attention.deinit();
@@ -222,6 +236,9 @@ pub const Runner = struct {
 
     fn verifyImpl(r: *Runner, round: *const Round, head: forward.Head, accepted: bool) !void {
         if (r.failed or r.active != null or round.ids.len > r.model.frame.capacity) return error.RoundNotReady;
+        const sieved = r.head_sieve and head == .all and round.ids.len <= HeadSieve.rows_max and r.sieve != null;
+        if (r.head_sieve and !sieved) return error.RoundNotReady;
+        if (head != .none) r.head_token = null;
         for (round.slots, round.windows) |slot, window| if (slot >= r.ready or r.offsets[slot] != window.start) return error.CachePositionDiffers;
         const paths = try r.allocator.alloc([]const u32, round.windows.len);
         defer r.allocator.free(paths);
@@ -266,7 +283,7 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
