@@ -679,7 +679,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 // subtracting 1024 is exact), load the next tile's (the next group's first tile after the last; a chain's last tile reloads
 // its own, which nothing reads), run, then FMAs. A SIMD group's tiles lie in one code batch, so one code and one metadata
 // pointer step through them and only one tile's codes stay live across a tensor op, whatever TN is.
-#if TF_PROMPT_TN == 2
+#if TF_PROMPT_TN == 2 && !defined(TF_NO_STREAM)
 #define TF_STREAM_RIGHT 1
 #else
 #define TF_STREAM_RIGHT 0
