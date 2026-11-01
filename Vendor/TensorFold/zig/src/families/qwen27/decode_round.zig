@@ -9,6 +9,8 @@ const commit_every = 8;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
+/// Decoded verify rounds read each attention layer's out projection ahead, beside its attention (Kernels.warm).
+const warm_attention_out = true;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -600,6 +602,9 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: the out projection's first code words are read beside the (latency-bound) attention kernels; the
+        // read writes only its own sink (Kernels.warm)
+        if (warm_attention_out and !promptPlan and rows <= 16) try r.model.kernels.warm(e, weights.out);
         try r.attention.encode(e, &r.scratch, &r.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }

@@ -101,7 +101,9 @@ pub const Buffers = struct {
 /// Group sums a gate writes for the projection that reads its rows; `written` is set once a dispatch writes them.
 pub const Sums = struct { span: Span, stride: u32, written: *bool };
 /// Work encoded beside a scan, before the barrier that ends it: rows only the gate reads (the z projection's).
-pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
+/// `passive`: the work reads only buffers the scan and gate never write and writes only its own, so a counted scan and
+/// gate keep their shared barrier interval beside it.
+pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void, passive: bool = false };
 /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
 /// rows, and how many it applies and whether it writes the state back.
 pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
@@ -229,7 +231,7 @@ pub const Round = struct {
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
     pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending) !void {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1)) return error.BadGdnPlan;
-        const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
+        const counted = counter != null and (if (beside) |b| b.passive else true) and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
         r.b.segments.bind(e, 7);
@@ -253,13 +255,13 @@ pub const Round = struct {
         r.gate(e, post_rows);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 16 value columns a simdgroup (prompt chunks, dk = 128).
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 8 value columns a simdgroup (prompt chunks, dk = 128).
     pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, beside: ?Beside) !void {
         e.setPipeline(chain);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
