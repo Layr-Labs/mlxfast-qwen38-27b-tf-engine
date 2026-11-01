@@ -190,7 +190,10 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const TfDeltaSegment* segments [[buffer(7)]],
                                    constant TfDeltaParams& p [[buffer(8)]],
                                    device bfloat* output [[buffer(9)]],
+                                   device atomic_uint* SC [[buffer(10)]],
+                                   constant uint& count_out [[buffer(11)]],
                                    uint3 position [[thread_position_in_grid]],
+                                   uint t [[thread_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
   const uint d0 = 2 * position.y, key_head = head / (p.nv / p.nk);
@@ -205,5 +208,12 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
   for (uint c = 1; c < span.rows; ++c) {
     float4 c0 = r0, c1 = r1; // node 0's states
     tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
+  }
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&SC[0], 1u, memory_order_relaxed);
+    }
   }
 }

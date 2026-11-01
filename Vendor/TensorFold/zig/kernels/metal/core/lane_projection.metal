@@ -273,9 +273,14 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 }
 #endif
 
-#if TF_BITS == 4 && defined(TF_REG) && !defined(TF_PROMPT_TN)
+#if (TF_BITS == 4 || TF_BITS == 2) && defined(TF_REG) && !defined(TF_PROMPT_TN)
 #ifndef TF_TB
 #define TF_TB 1
+#endif
+#if TF_BITS == 2
+#define TF_RW 32
+#else
+#define TF_RW 64
 #endif
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
@@ -313,9 +318,9 @@ inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
 
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
 #if defined(TF_ROWS8)
-  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
+  return {wl[(size_t)g * TF_TB * TF_RW], TF_BITS == 2 ? uint4(0) : wl[(size_t)g * TF_TB * TF_RW + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
 #else
-  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+  return {wl[(size_t)g * TF_TB * TF_RW], TF_BITS == 2 ? uint4(0) : wl[(size_t)g * TF_TB * TF_RW + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
 #endif
 }
 
@@ -343,6 +348,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     device float* HS [[buffer(6)]],
 #elif defined(TF_COUNT)
     device atomic_uint* TC [[buffer(6)]],
+#endif
+#if defined(TF_WAIT)
+    device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
@@ -378,11 +386,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int turn = 0; turn < 2; turn++) {
   const int tile = 2 * int(tg.x) + ks + turn * (TF_N / 64), n0 = tile * NT;
 #endif
-  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane;
+  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * TF_RW + lane;
 #if defined(TF_CHAIN_WALK)
   // one stream over all K: a chain's first group is already prefetched by the chain before it
   const int end = TF_G0 + TF_GN;
-  uint4 nw0 = wl[(size_t)TF_G0 * TF_TB * 64], nw1 = wl[(size_t)TF_G0 * TF_TB * 64 + 32];
+  uint4 nw0 = wl[(size_t)TF_G0 * TF_TB * TF_RW], nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)TF_G0 * TF_TB * TF_RW + 32];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -392,7 +400,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
 #endif
-  const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * 64;
+  const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
 #endif
 #if defined(TF_SERIAL_SK2)
   float C0[16];
@@ -413,12 +421,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
   // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
-  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+  const device uint4* cp = wl + (size_t)first * TF_TB * TF_RW;
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+  if (first < last) { nw0 = cp[0]; nw1 = TF_BITS == 2 ? uint4(0) : cp[32]; }
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
     sp += TF_N / 4;
@@ -427,7 +435,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if !defined(TF_CHAIN_WALK)
   const int end = last;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+  if (first < last) { nw0 = wl[(size_t)first * TF_TB * TF_RW]; nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)first * TF_TB * TF_RW + 32]; }
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -439,7 +447,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
-  const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+  const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
+#endif
+#if defined(TF_WAIT)
+  if (ks == 0 && lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -464,7 +483,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     for (int w = 0; w < 8; w++) {
       // codes as fp16 subnormals (bits = code, value code * 2^-24): products are the usual ones scaled by 2^-24 exactly, and
       // the scales below carry the 2^24 back
+#if TF_BITS == 2
+      const uint word = w < 4 ? (cur.w0[w] & 0x33333333u) : ((cur.w0[w - 4] >> 2) & 0x33333333u);
+#else
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
+#endif
       const int e = 16 * (w & 1) + 2 * (w >> 1);
       b2[e] = as_type<half2>(word & 0x000F000Fu);
       b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
@@ -474,11 +497,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
-    cp += g + 1 < last ? TF_TB * 64 : 0;
+    cp += g + 1 < last ? TF_TB * TF_RW : 0;
     nw0 = cp[0];
-    nw1 = cp[32];
+    nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
 #else
-    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
+    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
