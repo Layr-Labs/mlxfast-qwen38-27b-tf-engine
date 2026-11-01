@@ -26,10 +26,12 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  if (int(m) >= M) {
-    if ((t & 3) == 0) XS[(t >> 2) * MP + m] = 0.0f;
-    return;
+  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  if (int(m) == 0) {
+    const int pad = MP - M;
+    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  if (int(m) >= M) return;
   // wait_for above 0: this norm shares its barrier interval with the projection that writes R, whose threadgroups count
   // themselves on NC[0] past a device-scope fence; a row's threadgroup reads R once the count reaches wait_for (bounded),
   // past its own fence, and the last row's threadgroup leaves both words zero for the next pair
