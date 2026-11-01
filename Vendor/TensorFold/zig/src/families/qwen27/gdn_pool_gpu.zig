@@ -5,6 +5,7 @@ const abi = @import("gdn_contract.zig");
 const gdn = @import("gdn.zig");
 const Plan = @import("gdn_plan.zig").Plan;
 const Budget = @import("gdn_pool.zig").Budget;
+const pending_rows = @import("gdn_pool.zig").pending_rows;
 const Ref = @import("projection.zig").Ref;
 const Tensor = @import("gpu_weights.zig").Tensor;
 const profile = @import("core").gpu_profile;
@@ -12,7 +13,9 @@ const Kernels = @import("gdn_library.zig").Kernels;
 
 pub const PromptMarks = @import("gdn_marks_gpu.zig").Bank;
 
-const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent };
+const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing };
+/// The pending rows' fields, as tf_delta_gdn_stash, tf_delta_gdn_star_pending and tf_delta_gdn_unstash bind them.
+const pending_fields = [_]Field{ .pending_key, .pending_value, .pending_decay, .pending_mixing };
 
 pub const Metadata = struct {
     parents: Ref,
@@ -50,6 +53,10 @@ pub const Scalars = struct {
 };
 
 pub const DevicePlan = struct { host: Plan, metadata: Metadata };
+/// Rows depth-one star keeps stashed (Pool.stash) instead of replaying them into `slot`'s committed states, in keep order,
+/// and the rounds that stashed them since the last write-back: the committed words lag them until a star scan writes the
+/// state back (abi.Deferred.persist) or unstash replays them.
+pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
@@ -64,6 +71,11 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero.
+    scan_words: ?metal.Buffer = null,
+    /// Read by a deferred star scan, the keep that stashes behind it and unstash only; every other reader of the committed
+    /// states runs after the rows land (decode_round.Runner.settleGdn).
+    pending: Pending = .{},
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -78,7 +90,9 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..8], 0);
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -99,6 +113,7 @@ pub const Pool = struct {
         pool.releaseBefore();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
+        if (pool.scan_words) |b| b.deinit();
     }
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
@@ -151,16 +166,42 @@ pub const Pool = struct {
     }
 
     /// `beside`: encoded beside the scan, before the barrier that ends it.
+    /// The counted projections a decoded prepare waits on in its barrier interval (Kernels.quantCounted).
+    pub const After = struct { counter: metal.Buffer, wait: u32 };
+
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+        return pool.forwardAfter(layer, plan, refs, e, beside, null, null);
+    }
+
+    /// `deferred`: a lone depth-one star verify's scan applies the first `rows` pending rows before node 0
+    /// (tf_delta_gdn_star_pending) and, on `persist`, writes the state they leave back over the committed one.
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.star and prepared.usesSlots()) {
+            if (deferred) |d| {
+                if (d.rows > pending_rows) return error.BadGdnPending;
+                const pending = gdn.Pending{ .key = try pool.layerSpan(.pending_key, layer), .value = try pool.layerSpan(.pending_value, layer), .decay = try pool.layerSpan(.pending_decay, layer), .mixing = try pool.layerSpan(.pending_mixing, layer), .use = d };
+                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending);
+            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null);
+        } else if (deferred != null) {
+            return error.BadGdnPlan;
+        } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
+    }
+
+    /// Whether a verify of `plan` scans one depth-one star window (gdn.Round's `star` and usesSlots on one segment): the
+    /// rounds whose keeps may defer their replays.
+    pub fn starPlan(pool: *const Pool, plan: Plan) bool {
+        const c = pool.budget.shape.c;
+        if (plan.segments.len != 1 or !plan.compact or pool.tree_mode == .snapshot or c.dk != 128 or c.dv % 2 != 0) return false;
+        for (plan.parents, 0..) |parent, row| if (parent != @as(i32, if (row == 0) -1 else 0)) return false;
+        return true;
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
@@ -255,6 +296,12 @@ pub const Pool = struct {
     /// needs no next_history staging, no publish_conv launch and no fence between the two.
     pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try pool.commitReplay(layer, plan, e);
+        try pool.commitConvKeep(layer, plan, e);
+    }
+
+    /// commitKeep's conv window alone (a keep whose replay `stash` defers), unfenced.
+    pub fn commitConvKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
         const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         const m = plan.metadata;
         e.setPipeline(pool.kernels.conv_keep);
@@ -264,6 +311,61 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// commitConvKeep for every layer of a lone keep in one launch (tf_delta_gdn_conv_keep_layers), unfenced: each layer's
+    /// history and projection spans are a fixed share of the pool's buffers (layerSpan).
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host) or plan.host.keeps.len != 1) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const spans = abi.ConvLayers{ .history_words = @intCast(history.length() / pool.budget.layers / 2), .projection_words = @intCast(projections.length() / pool.budget.layers / 2) };
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(spans, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = pool.budget.layers }, .{ .width = 256 }); // a channel a thread, a layer a row
+    }
+
+    /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
+    /// the device keep's: the rows tf_delta_gdn_replay would take, in its order) copied behind the pending rows for the next
+    /// star scans; unfenced, beside the conv keeps. The keep's completion counts them (decode_round.Runner).
+    pub fn stash(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        const c = pool.budget.shape.c;
+        if (plan.host.keeps.len != 1 or !inPlace(plan.host) or c.dk != 128 or c.dv != 128 or pool.pending.rows >= pending_rows) return error.BadGdnPending;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        e.setPipeline(pool.kernels.stash);
+        inline for (.{ Field.key, Field.value, Field.decay, Field.mixing }, 0..) |field, index| e.setBuffer(pool.get(field), 0, index);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 4);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 5);
+        e.setValue(p, 6);
+        e.setValue(abi.Stash{ .base = pool.pending.rows, .room = pending_rows - pool.pending.rows, .log_rows = @intCast(pool.budget.rows), .pending_rows = pending_rows }, 7);
+        inline for (pending_fields, 8..) |field, index| e.setBuffer(pool.get(field), 0, index);
+        // a thread a 16-byte word of the key and value rows and a word of the gates, a layer a row of threads
+        e.dispatchThreads(.{ .width = @max(c.k_heads * c.dk / 8, pool.budget.shape.value / 8, c.v_heads), .height = pool.budget.layers }, .{ .width = 256 });
+    }
+
+    /// The pending rows replayed into their slot's committed state of every layer, in place and in keep order, each by
+    /// the delta update a keep's replay runs (tf_delta_gdn_unstash); one launch, unfenced. Its caller forgets them.
+    pub fn unstash(pool: *Pool, e: metal.ComputeEncoder) !void {
+        const c = pool.budget.shape.c;
+        if (pool.pending.rows > pending_rows or pool.pending.slot >= pool.budget.slots or c.dk != 128) return error.BadGdnPending;
+        const p = try pool.budget.shape.params(pending_rows, pool.budget.slots, commit_kinds);
+        e.setPipeline(pool.kernels.unstash);
+        inline for (pending_fields, 0..) |field, index| e.setBuffer(pool.get(field), 0, index);
+        e.setBuffer(pool.get(.state), 0, 4);
+        e.setValue(p, 5);
+        const layer_words = std.math.cast(u32, pool.budget.slots * pool.budget.shape.state) orelse return error.BadGdnPending;
+        e.setValue(abi.Unstash{ .rows = pool.pending.rows, .slot = pool.pending.slot, .pending_rows = pending_rows, .layer_words = layer_words }, 6);
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 4 });
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.

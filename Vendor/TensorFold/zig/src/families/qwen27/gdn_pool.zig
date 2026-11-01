@@ -41,6 +41,14 @@ pub fn validatePlan(shape: abi.Shape, slots: usize, capacity: usize, plan: Plan)
     if (first != rows or kept != plan.kept_rows.len) return error.BadGdnPoolPlan;
 }
 
+/// Depth-one star rounds whose keeps defer their GDN replays (gdn_pool_gpu.Pool.stash): every `defer_rounds`-th star scan
+/// writes the state the deferred rows leave back over the committed one.
+pub const defer_rounds = 2;
+/// Rows a depth-one star keeps at most: its root and one child.
+pub const star_kept = 2;
+/// Pending rows a layer holds: `defer_rounds` keeps of a depth-one star.
+pub const pending_rows = star_kept * defer_rounds;
+
 /// Only one-row windows advanced by a verify need rollback words, indexed by their original slot.
 pub fn beforeSlots(plan: Plan, advance: bool) usize {
     if (!advance) return 0;
@@ -67,6 +75,8 @@ pub const Budget = struct {
     snapshots: usize,
     conv_tails: usize,
     scratch: usize,
+    /// The pending rows' key, value, decay and mixing words, `pending_rows` a layer (gdn_pool_gpu.Pool.stash).
+    pending: [4]usize,
 
     pub fn init(shape: abi.Shape, layers: usize, slots: usize, rows: usize) !Budget {
         if (layers == 0 or layers > shape.c.layers or slots == 0 or slots > 128 or rows == 0 or rows > @import("gpu_frame.zig").max_rows) return error.BadGdnPool;
@@ -79,6 +89,7 @@ pub const Budget = struct {
         const snapshot = try abi.countBytes(f32, shape.state, @min(rows, abi.snapshot_rows)); // trees only: a chain keeps no snapshots
         const tails = try abi.countBytes(u16, shape.conv, rows);
         const outputs = try abi.countBytes(u16, shape.value, rows * 2);
+        const pending = try std.math.mul(usize, layers, pending_rows);
         return .{
             .shape = shape,
             .layers = layers,
@@ -95,11 +106,12 @@ pub const Budget = struct {
             .snapshots = snapshot,
             .conv_tails = tails,
             .scratch = try std.math.add(usize, try std.math.add(usize, snapshot, tails), outputs),
+            .pending = .{ try abi.countBytes(u16, shape.c.k_heads * shape.c.dk, pending), try abi.countBytes(u16, shape.value, pending), try abi.countBytes(f32, shape.c.v_heads, pending), try abi.countBytes(u16, shape.c.v_heads, pending) },
         };
     }
 
-    pub fn allocationSizes(b: Budget) [12]usize {
-        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2 };
+    pub fn allocationSizes(b: Budget) [16]usize {
+        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2, b.pending[0], b.pending[1], b.pending[2], b.pending[3] };
     }
 
     pub fn stateOffset(b: Budget, layer: usize, slot: usize) !usize {
@@ -117,6 +129,6 @@ pub const Budget = struct {
     }
 
     pub fn totalBytes(b: Budget) usize {
-        return 2 * b.state + 2 * b.history + b.projections + b.logBytes() + b.scratch;
+        return 2 * b.state + 2 * b.history + b.projections + b.logBytes() + b.scratch + b.pending[0] + b.pending[1] + b.pending[2] + b.pending[3];
     }
 };
