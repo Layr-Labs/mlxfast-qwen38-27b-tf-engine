@@ -25,6 +25,7 @@ const Fake = struct {
     mask_first: u32 = 0,
     embedded_rows: u32 = 0,
     lattice_rows: u32 = 0,
+    committed_picks: u32 = 0,
     fn self(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }
@@ -123,6 +124,15 @@ const Fake = struct {
         @memset(hp, 0);
         return .{ .gpa = a, .depth = projected.rows, .topk = c.topk, .rank = c.rank, .candidates = ids, .unary = unary, .projected = hp };
     }
+    fn latticeBegin(ptr: *anyopaque, _: u64, h: op.Head, _: cfg.Config) !op.View {
+        const f = self(ptr);
+        f.committed_picks += 1;
+        return f.view(h.logits.rows, 64);
+    }
+    fn latticeEnd(ptr: *anyopaque, frame: u64, h: op.Head, picks: op.View, projected: op.View, c: cfg.Config) !op.Lattice {
+        if (picks.rows != h.logits.rows or self(ptr).committed_picks == 0) return error.FakeLatticeOrder;
+        return lattice(ptr, frame, h, projected, c);
+    }
     fn contextBegin(_: *anyopaque, _: op.Context) !u64 {
         return 1;
     }
@@ -146,6 +156,9 @@ const Fake = struct {
     }
     fn ops(f: *Fake) op.Ops {
         return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend } };
+    }
+    fn splitOps(f: *Fake) op.Ops {
+        return .{ .ptr = f, .vtable = &.{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = mask, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = stage, .context_abort = abort, .stream_append = streamAppend, .lattice_begin = latticeBegin, .lattice_end = latticeEnd } };
     }
 };
 fn batch() session.Batch {
@@ -199,6 +212,42 @@ test "taps absorbed in the block's frame give the separate path's tree, one stag
     try std.testing.expectEqual(@as(u32, 1), merged.commits);
     try std.testing.expectEqual(@as(u32, 1), merged.stages);
     try std.testing.expectEqual(@as(u32, 5), merged.appends);
+}
+test "a block committed before its taps' round is read drafts absorbTreeBlock's tree once completed" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var g = try store.graph(a);
+    defer g.deinit();
+    const p = op.Preparation{ .mode = .bf16_reference };
+    const more = session.Batch{ .values = batch().values, .positions = &.{ 2, 3 }, .layers = cfg.tap_ids, .target_end = 4 };
+    var whole = Fake{};
+    var first = try session.Session.init(fixtures.toy, 1, 0);
+    try first.absorb(whole.ops(), &g, p, batch());
+    whole.appends = 0;
+    var want = try first.absorbTreeBlock(a, whole.ops(), &g, p, more, 5, 8, .{});
+    defer want.deinit();
+    var split = Fake{};
+    var second = try session.Session.init(fixtures.toy, 1, 0);
+    try second.absorb(split.ops(), &g, p, batch());
+    split.appends = 0;
+    const aborts = split.aborts;
+    try std.testing.expectError(error.BadRuntimeBlock, second.prepareTreeBlock(split.ops(), &g, p, more, 5, 8));
+    const prepared = try second.prepareTreeBlock(split.splitOps(), &g, p, more, 5, 8);
+    try std.testing.expectEqual(@as(u32, 1), split.committed_picks);
+    try std.testing.expectEqual(@as(u32, 1), split.stages);
+    try std.testing.expectEqual(@as(u32, 5), split.appends);
+    try std.testing.expectEqual(aborts, split.aborts);
+    var lattice = try execution.completeBlock(split.splitOps(), &g, prepared);
+    defer lattice.deinit();
+    try std.testing.expectEqual(aborts + 1, split.aborts);
+    second.context = try second.admit(more);
+    var got = try selector.propose(a, &g, lattice, 5, try second.firstDraw(), .{});
+    defer got.deinit();
+    try std.testing.expectEqualSlices(u32, want.tokens, got.tokens);
+    try std.testing.expectEqualSlices(i32, want.parents, got.parents);
+    try std.testing.expectEqualSlices(u32, whole.ids[0..8], split.ids[0..8]);
+    try std.testing.expectEqualSlices(u64, whole.positions[0..8], split.positions[0..8]);
 }
 test "context append failure aborts before session metadata or readiness advances" {
     const a = std.testing.allocator;
