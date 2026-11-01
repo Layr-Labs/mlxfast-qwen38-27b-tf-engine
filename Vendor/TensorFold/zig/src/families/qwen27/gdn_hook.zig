@@ -46,7 +46,11 @@ pub const Hook = struct {
         var gated = try refs(weight, frame);
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
-        gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
+        frame.mixer_count = 0;
+        // decoded verify rows on the counted path: the gate counts its threadgroups for the out projection, which waits on
+        // them in the gate's barrier interval (Frame.mixer_count, forward.Stages.post)
+        const out_count = if (after != null and !hook.accepted_chain) try hook.quant.afterWords(weight.out, rows) else null;
+        gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums, .out_count = out_count, .counted = if (out_count != null) &frame.mixer_count else null };
         if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred);
     }
 

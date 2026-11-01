@@ -99,7 +99,9 @@ pub const Buffers = struct {
 };
 
 /// Group sums a gate writes for the projection that reads its rows; `written` is set once a dispatch writes them.
-pub const Sums = struct { span: Span, stride: u32, written: *bool };
+/// `out_count` (two words, left zero): a counted gate (gateAfter) counts its threadgroups there and puts that count in
+/// `counted`, so the output projection waits on it in the gate's barrier interval (Kernels.quantCountedAfter).
+pub const Sums = struct { span: Span, stride: u32, written: *bool, out_count: ?metal.Buffer = null, counted: ?*u32 = null };
 /// Work encoded beside a scan, before the barrier that ends it: rows only the gate reads (the z projection's).
 pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
 /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
@@ -273,23 +275,32 @@ pub const Round = struct {
     }
     /// gate on post_rows in the star scan's barrier interval: each group waits until `counter`'s first word reaches `wait`
     /// (the scan's threadgroups) before it reads the scan's rows; the last group leaves both words zero.
+    /// With the sums' `out_count`, the groups count themselves there once their rows and sums are stored and no barrier
+    /// follows: the output projection waits on them (the count goes to the sums' `counted`).
     pub fn gateAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) void {
         e.setPipeline(rows);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
         r.b.output.bind(e, 4);
+        var out_count: ?metal.Buffer = null;
         if (r.sums) |w| {
             w.span.bind(e, 5);
             e.setValue(w.stride, 6);
             w.written.* = true;
+            if (w.counted) |c| if (w.out_count) |b| {
+                out_count = b;
+                c.* = r.p.nv * ((r.p.rows + 3) / 4);
+            };
         } else {
             r.b.output.bind(e, 5); // never read: a zero stride writes no sums
             e.setValue(@as(u32, 0), 6);
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
+        if (out_count) |b| e.setBuffer(b, 0, 9) else e.setBuffer(counter, 0, 9); // never written: count_out 0
+        e.setValue(@as(u32, @intFromBool(out_count != null)), 10);
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
-        e.barrier();
+        if (out_count == null) e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
         const wide = r.gateRows();
@@ -308,6 +319,8 @@ pub const Round = struct {
         if (wide) {
             r.b.output.bind(e, 7); // never read: wait_for 0
             e.setValue(@as(u32, 0), 8);
+            r.b.output.bind(e, 9); // never written: count_out 0
+            e.setValue(@as(u32, 0), 10);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();

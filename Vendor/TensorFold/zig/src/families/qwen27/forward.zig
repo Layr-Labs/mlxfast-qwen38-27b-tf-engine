@@ -104,6 +104,9 @@ pub const Stages = struct {
         // read and cleared before any return, and used only by the block whose GDN gate or attention merge wrote it
         const gated = f.mixer_sums;
         f.mixer_sums = false;
+        // a decoded GDN gate that counted its threadgroups ended its interval without a barrier: the out projection waits
+        const gate_count = f.mixer_count;
+        f.mixer_count = 0;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -115,7 +118,12 @@ pub const Stages = struct {
         const dims = f.get(if (s.compact) .last_dims else .dims);
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
-        if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
+        if (gate_count != 0) {
+            if (!gated or s.compact) return error.BadFrameRows;
+            // decoded rows: the projection waits on the gate's count and the norm on the projection's, in one interval
+            const counted = try m.kernels.quantCountedAfter(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows, gate_count);
+            try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+        } else if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {

@@ -709,6 +709,8 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          constant uint& sums_stride [[buffer(6)]],
                          device atomic_uint* NC [[buffer(7)]],
                          constant uint& wait_for [[buffer(8)]],
+                         device atomic_uint* OC [[buffer(9)]],
+                         constant uint& count_out [[buffer(10)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint3 groups [[threadgroups_per_grid]],
                          uint t [[thread_index_in_threadgroup]],
@@ -730,31 +732,39 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   const uint row = group.z * 4 + sg, head = group.y;
-  if (row >= p.rows || p.dv != 128) return;
-  const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
-  const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
-  float values[4];
-  float square = 0.0f;
-  for (uint part = 0; part < 4; ++part) {
-    values[part] = float(x[part]);
-    square += values[part] * values[part];
+  if (row < p.rows && p.dv == 128) {
+    const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+    const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
+    float values[4];
+    float square = 0.0f;
+    for (uint part = 0; part < 4; ++part) {
+      values[part] = float(x[part]);
+      square += values[part] * values[part];
+    }
+    square = simd_sum(square);
+    const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+    bfloat4 y;
+    for (uint part = 0; part < 4; ++part) {
+      const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
+      const float z = float(z4[part]);
+      y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    }
+    *(device bfloat4*)(output + at) = y;
+    if (sums_stride != 0) {
+      simdgroup_barrier(mem_flags::mem_device);
+      if ((lane & 15) == 0) {
+        const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
+        float acc = 0.0f;
+        for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
+        sums[g * int(sums_stride) + int(row)] = acc;
+      }
+    }
   }
-  square = simd_sum(square);
-  const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
-  bfloat4 y;
-  for (uint part = 0; part < 4; ++part) {
-    const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
-    const float z = float(z4[part]);
-    y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
-  }
-  *(device bfloat4*)(output + at) = y;
-  if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
-    if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
-      sums[g * int(sums_stride) + int(row)] = acc;
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&OC[0], 1u, memory_order_relaxed);
     }
   }
 }

@@ -581,6 +581,18 @@ pub const Kernels = struct {
         return k.countedKey(p, rows, false) != null;
     }
 
+    /// The words a producer in `p`'s barrier interval counts its threadgroups on when `p` takes quantCountedAfter for
+    /// these rows (the gate/up's, made zeroed on first use); null: `p` does not wait, its producer ends with a barrier.
+    pub fn afterWords(k: *Kernels, p: projection.Linear, rows: u32) !?mtl.Buffer {
+        if (k.countedKey(p, rows, true) == null) return null;
+        if (k.gu_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.gu_words = b;
+        }
+        return k.gu_words.?;
+    }
+
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {
