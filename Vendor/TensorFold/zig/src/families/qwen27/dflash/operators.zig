@@ -83,15 +83,15 @@ pub const Ops = struct {
         stream_append: *const fn (*anyopaque, u64, u32, u32, View, View, []const u64) anyerror!void,
         // one projection of a fused weight group (kind 1: k+v, 2: q+k+v, 3: gate+up) keyed by the group's first tensor; null: not fused
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
+        /// A gate|up group's projection with the SwiGLU applied in its epilogue: the activated rows (half the group's
+        /// width), or null where the backend has no fused launch for it (the caller takes project_group + swiglu).
+        project_swiglu: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
         // lattice in two calls: the head's top-k encoded and the frame committed without a wait (its picks), then, once
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
         lattice_end: ?*const fn (*anyopaque, u64, Head, View, View, Config) anyerror!Lattice = null,
-        // what is encoded between this call with true and the one with false is a transaction's append (an early frame
-        // reads the admitted rows' launch words for it); a block's stages may be encoded between an append's steps
-        append_steps: ?*const fn (*anyopaque, bool) void = null,
     };
 };
 

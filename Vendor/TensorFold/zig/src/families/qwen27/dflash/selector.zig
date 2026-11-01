@@ -78,6 +78,20 @@ fn edges(g: *const weights.Graph, lattice: op.Lattice, parent: u32, token: u32, 
     for (0..g.config.rank) |r| sum += (try native(g.predecessor, parent, @intCast(r))) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]) * (try native(g.successor, token, @intCast(r)));
     return sum;
 }
+/// A parent's codebook row times the projection of its depth, `native(predecessor) * projected` term by term: what
+/// edges multiplies by each child's successor row, made once for every child of the parent.
+const max_rank = 256;
+fn parentTerms(g: *const weights.Graph, lattice: op.Lattice, parent: u32, depth: u32, out: *[max_rank]f64) !void {
+    @setFloatMode(.strict);
+    for (0..g.config.rank) |r| out[r] = (try native(g.predecessor, parent, @intCast(r))) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]);
+}
+/// edges, the parent's terms given: the same products and sum in the same order.
+fn edgesFrom(g: *const weights.Graph, terms: *const [max_rank]f64, token: u32) !f64 {
+    @setFloatMode(.strict);
+    var sum: f64 = 0;
+    for (0..g.config.rank) |r| sum += terms[r] * (try native(g.successor, token, @intCast(r)));
+    return sum;
+}
 fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first: u64, parent_token: u32, parent: i32, depth: u32, cumulative: f64, frontier: *std.ArrayList(Node)) !void {
     @setFloatMode(.strict);
     var scores: [16]f64 = undefined;
@@ -85,9 +99,13 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     const temperature = if (options.noise != null) @max(options.temperature, 1e-6) else 1;
     const row = @as(usize, depth) * lattice.topk;
     var maximum: f64 = -std.math.inf(f64);
+    var terms: [max_rank]f64 = undefined;
+    const shared = g.config.rank <= max_rank;
+    if (shared) try parentTerms(g, lattice, parent_token, depth, &terms);
     for (0..lattice.topk) |i| {
         const token = lattice.candidates[row + i];
-        var score = @as(f64, lattice.unary[row + i]) / temperature + options.edge * try edges(g, lattice, parent_token, token, depth) / temperature;
+        const edge = if (shared) try edgesFrom(g, &terms, token) else try edges(g, lattice, parent_token, token, depth);
+        var score = @as(f64, lattice.unary[row + i]) / temperature + options.edge * edge / temperature;
         if (options.noise) |n| score += options.noise_weight * try n.draw(n.ptr, try std.math.add(u64, first, depth), token);
         score /= options.tau;
         if (!std.math.isFinite(score)) return error.DraftScoreFinite;

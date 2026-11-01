@@ -12,6 +12,10 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// A gate|up adapter's fused build for decode blocks (at most 8 rows): serial split-K, the target's SwiGLU epilogue
+    /// (TF_GU_TURNS: gate and up tiles on two SIMD groups, silu(gate) * up from registers) writing the activated rows and
+    /// their 64-column group sums, on the same words and indexed metadata.
+    swiglu: ?lane.Projection = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
         if (prepared.nibbles) {
@@ -57,7 +61,19 @@ pub const Adapter = struct {
             l8.rows8 = true;
             small = try lane.Projection.init(a, device, l8);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small };
+        errdefer if (small) |s| s.deinit();
+        var swiglu: ?lane.Projection = null;
+        if (layout.reg and layout.format.bits == 4 and layout.indexed and prepared.n % 128 == 0) {
+            var ls = layout;
+            ls.rows8 = true;
+            ls.serial_sk2 = true;
+            ls.sk = 2;
+            ls.swiglu = true;
+            if (ls.validate()) |_| {
+                swiglu = try lane.Projection.init(a, device, ls);
+            } else |_| {}
+        }
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .swiglu = swiglu };
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -81,6 +97,7 @@ pub const Adapter = struct {
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.swiglu) |s| s.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
         if (adapter.index) |b| b.deinit();

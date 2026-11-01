@@ -68,83 +68,30 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
     return encodeAppendTo(ops, g, preparation, taps, positions, frame, .{ .transaction = transaction });
 }
 fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
-    var steps = try AppendSteps.init(ops, g, preparation, taps, positions, frame, sink);
-    try steps.finish();
+    const c = g.config;
+    const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
+    const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
+    // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
+    // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
+    var keys: [max_layers]op.View = undefined;
+    var values: [max_layers]op.View = undefined;
+    if (g.layers.len > max_layers) return error.DraftOperatorShape;
+    for (g.layers, 0..) |layer, i| {
+        if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
+            keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());
+            values[i] = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
+        } else {
+            keys[i] = try project(ops, frame, hidden, layer.attention.k, preparation.mode);
+            values[i] = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
+        }
+    }
+    for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
+    for (g.layers, 0..) |_, i| keys[i] = try rotate(ops, frame, keys[i], positions, c.kv_heads, c);
+    for (g.layers, 0..) |_, i| switch (sink) {
+        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
+        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
+    };
 }
-/// An append encoded in its six steps: the fusion product, its norm, then stage by stage across the layers (every
-/// product, then every norm, rope and append), so a frame's concurrent encoder runs each stage's independent layers
-/// side by side; each value is computed exactly as layer by layer. A block encoded between the steps (appendBlock)
-/// takes its first stages beside them.
-const AppendSteps = struct {
-    ops: op.Ops,
-    g: *const w.Graph,
-    preparation: op.Preparation,
-    taps: op.View,
-    positions: []const u64,
-    frame: u64,
-    sink: Sink,
-    step: u32 = 0,
-    hidden: op.View = undefined,
-    keys: [max_layers]op.View = undefined,
-    values: [max_layers]op.View = undefined,
-    const count = 6;
-    fn init(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !AppendSteps {
-        if (g.layers.len > max_layers) return error.DraftOperatorShape;
-        return .{ .ops = ops, .g = g, .preparation = preparation, .taps = taps, .positions = positions, .frame = frame, .sink = sink };
-    }
-    fn next(s: *AppendSteps) !void {
-        const c = s.g.config;
-        const ops = s.ops;
-        const frame = s.frame;
-        // the backend tells the append's dispatches from a block's encoded between the steps
-        if (ops.vtable.append_steps) |mark| mark(ops.ptr, true);
-        defer if (ops.vtable.append_steps) |mark| mark(ops.ptr, false);
-        switch (s.step) {
-            0 => s.hidden = try project(ops, frame, s.taps, s.g.fusion, s.preparation.mode),
-            1 => s.hidden = try norm(ops, frame, s.hidden, s.g.hidden_norm, c.eps, 1, c.hidden),
-            2 => for (s.g.layers, 0..) |layer, i| {
-                if (try group(ops, frame, s.hidden, layer.attention.k, 1, s.preparation.mode)) |kv| {
-                    s.keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());
-                    s.values[i] = try cols(ops, frame, kv, c.kvWidth(), c.kvWidth());
-                } else {
-                    s.keys[i] = try project(ops, frame, s.hidden, layer.attention.k, s.preparation.mode);
-                    s.values[i] = try project(ops, frame, s.hidden, layer.attention.v, s.preparation.mode);
-                }
-            },
-            3 => for (s.g.layers, 0..) |layer, i| {
-                s.keys[i] = try norm(ops, frame, s.keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
-            },
-            4 => for (s.g.layers, 0..) |_, i| {
-                s.keys[i] = try rotate(ops, frame, s.keys[i], s.positions, c.kv_heads, c);
-            },
-            5 => for (s.g.layers, 0..) |_, i| switch (s.sink) {
-                .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), s.keys[i], s.values[i], s.positions),
-                .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), s.keys[i], s.values[i], s.positions),
-            },
-            else => return,
-        }
-        s.step += 1;
-    }
-    fn finish(s: *AppendSteps) !void {
-        while (s.step < count) try s.next();
-    }
-};
-/// appendBlock's append, its steps taken between the block's first-layer stages, and the context staged once they end.
-const Zip = struct {
-    steps: *AppendSteps,
-    transaction: u64,
-    next: op.Context,
-    fn step(z: ?*Zip) !void {
-        if (z) |x| if (x.steps.step < AppendSteps.count) try x.steps.next();
-    }
-    /// The rest of the append and the staged context, before the first layer's attention reads them.
-    fn close(z: ?*Zip) !void {
-        if (z) |x| {
-            try x.steps.finish();
-            try x.steps.ops.vtable.context_stage(x.steps.ops.ptr, x.transaction, x.steps.frame, x.next);
-        }
-    }
-};
 /// Layers a stage-by-stage append holds at once.
 const max_layers = 16;
 
@@ -157,11 +104,9 @@ pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, 
     defer ops.vtable.release(ops.ptr, frame);
     const transaction = try ops.vtable.context_begin(ops.ptr, context);
     errdefer ops.vtable.context_abort(ops.ptr, transaction);
-    // the append's steps run between the block's first-layer stages, sharing their barriers (each is independent of
-    // the block until the first attention, which reads the appended keys and values once the context is staged)
-    var steps = try AppendSteps.init(ops, g, preparation, taps, positions, frame, .{ .transaction = transaction });
-    var zip = Zip{ .steps = &steps, .transaction = transaction, .next = next };
-    const output = try encodeStreamsZipped(ops, g, preparation, &.{.{ .context = next, .anchor = anchor }}, frame, block, &.{}, &zip);
+    try encodeAppend(ops, g, preparation, taps, positions, frame, transaction);
+    try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
+    const output = try encode(ops, g, preparation, next, anchor, frame, block, &.{});
     var lattice = try ops.vtable.lattice(ops.ptr, frame, output.head, output.projected, g.config);
     errdefer lattice.deinit();
     try lattice.check(g.config);
@@ -184,10 +129,9 @@ pub fn appendBlockPrepare(ops: op.Ops, g: *const w.Graph, preparation: op.Prepar
     errdefer ops.vtable.release(ops.ptr, frame);
     const transaction = try ops.vtable.context_begin(ops.ptr, context);
     errdefer ops.vtable.context_abort(ops.ptr, transaction);
-    // as appendBlock: the append's steps between the block's first-layer stages
-    var steps = try AppendSteps.init(ops, g, preparation, taps, positions, frame, .{ .transaction = transaction });
-    var zip = Zip{ .steps = &steps, .transaction = transaction, .next = next };
-    const output = try encodeStreamsZipped(ops, g, preparation, &.{.{ .context = next, .anchor = anchor }}, frame, block, &.{}, &zip);
+    try encodeAppend(ops, g, preparation, taps, positions, frame, transaction);
+    try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
+    const output = try encode(ops, g, preparation, next, anchor, frame, block, &.{});
     const picks = try lattice_begin(ops.ptr, frame, output.head, g.config);
     return .{ .frame = frame, .transaction = transaction, .head = output.head, .projected = output.projected, .picks = picks };
 }
@@ -221,10 +165,6 @@ pub const Stream = struct { context: op.Context, anchor: u32 };
 
 /// Every stream's block stacked in one pass, weights read once; each stream attends to its own context.
 fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, streams: []const Stream, frame: u64, block: u32, given: []const u32) !Output {
-    return encodeStreamsZipped(ops, g, preparation, streams, frame, block, given, null);
-}
-/// encodeStreams with appendBlock's append steps taken between the first layer's stages (`zip`).
-fn encodeStreamsZipped(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, streams: []const Stream, frame: u64, block: u32, given: []const u32, zip: ?*Zip) !Output {
     const c = g.config;
     const n: u32 = @intCast(streams.len);
     const rows = n * block;
@@ -241,17 +181,11 @@ fn encodeStreamsZipped(ops: op.Ops, g: *const w.Graph, preparation: op.Preparati
     for (given, 1..) |t, i| ids[i] = t;
     var hidden = try ops.vtable.embed(ops.ptr, frame, g.embed, ids[0..rows]);
     try hidden.check(rows, c.hidden, .bf16);
-    // the append's steps (if any) go one after each first-layer stage up to the first attention
-    var z = zip;
-    try Zip.step(z);
     for (g.layers, 0..) |layer, i| {
         var residual = hidden;
         const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
-        try Zip.step(z);
         const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
-        try Zip.step(z);
         const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
-        try Zip.step(z);
         // the products, then both norms, then both ropes: independent neighbours for the concurrent encoder
         var raw_query: op.View = undefined;
         var raw_keys: op.View = undefined;
@@ -265,14 +199,10 @@ fn encodeStreamsZipped(ops: op.Ops, g: *const w.Graph, preparation: op.Preparati
             raw_keys = try project(ops, frame, input, layer.attention.k, preparation.mode);
             values = try project(ops, frame, input, layer.attention.v, preparation.mode);
         }
-        try Zip.step(z);
         const normed_query = try norm(ops, frame, raw_query, layer.attention.q_norm, c.eps, c.heads, c.head_dim);
         const normed_keys = try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
-        try Zip.step(z);
         const query = try rotate(ops, frame, normed_query, positions[0..rows], c.heads, c);
         const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
-        try Zip.close(z);
-        z = null;
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
@@ -280,16 +210,20 @@ fn encodeStreamsZipped(ops: op.Ops, g: *const w.Graph, preparation: op.Preparati
         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
         const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
         const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
-        var gate: op.View = undefined;
-        var up: op.View = undefined;
-        if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
-            gate = try cols(ops, frame, gu, 0, c.intermediate);
-            up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
-        } else {
-            gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
-            up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
-        }
-        const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        // decode blocks: the gate|up projection with the SwiGLU in its epilogue, one launch, where the backend has it
+        const fused: ?op.View = if (ops.vtable.project_swiglu) |f| try f(ops.ptr, frame, mlp_input, layer.mlp.gate, 3, preparation.mode) else null;
+        const activated = if (fused) |a| a else blk: {
+            var gate: op.View = undefined;
+            var up: op.View = undefined;
+            if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
+                gate = try cols(ops, frame, gu, 0, c.intermediate);
+                up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
+            } else {
+                gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
+                up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
+            }
+            break :blk try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        };
         try activated.check(rows, c.intermediate, .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }
