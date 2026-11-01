@@ -278,6 +278,15 @@ pub const Layout = struct {
     }
 };
 
+/// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
+fn lockstepGu(l:Layout)bool{
+    return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
+        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
+        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
+        l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
+        l.ranges.len==0 and l.y_stride==null;
+}
+
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
     const g = l.groupCut();
@@ -306,6 +315,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
+    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
 }
 
@@ -438,7 +448,7 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
         if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.rows8 or l.prompt_tn == 2) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
