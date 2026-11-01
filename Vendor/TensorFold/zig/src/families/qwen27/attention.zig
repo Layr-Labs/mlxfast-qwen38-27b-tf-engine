@@ -218,6 +218,7 @@ pub const Attention = struct {
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
+    prefix_quarter: ?mtl.Pipeline = null,
     /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
@@ -241,15 +242,18 @@ pub const Attention = struct {
         const units = device.tensorUnits();
         const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
         errdefer if (split_tail) |pipe| pipe.deinit();
+        const prefix_quarter: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prefix_quarter_1", false) else null;
+        errdefer if (prefix_quarter) |pipe| pipe.deinit();
         const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
         errdefer if (chain_words) |b| b.deinit();
         if (chain_words) |b| @memset(b.contents()[0..32], 0);
-        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .chain_words = chain_words };
+        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .prefix_quarter = prefix_quarter, .chain_words = chain_words };
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
         if (a.prompt) |pipes| for (pipes) |pipe| pipe.deinit();
         if (a.split_tail) |pipe| pipe.deinit();
+        if (a.prefix_quarter) |pipe| pipe.deinit();
         if (a.chain_words) |b| b.deinit();
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
@@ -506,7 +510,10 @@ pub const Attention = struct {
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
             prefix_groups = g.kv_heads * plan.prefix_chunks * ((plan.tiles + sg - 1) / sg);
-            e.setPipeline(a.prefix[sg - 1]);
+            // Sparse prefix grids benefit from four narrower accumulator owners.
+            // Keep the original partition once the grid has enough groups to fill the GPU.
+            const quarter = sg == 1 and prefix_groups < 128 and a.prefix_quarter != null;
+            e.setPipeline(if (quarter) a.prefix_quarter.? else a.prefix[sg - 1]);
             bind(e, .{ scratch.get(.qa), binding.get(.caches) });
             e.setValue(scale, 2);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
@@ -519,7 +526,7 @@ pub const Attention = struct {
             e.setValue(@as(u32, @intFromBool(chain != null)), 10);
             e.setBuffer(words, 16, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
-            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(64 * sg, 1, 1));
+            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
             if (chain == null) e.barrier();
         }
         if (!plan.fused) {

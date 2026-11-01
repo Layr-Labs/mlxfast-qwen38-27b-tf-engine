@@ -72,71 +72,128 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 
 #define TF_G (TF_QH / TF_KVH)
 
-// Split over key chunks: one simdgroup takes a KV head's query heads for one row, reading each key once for them.
+// Split over key chunks: one simdgroup takes one query head for one row and chunk (tg.x = kv head * TF_G + the head
+// within it), so the GPU runs four times the simdgroups; each head's per-key arithmetic is the same as when one
+// simdgroup took all of a KV head's query heads.
+// Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
+// k_stride and v_stride, in elements) instead of from copies behind the context.
+struct tf_own_rows { uint rows, k_stride, v_stride; };
+inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
+  return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
+}
 [[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
     const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
     const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
-    device float* part [[buffer(5)]], uint lane [[thread_index_in_simdgroup]],
+    device float* part [[buffer(5)]], const device bfloat* OK [[buffer(6)]], const device bfloat* OV [[buffer(7)]],
+    constant tf_own_rows& own [[buffer(8)]], uint lane [[thread_index_in_simdgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  const uint kh = tg.x, row = tg.y, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
+  const uint kh = tg.x / TF_G, g = tg.x % TF_G, row = tg.y, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
   if (kh >= TF_KVH || row >= args.rows || chunk >= chunks) return;
   const float scale = as_type<float>(args.scale_bits);
-  float q[TF_G][TF_D / 32], out[TF_G][TF_D / 32], maximum[TF_G], total[TF_G];
-  for (uint g = 0; g < TF_G; ++g) {
-    const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
-    for (uint d = 0; d < TF_D / 32; ++d) { q[g][d] = float(Q[qi + lane + d * 32]); out[g][d] = 0.0f; }
-    maximum[g] = -INFINITY;
-    total[g] = 0.0f;
-  }
+  const uint context = args.keys - min(own.rows, args.keys);
+  float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
+  const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
+  for (uint d = 0; d < TF_D / 32; ++d) { q[d] = float(Q[qi + lane + d * 32]); out[d] = 0.0f; }
   const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
   for (uint key = chunk * TF_CHUNK; key < last; ++key) {
     if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
-    const size_t ki = ((size_t)key * TF_KVH + kh) * TF_D;
+    const device bfloat* kr = tf_split_row(K, OK, key, context, own.k_stride, kh);
+    const device bfloat* vr = tf_split_row(V, OV, key, context, own.v_stride, kh);
     float k[TF_D / 32], v[TF_D / 32];
-    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(K[ki + lane + d * 32]); v[d] = float(V[ki + lane + d * 32]); }
-    for (uint g = 0; g < TF_G; ++g) {
-      float dot = 0.0f;
-      for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[g][d], k[d], dot);
-      const float score = simd_sum(dot) * scale;
-      const float next = max(maximum[g], score);
-      const float old_weight = maximum[g] == -INFINITY ? 0.0f : exp(maximum[g] - next);
-      const float weight = exp(score - next);
-      total[g] = fma(total[g], old_weight, weight);
-      for (uint d = 0; d < TF_D / 32; ++d) out[g][d] = fma(out[g][d], old_weight, weight * v[d]);
-      maximum[g] = next;
-    }
+    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[lane + d * 32]); v[d] = float(vr[lane + d * 32]); }
+    float dot = 0.0f;
+    for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
+    const float score = simd_sum(dot) * scale;
+    const float next = max(maximum, score);
+    const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+    const float weight = exp(score - next);
+    total = fma(total, old_weight, weight);
+    for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
+    maximum = next;
   }
   // partials [row][kv head][chunk][query head][D + 2]: outputs, then the chunk's maximum and total
-  for (uint g = 0; g < TF_G; ++g) {
-    device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
-    for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[g][d];
-    if (lane == 0) { p[TF_D] = maximum[g]; p[TF_D + 1] = total[g]; }
-  }
+  device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
+  for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[d];
+  if (lane == 0) { p[TF_D] = maximum; p[TF_D + 1] = total; }
 }
 
+
+// Chunks a merge lane holds: lane c reads chunk c's maximum and total (at most 32 chunks a row per lane pass).
+#define TF_MERGE_TILE 8
+
 // One query head and row: its chunks' partials rescaled to the largest maximum and added in chunk order.
-[[kernel]] void tf_shared_lane_attention_merge(const device float* part [[buffer(0)]],
-    constant tf_context_args& args [[buffer(1)]], device TF_OUT* O [[buffer(2)]],
-    uint lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+template <bool xs>
+inline void tf_attention_merge(const device float* part, constant tf_context_args& args, device TF_OUT* O,
+    device float* XS, uint xs_stride, uint lane, uint2 tg) {
   const uint head = tg.x, row = tg.y, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
   if (head >= TF_QH || row >= args.rows) return;
   const uint kh = head / TF_G, g = head % TF_G;
   const device float* first = part + (((size_t)row * TF_KVH + kh) * chunks * TF_G + g) * (TF_D + 2);
   const size_t step = (size_t)TF_G * (TF_D + 2);
+  // every chunk's maximum and total, 32 chunks a pass (one a lane); max is exact in any order
   float maximum = -INFINITY;
-  for (uint c = 0; c < chunks; ++c) maximum = max(maximum, first[c * step + TF_D]);
+  for (uint base = 0; base < chunks; base += 32) {
+    const uint c = base + lane;
+    const float m = c < chunks ? first[c * step + TF_D] : -INFINITY;
+    maximum = max(maximum, simd_max(m));
+  }
   float out[TF_D / 32];
   for (uint d = 0; d < TF_D / 32; ++d) out[d] = 0.0f;
   float total = 0.0f;
-  for (uint c = 0; c < chunks; ++c) {
-    const device float* p = first + c * step;
-    if (p[TF_D] == -INFINITY) continue;
-    const float w = exp(p[TF_D] - maximum);
-    total = fma(p[TF_D + 1], w, total);
-    for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(p[lane + d * 32], w, out[d]);
+  for (uint base = 0; base < chunks; base += 32) {
+    const uint mine = base + lane;
+    const float m_mine = mine < chunks ? first[mine * step + TF_D] : -INFINITY;
+    const float t_mine = mine < chunks ? first[mine * step + TF_D + 1] : 0.0f;
+    // each lane rescales its own chunk: the same exp of the same operands as one chunk at a time
+    const float w_mine = m_mine == -INFINITY ? 0.0f : exp(m_mine - maximum);
+    const uint count = min(32u, chunks - base);
+    for (uint tile = 0; tile < count; tile += TF_MERGE_TILE) {
+      float pv[TF_MERGE_TILE][TF_D / 32];
+      for (uint t = 0; t < TF_MERGE_TILE; ++t) {
+        const uint c = base + min(tile + t, count - 1);
+        const device float* p = first + c * step;
+        for (uint d = 0; d < TF_D / 32; ++d) pv[t][d] = p[lane + d * 32];
+      }
+      for (uint t = 0; t < TF_MERGE_TILE && tile + t < count; ++t) {
+        const uint src = tile + t;
+        if (simd_shuffle(m_mine, src) == -INFINITY) continue;
+        const float w = simd_shuffle(w_mine, src);
+        total = fma(simd_shuffle(t_mine, src), w, total);
+        for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(pv[t][d], w, out[d]);
+      }
+    }
   }
   const size_t qi = ((size_t)row * TF_QH + head) * TF_D;
-  for (uint d = 0; d < TF_D / 32; ++d) O[qi + lane + d * 32] = TF_OUT(total == 0.0f ? 0.0f : out[d] / total);
+  TF_OUT y[TF_D / 32];
+  for (uint d = 0; d < TF_D / 32; ++d) {
+    y[d] = TF_OUT(total == 0.0f ? 0.0f : out[d] / total);
+    O[qi + lane + d * 32] = y[d];
+  }
+  if (xs) {
+    // the row's 64-column groups of this head (two of them for D 128): their stored values added in column order
+    for (uint split = 0; split < TF_D / 64; ++split) {
+      float acc = 0.0f;
+      for (uint d = 2 * split; d < 2 * split + 2; ++d)
+        for (uint l = 0; l < 32; ++l) acc += simd_shuffle(float(y[d]), l);
+      const uint group = head * (TF_D / 64) + split;
+      if (lane == 0) XS[(size_t)group * xs_stride + row] = acc;
+      if (row == 0 && lane >= 1 && lane <= xs_stride - args.rows) XS[(size_t)group * xs_stride + args.rows + lane - 1] = 0.0f;
+    }
+  }
+}
+
+[[kernel]] void tf_shared_lane_attention_merge(const device float* part [[buffer(0)]],
+    constant tf_context_args& args [[buffer(1)]], device TF_OUT* O [[buffer(2)]],
+    uint lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  tf_attention_merge<false>(part, args, O, nullptr, 0, lane, tg);
+}
+
+// The merge plus the group sums a following q4 projection reads (tf_lane_sums' values and layout, rows past `rows` zero).
+[[kernel]] void tf_shared_lane_attention_merge_xs(const device float* part [[buffer(0)]],
+    constant tf_context_args& args [[buffer(1)]], device TF_OUT* O [[buffer(2)]],
+    device float* XS [[buffer(3)]], constant uint& xs_stride [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  tf_attention_merge<true>(part, args, O, XS, xs_stride, lane, tg);
 }
 
 // Ordinary one-sequence decode over all keys: the same fp32 order, with no mask or lane indexing.
