@@ -160,6 +160,7 @@ Q27_PREFIX(14)
 Q27_PREFIX(15)
 Q27_PREFIX(16)
 template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+template [[host_name("q27_attn_prefix_eighth_1")]] kernel void q27_attn_prefix<1, 8>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 
 kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
