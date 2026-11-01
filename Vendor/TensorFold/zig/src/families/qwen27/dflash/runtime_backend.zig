@@ -341,11 +341,13 @@ pub const Backend = struct {
             try @import("../residency.zig").putTiled(b, key, t);
         }
     }
-    /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
-    /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
-    /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
-    /// acceptance at 2 bits, and the down's 2-bit copy costs about as many extra rounds as its bytes save, so it stays
-    /// q4; the head's 2-bit copy only picks tiles for its q4 scores (head_bits).
+    /// Code width of a draft linear's prepared copy: the MLP's gate, up and down, attention's o and the fusion input
+    /// projection fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections and every other
+    /// linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
+    /// acceptance at 2 bits; the down's 2-bit copy cost about as many extra rounds as its bytes saved when every frame
+    /// read it, but each copy below 4 bits also keeps a q4 copy that precise frames read once siblings land less often,
+    /// so the down takes the 2-bit bytes only in the frames that land; the head's 2-bit copy only picks tiles for its q4
+    /// scores (head_bits).
     pub const mlp_bits: u8 = 2;
     /// Code width of the draft head's requantized copy of the spans' rows, which heads of at most Head.rescored_rows rows
     /// read first to pick the tiles the q4 head computes (4: no copy, the q4 head alone).
@@ -356,7 +358,7 @@ pub const Backend = struct {
     /// Elements a (scale, bias) pair covers in the plain kernel's copies below 4 bits (the draft head's included).
     pub const low_group: u32 = 128;
     fn draftBits(name: []const u8) u8 {
-        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
+        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
         for (mlp) |m| if (std.mem.endsWith(u8, name, m)) return mlp_bits;
         return 4;
     }

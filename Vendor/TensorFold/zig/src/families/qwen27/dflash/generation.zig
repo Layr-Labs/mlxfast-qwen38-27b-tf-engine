@@ -301,6 +301,9 @@ pub const Generation = struct {
             // Seed delivery, not a draft round (rounds = 0): the bench seed token, never journaled, so the
             // journal's committed sum equals the free-run count that follows it.
             try g.draft.drainNext();
+            // the first round's pending token is this one: nothing moves the target before it, so it need not
+            // take the logits' argmax again
+            g.pending = pending;
             const tokens = try g.allocator.alloc(u32, 1);
             tokens[0] = pending;
             return .{ .tokens = tokens, .rounds = 0, .verified = 0, .matched = 0 };
