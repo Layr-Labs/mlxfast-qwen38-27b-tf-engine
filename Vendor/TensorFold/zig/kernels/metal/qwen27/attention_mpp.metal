@@ -8,16 +8,22 @@ struct Q27AttnReadPtrs { device const bfloat* keys; device const bfloat* values;
 
 // A count's waiter: thread 0 of each group waits until NC[0] reaches wait_for (bounded), past a device-scope fence; every
 // group arrives on NC[1] and the last of `total` leaves both words zero for the next count. All threads of the group wait.
-inline void q27_wait_count(device atomic_uint* NC, uint wait_for, uint total, ushort tid) {
+inline bool q27_wait_count(device atomic_uint* NC, uint wait_for, uint total, ushort tid, threadgroup uint& dependency_ready) {
   if (tid == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-      atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-      atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+    dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+    if (dependency_ready == 0u) {
+      atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+    } else {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  return dependency_ready != 0u;
 }
 
 // A count's producer: once every thread of the group has stored, thread 0 passes a device-scope fence and counts the group.
@@ -44,7 +50,8 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
   constexpr int OD = D / PARTS, OE = 16 * OD / 32;
-  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
+  threadgroup uint dependency_ready;
+  if (wait_for != 0u && !q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid, dependency_ready)) return;
   const ushort lane = thread_index_in_simdgroup;
   const ushort sg = simdgroup_index_in_threadgroup;
   const int tile = int(threadgroup_position_in_grid.z) * SG + (sg / PARTS);
@@ -310,7 +317,8 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
-  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
+  threadgroup uint dependency_ready;
+  if (wait_for != 0u && !q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid, dependency_ready)) return;
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
   const uint r = threadgroup_position_in_grid.y;
@@ -391,7 +399,8 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
-  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
+  threadgroup uint dependency_ready;
+  if (wait_for != 0u && !q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid, dependency_ready)) return;
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
   const ushort lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x / 2;

@@ -286,10 +286,21 @@ pub const Runner = struct {
             r.failed = true;
             return err;
         };
+        r.checkCounted() catch |err| {
+            r.failed = true;
+            r.active = null;
+            return err;
+        };
         if (r.capture_taps) try r.taps.complete();
         if (accepted) {
             for (round.slots, round.windows) |slot, window| r.offsets[slot] = window.start + @as(u32, @intCast(window.parents.len));
         } else r.active = fingerprint(round);
+    }
+
+    fn checkCounted(r: *const Runner) !void {
+        try r.model.kernels.checkCounted();
+        try r.attention.checkCounted();
+        try r.gdn.checkCounted();
     }
 
     pub fn keep(r: *Runner, round: *const Round, paths: []const []const u32) !void {

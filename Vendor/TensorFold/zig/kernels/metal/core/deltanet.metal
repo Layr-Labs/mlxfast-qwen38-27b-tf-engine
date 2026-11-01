@@ -214,16 +214,22 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
   // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
   // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
@@ -538,11 +544,10 @@ kernel void tf_delta_gdn_chain(device const bfloat* query [[buffer(0)]],
   if (p.dk == 128) tf_delta_gdn_chain_body<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
   else tf_delta_gdn_chain_body<0>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
-// Prompt chains (may differ in bits from decode): 8 lanes a set of CC value columns (4 unmarked, 2 marked), 16 key
-// channels of each; dk = 128. Every column keeps its own arithmetic and order whatever CC is.
+// Prompt chains (may differ in bits from decode): 8 lanes a pair of value columns, 16 key channels of both each; dk = 128.
 // Each column keeps its in-order 16-channel sums and xor 1, 2, 4 tree; the pair shares k and q, converted once a row.
 #define TF_UNROLL _Pragma("clang loop unroll(full)")
-template <bool M, uint CC>
+template <bool M>
 inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     device const bfloat* key,
     device const bfloat* value,
@@ -558,47 +563,46 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     uint3 position,
     uint lane) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
-  const uint sub = lane & 7, dimension = position.y * (4 * CC) + (lane >> 3) * CC, key_head = head / (p.nv / p.nk);
+  const uint sub = lane & 7, dimension = position.y * 8 + (lane >> 3) * 2, key_head = head / (p.nv / p.nk);
   const TfDeltaSegment span = segments[segment_index];
   const uint state_stride = p.nv * p.dv * p.dk;
   const uint column = (head * p.dv + dimension) * p.dk + sub * 16;
-  float state[CC][16]; // state[c]: value column dimension + c, its words at column + c * p.dk
-  TF_UNROLL for (uint c = 0; c < CC; ++c)
+  float state[2][16]; // state[c]: value column dimension + c, its words at column + c * p.dk
+  TF_UNROLL for (uint c = 0; c < 2; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + c * p.dk + i];
   for (uint node = 0; node < span.rows; ++node) {
     const uint row = span.first + node, at = row * p.nv + head;
     device const bfloat* k = key + (row * p.nk + key_head) * p.dk + sub * 16;
     device const bfloat* q = query + (row * p.nk + key_head) * p.dk + sub * 16;
-    float kf[16], qf[16], remembered[CC], correction[CC], result[CC];
-    TF_UNROLL for (uint c = 0; c < CC; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
+    float kf[16], qf[16], remembered[2] = {0.0f, 0.0f}, correction[2], result[2] = {0.0f, 0.0f};
     TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
     const float forget = decay[at];
     TF_UNROLL for (uint i = 0; i < 16; ++i)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+      TF_UNROLL for (uint c = 0; c < 2; ++c) {
         state[c][i] = state[c][i] * forget;
         remembered[c] += state[c][i] * kf[i];
       }
     TF_UNROLL for (uint step = 1; step < 8; step <<= 1)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) remembered[c] += simd_shuffle_xor(remembered[c], step);
+      TF_UNROLL for (uint c = 0; c < 2; ++c) remembered[c] += simd_shuffle_xor(remembered[c], step);
     const float mix = float(mixing[at]);
-    TF_UNROLL for (uint c = 0; c < CC; ++c) correction[c] = (float(value[at * p.dv + dimension + c]) - remembered[c]) * mix;
+    TF_UNROLL for (uint c = 0; c < 2; ++c) correction[c] = (float(value[at * p.dv + dimension + c]) - remembered[c]) * mix;
     TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
     TF_UNROLL for (uint i = 0; i < 16; ++i)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+      TF_UNROLL for (uint c = 0; c < 2; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
         result[c] += state[c][i] * qf[i];
       }
     TF_UNROLL for (uint step = 1; step < 8; step <<= 1)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) result[c] += simd_shuffle_xor(result[c], step);
+      TF_UNROLL for (uint c = 0; c < 2; ++c) result[c] += simd_shuffle_xor(result[c], step);
     if (sub == 0)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) output[at * p.dv + dimension + c] = bfloat(result[c]);
+      TF_UNROLL for (uint c = 0; c < 2; ++c) output[at * p.dv + dimension + c] = bfloat(result[c]);
     if (M)
       for (uint m = 0; m < 4; ++m)
         if (marks[m] == node + 1)
-          TF_UNROLL for (uint c = 0; c < CC; ++c)
+          TF_UNROLL for (uint c = 0; c < 2; ++c)
             TF_UNROLL for (uint i = 0; i < 16; ++i) mark_state[(segment_index * 4 + m) * state_stride + column + c * p.dk + i] = state[c][i];
   }
-  TF_UNROLL for (uint c = 0; c < CC; ++c)
+  TF_UNROLL for (uint c = 0; c < 2; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
 }
 #undef TF_UNROLL
@@ -615,7 +619,7 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_body<false, 4>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
+  tf_delta_gdn_chain_wide_body<false>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
                                       uint4(0), next_state, position, lane);
 }
 
@@ -634,7 +638,7 @@ kernel void tf_delta_gdn_chain_wide_marks(device const bfloat* query [[buffer(0)
                           device float* mark_state [[buffer(11)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_body<true, 2>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
+  tf_delta_gdn_chain_wide_body<true>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
                                      marks[position.z / p.nv], mark_state, position, lane);
 }
 
@@ -718,16 +722,22 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
   // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
   // its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
