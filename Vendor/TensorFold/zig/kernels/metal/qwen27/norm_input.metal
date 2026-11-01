@@ -22,10 +22,12 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  if (int(m) >= M) {
-    if ((t & 3) == 0) XS[(t >> 2) * MP + m] = 0.0f;
-    return;
+  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  if (int(m) == 0) {
+    const int pad = MP - M;
+    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
   float hv[E];
   float ss = 0.0f;

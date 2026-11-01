@@ -208,13 +208,24 @@ pub const Layout = struct {
     /// Decoded rows (rows8, parallel K splits): each threadgroup counts itself on a counter word once its stores are past
     /// a device-scope fence (encodeCounted), for a norm that waits on that count in the same barrier interval.
     count: bool = false,
+    /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
+    /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
+    gu_count: bool = false,
+    /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
+    /// same barrier interval (encodeCountedAfter).
+    wait: bool = false,
+    /// Decoded rows over tiles a GPU list names (encodeTiles): threadgroup j computes the list's tile j and stores its 32
+    /// columns at j * 32 of rows `y_stride` apart; threadgroups past the list's count store the lowest finite bf16 there.
+    tile_list: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
-        if (l.reg and (l.cooperative or l.format.bits != 4 or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
+        if (l.reg and (l.cooperative or (l.format.bits != 4 and !l.regTwo()) or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
-        if (l.y_stride) |s| if (s < l.n or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
+        if (l.y_stride) |s| if ((s < l.n and !l.tile_list) or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
+        if (l.tile_list and (!l.reg or !l.rows8 or !l.reg_lean or l.swiglu or l.residual or l.count or l.prompt_sr or
+            l.prompt_tn != 1 or l.ranges.len != 0 or l.groups != null or l.output != .bf16 or l.y_stride == null or l.y_stride.? % 32 != 0)) return error.InvalidSchedule;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
@@ -234,7 +245,9 @@ pub const Layout = struct {
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
-        if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.serial_sk2 or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
+        if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
+        if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
+        if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -270,6 +283,11 @@ pub const Layout = struct {
         var count: usize = 0;
         for (l.ranges) |r| count += r[1];
         return count;
+    }
+
+    /// Two-bit reg launches (halveReg's words): lean decode-row launches only, one tile a code batch.
+    fn regTwo(l: Layout) bool {
+        return l.format.bits == 2 and l.reg_lean and l.tile_batch == 1 and !l.swiglu and !l.prompt_sr and l.prompt_tn == 1;
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
@@ -329,6 +347,9 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
+    if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
+    if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
+    if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
@@ -380,6 +401,19 @@ pub fn regBlock(tiled: *const [256]u32, out: *[256]u32) void {
 }
 
 pub const Order = struct { w: Ref, n: usize, k: usize };
+
+/// A 2-bit copy's reg words from its reg_layout ones whose codes are 0-3 a nibble: each (tile, group) block's second
+/// 32 lanes x 4 words move into bits 2-3 of every nibble of its first, so a block is 32 x 4 words and the kernel's two
+/// masks give back both halves' words exactly.
+pub fn halveReg(wide: []const u32, out: []u32) !void {
+    if (wide.len % 256 != 0 or out.len * 2 != wide.len) return error.InvalidStorage;
+    for (0..wide.len / 256) |block| for (0..128) |i| {
+        const lo = wide[block * 256 + i];
+        const hi = wide[block * 256 + 128 + i];
+        if ((lo | hi) & 0xCCCCCCCC != 0) return error.WideCodes;
+        out[block * 128 + i] = lo | (hi << 2);
+    };
+}
 
 /// The reg_layout rewrite on the GPU: one library and queue for any number of runs.
 pub const RegOrder = struct {
@@ -460,6 +494,12 @@ pub const Projection = struct {
     residual: bool = false,
     /// Built with Layout.count: encodeCounted only.
     count: bool = false,
+    /// Built with Layout.gu_count: encodeSwigluCounted only.
+    gu_count: bool = false,
+    /// Built with Layout.wait: encodeCountedAfter only.
+    wait: bool = false,
+    /// Built with Layout.tile_list: encodeTiles only.
+    tile_list: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -481,7 +521,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
     }
 
     pub fn deinit(p: Projection) void {
@@ -494,17 +534,24 @@ pub const Projection = struct {
     pub fn encode(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32) !void {
         if (p.residual) return error.InvalidSchedule;
         if (p.count) return error.InvalidSchedule;
-        return p.encodeImpl(e, x, w, sb, null, y, rows, null, null);
+        return p.encodeImpl(e, x, w, sb, null, y, rows, null, null, null);
     }
 
     /// The reg kernel on group sums its input's producer wrote (tf_lane_sums' order): no sums dispatch, no barrier.
     pub fn encodeSums(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32) !void {
+        return p.encodeSumsAt(e, x, w, sb, sums, y, rows, null);
+    }
+
+    /// encodeSums reading its [rows, stride] words at `dims` when given (an earlier dispatch wrote them: at most `rows`
+    /// rows, the stride of `sums`): the launch is the one for `rows`, its arithmetic the one for the words' rows.
+    pub fn encodeSumsAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, dims: ?Ref) !void {
         if (!p.reg) return error.SumsNeedReg;
         if (p.residual) return error.InvalidSchedule;
         if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         if (p.count) return error.InvalidSchedule;
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, null);
+        if (dims) |d| try checkRef(d, 8, 4);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, null, dims);
     }
 
     /// A residual projection (Layout.residual): `ro` gets `h` + the output rows, each word rounded to bf16 first, as
@@ -517,22 +564,49 @@ pub const Projection = struct {
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
         }
         try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
-        return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null);
+        return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null, null);
     }
 
     /// A counting projection (Layout.count): encodeSums whose threadgroups each add one to `counter` (a u32 word the
     /// waiting norm leaves zero) once their stores are past a device-scope fence; tile_count of them a launch.
     pub fn encodeCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref) !void {
-        if (!p.count) return error.InvalidSchedule;
+        if (!p.count or p.wait) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
+    }
+
+    /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
+    /// this launch leaves zero) reaches `wait_for`: the producer of `x` and `sums` shares this launch's barrier interval.
+    pub fn encodeCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !void {
+        if (!p.count or !p.wait or wait_for == 0) return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(counter, 8, 4);
+        try checkRef(waited, 8, 4);
+        e.setBuffer(waited.buf, waited.off, 9);
+        e.setValue(wait_for, 10);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
     }
 
     /// A swiglu projection: `h` gets silu(gate) * up of the rows' bf16 gate/up words (N / 2 columns a row) and `hs` its
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
+        if (p.gu_count) return error.InvalidSchedule;
+        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
+    }
+
+    /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
+    /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
+    pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
+        if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
+        try checkRef(counter, 8, 4);
+        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
+        return @intCast(p.n / 128);
+    }
+
+    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
@@ -551,28 +625,60 @@ pub const Projection = struct {
         e.setBuffer(h.buf, h.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
+        if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
     /// caller orders it before the encodeSums dispatches that read the returned sums.
     pub fn encodeSumsOf(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32) !Sums {
+        return p.encodeSumsOfAt(e, x, rows, null);
+    }
+
+    /// encodeSumsOf reading its row count (an i32) at `count` when given (an earlier dispatch wrote it, at most `rows`):
+    /// the grid is the one for `rows`, and rows past the count sum to zero.
+    pub fn encodeSumsOfAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32, count: ?Ref) !Sums {
         if (!p.reg) return error.SumsNeedReg;
         if (rows == 0 or rows > reg_rows) return error.InvalidRows;
         const pipe = p.sums_pipe orelse return error.SumsNeedReg;
         const buffer = p.sums_buffer orelse return error.SumsNeedReg;
         try checkRef(x, rows * p.k * 2, 2);
+        if (count) |c| try checkRef(c, 4, 4);
         const stride: u32 = 16 * ((rows + 15) / 16);
         e.setPipeline(pipe);
         e.setBuffer(x.buf, x.off, 0);
-        e.setValue(@as(i32, @intCast(rows)), 1);
+        if (count) |c| e.setBuffer(c.buf, c.off, 1) else e.setValue(@as(i32, @intCast(rows)), 1);
         e.setBuffer(buffer, 0, 2);
         e.setValue(@as(i32, @intCast(stride)), 3);
         e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
         return .{ .ref = .{ .buf = buffer }, .stride = stride };
     }
 
-    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref) !void {
+    /// A tile-list projection (Layout.tile_list): `slots` threadgroups, threadgroup j computing tile list[1 + j] while j <
+    /// list[0] (u32 words an earlier dispatch wrote, at most `slots` tiles) into columns [32 j, 32 j + 32) of `y`'s rows.
+    pub fn encodeTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
+        if (!p.tile_list) return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        if (slots == 0 or @as(usize, slots) * 32 > p.y_stride) return error.InvalidSchedule;
+        try checkRef(x, rows * p.k * 2, 2);
+        try checkRef(w, p.weight_bytes, 16);
+        try checkRef(sb, p.metadata_bytes, 16);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(list, (@as(usize, slots) + 1) * 4, 4);
+        try checkRef(y, ((rows - 1) * p.y_stride + @as(usize, slots) * 32) * 2, 2);
+        e.setPipeline(p.pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setBuffer(w.buf, w.off, 1);
+        e.setBuffer(sb.buf, sb.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
+        e.setBuffer(y.buf, y.off, 4);
+        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        e.setBuffer(list.buf, list.off, 7);
+        e.dispatchGroups(mtl.Size.of(slots, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+    }
+
+    fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
+        if (p.tile_list) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
@@ -593,7 +699,7 @@ pub const Projection = struct {
         e.setBuffer(x.buf, x.off, 0);
         e.setBuffer(w.buf, w.off, 1);
         e.setBuffer(sb.buf, sb.off, 2);
-        e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
+        if (dims) |d| e.setBuffer(d.buf, d.off, 3) else e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
         if (hidden) |h| {
@@ -647,6 +753,26 @@ test "serial SK2 keeps logical split and is off by default" {
     try std.testing.expectError(error.InvalidSchedule, l.validate());
     l.sk = 2;
     l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {
+    var l = Layout{ .n = 98592, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .rows8 = true, .reg_lean = true, .tile_batch = 8, .y_stride = 4128 };
+    try std.testing.expectError(error.InvalidOutputStride, l.validate());
+    l.tile_list = true;
+    const listed = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "#define TF_TILE_LIST 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "#define TF_YS 4128\n") != null);
+    l.y_stride = 4100;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.y_stride = null;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.y_stride = 4128;
+    l.rows8 = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.rows8 = true;
+    l.ranges = &.{.{ 0, 1 }};
     try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 
