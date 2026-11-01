@@ -21,41 +21,39 @@ pub const Head = struct {
         const input_words = if (source.raw) |raw| raw.w else source.words.buffer;
         const input_offset = if (source.raw) |raw| raw.w_off else source.words.offset;
         const groups = k / source.group;
-        // A round reads this head for one row, so it takes the tensor unit's eight-tile interleave every other decoded
-        // shape is packed in (projection.tileBatch): the whole-tile spans copy into that layout a 256-word (tile,
-        // group) block at a time, the block order unchanged by the lane rewrite, and the matrix encodes with batch 8.
-        const interleave = source.raw == null and source.batch == 1 and source.tile == 32 and source.bits == 4 and source.group == 64;
-        const tile: usize = source.tile;
-        const stored = if (interleave) std.mem.alignForward(usize, width, 8 * tile) else width;
+        // The borrowed head's rows land in a copy of their own, and a draft round's one row reads it once a round: it is
+        // the largest decode matrix left in the unbatched order, so its code blocks are stored in the same eight-tile
+        // interleave every other decoded shape reads (projection.prepareForced) — whole tiles of one group at a time, a
+        // block a tile's 32 lanes of one group's codes. The raw (row-major) copy keeps its rows.
+        const lane_layout = source.raw == null;
+        const batch: usize = if (lane_layout) 8 else 1;
+        const sb: usize = source.batch;
+        const block = @as(usize, source.tile) * 8 * 4;
+        const stored = if (lane_layout) projection.storedColumns(width, @intCast(batch)) else width;
         const words = try head.allocate(device, stored * row);
         var destination: usize = 0;
-        if (interleave) {
-            @memset(words.contents()[0 .. stored * row], 0);
-            const blocks = tile * 8; // u32 words of one (tile, group) block
-            const input_base = input_offset / 4;
-            const source_words: [*]const u32 = @ptrCast(@alignCast(input_words.contents()));
-            const destination_words: [*]u32 = @ptrCast(@alignCast(words.contents()));
-            var slot: usize = 0;
+        if (lane_layout) {
+            var at: usize = 0; // the copy's own tile index, in span order
             for (spans) |span| {
-                for (@as(usize, span[0]) / tile..@as(usize, span[1]) / tile) |at| {
+                for (0..(span[1] - span[0]) / source.tile) |i| {
+                    const st: usize = span[0] / source.tile + i;
                     for (0..groups) |g| {
-                        const to = ((slot / 8) * groups + g) * 8 + slot % 8;
-                        @memcpy(destination_words[to * blocks ..][0..blocks], source_words[input_base + (at * groups + g) * blocks ..][0..blocks]);
+                        const from = input_offset + (((st / sb) * groups + g) * sb + st % sb) * block;
+                        const to = (((at / batch) * groups + g) * batch + at % batch) * block;
+                        @memcpy(words.contents()[to..][0..block], input_words.contents()[from..][0..block]);
                     }
-                    slot += 1;
+                    at += 1;
                 }
             }
-            head.linear.batch = 8;
-        } else {
-            for (spans) |span| {
-                const rows = span[1] - span[0];
-                const first = input_offset + @as(usize, span[0]) * row;
-                @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
-                destination += rows;
-            }
+        } else for (spans) |span| {
+            const rows = span[1] - span[0];
+            const first = input_offset + @as(usize, span[0]) * row;
+            @memcpy(words.contents()[destination * row ..][0 .. @as(usize, rows) * row], input_words.contents()[first..][0 .. @as(usize, rows) * row]);
+            destination += rows;
         }
         head.linear.n = width;
         head.linear.index = null;
+        head.linear.batch = @intCast(batch);
         head.linear.words = .{ .buffer = words };
         if (source.raw) |raw| {
             const scales = try head.allocate(device, width * groups * 2);
