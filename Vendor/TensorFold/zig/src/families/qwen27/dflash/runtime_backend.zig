@@ -171,6 +171,8 @@ pub const RoundArgs = extern struct {
 /// First in a frame encoded early (Model.prepareNext): waits for the verify's result and writes block 0 of `args`.
 pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
 
+pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
+
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -192,6 +194,12 @@ pub const Backend = struct {
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
+    /// A conv with a residual held back for the norm that reads its output (one launch for both); the next launch of
+    /// anything else encodes it first, on its own.
+    held_conv: ?struct { x: op.View, p: op.Conv, y: op.View } = null,
+    /// Per-head norms held back for the ropes that read their outputs (one launch for each pair); any other launch
+    /// encodes them first, on their own.
+    held_norms: [8]?HeldNorm = @splat(null),
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
@@ -204,8 +212,6 @@ pub const Backend = struct {
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
-    /// An append's step is being encoded (Ops.append_steps): the dispatches between them may be a block's.
-    appending: bool = false,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -317,7 +323,7 @@ pub const Backend = struct {
     /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
     /// acceptance at 2 bits, and the down's 2-bit copy costs about as many extra rounds as its bytes save, so it stays
     /// q4; the head's 2-bit copy only picks tiles for its q4 scores (head_bits).
-    pub const mlp_bits: u8 = 2;
+    pub const mlp_bits: u8 = 4;
     /// Code width of the draft head's requantized copy of the spans' rows, which heads of at most Head.rescored_rows rows
     /// read first to pick the tiles the q4 head computes (4: no copy, the q4 head alone).
     pub const head_bits: u8 = 2;
@@ -424,7 +430,64 @@ pub const Backend = struct {
             try b.frame.part();
             if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
         }
+        try b.flushHeld(true);
         return b.frame.encoder;
+    }
+    /// `encoder` for a launch that takes or holds a per-head norm: the other held norms stay held.
+    pub fn encoderHolding(b: *Backend, epoch: u64) !mtl.ComputeEncoder {
+        if (b.failed) return error.DraftBackendFailed;
+        try b.frame.require(epoch);
+        b.frame.ops += 1;
+        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) {
+            const parts = b.frame.part_count;
+            try b.frame.part();
+            if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
+        }
+        try b.flushHeld(false);
+        return b.frame.encoder;
+    }
+    /// Encodes the held conv (and with `norms` the held norms) on their own.
+    fn flushHeld(b: *Backend, norms: bool) !void {
+        if (b.held_conv) |h| {
+            b.held_conv = null;
+            try b.encodeConv(b.frame.encoder, h.x, h.p, h.y);
+        }
+        if (!norms) return;
+        for (&b.held_norms) |*slot| {
+            if (slot.*) |h| {
+                slot.* = null;
+                try b.encodeNorm(b.frame.encoder, h.x, h.p, h.y);
+            }
+        }
+    }
+    /// The held norm whose output is `x`, for `heads` heads of `dim`, taken out of its slot.
+    pub fn takeHeldNorm(b: *Backend, x: op.View, heads: u32, dim: u32) ?HeldNorm {
+        for (&b.held_norms) |*slot| {
+            if (slot.*) |h| {
+                if (h.p.heads == heads and h.p.head_dim == dim and std.meta.eql(h.y, x)) {
+                    slot.* = null;
+                    return h;
+                }
+            }
+        }
+        return null;
+    }
+    /// A free held-norm slot.
+    pub fn heldNormSlot(b: *Backend) ?*?HeldNorm {
+        for (&b.held_norms) |*slot| {
+            if (slot.* == null) return slot;
+        }
+        return null;
+    }
+    /// The norm launch of `x` into `y` (tf_draft_rms).
+    pub fn encodeNorm(b: *Backend, e: mtl.ComputeEncoder, x: op.View, p: op.Norm, y: op.View) !void {
+        b.access(e, &.{try b.span(x)}, &.{try b.span(y)});
+        try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
+    }
+    /// The conv launch of `x` into `y` (tf_dynamic_conv2).
+    pub fn encodeConv(b: *Backend, e: mtl.ComputeEncoder, x: op.View, p: op.Conv, y: op.View) !void {
+        if (p.residual) |r| b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(r) }, &.{try b.span(y)}) else b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{try b.span(y)});
+        try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
     }
     /// A frame view's bytes, for hazard tracking.
     pub fn span(b: *Backend, v: op.View) !Span {
@@ -442,7 +505,7 @@ pub const Backend = struct {
     }
     /// The frame is an early one's append: its taps' count is the verify's, read from `args`.
     pub fn admitting(b: *const Backend) bool {
-        return b.early != null and b.transaction != null and b.appending;
+        return b.early != null and b.transaction != null;
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32, stride: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });

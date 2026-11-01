@@ -114,16 +114,21 @@ pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
     const result = try b.frame.alloc(p.query.rows, b.config.qWidth(), .bf16);
     if (p.streams.len == 0) {
         if (!std.meta.eql(p.context, b.context)) return error.BadDraftContext;
-        try attendRows(b, e, p, p.context, b.caches, 0, p.query.rows, result);
+        // a split attention's merge also writes the output projection's group sums
+        const callbacks = @import("runtime_callbacks.zig");
+        const keys = p.context.end - p.context.begin + p.query.rows;
+        const sums: ?op.View = if (keys > split_keys and p.query.rows <= callbacks.sums_rows and b.config.qWidth() % 64 == 0) try b.frame.alloc(callbacks.sums_rows, b.config.qWidth() / 64, .f32) else null;
+        try attendRows(b, e, p, p.context, b.caches, 0, p.query.rows, result, sums);
+        if (sums) |s| callbacks.offer_sums(b, result, try b.frame.ref(s));
     } else {
         if (p.streams.len > b.batch.len or p.block == 0 or p.query.rows != p.streams.len * p.block) return error.BadDraftContext;
-        for (p.streams, 0..) |context, k| try attendRows(b, e, p, context, b.batch[k], @intCast(k * p.block), p.block, result);
+        for (p.streams, 0..) |context, k| try attendRows(b, e, p, context, b.batch[k], @intCast(k * p.block), p.block, result, null);
     }
     return result;
 }
 
 /// Query rows [first, first + rows) against `context`'s cached keys and their own, into the same rows of `result`.
-fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, context: op.Context, caches: []const @import("runtime_backend.zig").Cache, first: u32, rows: u32, result: op.View) !void {
+fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, context: op.Context, caches: []const @import("runtime_backend.zig").Cache, first: u32, rows: u32, result: op.View, sums: ?op.View) !void {
     const context_rows: u32 = @intCast(context.end - context.begin);
     const keys = context_rows + rows;
     const R = @import("core").shared_attention.Ref;
@@ -150,15 +155,22 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
         try gather(b, e, context, caches[p.layer].keys, k);
         try gather(b, e, context, caches[p.layer].values, v);
     }
-    const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
-    // the gathers and these copies write disjoint rows; the attention below reads them all
-    b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
-    if (b.early != null) {
-        // an early frame's own rows go behind the context the verify admits: the slots its RoundArgs hold
-        try b.attention.appendKvStridedAt(e, rows, .{ .buf = b.args, .off = @offsetOf(RoundArgs, "slots") }, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = caches[p.layer].keys }, .{ .buf = caches[p.layer].values }, p.keys.stride, p.values.stride);
-    } else {
-        try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
-        try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
+    const own_k_rows: R = .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 };
+    const own_v_rows: R = .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 };
+    // a split attention over the unwrapped ring reads the block's own rows where rope and the products left them:
+    // no copies behind the context (nor an early frame's append of them) and no barrier for those
+    const direct = keys > split_keys and sums != null and at + keys <= b.config.window;
+    if (!direct) {
+        const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
+        // the gathers and these copies write disjoint rows; the attention below reads them all
+        b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
+        if (b.early != null) {
+            // an early frame's own rows go behind the context the verify admits: the slots its RoundArgs hold
+            try b.attention.appendKvStridedAt(e, rows, .{ .buf = b.args, .off = @offsetOf(RoundArgs, "slots") }, own_k_rows, own_v_rows, .{ .buf = caches[p.layer].keys }, .{ .buf = caches[p.layer].values }, p.keys.stride, p.values.stride);
+        } else {
+            try b.copy(e, .{ .buf = own_k_rows.buf, .off = own_k_rows.off }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
+            try b.copy(e, .{ .buf = own_v_rows.buf, .off = own_v_rows.off }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
+        }
     }
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
     const v_ref: R = .{ .buf = v.buf, .off = v.off };
@@ -166,19 +178,28 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const mask_ref = try b.frame.ref(mask);
     // an early frame's mask spans the larger count's keys: every key of either count must be visible
     if (b.early != null and !std.mem.allEqual(u8, mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], 1)) return error.DraftDeviceRound;
-    b.barrier(e);
+    if (!direct) b.barrier(e);
     if (keys > split_keys) b.access(e, &.{}, &.{Span.whole(b.attention.part)}); // encodeSplit's partials: one attention at a time
-    const kv_bytes = @as(usize, keys) * b.config.kvWidth() * 2;
-    b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask) }, &.{try b.span(result)});
+    const kv_bytes = @as(usize, if (direct) context_rows else keys) * b.config.kvWidth() * 2;
+    if (direct) b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask), try b.span(p.keys), try b.span(p.values) }, &.{ try b.span(result), try b.span(sums.?) }) else if (sums) |s| b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask) }, &.{ try b.span(result), try b.span(s) }) else b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask) }, &.{try b.span(result)});
+    const own: ?@import("core").shared_attention.Attention.Own = if (direct) .{ .k = own_k_rows, .v = own_v_rows, .rows = rows, .k_stride = p.keys.stride, .v_stride = p.values.stride } else null;
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
-    // Long contexts share each 256-key chunk across the query heads of one KV head.
+    // a split attention with `sums` also writes the group sums of its output for the projection that reads it
+    const xs: ?@import("core").shared_attention.Attention.Sums = if (sums) |s| blk: {
+        const sr = try b.frame.ref(s);
+        break :blk .{ .ref = .{ .buf = sr.buf, .off = sr.off }, .stride = @import("runtime_callbacks.zig").sums_rows };
+    } else null;
     if (b.early != null) {
         // an early frame's keys are the larger count's: the Args the verify picked hold its own (and the same kernel)
         const args: R = .{ .buf = b.args, .off = @offsetOf(RoundArgs, "attention") };
-        if (keys > split_keys) try b.attention.encodeSplitAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encodeAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]);
+        if (keys > split_keys) {
+            if (xs) |x| try b.attention.encodeSplitSums(e, rows, keys, keys, scale, args, views[0], views[1], views[2], views[3], views[4], x, own) else try b.attention.encodeSplitAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]);
+        } else try b.attention.encodeAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]);
         return;
     }
-    if (keys > split_keys) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
+    if (keys > split_keys) {
+        if (xs) |x| try b.attention.encodeSplitSums(e, rows, keys, keys, scale, null, views[0], views[1], views[2], views[3], views[4], x, own) else try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
+    } else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
 }
 
 /// Keys past which a block's attention splits them into chunks (encodeSplit) instead of one pass a row (encode).
