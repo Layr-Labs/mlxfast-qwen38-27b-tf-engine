@@ -797,6 +797,32 @@ kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
   }
   for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }
+// A layer's history and projection words (tf_delta_gdn_conv_keep_deferred): each layer's span of the pool's buffers.
+struct TfDeltaConvDeferred { uint history_words, projection_words; };
+// tf_delta_gdn_conv_keep for every layer of a lone keep (keeps[0]) in one launch: y is the layer, whose history and
+// projection words start a span further; each thread copies the words tf_delta_gdn_conv_keep copies for its channel.
+kernel void tf_delta_gdn_conv_keep_deferred(device ushort* history [[buffer(0)]],
+                                          device const ushort* projections [[buffer(1)]],
+                                          device const uint* kept_rows [[buffer(2)]],
+                                          device const TfDeltaKeep* keeps [[buffer(3)]],
+                                          device const uint* windows [[buffer(4)]],
+                                          constant TfDeltaParams& p [[buffer(5)]],
+                                          constant TfDeltaConvDeferred& spans [[buffer(6)]],
+                                          uint2 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const TfDeltaKeep keep = keeps[0];
+  if (item >= channels || keep.rows == 0) return;
+  device ushort* committed = history + (size_t)position.y * spans.history_words;
+  device const ushort* projection = projections + (size_t)position.y * spans.projection_words;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
 kernel void tf_delta_gdn_publish(device const uint* next_state [[buffer(0)]],
