@@ -66,6 +66,7 @@ pub const Ops = struct {
         rope: *const fn (*anyopaque, u64, View, Rotary) anyerror!View,
         attention: *const fn (*anyopaque, u64, Attention) anyerror!View,
         swiglu: *const fn (*anyopaque, u64, View, View) anyerror!View,
+        sparse_mlp_down: ?*const fn (*anyopaque, u64, View, View, ck.Tensor, Mode) anyerror!?View = null,
         mask_rows: *const fn (*anyopaque, u64, View, u32, u32) anyerror!View,
         // the draft head is the target's own repacked LM head (runtime_head.zig), so it takes no binding
         head: *const fn (*anyopaque, u64, View) anyerror!Head,
@@ -81,6 +82,8 @@ pub const Ops = struct {
         context_abort: *const fn (*anyopaque, u64) void,
         // a batched pass's stream k.
         stream_append: *const fn (*anyopaque, u64, u32, u32, View, View, []const u64) anyerror!void,
+        // All cache keys and values projected from one normalized hidden view, in layer-major order.
+        stacked_kv: ?*const fn (*anyopaque, u64, View, ck.Tensor, Mode) anyerror!?View = null,
         // one projection of a fused weight group (kind 1: k+v, 2: q+k+v, 3: gate+up) keyed by the group's first tensor; null: not fused
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
