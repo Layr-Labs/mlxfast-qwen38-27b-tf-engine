@@ -299,5 +299,7 @@ fn binding(a: std.mem.Allocator, target: *Target, prefix: []const u8, module: []
     return ck.validate(w, s, b, format, target.config.vocab, target.config.hidden);
 }
 
-/// Rows one flush pass absorbs; a prompt-sized catch-up takes one or two passes instead of nine.
-const flush_rows = 1024;
+/// Rows one flush pass absorbs: the drafter's whole window (2048, the stock config's sliding window), so a prompt's
+/// catch-up is one frame and one wait. Reg adapters still launch 128 rows at a time from the pass's first row, so the
+/// 128-row launches, and every appended key and value, are the ones the 1024 + remainder passes made.
+const flush_rows = 2048;

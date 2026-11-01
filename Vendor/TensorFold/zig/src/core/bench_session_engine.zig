@@ -243,6 +243,9 @@ pub fn GenerationBinding(comptime generation: type) type {
         chunk: usize,
         host: ?*api.LaneHost = null,
         depth: u8 = 0,
+        /// The last `reset` emptied slot 0 and the drafter and nothing has drafted since (the worker resets right
+        /// before every seed of a free_decode_begin): the seed need not clear the slot's state a second time.
+        fresh: bool = false,
 
         pub fn source(binding: *@This()) DflashSource {
             return .{ .ctx = binding, .seed = seed, .round = round, .reset = reset };
@@ -254,7 +257,14 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
             try binding.ready();
-            try binding.resetNow();
+            // A second slot clear rewrites the zeros the phase reset just wrote, behind one more GPU round trip. It is
+            // skipped only while that reset's state provably stands: nothing landed in slot 0 (a lane prompt pass that
+            // landed moves its offset; one that failed on the GPU marks the runner failed) and the drafter is empty.
+            const g = binding.generation;
+            const clean = binding.fresh and !g.runner.failed and g.runner.active == null and g.runner.offsets[0] == 0 and
+                g.keep == null and g.draft.committed_end == 0 and g.draft.session.context.end == 0;
+            binding.fresh = false;
+            if (!clean) try binding.resetNow();
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
             const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = depth }, &.{}, false, null, 0);
@@ -268,6 +278,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
             try binding.ready();
+            binding.fresh = false;
             if (binding.depth != 1) return error.SessionNotSeeded;
             if (binding.generation.journal != null) return error.AuditAlreadyAttached;
             var journal: generation.AuditJournal = .{};
@@ -287,7 +298,9 @@ pub fn GenerationBinding(comptime generation: type) type {
             const binding: *@This() = @ptrCast(@alignCast(ptr));
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
+            binding.fresh = false;
             try binding.resetNow();
+            binding.fresh = true;
         }
 
         /// The lane host idle, as EngineDflashBinding.ready requires, and its thread hook run.

@@ -341,8 +341,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
-#elif defined(TF_COUNT)
-    device atomic_uint* TC [[buffer(6)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
@@ -602,15 +600,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       const int m = mb + 8 * ((i >> 2) & 1), n = n0 + nb + 16 * (i >> 3) + (i & 3);
       if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[i]);
     }
-#endif
-#if defined(TF_COUNT)
-  // the norm that reads Y shares this launch's barrier interval: each threadgroup counts itself on TC[0] once its
-  // stores are past a device-scope fence (q27_norm_xs' wait_for)
-  threadgroup_barrier(mem_flags::mem_device);
-  if (ks == 0 && lane == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
-  }
 #endif
 }
 #endif

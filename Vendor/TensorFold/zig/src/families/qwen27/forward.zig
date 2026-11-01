@@ -35,9 +35,6 @@ pub const Stages = struct {
     /// The previous block's MLP down projection stored hidden + its output into `residual` (Kernels.quantResid): the next
     /// norm reads `residual` alone.
     summed: bool = false,
-    /// Decoded rows: the MLP down was a quantCounted launch with no barrier after it, so the next norm (the next pre, or
-    /// finish) waits on its `wait` counted threadgroups in that barrier interval (Kernels.normAfter).
-    norm_wait: u32 = 0,
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
@@ -45,6 +42,9 @@ pub const Stages = struct {
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
     after: ?Hook = null,
+    /// Host work run after the forward's last command buffer is committed, while the GPU still runs it: it encodes
+    /// nothing and reads no row, so unlike `after` it leaves terminal row pruning on.
+    idle: ?Hook = null,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -73,11 +73,8 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
-        if (s.norm_wait != 0) {
-            try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
-        } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
-        s.norm_wait = 0;
         s.summed = false;
         if (s.pending != null) {
             std.mem.swap(Ref, &s.hidden, &s.residual);
@@ -118,9 +115,6 @@ pub const Stages = struct {
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
-            // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
-            try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
         } else {
             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
@@ -162,11 +156,8 @@ pub const Stages = struct {
         lane.enc.barrier();
         if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
-        } else if (if (!s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {
-            s.norm_wait = counted;
         } else try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), dims, f.get(.output), s.rows);
-        // a counted down shares its barrier interval with the norm that waits on it
-        if (s.norm_wait == 0) lane.enc.barrier();
+        lane.enc.barrier();
         s.pending = f.get(.output);
     }
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
@@ -175,11 +166,8 @@ pub const Stages = struct {
         const f = &m.frame;
         const e = lane.enc;
         const dims = f.get(if (s.compact) .last_dims else .dims);
-        if (s.norm_wait != 0) {
-            try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(m.weights.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows, s.norm_wait);
-        } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(m.weights.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+        try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(m.weights.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
         e.barrier();
-        s.norm_wait = 0;
         s.summed = false;
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
@@ -204,6 +192,7 @@ pub const Stages = struct {
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
+        if (s.idle) |h| try h.run(h.ptr);
     }
 };
 

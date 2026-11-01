@@ -117,8 +117,16 @@ pub const Generation = struct {
         g.pending = null;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
+        // the prompt's last pass: while its GPU work runs, the drafter's frame scratch for the first round is remade
+        if (last) g.runner.idle = .{ .ptr = g.draft, .run = regrowDraftFrame };
+        defer g.runner.idle = null;
         try (TargetSession.Session{ .runner = g.runner }).promptChunk(ids, last);
         try g.absorbChunk(ids.len);
+    }
+    /// The drafter frame's remembered scratch (Frame.regrow): host allocations only, no GPU work and no content.
+    fn regrowDraftFrame(ptr: *anyopaque) anyerror!void {
+        const draft: *Draft = @ptrCast(@alignCast(ptr));
+        draft.backend.frame.regrow();
     }
     /// `promptChunk` with decoded rows' arithmetic (an earlier reply's tokens).
     pub fn decodeChunk(g: *Generation, ids: []const u32, last: bool) !void {

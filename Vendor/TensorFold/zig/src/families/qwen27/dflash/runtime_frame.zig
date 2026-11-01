@@ -112,6 +112,9 @@ pub const Frame = struct {
     poll_value: u64 = 0,
     unchecked: [9]mtl.CommandBuffer = undefined,
     n_unchecked: usize = 0,
+    /// The byte lengths of the pool's buffers, by cursor, when a used pool was last drained (a phase close). Sizes
+    /// only: no buffer and no content outlives the drain. `regrow` remakes that scratch while the GPU is busy.
+    grown: std.ArrayList(usize) = .empty,
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -129,6 +132,32 @@ pub const Frame = struct {
         for (f.pool.items) |buffer| buffer.deinit();
         f.pool.deinit(f.allocator);
         f.entries.deinit(f.allocator);
+        f.grown.deinit(f.allocator);
+    }
+    /// Notes the pool's buffer lengths before a drain frees them. An empty pool (a phase that never drafted, such
+    /// as a prefill phase) keeps the earlier note, so the next drafted phase still finds the shape its frames take.
+    pub fn remember(f: *Frame) void {
+        if (f.pool.items.len == 0) return;
+        f.grown.clearRetainingCapacity();
+        for (f.pool.items) |buffer| f.grown.append(f.allocator, buffer.length()) catch {
+            f.grown.clearRetainingCapacity();
+            return;
+        };
+    }
+    /// Remakes the remembered scratch in an empty, idle pool: a phase's first frames (a prompt's catch-up, its first
+    /// block) then find their buffers instead of making them between the seed and the first verify. Called beside
+    /// the seed's prompt pass, whose GPU work hides the allocations. Best effort: a refused buffer stops it, and the
+    /// frame then makes what it lacks on first use, as it does without this.
+    pub fn regrow(f: *Frame) void {
+        if (f.active or f.pool.items.len != 0) return;
+        for (f.grown.items) |bytes| {
+            const buffer = f.device.buffer(bytes, options) catch return;
+            f.pool.append(f.allocator, buffer) catch {
+                buffer.deinit();
+                return;
+            };
+            if (f.residency) |h| h.join(h.ctx, buffer);
+        }
     }
     pub fn cacheBytes(f: *const Frame) u64 {
         var bytes: u64 = 0;
@@ -138,6 +167,7 @@ pub const Frame = struct {
     /// Release idle reusable buffers. A live frame stays visible so phase close fails closed.
     pub fn drain(f: *Frame) u64 {
         if (f.active) return f.cacheBytes();
+        f.remember();
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
             buffer.deinit();

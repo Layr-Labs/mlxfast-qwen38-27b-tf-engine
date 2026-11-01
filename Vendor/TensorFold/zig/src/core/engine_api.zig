@@ -53,6 +53,8 @@ fn metalFrameBytes(frame: anytype) u64 {
 
 fn drainMetalFrame(frame: anytype) u64 {
     if (frame.active) return metalFrameBytes(frame);
+    // the pool's buffer lengths only (no buffer is kept): the next drafted phase remakes them beside its seed
+    if (comptime @hasDecl(@TypeOf(frame.*), "remember")) frame.remember();
     for (frame.pool.items) |buffer| {
         if (frame.residency) |hook| hook.leave(hook.ctx, buffer);
         buffer.deinit();
