@@ -18,8 +18,7 @@ Q27_SPECIALIZE
   const uint m = threadgroup_position_in_grid.y;
   const int M = dims[0], MP = dims[1];
   threadgroup bfloat hb[64];
-  // the grid covers the real rows: the first row's threadgroup zeroes its group's padded rows' sums
-  if (m == 0 && int(t) < MP - M) XS[g * MP + M + t] = 0.0f;
+  // the grid covers the real rows; a padded row's sums are read only for rows the lane kernel drops
   if (int(m) >= M) {
     if (t == 0) XS[g * MP + m] = 0.0f;
     return;
