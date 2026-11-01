@@ -149,6 +149,24 @@ pub const Round = struct {
         bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
         e.setValue(r.p, 9);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        r.b.qkv.bind(e, 15); // never read: wait_for 0
+        e.setValue(@as(u32, 0), 16);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
+    /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
+    /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
+    /// so any other shape is refused rather than run unsynchronised.
+    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) !void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return error.BadGdnPrepare;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return error.BadGdnPrepare;
+        e.setPipeline(rows);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.setBuffer(counter, 0, 15);
+        e.setValue(wait, 16);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
     }
@@ -252,12 +270,18 @@ pub const Round = struct {
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
+        r.commitConvBeside(e);
+        e.barrier();
+    }
+
+    /// commitConv without the barrier after it, for a caller that encodes it beside work that neither reads its next
+    /// windows nor writes what it reads (the prompt chain's scan).
+    pub fn commitConvBeside(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.conv_commit);
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
         e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 256 }); // a word a thread
-        e.barrier();
     }
 
     pub fn commit(r: Round, e: metal.ComputeEncoder) void {
