@@ -144,8 +144,12 @@ pub const Scratch = struct {
         for (s.buffers) |buffer| total += buffer.length();
         return total;
     }
-    pub fn upload(s: *Scratch, plan: Plan) !void {
+    /// Whether `plan` fits the scratch (upload's check, uploading nothing).
+    pub fn admit(s: *const Scratch, plan: Plan) !void {
         if (plan.rows > s.limits.rows or plan.streams > s.limits.streams or plan.tiles > s.tiles or plan.prefix_chunks > s.chunks or plan.tail_chunks > s.tail_chunks or plan.geometry.shared_prefix != s.limits.shared_prefix or !plan.geometry.sameShape(s.limits.geometry)) return error.AttentionLimits;
+    }
+    pub fn upload(s: *Scratch, plan: Plan) !void {
+        try s.admit(plan);
         @memcpy(s.get(.tile_stream).buffer.slice(i32, plan.tile_stream.len), plan.tile_stream);
         @memcpy(s.get(.q_rows).buffer.slice(i32, plan.q_rows.len), plan.q_rows);
         @memcpy(s.get(.nodes).buffer.slice(i32, plan.nodes.len), plan.nodes);
@@ -199,7 +203,7 @@ fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
 fn preprocessGroups(g: planning.Geometry) u32 {
     return (g.heads + g.kv_heads + 3) / 4;
 }
-/// The prompt kernel's threads a group: eight simdgroups, both kernels (attention_prompt*.metal's SG = 8).
+/// Fallback prompt kernel threads per group; the M5 tensor kernel uses four simdgroups.
 const prompt_threads = 256;
 /// h_end and w_end above 0: an M-RoPE round, the h and w position planes `plane` rows past each other in `positions`.
 /// key_stride: values from one key row to the next (0: kv_heads * dim); strided keys take the fused norm and rope alone.
@@ -258,7 +262,7 @@ pub const Attention = struct {
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
     fn promptPipelines(device: mtl.Device, library: mtl.Library, units: bool) !?[2]mtl.Pipeline {
-        const chunks = try mtl.Pipeline.init(device, library, if (units) "q27_attn_prompt_8" else "q27_attn_prompt_sg_8", false);
+        const chunks = try mtl.Pipeline.init(device, library, if (units) "q27_attn_prompt_4" else "q27_attn_prompt_sg_8", false);
         if (!units and chunks.maxThreads() < prompt_threads) {
             std.log.info("qwen27: the prompt attention kernel runs {d} threads a group here, not {d}; prompt rows take the decode path", .{ chunks.maxThreads(), prompt_threads });
             chunks.deinit();
@@ -429,13 +433,13 @@ pub const Attention = struct {
             e.setPipeline(a.io[2]);
             bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
             e.setValue(args, 5);
-            e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 4, 1));
+            e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 1, 1));
         }
         if (!prepacked and !appended) {
             e.setPipeline(a.io[0]);
             bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
             e.setValue(args, 3);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 4, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 1, 1)); // eight words a thread
         }
         if (a.promptPath(plan, prompt)) {
             e.barrier();
@@ -454,10 +458,12 @@ pub const Attention = struct {
         // before M5 (no shared prefix) the partials take the tail's buffers, which hold every chunk's packed rows
         const parts = if (g.shared_prefix) [3]Field{ .poa, .pma, .pla } else [3]Field{ .pob, .pmb, .plb };
         if (!g.shared_prefix and @as(usize, chunks) * plan.tiles * 16 > @as(usize, scratch.tail_chunks) * scratch.limits.rows * 16) return error.AttentionLimits;
-        const pairs = prompt_threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
+        const threads: u32 = if (a.units) 128 else prompt_threads;
+        const pairs = threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
         // rows before plan.live_from have no reader: start at the tile group holding the first live packed row
         const live = if (a.units) @min(plan.live_from, plan.rows) else 0; // the M5 kernel and merge take the offsets
-        const tile0: u32 = (live * g.group() / 16) / pairs * pairs;
+        // Preserve the original four-tile origin used by the ordered key-step limit.
+        const tile0: u32 = (live * g.group() / 16) / 4 * 4;
         const args = PromptArgs{ .start = start, .rows = @intCast(plan.rows), .chunks = @intCast(chunks), .rp = @intCast(plan.tiles * 16), .key_stride = @intCast(binding.strides[0][0]), .value_stride = @intCast(binding.strides[0][1]), .scale2 = 0.0625 * std.math.log2e, .tile0 = @intCast(tile0), .row0 = @intCast(live * g.group()) };
         e.setPipeline(a.prompt.?[0]);
         bind(e, .{ scratch.get(.qa), binding.get(.caches) });
@@ -465,7 +471,7 @@ pub const Attention = struct {
         e.setBuffer(scratch.get(parts[0]).buffer, 0, 3);
         e.setBuffer(scratch.get(parts[1]).buffer, 0, 4);
         e.setBuffer(scratch.get(parts[2]).buffer, 0, 5);
-        if (plan.tiles > tile0) e.dispatchGroups(mtl.Size.of(g.kv_heads, chunks, (plan.tiles - tile0 + pairs - 1) / pairs), mtl.Size.of(prompt_threads, 1, 1));
+        if (plan.tiles > tile0) e.dispatchGroups(mtl.Size.of(g.kv_heads, chunks, (plan.tiles - tile0 + pairs - 1) / pairs), mtl.Size.of(threads, 1, 1));
         e.barrier();
         e.setPipeline(a.prompt.?[1]);
         bind(e, .{ scratch.get(parts[0]), scratch.get(parts[1]), scratch.get(parts[2]) });
@@ -489,7 +495,7 @@ pub const Attention = struct {
             e.setPipeline(a.io[1]);
             bind(e, .{ q, scratch.get(.qb) });
             e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
         }
         // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
         if (!appended) e.barrier();
@@ -573,12 +579,12 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), scratch.get(.keep_k), scratch.get(.keep_v) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
         e.barrier();
         e.setPipeline(a.io[6]);
         bind(e, .{ scratch.get(.keep_k), scratch.get(.keep_v), binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
         e.barrier();
     }
     /// `keep`'s gather into a caller's own K/V lanes, without barriers: layers with distinct lanes gather side by side.
@@ -589,7 +595,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
     }
     /// The checks and resource uses of `keepGather`, without its dispatch (the all-layer launch reads through pointers).
     pub fn keepUse(e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache) !void {
@@ -609,7 +615,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[6]);
         bind(e, .{ keys, values, binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
     /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding reads; `layers` receives the

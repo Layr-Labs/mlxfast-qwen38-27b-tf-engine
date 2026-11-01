@@ -36,6 +36,8 @@ pub const Session = struct {
     }
     pub fn greedy(s: Session) !u32 {
         if (s.runner.failed or s.runner.active != null or s.runner.offsets[s.slot] == 0) return error.RoundNotReady;
+        // a sieved verify left no logits in row 0: its accepted row's token is the argmax that row would give
+        if (s.runner.head_token) |token| return token;
         const values = s.runner.model.frame.get(.logits).buffer.slice(u16, s.runner.model.config.vocab);
         return argmax(values);
     }
@@ -58,7 +60,8 @@ pub const Session = struct {
                 for (0..r.model.config.kv_heads) |head| hash.update(ref.buffer.contents()[ref.offset + head * @as(usize, head_stride) * 2 ..][0 .. @as(usize, r.offsets[0]) * head_dim * @sizeOf(u16)]);
             }
         }
-        hash.update(r.model.frame.get(.logits).buffer.contents()[0 .. r.model.config.vocab * 2]);
+        // after a sieved verify row 0 holds no logits: its token stands for them (the full head's state hashes its row)
+        if (r.head_token) |token| hash.update(std.mem.asBytes(&token)) else hash.update(r.model.frame.get(.logits).buffer.contents()[0 .. r.model.config.vocab * 2]);
         var out: [32]u8 = undefined;
         hash.final(&out);
         return out;

@@ -102,6 +102,8 @@ pub const Buffers = struct {
 pub const Sums = struct { span: Span, stride: u32, written: *bool };
 /// Work encoded beside a scan, before the barrier that ends it: rows only the gate reads (the z projection's).
 pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
+/// Byte offset of the prepare-to-star words (count, arrivals) in the pool's scan words, past the scan-to-gate pair.
+pub const star_words: usize = 8;
 /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
 /// rows, and how many it applies and whether it writes the state back.
 pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
@@ -154,6 +156,8 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         r.b.qkv.bind(e, 15); // never read: wait_for 0
         e.setValue(@as(u32, 0), 16);
+        r.b.qkv.bind(e, 17); // never written: count_out 0
+        e.setValue(@as(u32, 0), 18);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
     }
@@ -161,7 +165,10 @@ pub const Round = struct {
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
     /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
     /// so any other shape is refused rather than run unsynchronised.
-    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) !void {
+    /// `star` (its words 2 and 3, left zero): the star scan that reads the prepared rows shares this barrier interval too;
+    /// each group counts itself there once its rows are stored, no barrier follows, and forwardStar's scan waits on
+    /// prepareGroups of them.
+    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32, star: ?metal.Buffer) !void {
         if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return error.BadGdnPrepare;
         inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return error.BadGdnPrepare;
         e.setPipeline(rows);
@@ -170,8 +177,15 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
         e.setBuffer(counter, 0, 15);
         e.setValue(wait, 16);
+        if (star) |s| e.setBuffer(s, star_words, 17) else e.setBuffer(counter, 0, 17); // never written: count_out 0
+        e.setValue(@as(u32, @intFromBool(star != null)), 18);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
-        e.barrier();
+        if (star == null) e.barrier();
+    }
+
+    /// The threadgroups prepareRows launches: the count a star scan in its barrier interval waits on.
+    pub fn prepareGroups(r: Round) u32 {
+        return (2 * r.p.nk + r.p.nv) * ((r.p.rows + 15) / 16);
     }
 
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.
@@ -227,8 +241,10 @@ pub const Round = struct {
     /// `counter` (two words, left zero): with nothing beside the scan and the gate on post_rows, the scan counts its
     /// threadgroups once their rows are stored and the gate waits on that count in the same barrier interval.
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
-    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending) !void {
-        if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1)) return error.BadGdnPlan;
+    /// `wait_prep` above 0 (`counter` given): the prepare shares this scan's barrier interval (prepareRowsAfter's `star`);
+    /// each group loads its committed words and replays its pending rows, then waits on that many prepare groups.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32) !void {
+        if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1) or (wait_prep != 0 and counter == null)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
@@ -241,9 +257,13 @@ pub const Round = struct {
             bind(e, .{ q.key, q.value, q.decay, q.mixing }, 12);
             e.setValue(q.use, 16);
         }
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        if (wait_prep != 0) e.setBuffer(counter.?, star_words, 17) else r.b.recurrent.bind(e, 17); // never read: wait_prep 0
+        e.setValue(wait_prep, 18);
+        // one simdgroup a threadgroup (as the prompt scan): four times the groups, so the cores' shares of the
+        // latency-bound star come out even; the gate below waits on that many arrivals
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 1, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 8) * r.p.nv * r.segments));
+        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 2) * r.p.nv * r.segments));
         e.barrier();
         r.gate(e, post_rows);
     }
@@ -259,7 +279,9 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        // one simdgroup a threadgroup: four times the groups of four-simdgroup threadgroups, so the cores' shares of them
+        // come out even
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 1, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
@@ -310,6 +332,25 @@ pub const Round = struct {
             e.setValue(@as(u32, 0), 8);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
+        e.barrier();
+    }
+    /// gate for a prompt chain on `rows16` (tf_delta_gdn_post_rows16: post_rows' words and group sums, 16 rows a group of
+    /// 128); shapes post_rows does not take keep `gate`.
+    pub fn gatePrompt(r: Round, e: metal.ComputeEncoder, rows16: metal.Pipeline, post_rows: metal.Pipeline) void {
+        if (!r.gateRows()) return r.gate(e, post_rows);
+        e.setPipeline(rows16);
+        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
+        e.setValue(r.p, 3);
+        r.b.output.bind(e, 4);
+        if (r.sums) |w| {
+            w.span.bind(e, 5);
+            e.setValue(w.stride, 6);
+            w.written.* = true;
+        } else {
+            r.b.output.bind(e, 5); // never read: a zero stride writes no sums
+            e.setValue(@as(u32, 0), 6);
+        }
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128 });
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
