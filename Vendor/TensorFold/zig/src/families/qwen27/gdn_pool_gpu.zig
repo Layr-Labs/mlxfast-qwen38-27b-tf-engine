@@ -224,7 +224,7 @@ pub const Pool = struct {
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
-        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 8 == 0;
+        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 16 == 0;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
@@ -318,6 +318,26 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// commitConvKeep for every layer of a lone keep in one launch (tf_delta_gdn_conv_keep_deferred), unfenced: each layer's
+    /// history and projection spans are a fixed share of the pool's buffers (layerSpan).
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host) or plan.host.keeps.len != 1) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const spans = abi.ConvDeferred{ .history_words = @intCast(history.length() / pool.budget.layers / 2), .projection_words = @intCast(projections.length() / pool.budget.layers / 2) };
+        e.setPipeline(pool.kernels.conv_keep_deferred);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(spans, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = pool.budget.layers }, .{ .width = 256 }); // a channel a thread, a layer a row
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
