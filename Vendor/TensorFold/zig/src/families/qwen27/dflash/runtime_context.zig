@@ -2,6 +2,7 @@
 const std = @import("std");
 const op = @import("operators.zig");
 const Backend = @import("runtime_backend.zig").Backend;
+const RoundArgs = @import("runtime_backend.zig").RoundArgs;
 const Ref = @import("runtime_backend.zig").Ref;
 const Span = @import("runtime_backend.zig").Span;
 fn cast(ptr: *anyopaque) *Backend {
@@ -41,16 +42,27 @@ fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("r
     const k = try b.frame.ref(keys);
     const v = try b.frame.ref(values);
     b.access(e, &.{ try b.span(keys), try b.span(values) }, &.{ Span.whole(cache.keys), Span.whole(cache.values) });
+    // an early frame's append writes the rows the verify admits: their count is in its RoundArgs
+    const admitted: ?@import("core").shared_attention.Ref = if (b.admitting()) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "append") } else null;
+    if (admitted != null and positions.len > 16) return error.DraftDeviceRound;
     var first: usize = 0;
     while (first < positions.len) : (first += 16) {
         const count = @min(positions.len - first, 16);
         var slots: [16]u32 = undefined;
         for (slots[0..count], 0..) |*slot, i| slot.* = @intCast(positions[first + i] % b.config.window);
         if (values.stride != b.config.kvWidth() or keys.stride != b.config.kvWidth()) {
+            if (admitted) |rows| {
+                try b.attention.appendKvStridedRows(e, slots[0..count], .{ .buf = k.buf, .off = k.off }, .{ .buf = v.buf, .off = v.off }, .{ .buf = cache.keys }, .{ .buf = cache.values }, keys.stride, values.stride, rows);
+                continue;
+            }
             try b.attention.appendKvStrided(e, slots[0..count], .{ .buf = k.buf, .off = k.off + first * keys.stride * 2 }, .{ .buf = v.buf, .off = v.off + first * values.stride * 2 }, .{ .buf = cache.keys }, .{ .buf = cache.values }, keys.stride, values.stride);
             continue;
         }
         const off = first * b.config.kvWidth() * 2;
+        if (admitted) |rows| {
+            try b.attention.appendKvRows(e, slots[0..count], .{ .buf = k.buf, .off = k.off }, .{ .buf = v.buf, .off = v.off }, .{ .buf = cache.keys }, .{ .buf = cache.values }, rows);
+            continue;
+        }
         try b.attention.appendKv(e, slots[0..count], .{ .buf = k.buf, .off = k.off + off }, .{ .buf = v.buf, .off = v.off + off }, .{ .buf = cache.keys }, .{ .buf = cache.values });
     }
 }
@@ -117,7 +129,7 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const R = @import("core").shared_attention.Ref;
     const q = try b.frame.ref(p.query);
     const y = try b.frame.ref(result);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(b.config.head_dim)));
+    const scale = scaleOf(b.config);
     const own_k = try b.frame.ref(p.keys);
     const own_v = try b.frame.ref(p.values);
     const at: u32 = @intCast(context.begin % b.config.window);
@@ -129,6 +141,7 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
         k = .{ .buf = caches[p.layer].keys, .off = @as(usize, at) * b.config.kvWidth() * 2 };
         v = .{ .buf = caches[p.layer].values, .off = @as(usize, at) * b.config.kvWidth() * 2 };
     } else {
+        if (b.early != null) return error.DraftDeviceRound;
         const merged_k = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
         const merged_v = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
         k = try b.frame.ref(merged_k);
@@ -140,19 +153,50 @@ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, 
     const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
     // the gathers and these copies write disjoint rows; the attention below reads them all
     b.access(e, &.{ try b.span(p.keys), try b.span(p.values) }, &.{ Span.of(k, @as(usize, keys) * b.config.kvWidth() * 2), Span.of(v, @as(usize, keys) * b.config.kvWidth() * 2) });
-    try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
-    try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
+    if (b.early != null) {
+        // an early frame's own rows go behind the context the verify admits: the slots its RoundArgs hold
+        try b.attention.appendKvStridedAt(e, rows, .{ .buf = b.args, .off = @offsetOf(RoundArgs, "slots") }, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = caches[p.layer].keys }, .{ .buf = caches[p.layer].values }, p.keys.stride, p.values.stride);
+    } else {
+        try b.copy(e, .{ .buf = own_k.buf, .off = own_k.off + @as(usize, first) * p.keys.stride * 2 }, .{ .buf = k.buf, .off = k.off + off }, rows, p.keys.width, p.keys.stride);
+        try b.copy(e, .{ .buf = own_v.buf, .off = own_v.off + @as(usize, first) * p.values.stride * 2 }, .{ .buf = v.buf, .off = v.off + off }, rows, p.values.width, p.values.stride);
+    }
     const k_ref: R = .{ .buf = k.buf, .off = k.off };
     const v_ref: R = .{ .buf = v.buf, .off = v.off };
     const mask = try maskOf(b, context_rows, rows);
     const mask_ref = try b.frame.ref(mask);
+    // an early frame's mask spans the larger count's keys: every key of either count must be visible
+    if (b.early != null and !std.mem.allEqual(u8, mask_ref.buf.contents()[mask_ref.off..][0 .. @as(usize, rows) * keys], 1)) return error.DraftDeviceRound;
     b.barrier(e);
-    if (keys > 1024) b.access(e, &.{}, &.{Span.whole(b.attention.part)}); // encodeSplit's partials: one attention at a time
+    if (keys > split_keys) b.access(e, &.{}, &.{Span.whole(b.attention.part)}); // encodeSplit's partials: one attention at a time
     const kv_bytes = @as(usize, keys) * b.config.kvWidth() * 2;
     b.access(e, &.{ try b.span(p.query), Span.of(k, kv_bytes), Span.of(v, kv_bytes), try b.span(mask) }, &.{try b.span(result)});
     const views = [_]R{ .{ .buf = q.buf, .off = q.off + @as(usize, first) * p.query.stride * 2 }, k_ref, v_ref, .{ .buf = mask_ref.buf, .off = mask_ref.off }, .{ .buf = y.buf, .off = y.off + @as(usize, first) * result.stride * 2 } };
     // Long contexts share each 256-key chunk across the query heads of one KV head.
-    if (keys > 1024) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
+    if (b.early != null) {
+        // an early frame's keys are the larger count's: the Args the verify picked hold its own (and the same kernel)
+        const args: R = .{ .buf = b.args, .off = @offsetOf(RoundArgs, "attention") };
+        if (keys > split_keys) try b.attention.encodeSplitAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encodeAt(e, rows, keys, keys, args, views[0], views[1], views[2], views[3], views[4]);
+        return;
+    }
+    if (keys > split_keys) try b.attention.encodeSplit(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]) else try b.attention.encode(e, rows, keys, keys, scale, views[0], views[1], views[2], views[3], views[4]);
+}
+
+/// Keys past which a block's attention splits them into chunks (encodeSplit) instead of one pass a row (encode).
+pub const split_keys = 1024;
+
+/// The drafter attention's score scale.
+pub fn scaleOf(c: @import("config.zig").Config) f32 {
+    return 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+}
+
+/// Whether a 2-row block can follow `end`'s context (`first` its first key) as one or two more committed rows alike: for
+/// either count the window keeps its beginning, the new taps' ring slots, their K/V slots and the attention's in-place
+/// keys (with the block's own rows) do not wrap, and the attention takes the same kernel. Its mask is all ones then.
+pub fn sameForEither(end: u64, first: u64, window: u32) bool {
+    if (first > end or window < 4) return false;
+    const w: u64 = window;
+    const most = end + 2 - first; // context rows when two rows are admitted
+    return end + 2 <= first + (w - 1) and end % w + 2 <= w and first % w + most + 2 <= w and (most + 1 > split_keys) == (most + 2 > split_keys);
 }
 
 /// The frame's mask for `rows` queries over `context_rows` cached keys, filled once and read by every layer after.
@@ -194,6 +238,33 @@ test "sliding context advances per query; trained slots see no later slot, later
             };
         }
     }
+}
+
+test "a block that can follow either count of committed rows sees every key and stays off the window's edges" {
+    const window: u32 = 2048;
+    var mask: [2 * 2048]u8 = undefined;
+    var seen = [_]bool{ false, false };
+    for ([_]u64{ 0, 1, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1065, 1200, 2038, 2041, 2042, 2043, 2044, 2045, 2046, 2047, 2048, 4000 }) |end| {
+        for ([_]u64{ 0, 1, 7, 2047 }) |first| {
+            const either = sameForEither(end, first, window);
+            seen[@intFromBool(either)] = true;
+            if (!either) continue;
+            for ([_]u64{ 1, 2 }) |rows| {
+                const next = end + rows;
+                try std.testing.expectEqual(first, @max(first, next -| (window - 1)));
+                const context: u32 = @intCast(next - first);
+                try std.testing.expect(first % window + context + 2 <= window);
+                try std.testing.expect(end % window + rows <= window);
+                try std.testing.expectEqual(end + 4 - first > split_keys, context + 2 > split_keys);
+                const keys = context + 2;
+                try fillMask(mask[0 .. 2 * keys], context, 2, window, 8);
+                try std.testing.expect(std.mem.allEqual(u8, mask[0 .. 2 * keys], 1));
+            }
+        }
+    }
+    try std.testing.expect(seen[0] and seen[1]);
+    try std.testing.expect(sameForEither(1065, 0, window) and sameForEither(2044, 0, window) and !sameForEither(2045, 0, window));
+    try std.testing.expect(!sameForEither(1021, 0, window) and sameForEither(1020, 0, window) and sameForEither(1022, 0, window));
 }
 
 test "sliding context advances per query while every proposal slot remains visible" {
