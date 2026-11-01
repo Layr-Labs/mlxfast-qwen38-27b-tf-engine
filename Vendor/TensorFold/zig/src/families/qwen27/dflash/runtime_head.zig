@@ -11,6 +11,8 @@ pub const Head = struct {
     linear: projection.Linear,
     ids: ?mtl.Buffer = null,
     owned: std.ArrayList(mtl.Buffer) = .empty,
+    /// The spans' rows at fewer bits on the plain lane kernel (draft logits only), from the target checkpoint's q4 head.
+    plain: ?@import("core").affine4_lane.Adapter = null,
     pub fn init(a: std.mem.Allocator, device: mtl.Device, source: projection.Linear) !Head {
         var head = Head{ .allocator = a, .linear = source };
         errdefer head.deinit();
@@ -123,7 +125,66 @@ pub const Head = struct {
         };
         return buffer;
     }
+    /// Requantize the spans' rows of the checkpoint's MLX q4 `lm_head` to `bits` bits for the draft's own logits.
+    pub fn lowBits(h: *Head, a: std.mem.Allocator, device: mtl.Device, ck: *const @import("core").checkpoint_metal.Checkpoint, bits: u8, group: u32, reg: bool) !void {
+        const core = @import("core");
+        const names = [_][3][]const u8{ .{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, .{ "language_model.lm_head.weight", "language_model.lm_head.scales", "language_model.lm_head.biases" } };
+        var found: ?[3][]const u8 = null;
+        for (names) |n| if (ck.has(n[0]) and ck.has(n[1]) and ck.has(n[2])) {
+            found = n;
+            break;
+        };
+        const n = found orelse return error.BadDraftHead;
+        const k: usize = h.linear.k;
+        const groups = k / 64;
+        if (k % 64 != 0) return error.BadDraftHead;
+        // the spans' rows of the q4 head: the checkpoint's own buffer where it is kept, else read from its file
+        const w = try a.alloc(u32, width * k / 8);
+        defer a.free(w);
+        const sc = try a.alloc(u16, width * groups);
+        defer a.free(sc);
+        const bi = try a.alloc(u16, width * groups);
+        defer a.free(bi);
+        try spanRows(ck, n[0], 248320, k / 2, std.mem.sliceAsBytes(w));
+        try spanRows(ck, n[1], 248320, groups * 2, std.mem.sliceAsBytes(sc));
+        try spanRows(ck, n[2], 248320, groups * 2, std.mem.sliceAsBytes(bi));
+        const rows = try a.alloc(u16, width * k);
+        defer a.free(rows);
+        var dst: usize = 0;
+        for (spans) |span| for (span[0]..span[1]) |_| {
+            for (0..groups) |g| {
+                const scale = core.affine4.asFloat(sc[dst * groups + g]);
+                const bias = core.affine4.asFloat(bi[dst * groups + g]);
+                const words = w[dst * (k / 8) + g * 8 ..][0..8];
+                for (0..64) |i| {
+                    const code: u32 = (words[i / 8] >> @intCast(4 * (i % 8))) & 15;
+                    rows[dst * k + g * 64 + i] = core.affine4.asBf16(scale * @as(f32, @floatFromInt(code)) + bias);
+                }
+            }
+            dst += 1;
+        };
+        var p = if (reg) try core.affine4.prepareNibbles(a, rows, width, k, bits) else try core.affine4.prepareBits(a, rows, width, k, bits, group);
+        defer p.deinit();
+        const order = if (reg) try lane.RegOrder.init(device) else null;
+        defer if (order) |o| o.deinit();
+        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.split(width, k), order);
+    }
+    /// The spans' rows of `name` ([rows][row_bytes] in the checkpoint), packed in span order into `out`.
+    fn spanRows(ck: *const @import("core").checkpoint_metal.Checkpoint, name: []const u8, rows: usize, row_bytes: usize, out: []u8) !void {
+        if (out.len != width * row_bytes) return error.BadDraftHead;
+        const kept = ck.tensors.get(name);
+        if (kept == null and !ck.deferred.contains(name)) return error.MissingTensor;
+        if (kept) |t| if (t.bytes != rows * row_bytes) return error.BadDraftHead;
+        var at: usize = 0;
+        for (spans) |span| {
+            const bytes = @as(usize, span[1] - span[0]) * row_bytes;
+            const from = @as(usize, span[0]) * row_bytes;
+            if (kept) |t| @memcpy(out[at..][0..bytes], t.buffer.contents()[t.offset + from ..][0..bytes]) else try ck.read(name, from, out[at..][0..bytes]);
+            at += bytes;
+        }
+    }
     pub fn deinit(h: *Head) void {
+        if (h.plain) |p| p.deinit();
         for (h.owned.items) |buffer| buffer.deinit();
         h.owned.deinit(h.allocator);
     }
