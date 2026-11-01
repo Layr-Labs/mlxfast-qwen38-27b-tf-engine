@@ -61,6 +61,9 @@ pub const Pool = struct {
     before: ?metal.Buffer = null,
     marks: ?*PromptMarks = null, // borrowed through one synchronous plain prompt and its cache callbacks
     before_slots: usize = 0,
+    /// The round's plan words already stand in the frame: the first layer's launch copies them, the rest of the round
+    /// reads the same words. A round clears it in `prepare`.
+    plan_uploaded: bool = false,
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
@@ -103,6 +106,8 @@ pub const Pool = struct {
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
     pub fn prepare(pool: *Pool, device: metal.Device, plan: Plan, accepted: bool) !void {
+        // a new round's plan words: its first layer copies them into the frame
+        pool.plan_uploaded = false;
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan);
         if (!inPlace(plan)) return error.GdnSlotMoves;
         const slots = @import("gdn_pool.zig").beforeSlots(plan, !accepted and pool.advances(plan));
@@ -150,11 +155,20 @@ pub const Pool = struct {
         return .{ .buffer = span.buffer, .offset = span.offset };
     }
 
+    /// A round's plan words (its parents, windows, keeps and kept rows) are the round's, not the layer's: the first
+    /// launch of the round admits the plan (its bounds checked, its words copied into the frame) and every later layer
+    /// of the round reads the same words.
+    pub fn admitPlan(pool: *Pool, plan: DevicePlan) !void {
+        if (pool.plan_uploaded) return;
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        try plan.metadata.upload(plan.host);
+        pool.plan_uploaded = true;
+    }
+
     /// `beside`: encoded beside the scan, before the barrier that ends it.
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
-        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        try pool.admitPlan(plan);
         const prepared = try pool.round(layer, plan, refs, false);
-        try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
@@ -165,7 +179,7 @@ pub const Pool = struct {
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
     pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
-        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        try pool.admitPlan(plan);
         for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
             for (0..segment.rows) |row| if (plan.host.parents[segment.first + row] != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
@@ -176,7 +190,6 @@ pub const Pool = struct {
         if (in_place) prepared.b.next_state = prepared.b.state;
         // one row a slot kept in place: its prepare writes the next conv window, so no commit or publication follows
         const step = step_rounds and in_place and !prompt and oneRowSegments(plan.host);
-        try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
         if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
