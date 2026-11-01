@@ -218,6 +218,7 @@ pub const Attention = struct {
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
+    /// q27_attn_prefix_quarter_1: a one-tile prefix group of four simdgroups, each owning a quarter of the head dim.
     prefix_quarter: ?mtl.Pipeline = null,
     /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
@@ -510,8 +511,7 @@ pub const Attention = struct {
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
             prefix_groups = g.kv_heads * plan.prefix_chunks * ((plan.tiles + sg - 1) / sg);
-            // Sparse prefix grids benefit from four narrower accumulator owners.
-            // Keep the original partition once the grid has enough groups to fill the GPU.
+            // a sparse one-tile grid takes four narrower accumulator owners a tile; a full grid keeps the pair
             const quarter = sg == 1 and prefix_groups < 128 and a.prefix_quarter != null;
             e.setPipeline(if (quarter) a.prefix_quarter.? else a.prefix[sg - 1]);
             bind(e, .{ scratch.get(.qa), binding.get(.caches) });
