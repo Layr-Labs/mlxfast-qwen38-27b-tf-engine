@@ -287,11 +287,13 @@ pub const Runner = struct {
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
         const e = cb.compute(.serial);
+        const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = r.metadata() };
+        try r.gdn.admitPlan(plan);
         var gi: usize = 0;
         var ai: usize = 0;
         for (r.model.weights.layers) |layer| switch (layer.mixer) {
             .linear => {
-                try r.gdn.commit(gi, .{ .host = recurrent, .metadata = r.metadata() }, e);
+                try r.gdn.commitDevice(gi, plan, e);
                 gi += 1;
             },
             .attention => {
@@ -322,7 +324,9 @@ pub const Runner = struct {
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
         const m = r.metadata();
-        try m.upload(recurrent);
+        const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
+        // the verify of this round already copied these words (its keep path carries no accepted path either)
+        try r.gdn.admitPlan(plan);
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
         const rows = @import("core").tree_commit_gpu.Ref{ .buf = m.kept_rows.buffer, .off = m.kept_rows.offset };
@@ -347,7 +351,6 @@ pub const Runner = struct {
             };
         }
         e.barrier();
-        const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         // Each layer replays its state and copies all conv taps before overwriting that channel's history.
         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
