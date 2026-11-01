@@ -114,6 +114,63 @@ pub const Hazards = struct {
     }
 };
 
+/// A frame's words that depend on how many taps the verify before it admits (1 or 2), when the frame is encoded before the
+/// host reads that verify (runtime_model.prepareNext): the host writes one block per count behind block 0 of `args`, the
+/// verify's result picks one into block 0 on the GPU (tree_commit_gpu.select), and the frame's dispatches read it there.
+/// Each field starts its own 256 bytes, so every binding's offset is aligned.
+pub const RoundArgs = extern struct {
+    /// the block's rope positions: right behind the admitted taps
+    positions: [2]u64 align(256),
+    /// the block's tokens: the verify's last token (written on the GPU), then the mask
+    ids: [2]u32 align(256),
+    /// the K/V slots of the block's own rows, behind the admitted context in the ring
+    slots: [2]u32 align(256),
+    /// the block's attention: the admitted context and its own rows
+    attention: core.shared_attention.Args align(256),
+    /// the admitted taps' K/V appends
+    append: core.shared_attention.Args align(256),
+    /// the admitted taps' lane projections: [rows, sums stride]
+    dims: [2]i32 align(256),
+    /// their group sums' rows
+    count: i32 align(256),
+    /// the admitted taps' projections on simdgroup tiles (no tensor units): the fusion's and each K or V one's
+    fusion: simd.Args align(256),
+    kv: simd.Args align(256),
+    /// [admitted taps, status (0: the verify's result was valid), keys, 0]
+    meta: [4]u32 align(256),
+
+    /// Words a block takes.
+    pub const words = @sizeOf(RoundArgs) / 4;
+    /// The word tree_commit_gpu.select writes the verify's last token to, and the one it writes its status to.
+    pub const token_word = @offsetOf(RoundArgs, "ids") / 4;
+    pub const status_word = @offsetOf(RoundArgs, "meta") / 4 + 1;
+    /// The blocks `args` holds: block 0 for the frame, then one per admitted count.
+    pub const blocks = 3;
+
+    /// The block for `rows` (1 or 2) taps admitted behind `context` (begin, end) and a 2-row block after them, whose
+    /// attention keys reach at most `keys`; the frame's launches are those of 2 rows.
+    pub fn of(c: cfg.Config, context: op.Context, rows: u32, keys: u32) RoundArgs {
+        const end = context.end + rows;
+        const context_rows: u32 = @intCast(end - context.begin);
+        const at: u32 = @intCast(context.begin % c.window);
+        return .{
+            .positions = .{ end, end + 1 },
+            .ids = .{ c.mask, c.mask },
+            .slots = .{ at + context_rows, at + context_rows + 1 },
+            .attention = .{ .rows = 2, .keys = context_rows + 2, .mask_stride = keys, .scale_bits = @bitCast(@import("runtime_context.zig").scaleOf(c)) },
+            .append = .{ .rows = rows },
+            .dims = .{ @intCast(rows), 16 },
+            .count = @intCast(rows),
+            .fusion = .{ .k = @intCast(c.tapWidth()), .n = @intCast(c.hidden), .r = @intCast(rows) },
+            .kv = .{ .k = @intCast(c.hidden), .n = @intCast(c.kvWidth()), .r = @intCast(rows) },
+            .meta = .{ rows, 0, context_rows + 2, 0 },
+        };
+    }
+};
+
+/// First in a frame encoded early (Model.prepareNext): waits for the verify's result and writes block 0 of `args`.
+pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
+
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -142,6 +199,13 @@ pub const Backend = struct {
     hazards: Hazards = .{},
     /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
+    /// RoundArgs blocks: the frame's (0), then one per count the verify before it may admit.
+    args: mtl.Buffer,
+    /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
+    /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
+    early: ?Lead = null,
+    /// An append's step is being encoded (Ops.append_steps): the dispatches between them may be a block's.
+    appending: bool = false,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -152,11 +216,14 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        if (head_bits < 4 and target.device.tensorUnits()) head.lowBits(a, target.device, &target.checkpoint, head_bits, low_group, low_reg) catch |err| std.log.warn("draft head stays q4: {s}", .{@errorName(err)});
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
         try target.kernels.prepareDecode(head.linear, 1);
         const caches = try newCaches(a, target.device, c, c.layers);
-        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches };
+        errdefer freeCaches(a, caches);
+        const args = try target.device.buffer(RoundArgs.blocks * @sizeOf(RoundArgs), options);
+        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -173,6 +240,7 @@ pub const Backend = struct {
         b.tiled.deinit(b.allocator);
         if (b.simd) |*p| p.deinit();
         freeCaches(b.allocator, b.caches);
+        b.args.deinit();
         b.head.deinit();
         b.topk.deinit();
         b.attention.deinit();
@@ -217,7 +285,8 @@ pub const Backend = struct {
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
-        var prepared_words = try core.affine4.prepare(b.allocator, rows, shape[0], shape[1]);
+        const bits: u8 = if (order != null) draftBits(name) else 4;
+        var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
         defer prepared_words.deinit();
         if (b.stash) |st| if (shortName(name)) |short| {
             const layer = layerOf(name) orelse return error.DraftTensorCoverage;
@@ -225,7 +294,7 @@ pub const Backend = struct {
             const id = try std.fmt.bufPrint(&buf, "{d}{s}", .{ layer, short });
             const owned = try b.allocator.dupe(u8, id);
             errdefer b.allocator.free(owned);
-            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases) };
+            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases), .bits = prepared_words.bits, .group = prepared_words.group, .nibbles = prepared_words.nibbles };
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
@@ -235,6 +304,24 @@ pub const Backend = struct {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
         }
+    }
+    /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
+    /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
+    /// other linear q4. In this account's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
+    /// acceptance at 2 bits, and the down's and the head's 2-bit copies each cost about as many extra rounds as their
+    /// bytes save, so they stay q4.
+    pub const mlp_bits: u8 = 2;
+    /// Code width of the draft head's own copy of the spans' rows (4: the base's q4 copy, no requantized copy).
+    pub const head_bits: u8 = 4;
+    /// Copies below 4 bits on the reg kernel's 2-bit words (prepareNibbles, then lane_projection.halveReg) at 64-element
+    /// groups; false takes MLX bit streams at `low_group` on the plain lane kernel.
+    pub const low_reg: bool = true;
+    /// Elements a (scale, bias) pair covers in the plain kernel's copies below 4 bits (the draft head's included).
+    pub const low_group: u32 = 128;
+    fn draftBits(name: []const u8) u8 {
+        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
+        for (mlp) |m| if (std.mem.endsWith(u8, name, m)) return mlp_bits;
+        return 4;
     }
     fn shortName(name: []const u8) ?[]const u8 {
         const table = [_][2][]const u8{ .{ "self_attn.q_proj.weight", "q" }, .{ "self_attn.k_proj.weight", "k" }, .{ "self_attn.v_proj.weight", "v" }, .{ "mlp.gate_proj.weight", "g" }, .{ "mlp.up_proj.weight", "u" } };
@@ -250,29 +337,37 @@ pub const Backend = struct {
     fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
         var n: usize = 0;
         var k: usize = 0;
+        var bits: u8 = 0;
+        var size: u32 = 0;
+        var nibbles = false;
         var buf: [16]u8 = undefined;
         for (parts) |p| {
             const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })) orelse return;
             n += got.prepared.n;
             if (k != 0 and k != got.prepared.k) return error.DraftPreparationUnqualified;
             k = got.prepared.k;
+            if (bits != 0 and (bits != got.prepared.bits or size != got.prepared.group or nibbles != got.prepared.nibbles)) return;
+            bits = got.prepared.bits;
+            size = got.prepared.group;
+            nibbles = got.prepared.nibbles;
         }
-        const words = try b.allocator.alloc(u32, n * k / 8);
+        const word_bits: usize = if (nibbles) 4 else bits;
+        const words = try b.allocator.alloc(u32, n * k / 32 * word_bits);
         defer b.allocator.free(words);
-        const scales = try b.allocator.alloc(u16, n * k / 64);
+        const scales = try b.allocator.alloc(u16, n * k / size);
         defer b.allocator.free(scales);
-        const biases = try b.allocator.alloc(u16, n * k / 64);
+        const biases = try b.allocator.alloc(u16, n * k / size);
         defer b.allocator.free(biases);
         var at: usize = 0;
         for (parts) |p| {
             const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })).?;
-            @memcpy(words[at * k / 8 ..][0..got.prepared.words.len], got.prepared.words);
-            @memcpy(scales[at * k / 64 ..][0..got.prepared.scales.len], got.prepared.scales);
-            @memcpy(biases[at * k / 64 ..][0..got.prepared.biases.len], got.prepared.biases);
+            @memcpy(words[at * k / 32 * word_bits ..][0..got.prepared.words.len], got.prepared.words);
+            @memcpy(scales[at * k / size ..][0..got.prepared.scales.len], got.prepared.scales);
+            @memcpy(biases[at * k / size ..][0..got.prepared.biases.len], got.prepared.biases);
             at += got.prepared.n;
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
-        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
+        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
         const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
@@ -332,6 +427,14 @@ pub const Backend = struct {
     }
     pub fn barrier(b: *Backend, e: mtl.ComputeEncoder) void {
         b.hazards.barrier(e);
+    }
+    /// Field `name` of the frame's RoundArgs block.
+    pub fn roundArg(b: *const Backend, comptime name: []const u8) Ref {
+        return .{ .buf = b.args, .off = @offsetOf(RoundArgs, name) };
+    }
+    /// The frame is an early one's append: its taps' count is the verify's, read from `args`.
+    pub fn admitting(b: *const Backend) bool {
+        return b.early != null and b.transaction != null and b.appending;
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32, stride: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
