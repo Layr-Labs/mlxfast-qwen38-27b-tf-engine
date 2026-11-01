@@ -184,6 +184,12 @@ pub const Pool = struct {
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
         const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 8 == 0;
+        // windows that all land in the history directly are written beside the scan: the prepare before it has read the
+        // old history, and nothing after it in the layer reads or writes the history
+        const beside_windows = !step and pool.marks == null and in_place and projectedWindows(plan.host, prepared.p.taps);
+        var windows = DirectWindows{ .round = prepared, .beside = beside };
+        windows.round.b.next_history = prepared.b.history;
+        const scan_beside: ?gdn.Beside = if (beside_windows) .{ .ptr = &windows, .encode = DirectWindows.encode } else beside;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
@@ -191,13 +197,13 @@ pub const Pool = struct {
                 try b.encode(b.ptr, scan.encoder);
                 scan.encoder.barrier();
             }
-        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, beside);
+        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, scan_beside);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
         prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
-        if (step) return;
+        if (step or beside_windows) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
         errdefer publication.cancel();
         const e = publication.encoder;
@@ -409,6 +415,16 @@ fn oneRowSegments(plan: Plan) bool {
 }
 
 /// Whether every kept window (a keep's last row's next conv window) reads projected rows alone.
+/// A chain's conv windows written straight to the history beside its scan, after the scan's own beside work.
+const DirectWindows = struct {
+    round: gdn.Round,
+    beside: ?gdn.Beside,
+    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
+        const w: *DirectWindows = @ptrCast(@alignCast(ptr));
+        if (w.beside) |b| try b.encode(b.ptr, e);
+        w.round.encodeCommitConv(e);
+    }
+};
 fn projectedWindows(plan: Plan, taps: u32) bool {
     for (plan.keeps) |keep| {
         if (keep.rows == 0) continue;

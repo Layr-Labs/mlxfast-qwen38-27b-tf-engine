@@ -1,5 +1,6 @@
 //! Typed draft callbacks share the target queue and encode primitives into one owned frame.
 const std = @import("std");
+const core = @import("core");
 const op = @import("operators.zig");
 const ck = @import("../checkpoint.zig");
 const Config = @import("config.zig").Config;
@@ -102,12 +103,31 @@ fn sliceCols(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, width: u32) !o
     const r = try b.frame.ref(x);
     return b.frame.add(.{ .buf = r.buf, .off = r.off + @as(usize, first) * 2 }, x.rows, width, x.stride, .bf16);
 }
+/// A producer's output group sums for the reg projection that reads its output (tensor-unit adapters only, rows of one
+/// 16-row block, whole 64-column groups): the values that projection's own sums pass would write, so it dispatches none.
+fn producedSums(b: *Backend, rows: u32, width: u32) !?core.draft_ops.Sums {
+    if (b.prepared.count() == 0 or rows == 0 or rows > 16 or width % 64 != 0) return null;
+    const stride: u32 = 16 * ((rows + 15) / 16);
+    const r = try b.frame.ref(try b.frame.alloc(width / 64, stride, .f32));
+    return .{ .ref = .{ .buf = r.buf, .off = r.off }, .stride = stride };
+}
+/// The projection that reads `y` next takes `sums` (encodePrepared's input_sums) instead of a sums pass.
+fn offerSums(b: *Backend, y: op.View, sums: core.draft_ops.Sums) void {
+    b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sums.ref.buf, .off = sums.ref.off }, .stride = sums.stride } };
+}
 fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
+    const params = core.draft_ops.Norm{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps };
+    if (p.heads == 1) if (try producedSums(b, x.rows, x.width)) |sums| {
+        b.access(e, &.{try b.span(x)}, &.{ try b.span(y), Span.whole(sums.ref.buf) });
+        try b.primitives.normSums(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), params, sums);
+        offerSums(b, y, sums);
+        return y;
+    };
     b.access(e, &.{try b.span(x)}, &.{try b.span(y)});
-    try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
+    try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), params);
     return y;
 }
 fn embed(ptr: *anyopaque, epoch: u64, _: ck.Linear, ids: []const u32) !op.View {
@@ -126,8 +146,16 @@ fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
+    const params = core.draft_ops.Conv{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride };
+    // a residual branch feeds a norm; the other branch feeds a projection, which takes the sums written here
+    if (p.residual == null) if (try producedSums(b, x.rows, x.width)) |sums| {
+        b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{ try b.span(y), Span.whole(sums.ref.buf) });
+        try b.primitives.convSums(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), null, try b.frame.ref(y), params, sums);
+        offerSums(b, y, sums);
+        return y;
+    };
     if (p.residual) |r| b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(r) }, &.{try b.span(y)}) else b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{try b.span(y)});
-    try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
+    try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), params);
     return y;
 }
 fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
@@ -145,8 +173,15 @@ fn swiglu(ptr: *anyopaque, epoch: u64, g: op.View, u: op.View) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(g.rows, g.width, .bf16);
+    const params = core.draft_ops.Activation{ .rows = g.rows, .width = g.width, .gate_stride = g.stride, .up_stride = u.stride, .y_stride = y.stride };
+    if (try producedSums(b, g.rows, g.width)) |sums| {
+        b.access(e, &.{ try b.span(g), try b.span(u) }, &.{ try b.span(y), Span.whole(sums.ref.buf) });
+        try b.primitives.swigluSums(e, try b.frame.ref(g), try b.frame.ref(u), try b.frame.ref(y), params, sums);
+        offerSums(b, y, sums);
+        return y;
+    }
     b.access(e, &.{ try b.span(g), try b.span(u) }, &.{try b.span(y)});
-    try b.primitives.swiglu(e, try b.frame.ref(g), try b.frame.ref(u), try b.frame.ref(y), .{ .rows = g.rows, .width = g.width, .gate_stride = g.stride, .up_stride = u.stride, .y_stride = y.stride });
+    try b.primitives.swiglu(e, try b.frame.ref(g), try b.frame.ref(u), try b.frame.ref(y), params);
     return y;
 }
 fn maskRows(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, rows: u32) !op.View {

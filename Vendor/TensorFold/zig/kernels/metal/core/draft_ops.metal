@@ -29,6 +29,36 @@ kernel void tf_draft_rms(device const bfloat* X [[buffer(0)]],device const bfloa
     Y[size_t(block.y)*a.y_stride+block.x*a.dim+col]=bfloat(normalized*float(W[col]));
   }
 }
+// tf_draft_rms of a whole row (one head) that also writes its 64-column group sums for the projection that reads Y: each
+// group's stored words added in order from zero into XS[group * stride + row], as tf_lane_sums adds them; row 0's
+// threadgroup writes the padded rows' zeros
+kernel void tf_draft_rms_sums(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& stride [[buffer(5)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+  threadgroup float sums[32],inverse[1];
+  float value=0.0f;
+  const size_t base=size_t(block.y)*a.x_stride+block.x*a.dim;
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){float x=float(X[base+first+j]);value+=x*x;}
+  value=simd_sum(value);
+  if(sg==0)sums[lane]=0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(lane==0)sums[sg]=value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(sg==0){float total=simd_sum(sums[lane]);if(lane==0)inverse[0]=precise::rsqrt(total/float(a.dim)+a.eps);}
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){
+    const uint col=first+j;
+    float normalized=float(X[base+col])*inverse[0];
+    normalized=float(bfloat(normalized));
+    Y[size_t(block.y)*a.y_stride+block.x*a.dim+col]=bfloat(normalized*float(W[col]));
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  const device bfloat* row=Y+size_t(block.y)*a.y_stride;
+  for(uint g=t;g<a.dim/64;g+=threads.x){
+    float acc=0.0f;
+    for(uint i=0;i<64;i++)acc+=float(row[g*64+i]);
+    XS[g*stride+block.y]=acc;
+    if(block.y==0)for(uint r=a.rows;r<stride;r++)XS[g*stride+r]=0.0f;
+  }
+}
 struct Conv { uint rows,width,group,block,branch,residual,x_stride,dynamic_stride,y_stride,rounding; };
 kernel void tf_dynamic_conv2(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],uint2 index [[thread_position_in_grid]]) {
   if(index.x>=a.width||index.y>=a.rows)return;
@@ -42,6 +72,32 @@ kernel void tf_dynamic_conv2(device const bfloat* X [[buffer(0)]],device const b
   }
   const float conv=float(bfloat(total));
   Y[size_t(index.y)*a.y_stride+index.x]=bfloat(a.residual?float(R[size_t(index.y)*a.x_stride+index.x])+conv:conv);
+}
+// tf_dynamic_conv2 with a 64-thread threadgroup a (64-column group, row): each thread's word as above, then the group's
+// words added in order from zero into XS[group * stride + row] (tf_lane_sums' sum); row 0's threadgroup writes the
+// padded rows' zeros
+kernel void tf_dynamic_conv2_sums(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],device float* XS [[buffer(6)]],constant uint& stride [[buffer(7)]],uint2 tg [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float words[64];
+  const uint2 index=uint2(tg.x*64+t,tg.y);
+  const uint groups=a.width/a.group,g=index.x/a.group;
+  float total=0.0f;
+  for(uint lag=0;lag<2;lag++) {
+    const float x=lag&&index.y%a.block==0?0.0f:float(X[size_t(index.y-lag)*a.x_stride+index.x]);
+    const float base=float(B[(a.branch*2+lag)*a.width+index.x]);
+    const float dynamic=float(D[size_t(index.y)*a.dynamic_stride+(a.branch*2+lag)*groups+g]);
+    total=float(bfloat(total+float(bfloat(base*x))));total=float(bfloat(total+float(bfloat(dynamic*x))));
+  }
+  const float conv=float(bfloat(total));
+  const bfloat y=bfloat(a.residual?float(R[size_t(index.y)*a.x_stride+index.x])+conv:conv);
+  Y[size_t(index.y)*a.y_stride+index.x]=y;
+  words[t]=float(y);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(t==0){
+    float acc=0.0f;
+    for(uint i=0;i<64;i++)acc+=words[i];
+    XS[tg.x*stride+tg.y]=acc;
+    if(tg.y==0)for(uint r=a.rows;r<stride;r++)XS[tg.x*stride+r]=0.0f;
+  }
 }
 struct Rope { uint rows,heads,dim,x_stride,y_stride;float theta; };
 kernel void tf_full_rope(device const bfloat* X [[buffer(0)]],device const ulong* positions [[buffer(1)]],constant Rope& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],uint3 index [[thread_position_in_grid]]) {
@@ -65,5 +121,32 @@ kernel void tf_draft_swiglu(device const bfloat* G [[buffer(0)]],device const bf
     const bfloat sigmoid=gate<0.0f?inverse:bfloat(1.0f-float(inverse));
     const bfloat activation=bfloat(float(g)*float(sigmoid));
     Y[size_t(index.y)*a.y_stride+index.x]=bfloat(float(activation)*float(u));
+  }
+}
+// tf_draft_swiglu with a 64-thread threadgroup a (64-column group, row): each thread's word as above, then the group's
+// words added in order from zero into XS[group * stride + row] (tf_lane_sums' sum); row 0's threadgroup writes the
+// padded rows' zeros
+kernel void tf_draft_swiglu_sums(device const bfloat* G [[buffer(0)]],device const bfloat* U [[buffer(1)]],constant Activation& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& stride [[buffer(5)]],uint2 tg [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float words[64];
+  const uint2 index=uint2(tg.x*64+t,tg.y);
+  const float gate=float(G[size_t(index.y)*a.gate_stride+index.x]),up=float(U[size_t(index.y)*a.up_stride+index.x]);
+  bfloat y;
+  {
+    const bfloat g=bfloat(gate),u=bfloat(up);
+    const bfloat exponential=bfloat(exp(abs(gate)));
+    const bfloat denominator=bfloat(1.0f+float(exponential));
+    const bfloat inverse=bfloat(1.0f/float(denominator));
+    const bfloat sigmoid=gate<0.0f?inverse:bfloat(1.0f-float(inverse));
+    const bfloat activation=bfloat(float(g)*float(sigmoid));
+    y=bfloat(float(activation)*float(u));
+  }
+  Y[size_t(index.y)*a.y_stride+index.x]=y;
+  words[t]=float(y);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(t==0){
+    float acc=0.0f;
+    for(uint i=0;i<64;i++)acc+=words[i];
+    XS[tg.x*stride+tg.y]=acc;
+    if(tg.y==0)for(uint r=a.rows;r<stride;r++)XS[tg.x*stride+r]=0.0f;
   }
 }

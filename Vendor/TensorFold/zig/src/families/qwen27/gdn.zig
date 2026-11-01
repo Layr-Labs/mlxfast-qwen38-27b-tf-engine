@@ -252,12 +252,16 @@ pub const Round = struct {
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
+        r.encodeCommitConv(e);
+        e.barrier();
+    }
+    /// commitConv without its barrier, for work encoded beside it that neither reads nor writes the history.
+    pub fn encodeCommitConv(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.conv_commit);
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
         e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 256 }); // a word a thread
-        e.barrier();
     }
 
     pub fn commit(r: Round, e: metal.ComputeEncoder) void {
