@@ -151,12 +151,25 @@ pub const Pool = struct {
     }
 
     /// `beside`: encoded beside the scan, before the barrier that ends it.
+    /// The counted projections a decoded prepare waits on in its barrier interval (Kernels.quantCounted).
+    /// `counter`/`wait`: the prepare waits on its counted projections. `gate`: the gate counts on it for a waiting out
+    /// projection, and `gated` reports whether it did.
+    pub const After = struct { counter: metal.Buffer, wait: u32, gate: ?metal.Buffer = null, gated: ?*bool = null };
+
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+        return pool.forwardAfter(layer, plan, refs, e, beside, null);
+    }
+
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
-        const prepared = try pool.round(layer, plan, refs, false);
+        var prepared = try pool.round(layer, plan, refs, false);
+        if (after) |a| if (a.gate) |g| {
+            prepared.gate_counter = .{ .buffer = g, .offset = 0, .bytes = 8 };
+            prepared.gate_counted = a.gated;
+        };
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);

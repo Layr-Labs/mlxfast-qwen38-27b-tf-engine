@@ -258,7 +258,7 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .waits = mixerWaits }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -483,17 +483,46 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
-        if (dead < rows) {
-            var input = f.get(.input);
-            input.offset += @as(usize, dead) * weights.q.k * 2;
-            var query_sums = forward.sums(f, .sums, rows);
-            query_sums.ref.offset += @as(usize, dead) * 4;
-            var query = f.get(.q_gate);
-            query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
+        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
+        // or neither, so the shared counter always returns to zero
+        var after: ?attn.After = null;
+        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
+        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+            // with input_wait, both also wait on the pre-norm's count and warm their first code blocks while they do
+            const ks = &r.model.kernels;
+            const iw = ks.input_wait;
+            ks.input_wait = 0;
+            var a: u32 = 0;
+            var b: u32 = 0;
+            // the waiting launches count on head_words: count_words may still hold the out projection's count this interval
+            var counter: ?mtl.Buffer = null;
+            if (iw != 0) {
+                const arrive = try ks.waitingTiles(weights.q, rows) + try ks.waitingTiles(weights.kv, rows);
+                const words = ks.input_words orelse return error.RoundNotReady;
+                const head = try ks.pair(&ks.head_words);
+                a = try ks.quantCountedAfterOn(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows, words, head, iw, arrive);
+                b = try ks.quantCountedAfterOn(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows, words, head, iw, arrive);
+                counter = head;
+            } else {
+                a = (try ks.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
+                b = (try ks.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
+            }
+            after = .{ .counter = counter orelse ks.count_words.?, .wait = a + b };
+        } else {
+            if (r.model.kernels.input_wait != 0) return error.RoundNotReady; // the pre-norm counted for launches that do not wait
+            if (dead < rows) {
+                var input = f.get(.input);
+                input.offset += @as(usize, dead) * weights.q.k * 2;
+                var query_sums = forward.sums(f, .sums, rows);
+                query_sums.ref.offset += @as(usize, dead) * 4;
+                var query = f.get(.q_gate);
+                query.offset += @as(usize, dead) * weights.q.n * 2;
+                try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            }
+            try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+            e.barrier();
         }
-        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-        e.barrier();
         // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
         const mixed = f.get(.mixed);
@@ -501,12 +530,28 @@ pub const Runner = struct {
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
         try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
         f.mixer_sums = out_sums;
+    }
+
+    /// forward.Mixer.waits: the same test gdnForward's and attentionForward's counted input paths take, and no tap reading
+    /// the norm's combined rows before the mixer (forward.pre records layer index - 1's).
+    fn mixerWaits(ptr: *anyopaque, index: usize, rows: u32) bool {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        const k = &r.model.kernels;
+        if (k.prompt) return false;
+        if (r.capture_taps and index > 0 and std.mem.indexOfScalar(usize, &r.taps.ids, index - 1) != null) return false;
+        return switch (r.model.weights.layers[index].mixer) {
+            .linear => |g| !r.accepted_chain and k.countable(g.qkv, rows) and k.countable(g.zba, rows),
+            .attention => |a| blk: {
+                const plan = (r.current_attention orelse break :blk false).*;
+                break :blk !r.attention.promptPath(plan, false) and k.countable(a.q, rows) and k.countable(a.kv, rows);
+            },
+        };
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
