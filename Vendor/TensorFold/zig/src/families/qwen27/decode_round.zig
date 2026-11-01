@@ -483,17 +483,28 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
-        if (dead < rows) {
-            var input = f.get(.input);
-            input.offset += @as(usize, dead) * weights.q.k * 2;
-            var query_sums = forward.sums(f, .sums, rows);
-            query_sums.ref.offset += @as(usize, dead) * 4;
-            var query = f.get(.q_gate);
-            query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
+        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
+        // or neither, so the shared counter always returns to zero
+        var after: ?attn.After = null;
+        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
+        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+            const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
+            const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
+            after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
+        } else {
+            if (dead < rows) {
+                var input = f.get(.input);
+                input.offset += @as(usize, dead) * weights.q.k * 2;
+                var query_sums = forward.sums(f, .sums, rows);
+                query_sums.ref.offset += @as(usize, dead) * 4;
+                var query = f.get(.q_gate);
+                query.offset += @as(usize, dead) * weights.q.n * 2;
+                try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            }
+            try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+            e.barrier();
         }
-        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-        e.barrier();
         // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
         const mixed = f.get(.mixed);
@@ -501,11 +512,13 @@ pub const Runner = struct {
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
+        var live_plan = plan;
+        live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
         f.mixer_sums = out_sums;
     }
 
