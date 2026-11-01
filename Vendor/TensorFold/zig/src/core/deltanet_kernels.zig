@@ -54,6 +54,12 @@ pub const Kernels = struct {
     stash: metal.Pipeline,
     /// The pending rows replayed into every layer's committed state, one launch.
     unstash: metal.Pipeline,
+    /// tf_delta_gdn_conv_keep_layers: every GDN layer's window in one launch, a grid depth a layer.
+    conv_keep_layers: metal.Pipeline,
+    /// tf_delta_gdn_replay_layers: every GDN layer's replay in one launch, a grid depth spans all layers' keeps.
+    replay_layers: metal.Pipeline,
+    /// conv_keep for every layer of a lone keep, one launch.
+    conv_keep_deferred: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -85,6 +91,9 @@ pub const Kernels = struct {
             "star_pending",
             "stash",
             "unstash",
+            "conv_keep_layers",
+            "replay_layers",
+            "conv_keep_deferred",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -120,6 +129,9 @@ pub const Kernels = struct {
             .star_pending = pipelines[23],
             .stash = pipelines[24],
             .unstash = pipelines[25],
+            .conv_keep_layers = pipelines[26],
+            .replay_layers = pipelines[27],
+            .conv_keep_deferred = pipelines[28],
         };
     }
 
@@ -146,6 +158,9 @@ pub const Kernels = struct {
             k.star_pending,
             k.stash,
             k.unstash,
+            k.conv_keep_layers,
+            k.replay_layers,
+            k.conv_keep_deferred,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

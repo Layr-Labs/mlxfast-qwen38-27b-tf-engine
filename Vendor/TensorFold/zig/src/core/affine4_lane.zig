@@ -12,6 +12,12 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
+    /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
+    prompt: ?lane.Projection = null,
+    /// The prompt build's words when it takes two tiles a SIMD group: the same code blocks in the eight-tile interleave
+    /// (a block a tile and group, eight tiles of one group adjacent), as the target's prompt projections read them.
+    words8: ?mtl.Buffer = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
         if (prepared.nibbles) {
@@ -57,7 +63,40 @@ pub const Adapter = struct {
             l8.rows8 = true;
             small = try lane.Projection.init(a, device, l8);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small };
+        errdefer if (small) |s| s.deinit();
+        var prompt: ?lane.Projection = null;
+        var words8: ?mtl.Buffer = null;
+        errdefer if (words8) |b| b.deinit();
+        if (layout.reg and layout.format.bits == 4) {
+            var lp = layout;
+            lp.indexed = false;
+            lp.indexed12 = false;
+            lp.prompt_sr = true;
+            // two tiles a SIMD group (the target's prompt form) where the tiles fill whole eight-tile batches: the code
+            // blocks copied into that interleave, the pairs (indexed by column) unchanged
+            const tiles = prepared.n / 32;
+            if (prepared.n % 32 == 0 and tiles % 8 == 0) {
+                var l2 = lp;
+                l2.tile_batch = 8;
+                l2.prompt_tn = 2;
+                if (l2.validate()) |_| {
+                    const groups = prepared.k / 64;
+                    const block = 64 * 4; // a tile's 32 lanes of one group's codes: 64 uint4, 256 u32
+                    const copy = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+                    const src = words.slice(u32, layout.weightWords());
+                    const dst = copy.slice(u32, layout.weightWords());
+                    for (0..tiles) |t| for (0..groups) |g| {
+                        const from = (t * groups + g) * block;
+                        const to = (((t / 8) * groups + g) * 8 + t % 8) * block;
+                        @memcpy(dst[to..][0..block], src[from..][0..block]);
+                    };
+                    words8 = copy;
+                    lp = l2;
+                } else |_| {}
+            }
+            prompt = try lane.Projection.init(a, device, lp);
+        }
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt, .words8 = words8 };
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -81,6 +120,8 @@ pub const Adapter = struct {
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.prompt) |p| p.deinit();
+        if (adapter.words8) |b| b.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
         if (adapter.index) |b| b.deinit();
@@ -90,6 +131,8 @@ pub const Adapter = struct {
         return .{ .buf = adapter.index orelse adapter.metadata };
     }
     pub fn encode(adapter: Adapter, e: mtl.ComputeEncoder, x: lane.Ref, y: lane.Ref, rows: u32) !void {
+        // prompt-sized launches: the prompt loop on the pairs (its words are the indexed launch's)
+        if (rows > 16) if (adapter.prompt) |p| return p.encode(e, x, .{ .buf = adapter.words8 orelse adapter.words }, .{ .buf = adapter.metadata }, y, rows);
         try adapter.forRows(rows).encode(e, x, .{ .buf = adapter.words }, adapter.meta(), y, rows);
     }
 };
