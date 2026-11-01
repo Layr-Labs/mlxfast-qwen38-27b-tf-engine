@@ -128,9 +128,58 @@ TF_TREE_SLOTS(2)
 TF_TREE_SLOTS(4)
 TF_TREE_SLOTS(8)
 TF_TREE_SLOTS(16)
+// tf_delta_delta_update and tf_delta_delta_read on a lane's key and query words already in registers: the same statements
+// (so the same products, fused multiply-adds, in-order lane sums and simd_sum), with each float(key[...]) a register.
+inline void tf_delta_delta_update_words(thread float* state, thread const float* key, float forget, float incoming,
+                                        float mix) {
+  float remembered = 0.0f;
+  for (uint part = 0; part < 4; ++part) {
+    state[part] = state[part] * forget;
+    remembered += state[part] * key[part];
+  }
+  remembered = simd_sum(remembered);
+  const float correction = (incoming - remembered) * mix;
+  for (uint part = 0; part < 4; ++part) state[part] = state[part] + key[part] * correction;
+}
+inline float tf_delta_delta_read_words(thread const float* state, thread const float* query) {
+  float result = 0.0f;
+  for (uint part = 0; part < 4; ++part) result += state[part] * query[part];
+  return simd_sum(result);
+}
+// tf_delta_tree_node for two adjacent value columns (dk = 128): the row's key and query words, decay, mixing and both
+// value words are loaded and converted once, ahead of either column's output store (a device store the compiler must
+// assume may alias them). Each column then runs tf_delta_tree_node's update and read in the same lanes and order.
+inline void tf_delta_tree_node_pair(thread float4& s0, thread float4& s1, device const bfloat* query,
+                                    device const bfloat* key, device const bfloat* value, device const float* decay,
+                                    device const bfloat* mixing, constant TfDeltaParams& p, device bfloat* output,
+                                    uint row, uint head, uint key_head, uint dimension, uint lane) {
+  const uint at = row * p.nv + head;
+  device const bfloat* k = key + (row * p.nk + key_head) * p.dk + lane * 4;
+  device const bfloat* q = query + (row * p.nk + key_head) * p.dk + lane * 4;
+  float kf[4], qf[4];
+  for (uint part = 0; part < 4; ++part) {
+    kf[part] = float(k[part]);
+    qf[part] = float(q[part]);
+  }
+  const float forget = decay[at], mix = float(mixing[at]);
+  const float incoming0 = float(value[at * p.dv + dimension]), incoming1 = float(value[at * p.dv + dimension + 1]);
+  float a[4] = {s0[0], s0[1], s0[2], s0[3]};
+  float b[4] = {s1[0], s1[1], s1[2], s1[3]};
+  tf_delta_delta_update_words(a, kf, forget, incoming0, mix);
+  tf_delta_delta_update_words(b, kf, forget, incoming1, mix);
+  const float ra = tf_delta_delta_read_words(a, qf);
+  const float rb = tf_delta_delta_read_words(b, qf);
+  if (lane == 0) {
+    output[at * p.dv + dimension] = bfloat(ra);
+    output[at * p.dv + dimension + 1] = bfloat(rb);
+  }
+  s0 = float4(a[0], a[1], a[2], a[3]);
+  s1 = float4(b[0], b[1], b[2], b[3]);
+}
 // A depth-one star (each segment's node 0, then its other rows as children of node 0) for two adjacent value columns a
-// simdgroup: every node of each column is tf_delta_tree_node from the same parent state as in tf_delta_gdn_tree_slots,
-// so each column's arithmetic is that kernel's; the star needs no slot steps, no parent selects and no kept states.
+// simdgroup: every node of each column is tf_delta_tree_node's arithmetic from the same parent state as in
+// tf_delta_gdn_tree_slots (tf_delta_tree_node_pair, a row's loads shared by the two columns), so each column's arithmetic
+// is that kernel's; the star needs no slot steps, no parent selects and no kept states.
 // Verify rounds only (no advance): no state is written.
 kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const bfloat* key [[buffer(1)]],
@@ -152,10 +201,9 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
     r0[part] = committed[base + column + part];
     r1[part] = committed[base + column + p.dk + part];
   }
-  const float4 n0 = tf_delta_tree_node(r0, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
-  const float4 n1 = tf_delta_tree_node(r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0 + 1, lane);
+  tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
   for (uint c = 1; c < span.rows; ++c) {
-    tf_delta_tree_node(n0, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
-    tf_delta_tree_node(n1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0 + 1, lane);
+    float4 c0 = r0, c1 = r1; // node 0's states
+    tf_delta_tree_node_pair(c0, c1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
   }
 }

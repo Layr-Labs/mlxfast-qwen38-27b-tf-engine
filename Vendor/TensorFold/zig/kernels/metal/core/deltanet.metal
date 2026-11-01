@@ -148,9 +148,11 @@ inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const
   for (uint i = 0; i < count; ++i) {
     const uint row = first + i;
     float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // the row's slot read once (row_slot holds p.rows words), not in each history tap's arm: no branch around a tap's load
+    const uint slot = row_slot[row];
     for (uint tap = 0; tap < 4; ++tap) {
       const uint source = windows[row * p.taps + tap];
-      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (row_slot[row] * keep + source) * channels + channel)
+      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                           : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
       for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
     }
@@ -728,4 +730,77 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   const ulong row = ulong(at.y) * p.slots + slot; // the whole pool's words pass 32 bits past 113 slots of a 27B
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
+}
+kernel void tf_delta_gdn_replay_all(device const bfloat* key [[buffer(0)]],
+                               device const bfloat* value [[buffer(1)]],
+                               device const float* decay [[buffer(2)]],
+                               device const bfloat* mixing [[buffer(3)]],
+                               device const float* committed [[buffer(4)]],
+                               device const uint* kept_rows [[buffer(5)]],
+                               device const TfDeltaKeep* keeps [[buffer(6)]],
+                               constant TfDeltaParams& p [[buffer(7)]],
+                               device float* next [[buffer(8)]],
+                               device const TfDeltaSegment* segments [[buffer(9)]],
+                               device const float* before [[buffer(10)]],
+                               constant uint& layers [[buffer(11)]],
+                               constant uint& segments_per_layer [[buffer(12)]],
+                               constant uint& key_words [[buffer(13)]],
+                               constant uint& value_words [[buffer(14)]],
+                               constant uint& decay_words [[buffer(15)]],
+                               constant uint& mixing_words [[buffer(16)]],
+                               constant uint& state_words [[buffer(17)]],
+                               constant uint& before_words [[buffer(18)]],
+                               uint3 position [[thread_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  const uint per_layer = p.nv * segments_per_layer;
+  if (per_layer == 0) return;
+  const uint layer = position.z / per_layer;
+  if (layer >= layers) return;
+  const uint3 at = uint3(position.x, position.y, position.z % per_layer);
+  device const bfloat* k = key + (size_t)layer * key_words;
+  device const bfloat* v = value + (size_t)layer * value_words;
+  device const float* dec = decay + (size_t)layer * decay_words;
+  device const bfloat* mix = mixing + (size_t)layer * mixing_words;
+  device const float* com = committed + (size_t)layer * state_words;
+  device float* nxt = next + (size_t)layer * state_words;
+  device const float* bef = before + (size_t)layer * before_words;
+  const uint segment = at.z / p.nv;
+  if (p.advance != 0 && segments[segment].rows == 1) {
+    const TfDeltaKeep keep = keeps[segment];
+    if (keep.rows == 0) {
+      const uint stride = p.nv * p.dv * p.dk;
+      const uint column = ((at.z % p.nv) * p.dv + at.y) * p.dk + lane * 4;
+      for (uint part = 0; part < 4; ++part)
+        nxt[keep.next_slot * stride + column + part] = bef[keep.state_slot * stride + column + part];
+    }
+    return;
+  }
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(k, v, dec, mix, com, kept_rows, keeps, p, nxt, at, lane);
+  else tf_delta_gdn_replay_body<0>(k, v, dec, mix, com, kept_rows, keeps, p, nxt, at, lane);
+}
+
+kernel void tf_delta_gdn_conv_keep_all(device ushort* committed [[buffer(0)]],
+                                  device const ushort* projection [[buffer(1)]],
+                                  device const uint* kept_rows [[buffer(2)]],
+                                  device const TfDeltaKeep* keeps [[buffer(3)]],
+                                  device const uint* windows [[buffer(4)]],
+                                  constant TfDeltaParams& p [[buffer(5)]],
+                                  constant uint& keeps_per_layer [[buffer(6)]],
+                                  constant uint& history_words [[buffer(7)]],
+                                  constant uint& projection_words [[buffer(8)]],
+                                  uint2 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  if (item >= channels or keeps_per_layer == 0) return;
+  const uint index = position.y % keeps_per_layer, layer = position.y / keeps_per_layer;
+  const TfDeltaKeep keep = keeps[index];
+  if (keep.rows == 0) return;
+  device ushort* window = committed + (size_t)layer * history_words + (size_t)keep.state_slot * held * channels + item;
+  device const ushort* rows = projection + (size_t)layer * projection_words;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : rows[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }

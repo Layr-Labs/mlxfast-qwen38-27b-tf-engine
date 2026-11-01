@@ -48,6 +48,10 @@ pub const Kernels = struct {
     star_pair: metal.Pipeline,
     /// conv_commit for in-place keeps: a thread a channel, the window written straight over history (no publish_conv).
     conv_keep: metal.Pipeline,
+    /// The pool's replay for every layer of a round in one launch, the layer from the grid's depth.
+    replay_all: metal.Pipeline,
+    /// conv_keep for every layer of a round in one launch, the layer from the grid's height.
+    conv_keep_all: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -76,6 +80,8 @@ pub const Kernels = struct {
             "tree_pair",
             "star_pair",
             "conv_keep",
+            "replay_all",
+            "conv_keep_all",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -108,6 +114,8 @@ pub const Kernels = struct {
             .tree_pair = pipelines[20],
             .star_pair = pipelines[21],
             .conv_keep = pipelines[22],
+            .replay_all = pipelines[23],
+            .conv_keep_all = pipelines[24],
         };
     }
 
@@ -131,6 +139,8 @@ pub const Kernels = struct {
             k.tree_pair,
             k.star_pair,
             k.conv_keep,
+            k.replay_all,
+            k.conv_keep_all,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

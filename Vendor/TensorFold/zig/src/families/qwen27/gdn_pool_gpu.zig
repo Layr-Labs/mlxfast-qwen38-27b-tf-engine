@@ -266,6 +266,59 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
     }
 
+    /// A round's whole keep as two launches: every layer's state replay, then every layer's conv window. Each thread
+    /// computes exactly what commitReplay and commitKeep compute for one layer; the layer comes from the grid, and
+    /// the layer-major spans from one stride each (every pool buffer is `layers` equal spans).
+    pub fn commitKeepAll(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const layers = pool.budget.layers;
+        if (layers == 0 or plan.host.keeps.len == 0) return;
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        p.advance = @intFromBool(pool.advances(plan.host));
+        const m = plan.metadata;
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        if (replays) {
+            const key = try pool.layerSpan(.key, 0);
+            const value = try pool.layerSpan(.value, 0);
+            const decay = try pool.layerSpan(.decay, 0);
+            const mixing = try pool.layerSpan(.mixing, 0);
+            const state = try pool.layerSpan(.state, 0);
+            const bank = (try pool.beforeSpan(0, plan.host, pool.advances(plan.host))) orelse state;
+            e.setPipeline(pool.kernels.replay_all);
+            gdn.bind(e, .{ key, value, decay, mixing, state }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+            e.setValue(p, 7);
+            state.bind(e, 8);
+            e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+            bank.bind(e, 10);
+            e.setValue(@as(u32, @intCast(layers)), 11);
+            e.setValue(@as(u32, @intCast(plan.host.keeps.len)), 12);
+            e.setValue(@as(u32, @intCast(key.bytes / 2)), 13);
+            e.setValue(@as(u32, @intCast(value.bytes / 2)), 14);
+            e.setValue(@as(u32, @intCast(decay.bytes / 4)), 15);
+            e.setValue(@as(u32, @intCast(mixing.bytes / 2)), 16);
+            e.setValue(@as(u32, @intCast(state.bytes / 4)), 17);
+            e.setValue(@as(u32, @intCast(bank.bytes / 4)), 18);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = @as(usize, p.nv) * plan.host.keeps.len * layers }, .{ .width = 32, .height = 4 });
+        }
+        const history = try pool.layerSpan(.history, 0);
+        const qkv = try pool.layerSpan(.qkv, 0);
+        e.setPipeline(pool.kernels.conv_keep_all);
+        gdn.bind(e, .{ history, qkv }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(@as(u32, @intCast(plan.host.keeps.len)), 6);
+        e.setValue(@as(u32, @intCast(history.bytes / 2)), 7);
+        e.setValue(@as(u32, @intCast(qkv.bytes / 2)), 8);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len * layers }, .{ .width = 256 });
+    }
+
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
     fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
