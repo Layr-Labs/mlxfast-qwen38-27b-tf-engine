@@ -344,6 +344,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_COUNT)
     device atomic_uint* TC [[buffer(6)]],
 #endif
+#if defined(TF_WAIT)
+    device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
@@ -440,6 +443,30 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+#endif
+#if defined(TF_WAIT)
+  // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
+  // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
+  // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  {
+    // while the producer finishes, touch this SIMD group's next groups' code blocks so their lines are cached when the
+    // chain reaches them (the words are not used here; the chain loads them as before)
+    uint touched = 0u;
+    for (int j = 1; j <= 8; j++) {
+      const int gj = first + j;
+      if (gj < last) { const uint4 a = wl[(size_t)gj * TF_TB * 64], b = wl[(size_t)gj * TF_TB * 64 + 32]; touched ^= a.x ^ b.w; }
+    }
+    if (touched == 0x9e3779b9u && wait_for == 0u) atomic_fetch_add_explicit(&WC[1], 0u, memory_order_relaxed); // keeps the loads
+  }
+  if (ks == 0 && lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
