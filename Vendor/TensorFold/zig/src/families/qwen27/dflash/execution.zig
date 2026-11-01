@@ -114,6 +114,40 @@ pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, 
     return lattice;
 }
 
+/// appendBlock's frame up to its commit: completeBlock reads its lattice once the GPU ran it.
+pub const Prepared = struct { frame: u64, transaction: u64, head: op.Head, projected: op.View, picks: op.View };
+
+/// appendBlock without its wait: the frame is committed and runs while the caller works on. completeBlock ends it; an
+/// error releases it, which fails the backend if anything of it was committed.
+pub fn appendBlockPrepare(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !Prepared {
+    if (block < 2 or block > 16) return error.BadRuntimeBlock;
+    const lattice_begin = ops.vtable.lattice_begin orelse return error.BadRuntimeBlock;
+    if (ops.vtable.lattice_end == null) return error.BadRuntimeBlock;
+    try checkAppend(g, preparation, context, taps, positions, next);
+    if (anchor >= g.config.vocab or next.end - next.begin > g.config.window - 1) return error.BadDraftContext;
+    const frame = try ops.vtable.begin(ops.ptr);
+    errdefer ops.vtable.release(ops.ptr, frame);
+    const transaction = try ops.vtable.context_begin(ops.ptr, context);
+    errdefer ops.vtable.context_abort(ops.ptr, transaction);
+    try encodeAppend(ops, g, preparation, taps, positions, frame, transaction);
+    try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
+    const output = try encode(ops, g, preparation, next, anchor, frame, block, &.{});
+    const picks = try lattice_begin(ops.ptr, frame, output.head, g.config);
+    return .{ .frame = frame, .transaction = transaction, .head = output.head, .projected = output.projected, .picks = picks };
+}
+
+/// A prepared frame's lattice once the GPU ran it; the frame is released either way.
+pub fn completeBlock(ops: op.Ops, g: *const w.Graph, p: Prepared) !op.Lattice {
+    defer ops.vtable.release(ops.ptr, p.frame);
+    errdefer ops.vtable.context_abort(ops.ptr, p.transaction);
+    const lattice_end = ops.vtable.lattice_end orelse return error.BadRuntimeBlock;
+    var lattice = try lattice_end(ops.ptr, p.frame, p.head, p.picks, p.projected, g.config);
+    errdefer lattice.deinit();
+    try lattice.check(g.config);
+    ops.vtable.context_abort(ops.ptr, p.transaction); // completed: clears the stage mark
+    return lattice;
+}
+
 pub const Output = struct { head: op.Head, projected: op.View };
 pub const Consumer = struct { ptr: *anyopaque, call: *const fn (*anyopaque, u64, Output, Config) anyerror!void };
 fn start(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32) !u64 {
