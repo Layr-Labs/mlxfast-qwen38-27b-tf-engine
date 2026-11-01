@@ -601,6 +601,103 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
   TF_UNROLL for (uint c = 0; c < CC; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
 }
+
+// A set's xor 1, 2, 4 sum of CC = 2 or 4 columns as a reduce-scatter: every node of the tree adds the same two partial
+// sums as the full reduction's (IEEE addition commutes), but after the first steps a lane carries only some columns'
+// partials. Returns the total of column `held` (CC = 2: b0; CC = 4: 2 b0 + b1; b0 = sub & 1, b1 = sub >> 1 & 1).
+template <uint CC>
+inline float tf_delta_scatter_sum(thread const float (&r)[CC], const bool b0, const bool b1) {
+  static_assert(CC == 2 || CC == 4, "two or four columns");
+  if (CC == 2) {
+    float kept = b0 ? r[1 % CC] : r[0];
+    const float sent = b0 ? r[0] : r[1 % CC];
+    kept += simd_shuffle_xor(sent, 1);
+    kept += simd_shuffle_xor(kept, 2);
+    kept += simd_shuffle_xor(kept, 4);
+    return kept;
+  }
+  float k0 = b0 ? r[2 % CC] : r[0], k1 = b0 ? r[3 % CC] : r[1 % CC]; // b0 keeps columns 2 and 3, sends 0 and 1
+  const float s0 = b0 ? r[0] : r[2 % CC], s1 = b0 ? r[1 % CC] : r[3 % CC];
+  k0 += simd_shuffle_xor(s0, 1);
+  k1 += simd_shuffle_xor(s1, 1);
+  float kept = b1 ? k1 : k0; // b1 keeps the second column of its pair
+  const float sent = b1 ? k0 : k1;
+  kept += simd_shuffle_xor(sent, 2);
+  kept += simd_shuffle_xor(kept, 4);
+  return kept;
+}
+
+// The unmarked prompt scan: tf_delta_gdn_chain_wide_body's arithmetic for every column, with running row offsets in
+// place of per-row products, and both sums of a row reduced by tf_delta_scatter_sum. A lane forms the correction of
+// column `held` alone and gathers the other columns' corrections by shuffles; lanes sub < CC store column `held`.
+template <uint CC>
+inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
+    device const bfloat* key,
+    device const bfloat* value,
+    device const float* decay,
+    device const bfloat* mixing,
+    device const float* committed,
+    device const TfDeltaSegment* segments,
+    constant TfDeltaParams& p,
+    device bfloat* output,
+    device float* next_state,
+    uint3 position,
+    uint lane) {
+  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+  const uint sub = lane & 7, dimension = position.y * (4 * CC) + (lane >> 3) * CC, key_head = head / (p.nv / p.nk);
+  const TfDeltaSegment span = segments[segment_index];
+  const uint state_stride = p.nv * p.dv * p.dk;
+  const uint column = (head * p.dv + dimension) * p.dk + sub * 16;
+  const bool b0 = (sub & 1) != 0, b1 = (sub & 2) != 0;
+  const uint held = CC == 2 ? (sub & 1) : ((sub & 1) << 1 | (sub >> 1 & 1));
+  float state[CC][16]; // state[c]: value column dimension + c, its words at column + c * p.dk
+  TF_UNROLL for (uint c = 0; c < CC; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + c * p.dk + i];
+  // the row's key and query words, its (row, head) scalars, and its value and output words
+  uint kq = (span.first * p.nk + key_head) * p.dk + sub * 16, at = span.first * p.nv + head, vo = at * p.dv + dimension;
+  const uint kq_step = p.nk * p.dk, at_step = p.nv, vo_step = p.nv * p.dv;
+  for (uint node = 0; node < span.rows; ++node) {
+    device const bfloat* k = key + kq;
+    device const bfloat* q = query + kq;
+    float kf[16], qf[16], remembered[CC], correction[CC], result[CC];
+    TF_UNROLL for (uint c = 0; c < CC; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
+    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
+    const float forget = decay[at];
+    TF_UNROLL for (uint i = 0; i < 16; ++i)
+      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+        state[c][i] = state[c][i] * forget;
+        remembered[c] += state[c][i] * kf[i];
+      }
+    const float mix = float(mixing[at]);
+    const float own = (float(value[vo + held]) - tf_delta_scatter_sum<CC>(remembered, b0, b1)) * mix;
+    if (CC == 2) {
+      const float other = simd_shuffle_xor(own, 1);
+      correction[0] = b0 ? other : own;
+      correction[1 % CC] = b0 ? own : other;
+    } else { // xor 2 brings column held ^ 1; xor 1 then brings the other pair
+      const float pair = simd_shuffle_xor(own, 2);
+      const float lo = b1 ? pair : own, hi = b1 ? own : pair; // columns 2 b0 and 2 b0 + 1
+      const float other_lo = simd_shuffle_xor(lo, 1), other_hi = simd_shuffle_xor(hi, 1);
+      correction[0] = b0 ? other_lo : lo;
+      correction[1 % CC] = b0 ? other_hi : hi;
+      correction[2 % CC] = b0 ? lo : other_lo;
+      correction[3 % CC] = b0 ? hi : other_hi;
+    }
+    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
+    TF_UNROLL for (uint i = 0; i < 16; ++i)
+      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+        state[c][i] = state[c][i] + kf[i] * correction[c];
+        result[c] += state[c][i] * qf[i];
+      }
+    const float total = tf_delta_scatter_sum<CC>(result, b0, b1);
+    if (sub < CC) output[vo + held] = bfloat(total);
+    kq += kq_step;
+    at += at_step;
+    vo += vo_step;
+  }
+  TF_UNROLL for (uint c = 0; c < CC; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
+}
 #undef TF_UNROLL
 
 kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
@@ -615,8 +712,7 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_body<false, 4>(query, key, value, decay, mixing, committed, segments, p, output, next_state,
-                                      uint4(0), next_state, position, lane);
+  tf_delta_gdn_chain_wide_scatter<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
 
 // marks[segment] (its rows, 0 unused): mark_state[segment * 4 + m] is the state a segment ending there would leave.
@@ -757,6 +853,57 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
       sums[g * int(sums_stride) + int(row)] = acc;
     }
   }
+}
+
+// tf_delta_gdn_post_rows for a prompt chain's rows: 16 rows of a head a group of 128, 4 a simdgroup, each row's words
+// post_rows' expressions verbatim. Its group sums (sums_stride above 0) add the same stored words in the same order from
+// zero, a lane a (row, 64-value group): the rows' words are parked in threadgroup memory, so 32 sums run side by side on
+// one simdgroup instead of two serial 64-word walks over device memory on every row's simdgroup.
+kernel void tf_delta_gdn_post_rows16(device const bfloat* recurrence [[buffer(0)]],
+                         device const bfloat* gate [[buffer(1)]],
+                         device const void* norm [[buffer(2)]],
+                         constant TfDeltaParams& p [[buffer(3)]],
+                         device bfloat* output [[buffer(4)]],
+                         device float* sums [[buffer(5)]],
+                         constant uint& sums_stride [[buffer(6)]],
+                         uint3 group [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float parked[32 * 65]; // [local row * 2 + group of the head][word]: 65 words apart, a summing lane a bank
+  const uint head = group.y, base = group.z * 16;
+  if (p.dv != 128) return;
+  for (uint i = 0; i < 4; ++i) {
+    const uint local = sg * 4 + i, row = base + local;
+    if (row >= p.rows) break;
+    const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+    const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
+    float values[4];
+    float square = 0.0f;
+    for (uint part = 0; part < 4; ++part) {
+      values[part] = float(x[part]);
+      square += values[part] * values[part];
+    }
+    square = simd_sum(square);
+    const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+    bfloat4 y;
+    for (uint part = 0; part < 4; ++part) {
+      const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
+      const float z = float(z4[part]);
+      y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    }
+    *(device bfloat4*)(output + at) = y;
+    // the head's group of lane's words is (head * dv + lane * 4) / 64 = head * 2 + lane / 16, at word (lane % 16) * 4
+    if (sums_stride != 0)
+      for (uint part = 0; part < 4; ++part) parked[(local * 2 + lane / 16) * 65 + (lane & 15) * 4 + part] = float(y[part]);
+  }
+  if (sums_stride == 0) return;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  const uint local = lane / 2, half_of_head = lane & 1, row = base + local;
+  if (row >= p.rows) return;
+  float acc = 0.0f;
+  for (uint i = 0; i < 64; ++i) acc += parked[lane * 65 + i];
+  sums[(head * 2 + half_of_head) * sums_stride + row] = acc;
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
 
