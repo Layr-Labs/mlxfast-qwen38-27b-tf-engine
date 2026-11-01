@@ -320,6 +320,26 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
     }
 
+    /// commitConvKeep for every layer of a lone keep in one launch (tf_delta_gdn_conv_keep_layers), unfenced: each layer's
+    /// history and projection spans are a fixed share of the pool's buffers.
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host) or plan.host.keeps.len != 1) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const spans = abi.ConvLayers{ .history_words = @intCast(history.length() / pool.budget.layers / 2), .projection_words = @intCast(projections.length() / pool.budget.layers / 2) };
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(spans, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = pool.budget.layers }, .{ .width = 256 }); // a channel a thread, a layer a row
+    }
+
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
     /// the device keep's: the rows tf_delta_gdn_replay would take, in its order) copied behind the pending rows for the next
     /// star scans; unfenced, beside the conv keeps. The keep's completion counts them (decode_round.Runner).
