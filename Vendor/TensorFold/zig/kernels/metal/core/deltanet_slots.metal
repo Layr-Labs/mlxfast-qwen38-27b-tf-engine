@@ -176,6 +176,19 @@ inline void tf_delta_tree_node_pair(thread float4& s0, thread float4& s1, device
   s0 = float4(a[0], a[1], a[2], a[3]);
   s1 = float4(b[0], b[1], b[2], b[3]);
 }
+inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3 groups, uint t) {
+  if (wait_prep == 0u) return;
+  if (t == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&PC[0], memory_order_relaxed) < wait_prep; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const uint total = groups.x * groups.y * groups.z;
+    if (atomic_fetch_add_explicit(&PC[1], 1u, memory_order_relaxed) + 1u == total) {
+      atomic_store_explicit(&PC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&PC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 // A depth-one star (each segment's node 0, then its other rows as children of node 0) for two adjacent value columns a
 // simdgroup: every node of each column is tf_delta_tree_node's arithmetic from the same parent state as in
 // tf_delta_gdn_tree_slots (tf_delta_tree_node_pair, a row's loads shared by the two columns), so each column's arithmetic
@@ -192,7 +205,10 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device bfloat* output [[buffer(9)]],
                                    device atomic_uint* SC [[buffer(10)]],
                                    constant uint& count_out [[buffer(11)]],
+                                   device atomic_uint* PC [[buffer(17)]],
+                                   constant uint& wait_prep [[buffer(18)]],
                                    uint3 position [[thread_position_in_grid]],
+                                   uint3 groups [[threadgroups_per_grid]],
                                    uint t [[thread_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -204,6 +220,7 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
     r0[part] = committed[base + column + part];
     r1[part] = committed[base + column + p.dk + part];
   }
+  tf_delta_gdn_star_wait(PC, wait_prep, groups, t);
   tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
   for (uint c = 1; c < span.rows; ++c) {
     float4 c0 = r0, c1 = r1; // node 0's states
@@ -241,7 +258,10 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
                                       device const float* pending_decay [[buffer(14)]],
                                       device const bfloat* pending_mixing [[buffer(15)]],
                                       constant TfDeltaPending& pending [[buffer(16)]],
+                                      device atomic_uint* PC [[buffer(17)]],
+                                      constant uint& wait_prep [[buffer(18)]],
                                       uint3 position [[thread_position_in_grid]],
+                                      uint3 groups [[threadgroups_per_grid]],
                                       uint t [[thread_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -265,6 +285,7 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
       committed[base + column + p.dk + part] = b[part];
     }
   float4 r0 = float4(a[0], a[1], a[2], a[3]), r1 = float4(b[0], b[1], b[2], b[3]);
+  tf_delta_gdn_star_wait(PC, wait_prep, groups, t);
   tf_delta_tree_node_pair(r0, r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
   for (uint c = 1; c < span.rows; ++c) {
     float4 c0 = r0, c1 = r1; // node 0's states
