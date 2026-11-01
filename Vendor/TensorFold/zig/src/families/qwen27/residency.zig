@@ -30,6 +30,7 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
     try fields.append(a, list, &b.topk);
     try list.appendSlice(a, b.head.owned.items);
     try list.appendSlice(a, b.frame.pool.items);
+    try list.append(a, b.args);
     for (b.caches) |*c| try fields.append(a, list, c);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| {
@@ -45,6 +46,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.apply(&b.attention, hook, joining);
     fields.apply(&b.topk, hook, joining);
     for (b.head.owned.items) |buffer| fields.one(buffer, hook, joining);
+    fields.one(b.args, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| prepared(adapter, hook, joining);

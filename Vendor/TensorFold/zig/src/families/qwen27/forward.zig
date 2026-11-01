@@ -13,6 +13,8 @@ pub const Mixer = struct {
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+    /// The blocks `tap` records: a norm whose output a tap copy reads keeps its barrier (a copy is unfenced).
+    tap_ids: ?[]const usize = null,
 };
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
@@ -73,10 +75,24 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
-        if (s.norm_wait != 0) {
-            try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
-        } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        e.barrier();
+        // a decoded block's first projection waits on this norm's threadgroups in its barrier interval, so the norm needs
+        // no barrier after it: only the linear mixer's qkv and zba (both counted and waiting) take that form, and only
+        // where no unfenced tap copy reads the norm's rows
+        const counted: u32 = if (s.norm_wait != 0 and s.rows <= 8 and !s.compact and s.pending != null and !tapped(s.hooks, index - 1)) blk: {
+            const g = switch (layer.mixer) {
+                .linear => |w| w,
+                .attention => break :blk 0,
+            };
+            if (!m.kernels.countableAfter(g.qkv, s.rows) or !m.kernels.countableAfter(g.zba, s.rows)) break :blk 0;
+            break :blk try m.kernels.normAfterCounted(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
+        } else 0;
+        if (counted == 0) {
+            if (s.norm_wait != 0) {
+                try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
+            } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+            e.barrier();
+        }
+        f.pre_wait = counted;
         s.norm_wait = 0;
         s.summed = false;
         if (s.pending != null) {
@@ -154,13 +170,20 @@ pub const Stages = struct {
             lane.enc.barrier();
             s.pending = f.get(.output);
             return;
-        } else if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
-            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
-            e.barrier();
-            try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
         }
-        lane.enc.barrier();
-        if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
+        // decoded rows: a counted gate/up shares its barrier interval with the counted down that waits on it
+        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCounted(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows) else null;
+        if (gu_wait == null) {
+            if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
+                try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
+                e.barrier();
+                try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
+            }
+            lane.enc.barrier();
+        }
+        if (gu_wait) |n| {
+            s.norm_wait = try m.kernels.quantCountedAfter(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows, n, .{ .buf = m.kernels.gu_words orelse return error.BadCoreProjectionRows });
+        } else if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
         } else if (if (!s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             s.norm_wait = counted;
@@ -222,4 +245,12 @@ pub fn encode(m: *Model, e: mtl.ComputeEncoder, rows: u32, mixer: Mixer) !void {
 /// A norm's or the MLP gate's group sums for the frame's padded rows.
 pub fn sums(f: *Frame, field: @import("gpu_frame.zig").Field, rows: u32) @import("quant_gpu.zig").Sums {
     return .{ .ref = f.get(field), .stride = @import("quant_gpu.zig").padded(rows) };
+}
+
+/// Whether `mixer`'s tap copies block `block`'s rows: those copies run unfenced beside the mixer, so the norm that writes
+/// their source keeps a barrier after it.
+fn tapped(mixer: Mixer, block: usize) bool {
+    if (mixer.tap == null) return false;
+    const ids = mixer.tap_ids orelse return true;
+    return std.mem.indexOfScalar(usize, ids, block) != null;
 }
