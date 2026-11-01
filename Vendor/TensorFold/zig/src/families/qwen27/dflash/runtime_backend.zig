@@ -139,6 +139,7 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
+    reg3_count:usize=0,
     hazards: Hazards = .{},
     /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
@@ -212,12 +213,16 @@ pub const Backend = struct {
         };
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
+        if(units and b.reg3_count!=1+4*b.config.layers)return error.DraftPreparationUnqualified;
+        if(units)std.log.info("qwen27: draft reg3 base linears={d}, fused GU={d}; target checkpoint unchanged",.{b.reg3_count,b.config.layers});
         if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
     }
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
-        var prepared_words = try core.affine4.prepare(b.allocator, rows, shape[0], shape[1]);
+        const low=order!=null and (std.mem.eql(u8,name,"fc.weight") or std.mem.endsWith(u8,name,".mlp.gate_proj.weight") or std.mem.endsWith(u8,name,".mlp.up_proj.weight") or std.mem.endsWith(u8,name,".mlp.down_proj.weight") or std.mem.endsWith(u8,name,".self_attn.o_proj.weight"));
+        var prepared_words=if(low)try core.affine4.prepareThree(b.allocator,rows,shape[0],shape[1]) else try core.affine4.prepare(b.allocator,rows,shape[0],shape[1]);
+        if(low)b.reg3_count+=1;
         defer prepared_words.deinit();
         if (b.stash) |st| if (shortName(name)) |short| {
             const layer = layerOf(name) orelse return error.DraftTensorCoverage;
@@ -225,7 +230,7 @@ pub const Backend = struct {
             const id = try std.fmt.bufPrint(&buf, "{d}{s}", .{ layer, short });
             const owned = try b.allocator.dupe(u8, id);
             errdefer b.allocator.free(owned);
-            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases) };
+            const dup = core.affine4.Prepared{ .bits=prepared_words.bits,.nibbles=prepared_words.nibbles,.allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases) };
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
@@ -250,9 +255,11 @@ pub const Backend = struct {
     fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
         var n: usize = 0;
         var k: usize = 0;
+        var bits:u8=0;
         var buf: [16]u8 = undefined;
         for (parts) |p| {
             const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })) orelse return;
+            if(bits!=0 and bits!=got.prepared.bits)return error.DraftPreparationUnqualified;bits=got.prepared.bits;
             n += got.prepared.n;
             if (k != 0 and k != got.prepared.k) return error.DraftPreparationUnqualified;
             k = got.prepared.k;
@@ -272,7 +279,7 @@ pub const Backend = struct {
             at += got.prepared.n;
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
-        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
+        const joined = core.affine4.Prepared{ .bits=bits,.nibbles=bits==3,.allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
         const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;

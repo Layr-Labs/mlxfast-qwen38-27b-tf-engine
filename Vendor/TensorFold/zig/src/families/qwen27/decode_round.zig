@@ -270,6 +270,11 @@ pub const Runner = struct {
             r.failed = true;
             return err;
         };
+        r.model.kernels.checkCounted() catch |err| {
+            r.failed = true;
+            r.active = null;
+            return err;
+        };
         if (r.capture_taps) try r.taps.complete();
         if (accepted) {
             for (round.slots, round.windows) |slot, window| r.offsets[slot] = window.start + @as(u32, @intCast(window.parents.len));

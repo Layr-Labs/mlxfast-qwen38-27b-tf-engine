@@ -2,13 +2,14 @@
 const std = @import("std");
 const ck = @import("../checkpoint.zig");
 const Config = @import("config.zig").Config;
-pub const Mode = enum { bf16_reference, prepared_q4_reference, python_q4g64 };
+pub const Mode = enum { bf16_reference, prepared_q4_reference, prepared_reg3_reference, python_q4g64 };
 pub const Preparation = struct {
     mode: Mode = .python_q4g64,
     quantization_verified: bool = false,
     default_proposal_parity: bool = false,
     source_sha256: [32]u8 = @splat(0),
     pub fn check(p: Preparation) !void {
+        if(p.mode==.prepared_reg3_reference and (!p.quantization_verified or p.default_proposal_parity or std.mem.allEqual(u8,&p.source_sha256,0)))return error.DraftPreparationUnqualified;
         if (p.mode == .prepared_q4_reference and (!p.quantization_verified or std.mem.allEqual(u8, &p.source_sha256, 0))) return error.DraftPreparationUnqualified;
         if (p.mode == .python_q4g64 and (!p.quantization_verified or !p.default_proposal_parity or std.mem.allEqual(u8, &p.source_sha256, 0))) return error.DraftPreparationUnqualified;
     }

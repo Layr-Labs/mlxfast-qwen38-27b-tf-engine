@@ -273,10 +273,25 @@ uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_sim
 }
 #endif
 
-#if TF_BITS == 4 && defined(TF_REG) && !defined(TF_PROMPT_TN)
+#if (TF_BITS == 4 || TF_BITS == 3) && defined(TF_REG) && !defined(TF_PROMPT_TN)
 #ifndef TF_TB
 #define TF_TB 1
 #endif
+#if TF_BITS == 3
+#define TF_RW 48
+#else
+#define TF_RW 64
+#endif
+// Reg3 keeps the low two bits in paired nibbles and each word's third bits in a byte plane.
+inline uint4 tf_reg3_upper(const device uint4*laneBase,int lane){
+ const device uint2*plane=(const device uint2*)(laneBase-lane+32);return uint4(plane[lane],0u,0u);
+}
+inline uint tf_reg3_word(uint4 low,uint4 high,int w){
+ uint word=w<4?(low[w]&0x33333333u):((low[w-4]>>2)&0x33333333u);
+ uint h=(high[w>>2]>>(8*(w&3)))&255u;
+ h=(h|(h<<12))&0x000f000fu;h=(h|(h<<6))&0x03030303u;h=(h|(h<<3))&0x11111111u;
+ return word|(h<<2);
+}
 struct tf_reg_load { uint4 w0, w1, q0, q1; float x0, x1; }; // a lane's codes, its two metadata quads and its two row sums for one group
 
 // TF_SBI (decoded rows' lean loop only): metadata indexed as lane_projection.indexed_layout, TF_SBI distinct
@@ -311,11 +326,11 @@ inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
 #define TF_PART 16
 #endif
 
-inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
+inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride, int lane) {
 #if defined(TF_ROWS8)
-  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
+  return {wl[(size_t)g * TF_TB * TF_RW], (TF_BITS==3?tf_reg3_upper(wl+((size_t)g * TF_TB * TF_RW),lane):wl[(size_t)g * TF_TB * TF_RW + 32]), sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
 #else
-  return {wl[(size_t)g * TF_TB * 64], wl[(size_t)g * TF_TB * 64 + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
+  return {wl[(size_t)g * TF_TB * TF_RW], (TF_BITS==3?tf_reg3_upper(wl+((size_t)g * TF_TB * TF_RW),lane):wl[(size_t)g * TF_TB * TF_RW + 32]), sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], XS[g * stride + m + 8]};
 #endif
 }
 
@@ -378,11 +393,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int turn = 0; turn < 2; turn++) {
   const int tile = 2 * int(tg.x) + ks + turn * (TF_N / 64), n0 = tile * NT;
 #endif
-  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane;
+  const device uint4* wl = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * TF_RW + lane;
 #if defined(TF_CHAIN_WALK)
   // one stream over all K: a chain's first group is already prefetched by the chain before it
   const int end = TF_G0 + TF_GN;
-  uint4 nw0 = wl[(size_t)TF_G0 * TF_TB * 64], nw1 = wl[(size_t)TF_G0 * TF_TB * 64 + 32];
+  uint4 nw0 = wl[(size_t)TF_G0 * TF_TB * TF_RW], nw1 = (TF_BITS==3?tf_reg3_upper(wl+((size_t)TF_G0 * TF_TB * TF_RW),lane):wl[(size_t)TF_G0 * TF_TB * TF_RW + 32]);
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -392,7 +407,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
 #endif
-  const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * 64;
+  const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
 #endif
 #if defined(TF_SERIAL_SK2)
   float C0[16];
@@ -411,14 +426,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
 #if defined(TF_PROMPT_SR)
   // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
-  // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
+  // the same words as wl[g * TF_TB * TF_RW], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
-  const device uint4* cp = wl + (size_t)first * TF_TB * 64;
+  const device uint4* cp = wl + (size_t)first * TF_TB * TF_RW;
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+  if (first < last) { nw0 = cp[0]; nw1 = (TF_BITS==3?tf_reg3_upper(cp,lane):cp[32]); }
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
     sp += TF_N / 4;
@@ -427,7 +442,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if !defined(TF_CHAIN_WALK)
   const int end = last;
   uint4 nw0 = 0, nw1 = 0;
-  if (first < last) { nw0 = wl[(size_t)first * TF_TB * 64]; nw1 = wl[(size_t)first * TF_TB * 64 + 32]; }
+  if (first < last) { nw0 = wl[(size_t)first * TF_TB * TF_RW]; nw1 = (TF_BITS==3?tf_reg3_upper(wl+((size_t)first * TF_TB * TF_RW),lane):wl[(size_t)first * TF_TB * TF_RW + 32]); }
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -439,7 +454,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
-  const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+  const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -457,14 +472,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #else
   tf_reg_load next = {};
-  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride);
+  if (first < last) next = tf_reg_fetch(wl, sbv, XS, first, n0 + nb, mb, stride, lane);
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
 #endif
     for (int w = 0; w < 8; w++) {
       // codes as fp16 subnormals (bits = code, value code * 2^-24): products are the usual ones scaled by 2^-24 exactly, and
       // the scales below carry the 2^24 back
+#if TF_BITS == 3
+      const uint word=tf_reg3_word(cur.w0,cur.w1,w);
+#else
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
+#endif
       const int e = 16 * (w & 1) + 2 * (w >> 1);
       b2[e] = as_type<half2>(word & 0x000F000Fu);
       b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
@@ -474,11 +493,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
-    cp += g + 1 < last ? TF_TB * 64 : 0;
+    cp += g + 1 < last ? TF_TB * TF_RW : 0;
     nw0 = cp[0];
-    nw1 = cp[32];
+    nw1 = (TF_BITS==3?tf_reg3_upper(cp,lane):cp[32]);
 #else
-    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * 64; nw0 = wp[0]; nw1 = wp[32]; }
+    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = (TF_BITS==3?tf_reg3_upper(wp,lane):wp[32]); }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
@@ -486,7 +505,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #endif
 #else
-    if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
+    if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride, lane);
 #endif
 #if defined(TF_REG_LEAN)
     const array<int32_t, 2> xstr = {1, TF_K};

@@ -73,7 +73,8 @@ pub const Kernels = struct {
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
-    /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
+    /// Producer count, norm arrivals and sticky dependency failure; fourth word reserved.
+    /// A dependency failure remains sticky until the model is unloaded.
     count_words: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
@@ -514,6 +515,12 @@ pub const Kernels = struct {
         try span.end();
     }
 
+    /// Called only after all submitted target GPU work has completed, before
+    /// the host exposes picks, accepts state or returns target tokens.
+    pub fn checkCounted(k: *const Kernels) !void {
+        if (k.count_words) |words| try @import("counted_norm_status.zig").check(words.slice(u32, 4)[2]);
+    }
+
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
     /// threadgroup waits until that launch's `wait_for` threadgroups have counted their fenced stores.
     pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
@@ -538,8 +545,8 @@ pub const Kernels = struct {
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true };
         if (key.serialSk2() or p.slices < 2) return null;
         if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.count_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);

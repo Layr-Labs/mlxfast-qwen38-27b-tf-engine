@@ -4,6 +4,8 @@ pub const Prepared = struct {
     allocator: std.mem.Allocator,
     n: usize,
     k: usize,
+    bits: u8 = 4,
+    nibbles: bool = false, // low-bit copies prepared on a nibble grid until reg packing
     words: []u32,
     scales: []u16,
     biases: []u16,
@@ -118,3 +120,8 @@ pub fn signature() [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(@embedFile("affine4.zig"), &result, .{});
     return result;
 }
+
+/// A low-bit drafter copy, prepared without touching the source checkpoint.
+pub fn prepareThree(a: std.mem.Allocator,weights:[]const u16,n:usize,k:usize)!Prepared{return @import("affine3.zig").prepare(a,weights,n,k);}
+
+pub fn threeSignature()[32]u8{return @import("affine3.zig").signature();}

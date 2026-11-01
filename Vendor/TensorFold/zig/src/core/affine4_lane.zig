@@ -14,9 +14,10 @@ pub const Adapter = struct {
     small: ?lane.Projection = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
+        if (prepared.bits!=4 and (prepared.bits!=3 or !prepared.nibbles or order==null))return error.UnsupportedDraftBits;
         var layout = lane.Layout{ .n = prepared.n, .k = prepared.k, .format = .{ .bits = 4, .group = 64 }, .sk = sk, .precompute_sums = true, .cooperative = order == null, .reg = order != null, .reg_lean = order != null };
         try layout.validate();
-        const words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        var words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         errdefer words.deinit();
         const metadata = try device.buffer(layout.metadataElements() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         errdefer metadata.deinit();
@@ -24,6 +25,12 @@ pub const Adapter = struct {
         if (order) |o| try o.run(&.{.{ .w = .{ .buf = words }, .n = prepared.n, .k = prepared.k }});
         // the reg kernel's scales carry 2^24 (lane.foldScale); the cooperative kernel reads them as packed
         if (order != null) try lane.foldScales(metadata.slice(u16, layout.metadataElements()));
+        if(prepared.bits==3){
+            var three=layout;three.format.bits=3;try three.validate();
+            const compact=try device.buffer(three.weightWords()*4,mtl.ResourceOptions.shared|mtl.ResourceOptions.untracked);
+            @import("reg3.zig").pack(words.slice(u32,layout.weightWords()),compact.slice(u32,three.weightWords()))catch|err|{compact.deinit();return err;};
+            words.deinit();words=compact;layout=three;
+        }
         // reg adapters read the pairs through an index (the same words, fewer bytes a group) when they fit its table
         var index: ?mtl.Buffer = null;
         errdefer if (index) |b| b.deinit();

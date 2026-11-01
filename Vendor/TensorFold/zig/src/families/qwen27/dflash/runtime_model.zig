@@ -47,18 +47,21 @@ pub const Model = struct {
         model.checkpoint = core.checkpoint_metal.Checkpoint.init(a);
         errdefer model.checkpoint.deinit();
         // q4 drafts read their linears only through prepared copies: those stay in the file until prepare reads them
-        const later: ?core.checkpoint_metal.Later = if (mode == .prepared_q4_reference) Backend.linear else null;
+        const later: ?core.checkpoint_metal.Later = if (mode == .prepared_q4_reference or mode == .prepared_reg3_reference) Backend.linear else null;
         for (shards) |file| try model.checkpoint.addFileSplit(target.device, file, "", null, later);
         model.backend = try Backend.init(a, target, &model.checkpoint, c);
         errdefer model.backend.deinit();
         model.graph = try loadGraph(a, &model.backend);
         errdefer model.graph.deinit();
-        if (mode == .prepared_q4_reference) try model.backend.prepare();
+        if (mode == .prepared_q4_reference or mode == .prepared_reg3_reference) try model.backend.prepare();
         model.checkpoint.closeFiles();
         model.pending = try target.device.buffer(@as(usize, c.window) * c.tapWidth() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         errdefer model.pending.deinit();
         model.session = try Session.init(c, 1, 0);
-        model.preparation = .{ .mode = mode, .quantization_verified = mode == .prepared_q4_reference, .source_sha256 = if (mode == .prepared_q4_reference) core.affine4.signature() else @splat(0) };
+        const reg3=model.backend.reg3_count>0;
+        model.preparation=.{.mode=if(reg3).prepared_reg3_reference else mode,.quantization_verified=mode==.prepared_q4_reference or mode==.prepared_reg3_reference,.source_sha256=if(reg3)core.affine4.threeSignature() else if(mode==.prepared_q4_reference)core.affine4.signature() else @splat(0)};
+        try model.preparation.check();
+        if(reg3)std.log.info("qwen27: drafter preparation=prepared_reg3_reference; proposal parity not claimed",.{});
         return model;
     }
     pub fn deinit(m: *Model) void {
