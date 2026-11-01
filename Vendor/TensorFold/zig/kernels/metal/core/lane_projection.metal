@@ -344,6 +344,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_COUNT)
     device atomic_uint* TC [[buffer(6)]],
 #endif
+#if defined(TF_WAIT)
+    device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
+#endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
@@ -440,6 +443,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * 64;
+#endif
+#if defined(TF_WAIT)
+  if (ks == 0 && lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)

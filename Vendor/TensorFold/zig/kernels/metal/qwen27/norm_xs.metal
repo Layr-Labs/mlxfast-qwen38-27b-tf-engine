@@ -14,6 +14,9 @@ typedef half float16_t;
   device float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
+  device atomic_uint* NC2 [[buffer(10)]],
+  device atomic_uint* NC3 [[buffer(11)]],
+  constant uint& own_count [[buffer(12)]],
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -75,5 +78,13 @@ HO[base + i] = h;
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+  if (own_count != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if ((own_count & 1u) != 0u) atomic_fetch_add_explicit(&NC2[0], 1u, memory_order_relaxed);
+      if ((own_count & 2u) != 0u) atomic_fetch_add_explicit(&NC3[0], 1u, memory_order_relaxed);
+    }
+  }
 
 }
