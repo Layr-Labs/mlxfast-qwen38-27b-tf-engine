@@ -266,7 +266,7 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .tap_ids = if (r.capture_taps) @as([]const usize, r.taps.ids[0..]) else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -376,8 +376,9 @@ pub const Runner = struct {
             for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
         } else {
             if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
-            // Each layer replays its state and copies all conv taps before overwriting that channel's history.
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+            // Each layer replays its state, then one launch copies every layer's conv taps before overwriting that
+            // channel's history.
+            try r.gdn.keepLayers(plan, e);
         }
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();

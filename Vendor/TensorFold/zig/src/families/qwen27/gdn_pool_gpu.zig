@@ -355,6 +355,70 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 4 });
     }
 
+    /// Every GDN layer's keep: one replay launch for all layers when no window steps its state in place, otherwise
+    /// the per-layer replay, then tf_delta_gdn_conv_keep_layers writes all layers' conv windows in one launch whose
+    /// grid depth is a layer. History and qkv are one pooled buffer each, a layer apart at a fixed word stride, and
+    /// every layer reads the round's keeps and windows.
+    pub fn keepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (pool.advances(plan.host) or !inPlace(plan.host)) {
+            for (0..pool.budget.layers) |layer| try pool.commitReplay(layer, plan, e);
+        } else try pool.replayLayers(plan, e);
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const qkv = pool.get(.qkv);
+        const layers: u32 = @intCast(pool.budget.layers);
+        const stride = abi.LayerStride{
+            .layers = layers,
+            .history = @intCast(history.length() / (pool.budget.layers * 2)),
+            .qkv = @intCast(qkv.length() / (pool.budget.layers * 2)),
+        };
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(qkv, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(stride, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = pool.budget.layers }, .{ .width = 256 }); // a channel a layer
+    }
+
+    /// Every GDN layer's replay in one launch: the grid depth holds every layer's keeps, and a layer's key, value,
+    /// decay, mixing and state spans start at their own word strides in the pooled buffers. The rounds that take it
+    /// are the ones whose windows all replay (no in-place advance), so no slot copy reads `before`.
+    fn replayLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const state = pool.get(.state);
+        const stride = abi.LayerSpans{
+            .layers = @intCast(pool.budget.layers),
+            .keeps = @intCast(plan.host.keeps.len),
+            .key = @intCast(pool.get(.key).length() / (pool.budget.layers * 2)),
+            .value = @intCast(pool.get(.value).length() / (pool.budget.layers * 2)),
+            .decay = @intCast(pool.get(.decay).length() / (pool.budget.layers * 4)),
+            .mixing = @intCast(pool.get(.mixing).length() / (pool.budget.layers * 2)),
+            .state = @intCast(state.length() / (pool.budget.layers * 4)),
+            .before = 0,
+        };
+        e.setPipeline(pool.kernels.replay_layers);
+        e.setBuffer(pool.get(.key), 0, 0);
+        e.setBuffer(pool.get(.value), 0, 1);
+        e.setBuffer(pool.get(.decay), 0, 2);
+        e.setBuffer(pool.get(.mixing), 0, 3);
+        e.setBuffer(state, 0, 4);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+        e.setValue(p, 7);
+        e.setBuffer(state, 0, 8);
+        e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+        e.setBuffer(state, 0, 10);
+        e.setValue(stride, 11);
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len * pool.budget.layers }, .{ .width = 32, .height = 4 });
+    }
+
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
     fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);

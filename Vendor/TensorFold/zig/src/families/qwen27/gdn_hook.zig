@@ -32,7 +32,14 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
+        // a decoded pre-norm counts its rows and the two projections that read them wait on that count in the same barrier
+        // interval (Kernels.normAfterCounted, quantCountedAfter): qkv on the first word pair, zba on the second
+        if (frame.pre_wait != 0) {
+            const words = hook.quant.norm_words orelse return error.BadGdnHook;
+            const a = try hook.quant.quantCountedAfter(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows, frame.pre_wait, .{ .buf = words });
+            const b = try hook.quant.quantCountedAfter(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows, frame.pre_wait, .{ .buf = words, .off = 8 });
+            after = .{ .counter = hook.quant.count_words orelse return error.BadGdnHook, .wait = a + b };
+        } else if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
@@ -41,6 +48,7 @@ pub const Hook = struct {
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
         }
+        frame.pre_wait = 0;
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);

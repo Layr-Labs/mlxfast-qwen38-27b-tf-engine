@@ -424,6 +424,33 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
 }
+struct TfDeltaLayerSpans { uint layers; uint keeps; uint key; uint value; uint decay; uint mixing; uint state; uint before; };
+kernel void tf_delta_gdn_replay_layers(device const bfloat* key [[buffer(0)]],
+                                  device const bfloat* value [[buffer(1)]],
+                                  device const float* decay [[buffer(2)]],
+                                  device const bfloat* mixing [[buffer(3)]],
+                                  device const float* committed [[buffer(4)]],
+                                  device const uint* kept_rows [[buffer(5)]],
+                                  device const TfDeltaKeep* keeps [[buffer(6)]],
+                                  constant TfDeltaParams& p [[buffer(7)]],
+                                  device float* next [[buffer(8)]],
+                                  device const TfDeltaSegment* segments [[buffer(9)]],
+                                  device const float* before [[buffer(10)]],
+                                  constant TfDeltaLayerSpans& s [[buffer(11)]],
+                                  uint3 position [[thread_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  const uint span = p.nv * s.keeps, layer = position.z / span;
+  if (layer >= s.layers) return;
+  const uint3 at = uint3(position.x, position.y, position.z - layer * span);
+  device const bfloat* k = key + (size_t)layer * s.key;
+  device const bfloat* v = value + (size_t)layer * s.value;
+  device const float* d = decay + (size_t)layer * s.decay;
+  device const bfloat* m = mixing + (size_t)layer * s.mixing;
+  device const float* st = committed + (size_t)layer * s.state;
+  device float* nx = next + (size_t)layer * s.state;
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
+  else tf_delta_gdn_replay_body<0>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
+}
 
 // A deferred keep's rows: the pending row its first kept row lands at, the rows left after it, and the log's and pending
 // rows a layer (their strides).
@@ -797,6 +824,31 @@ kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
   }
   for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }
+struct TfDeltaLayerStride { uint layers; uint history; uint qkv; };
+kernel void tf_delta_gdn_conv_keep_layers(device ushort* committed [[buffer(0)]],
+                                     device const ushort* projection [[buffer(1)]],
+                                     device const uint* kept_rows [[buffer(2)]],
+                                     device const TfDeltaKeep* keeps [[buffer(3)]],
+                                     device const uint* windows [[buffer(4)]],
+                                     constant TfDeltaParams& p [[buffer(5)]],
+                                     constant TfDeltaLayerStride& s [[buffer(6)]],
+                                     uint3 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const uint layer = position.z;
+  if (item >= channels || layer >= s.layers) return;
+  const TfDeltaKeep keep = keeps[position.y];
+  if (keep.rows == 0) return;
+  device ushort* history = committed + (size_t)layer * s.history;
+  device const ushort* qkv = projection + (size_t)layer * s.qkv;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = history + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : qkv[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
 // Replay finishes before publication, which copies storage words without another floating-point operation.
 
 kernel void tf_delta_gdn_publish(device const uint* next_state [[buffer(0)]],
@@ -835,3 +887,4 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+// Second measurement of terrapinelf's submission 42f3db3b-56ab-4e2f-87f9-ebfc2946aad4; code unchanged.
