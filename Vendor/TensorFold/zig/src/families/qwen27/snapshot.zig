@@ -204,6 +204,7 @@ pub fn save(a: std.mem.Allocator, r: *Runner, draft: ?*Draft, at: u32) !*State {
 /// Slot `slot`'s state after `at` tokens (and its taps ring), its blit not waited for: see settleSlot and landed.
 pub fn saveSlot(a: std.mem.Allocator, r: *Runner, slot: u32, ring: ?Ring, at: u32, spares: ?*Spares) !*State {
     if (at == 0 or r.failed or r.active != null or slot >= r.ready) return error.NotAtMark;
+    try r.flushLazy(); // a deferred keep's replays land in the state saved
     const marked = if (r.gdn.marks) |m| m.index(slot, at, r.offsets[slot]) != null else false;
     if ((r.offsets[slot] != at and !marked) or (ring != null and (marked or ring.?.end.* != at))) return error.NotAtMark;
     const n = slotBytes(r, ring, at);

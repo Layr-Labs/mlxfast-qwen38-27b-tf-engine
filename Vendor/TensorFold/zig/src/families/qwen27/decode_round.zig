@@ -6,8 +6,9 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
-/// Layers a verify encodes before its first commit: the idle GPU starts after two layers' encode.
-const first_commit = 2;
+/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
+/// encode, while the host encodes the rest of the chunk.
+const first_commit = 1;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -68,6 +69,24 @@ pub const Runner = struct {
     images: ?image_rows.Images = null,
     /// A kept state's blit still reading a slot, by slot: the slot's next write waits for it (settleSlot).
     reading: [attn.planning.max_streams]?mtl.CommandBuffer = @splat(null),
+    /// A decoded keep's DeltaNet replays and conv windows, deferred (`Lazy`): the next verify of its slot encodes each
+    /// layer's beside the scan of the layer before (the first layer's in the verify's first interval), where the GPU's
+    /// bandwidth is otherwise idle, instead of beside the drafter frame that runs with the keep; anything else that reads
+    /// or replaces that state applies (flushLazy) or drops (dropLazy) it first.
+    lazy: ?Lazy = null,
+    lazy_now: ?*const Lazy = null,
+    lazy_next: usize = 0,
+    lazy_done: usize = 0,
+    /// The two keep metadata sets a deferring keep takes in turn: a keep's upload never overwrites the set the replays
+    /// still pending from the keep before it read.
+    keep_sets: [2]?[keep_fields]mtl.Buffer = .{ null, null },
+    keep_turn: u1 = 0,
+
+    /// A deferred keep: its plan (owned), the keep metadata set it uploaded and its GPU picks wrote, and its slot.
+    const Lazy = struct { plan: GdnPlan, meta: @import("gdn_pool_gpu.zig").Metadata, set: u1, slot: u32 };
+    const keep_fields = 7;
+    /// Bytes of each buffer of a keep metadata set: a decoded round's rows (at most gpu_frame.max_rows) with room to spare.
+    const keep_field_bytes = 16 << 10;
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -176,6 +195,8 @@ pub const Runner = struct {
     }
 
     pub fn deinit(r: *Runner) void {
+        r.dropLazy();
+        for (r.keep_sets) |maybe| if (maybe) |set| for (set) |b| b.deinit();
         for (0..r.slots) |slot| r.settleSlot(@intCast(slot));
         r.setResident(null);
         r.taps.deinit();
@@ -229,6 +250,19 @@ pub const Runner = struct {
         };
         r.accepted_chain = accepted;
         defer r.accepted_chain = false;
+        // the last keep's deferred replays: into this pass when it is its slot's decoded verify, else applied first
+        var lazy_take: ?Lazy = null;
+        if (r.lazy) |lz| {
+            if (!accepted and round.windows.len == 1 and round.slots[0] == lz.slot and r.gdn.marks == null) {
+                lazy_take = lz;
+                r.lazy = null;
+            } else try r.flushLazy();
+        }
+        defer if (lazy_take) |*t| t.plan.deinit();
+        r.lazy_now = if (lazy_take) |*t| t else null;
+        defer r.lazy_now = null;
+        r.lazy_done = 0;
+        var lead_lazy = LeadLazy{ .r = r, .inner = r.lead };
         var recurrent = try round.recurrent(try r.params(round.ids.len), paths);
         defer recurrent.deinit();
         if (r.gdn.marks) |m| {
@@ -258,7 +292,8 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        const lead: ?forward.Tail = if (lazy_take != null) .{ .ptr = &lead_lazy, .encode = LeadLazy.encode } else r.lead;
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = lead, .after = r.after, .images = placed.images };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
         r.last_gpu_seconds = @import("core").segments.runCommittingFrom(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every) catch |err| {
@@ -266,6 +301,12 @@ pub const Runner = struct {
             r.active = null;
             return err;
         };
+        // every layer's deferred keep went into this verify, or its state would now be stale
+        if (lazy_take != null and r.lazy_done != r.gdn.budget.layers) {
+            r.failed = true;
+            r.active = null;
+            return error.RoundNotReady;
+        }
         if (r.model.ane) |share| share.drain() catch |err| {
             r.failed = true;
             return err;
@@ -278,6 +319,7 @@ pub const Runner = struct {
 
     pub fn keep(r: *Runner, round: *const Round, paths: []const []const u32) !void {
         const active = r.active orelse return error.RoundNotReady;
+        try r.flushLazy();
         if (r.failed or !std.mem.eql(u8, &active, &fingerprint(round))) return error.RoundNotReady;
         var recurrent = try round.recurrent(try r.params(round.ids.len), paths);
         defer recurrent.deinit();
@@ -317,11 +359,17 @@ pub const Runner = struct {
     pub fn keepDevice(r: *Runner, round: *const Round, e: mtl.ComputeEncoder, ops: @import("core").tree_commit_gpu.Ops, result: @import("core").tree_commit_gpu.Ref) !void {
         const active = r.active orelse return error.RoundNotReady;
         if (r.failed or round.windows.len != 1 or round.ids.len > @import("core").tree_round.max_rows or !std.mem.eql(u8, &active, &fingerprint(round))) return error.RoundNotReady;
+        // the verify this keep follows took (or applied) any earlier deferred keep
+        if (r.lazy != null) return error.RoundNotReady;
         var recurrent = try round.recurrent(try r.params(round.ids.len), &.{&.{}});
-        defer recurrent.deinit();
+        // a single window's keep defers its DeltaNet replays into the next verify (Runner.lazy)
+        const deferring = round.slots.len == 1 and recurrent.segments.len == 1;
+        var deferred = false;
+        defer if (!deferred) recurrent.deinit();
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
-        const m = r.metadata();
+        const set = r.keep_turn;
+        const m = if (deferring) try r.keepMetadata(set, e) else r.metadata();
         try m.upload(recurrent);
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
@@ -351,8 +399,13 @@ pub const Runner = struct {
         try ops.metadata(e, result, keep_ref, rows, shared_map, p);
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        // Each layer replays its state and copies all conv taps before overwriting that channel's history.
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+        // Each layer replays its state and copies all conv taps before overwriting that channel's history: here, or
+        // (deferring) in the next verify of the slot, which reads them only after.
+        if (deferring) {
+            r.lazy = .{ .plan = recurrent, .meta = m, .set = set, .slot = round.slots[0] };
+            r.keep_turn +%= 1;
+            deferred = true;
+        } else for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;
@@ -402,6 +455,7 @@ pub const Runner = struct {
 
     /// After a GPU failure, once no stream holds a slot: rounds run again, each slot reset by its next prompt.
     pub fn recover(r: *Runner) void {
+        r.dropLazy();
         r.failed = false;
         r.active = null;
     }
@@ -428,6 +482,8 @@ pub const Runner = struct {
     pub fn reset(r: *Runner, slot: u32) !void {
         r.settleSlot(slot);
         if (r.failed or r.active != null or slot >= r.ready) return error.RoundNotReady;
+        // a deferred keep of the slot being cleared has nothing left to write; another slot's is applied
+        if (r.lazy) |lz| if (lz.slot == slot) r.dropLazy() else try r.flushLazy();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
@@ -445,6 +501,70 @@ pub const Runner = struct {
 
     fn params(r: *Runner, rows: usize) !abi.Params {
         return r.gdn.budget.shape.params(rows, r.slots, .{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 });
+    }
+
+    /// Keep metadata set `set` (made at first use), resident for encoder `e`.
+    fn keepMetadata(r: *Runner, set: u1, e: mtl.ComputeEncoder) !@import("gdn_pool_gpu.zig").Metadata {
+        if (r.keep_sets[set] == null) {
+            var made: [keep_fields]mtl.Buffer = undefined;
+            var n: usize = 0;
+            errdefer for (made[0..n]) |b| b.deinit();
+            while (n < keep_fields) : (n += 1) made[n] = try r.model.device.buffer(keep_field_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            r.keep_sets[set] = made;
+        }
+        const b = r.keep_sets[set].?;
+        for (b) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        return .{ .parents = .{ .buffer = b[0] }, .windows = .{ .buffer = b[1] }, .row_slots = .{ .buffer = b[2] }, .segments = .{ .buffer = b[3] }, .keeps = .{ .buffer = b[4] }, .kept_rows = .{ .buffer = b[5] }, .slot_steps = .{ .buffer = b[6] } };
+    }
+
+    /// Layer `layer`'s deferred keep (replay and conv window) into `e`.
+    fn encodeLazy(r: *Runner, layer: usize, e: mtl.ComputeEncoder) !void {
+        const lz = r.lazy_now orelse return error.RoundNotReady;
+        _ = try r.keepMetadata(lz.set, e);
+        try r.gdn.commitKeep(layer, .{ .host = lz.plan, .metadata = lz.meta }, e);
+        r.lazy_done += 1;
+    }
+    /// Beside a verify's scan: the next layer's deferred keep.
+    fn lazyNext(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        return r.encodeLazy(r.lazy_next, e);
+    }
+    /// First in a verify's first interval: the lead it had, then the first layer's deferred keep.
+    const LeadLazy = struct {
+        r: *Runner,
+        inner: ?forward.Tail,
+        fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+            const l: *LeadLazy = @ptrCast(@alignCast(ptr));
+            if (l.inner) |t| try t.encode(t.ptr, e);
+            try l.r.encodeLazy(0, e);
+        }
+    };
+
+    /// The deferred keep applied in a command buffer of its own, before anything but its slot's next verify reads the
+    /// state it writes; the keep that deferred it has ended (its picks wrote the metadata the replays read).
+    pub fn flushLazy(r: *Runner) !void {
+        var lz = r.lazy orelse return;
+        r.lazy = null;
+        defer lz.plan.deinit();
+        if (r.failed) return;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = r.model.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        _ = try r.keepMetadata(lz.set, e);
+        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, .{ .host = lz.plan, .metadata = lz.meta }, e);
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (gpuFailed(cb, "a deferred keep")) {
+            r.failed = true;
+            return error.RoundGpuFailure;
+        }
+    }
+    /// The deferred keep forgotten: its slot is cleared or every slot starts over.
+    pub fn dropLazy(r: *Runner) void {
+        if (r.lazy) |*lz| lz.plan.deinit();
+        r.lazy = null;
     }
 
     fn metadata(r: *Runner) @import("gdn_pool_gpu.zig").Metadata {
@@ -471,6 +591,10 @@ pub const Runner = struct {
     fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain };
+        if (r.lazy_now != null and block < r.linear_index.len and r.linear_index[block] + 1 < r.gdn.budget.layers) {
+            r.lazy_next = r.linear_index[block] + 1;
+            hook.lazy = .{ .ptr = r, .encode = lazyNext };
+        }
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
@@ -483,17 +607,28 @@ pub const Runner = struct {
         try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
         const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
-        if (dead < rows) {
-            var input = f.get(.input);
-            input.offset += @as(usize, dead) * weights.q.k * 2;
-            var query_sums = forward.sums(f, .sums, rows);
-            query_sums.ref.offset += @as(usize, dead) * 4;
-            var query = f.get(.q_gate);
-            query.offset += @as(usize, dead) * weights.q.n * 2;
-            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
+        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
+        // or neither, so the shared counter always returns to zero
+        var after: ?attn.After = null;
+        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
+        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+            const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
+            const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
+            after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
+        } else {
+            if (dead < rows) {
+                var input = f.get(.input);
+                input.offset += @as(usize, dead) * weights.q.k * 2;
+                var query_sums = forward.sums(f, .sums, rows);
+                query_sums.ref.offset += @as(usize, dead) * 4;
+                var query = f.get(.q_gate);
+                query.offset += @as(usize, dead) * weights.q.n * 2;
+                try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+            }
+            try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+            e.barrier();
         }
-        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-        e.barrier();
         // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
         const mixed = f.get(.mixed);
@@ -501,7 +636,7 @@ pub const Runner = struct {
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
