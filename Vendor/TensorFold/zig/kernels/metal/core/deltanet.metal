@@ -203,9 +203,25 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
