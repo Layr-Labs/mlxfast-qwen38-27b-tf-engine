@@ -15,13 +15,13 @@ pub const sb_table = 65536;
 pub fn indexedBytes(n: usize, k: usize, group: usize) usize {
     return sb_table * 4 + n * (k / group) * 2;
 }
-/// The same with at most 4096 distinct pairs: 12-bit indices, each group's tile as four u32[3] of eight indices low bits first
-/// (columns 0-3 and 16-19 of the tile, then 4-7 and 20-23, ...), so a lane's two quads are one load.
-pub const indexed12_layout = "u32[sb_table12] then u32[K/group][N/32][4][3]";
+/// At most 4096 distinct pairs: a compact table followed by u16 ranks in group/column order.
+/// `indexed12` names the table capacity, while ranks use the same layout as indexed_layout.
+pub const indexed12_layout = "u32[sb_table12] then u16[K/group][N]";
 pub const sb_table12 = 4096;
 
 pub fn indexed12Bytes(n: usize, k: usize, group: usize) usize {
-    return sb_table12 * 4 + (k / group) * (n / 32) * 48;
+    return sb_table12 * 4 + n * (k / group) * 2;
 }
 /// The distinct (scale | bias << 16) words of packed pairs ([K/64][N][scale, bias]), most used first (ties in first-seen
 /// order, as fkiene's d2bb6335 and terrapinelf's d81c8214 order them), and each group's rank among them. Every rank still
@@ -127,17 +127,8 @@ fn indexPairs12(device: mtl.Device, allocator: std.mem.Allocator, pair: []const 
     const table = sb.slice(u32, cap);
     @memset(table, 0);
     @memcpy(table[0..ranked.words.len], ranked.words);
-    const out = @as([*]u32, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * (n / 32) * 12];
-    @memset(out, 0);
-    for (0..groups) |g| for (0..n) |c| {
-        const i = g * n + c;
-        const x = c % 32;
-        const bit = 12 * ((x / 16) * 4 + x % 4);
-        const at = (g * (n / 32) + c / 32) * 12 + ((x % 16) / 4) * 3 + bit / 32;
-        const ix: u64 = @as(u64, ranked.ranks[i]) << @intCast(bit % 32);
-        out[at] |= @truncate(ix);
-        if (ix >> 32 != 0) out[at + 1] |= @truncate(ix >> 32);
-    };
+    const out = @as([*]u16, @ptrCast(@alignCast(sb.contents() + cap * 4)))[0 .. groups * n];
+    @memcpy(out, ranked.ranks);
     keep = true;
     return sb;
 }
@@ -185,6 +176,8 @@ pub const Layout = struct {
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
     prompt_sr: bool = false,
+    /// Permit whole-frame reg launches only when caller supplies complete padded sums.
+    wide_given: bool = false,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
@@ -330,7 +323,6 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
-    if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
     if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
@@ -450,6 +442,7 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    wide_given: bool = false,
     /// Built with Layout.rows8: launches take at most 8 rows.
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
@@ -481,7 +474,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .wide_given = l.wide_given, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count };
     }
 
     pub fn deinit(p: Projection) void {
@@ -501,8 +494,10 @@ pub const Projection = struct {
     pub fn encodeSums(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32) !void {
         if (!p.reg) return error.SumsNeedReg;
         if (p.residual) return error.InvalidSchedule;
-        if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
-        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        if (rows == 0 or rows > (if (p.wide_given) max_reg_rows else reg_rows)) return error.InvalidRows;
+        const sum_rows: u32 = if (p.wide_given) paddedRows(rows) else rows;
+        if (sums.stride < sum_rows) return error.InvalidRows;
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + sum_rows) * 4, 4);
         if (p.count) return error.InvalidSchedule;
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, null);
     }
@@ -511,10 +506,11 @@ pub const Projection = struct {
     /// q27_norm_xs forms the residual stream; no output rows are stored. `sums` null: the projection's own sums pass.
     pub fn encodeResid(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: ?Sums, h: Ref, ro: Ref, rows: u32) !void {
         if (!p.residual) return error.InvalidSchedule;
-        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (rows == 0 or rows > (if (p.wide_given and sums != null) max_reg_rows else reg_rows)) return error.InvalidRows;
         if (sums) |s| {
-            if (s.stride < rows) return error.InvalidRows;
-            try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
+            const sum_rows: u32 = if (p.wide_given) paddedRows(rows) else rows;
+            if (s.stride < sum_rows) return error.InvalidRows;
+            try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + sum_rows) * 4, 4);
         }
         try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
         return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null);
@@ -534,12 +530,14 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.wide_given) max_reg_rows else reg_rows)) return error.InvalidRows;
+        const sum_rows: u32 = if (p.wide_given and !p.rows8) paddedRows(rows) else rows;
+        if (sums.stride < sum_rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
         try checkRef(sb, p.metadata_bytes, 16);
-        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + sum_rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
         const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
         try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
@@ -573,7 +571,7 @@ pub const Projection = struct {
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref) !void {
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) (if (p.wide_given and given != null) max_reg_rows else reg_rows) else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
@@ -609,6 +607,8 @@ pub const Projection = struct {
 
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
+pub const max_reg_rows: u32 = 2048;
+fn paddedRows(rows: u32) u32 { return 16 * ((rows + 15) / 16); }
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
