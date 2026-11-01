@@ -112,6 +112,9 @@ pub const Round = struct {
     tree_mode: TreeMode = .auto,
     /// The out projection's group sums `gate` writes beside its rows (tf_lane_sums' layout, `stride` rows a group).
     sums: ?Sums = null,
+    /// Decoded verify rows: forwardStar's scan counts its groups on this pair and the gate waits on them, no barrier
+    /// between (only on the gate's bfloat4-rows kernel, with nothing encoded beside the scan).
+    gate_wait: ?metal.Buffer = null,
     compact: bool,
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
@@ -149,6 +152,24 @@ pub const Round = struct {
         bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
         e.setValue(r.p, 9);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        r.b.qkv.bind(e, 15); // never read: wait_for 0
+        e.setValue(@as(u32, 0), 16);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
+    /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
+    /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
+    /// so any other shape is refused rather than run unsynchronised.
+    pub fn prepareRowsAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) !void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return error.BadGdnPrepare;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return error.BadGdnPrepare;
+        e.setPipeline(rows);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.setBuffer(counter, 0, 15);
+        e.setValue(wait, 16);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
     }
@@ -210,10 +231,19 @@ pub const Round = struct {
         r.b.segments.bind(e, 7);
         e.setValue(r.p, 8);
         r.b.recurrent.bind(e, 9);
+        const waits = r.gate_wait != null and beside == null and r.gateWide();
+        if (waits) {
+            e.setBuffer(r.gate_wait.?, 0, 10);
+            e.setValue(@as(u32, 1), 11);
+        } else {
+            r.b.recurrent.bind(e, 10); // never written: count_out 0
+            e.setValue(@as(u32, 0), 11);
+        }
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        e.barrier();
-        r.gate(e, post_rows);
+        if (!waits) e.barrier();
+        // the scan's groups: 32 x 4 threads, two value columns a SIMD group
+        r.gateAfter(e, post_rows, if (waits) @intCast((r.p.dv / 2 / 4) * r.p.nv * r.segments) else 0);
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) !void {
@@ -234,8 +264,20 @@ pub const Round = struct {
     /// tf_delta_gdn_post a simdgroup a (row, head); 128-wide heads on bfloat4 rows take `rows` (tf_delta_gdn_post_rows),
     /// 4 rows a group of 128.
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+        r.gateAfter(e, rows, 0);
+    }
+
+    /// Whether gate takes the bfloat4-rows kernel (tf_delta_gdn_post_rows).
+    fn gateWide(r: Round) bool {
         var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
         inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // bfloat4 rows
+        return wide;
+    }
+
+    /// gate; `wait_for` above 0 (the wide kernel only): each live (row, head) SIMD group first waits until gate_wait's
+    /// first word reaches it (forwardStar's scan groups).
+    fn gateAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, wait_for: u32) void {
+        const wide = r.gateWide();
         e.setPipeline(if (wide) rows else r.pipelines.post);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
@@ -247,6 +289,13 @@ pub const Round = struct {
         } else {
             r.b.output.bind(e, 5); // never read: a zero stride writes no sums
             e.setValue(@as(u32, 0), 6);
+        };
+        if (wide) if (wait_for != 0) {
+            e.setBuffer(r.gate_wait.?, 0, 7);
+            e.setValue(wait_for, 8);
+        } else {
+            r.b.output.bind(e, 7); // never read: wait_for 0
+            e.setValue(@as(u32, 0), 8);
         };
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
