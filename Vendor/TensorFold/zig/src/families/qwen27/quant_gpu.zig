@@ -546,6 +546,13 @@ pub const Kernels = struct {
         try span.end();
     }
 
+    /// Inspect sticky dependency status only after all target GPU work completes, before token selection.
+    pub fn checkCounted(k: *const Kernels) !void {
+        const status = @import("counted_norm_status.zig");
+        if (k.count_words) |words| try status.checkBank(words.slice(u32, 4));
+        if (k.gu_words) |words| try status.checkBank(words.slice(u32, 4));
+    }
+
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
     /// threadgroup waits until that launch's `wait_for` threadgroups have counted their fenced stores.
     pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
@@ -584,8 +591,8 @@ pub const Kernels = struct {
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.count_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -609,8 +616,8 @@ pub const Kernels = struct {
         const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.count_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -638,8 +645,8 @@ pub const Kernels = struct {
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
         if (!key.serialSk2()) return null;
         if (k.gu_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
             k.gu_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);

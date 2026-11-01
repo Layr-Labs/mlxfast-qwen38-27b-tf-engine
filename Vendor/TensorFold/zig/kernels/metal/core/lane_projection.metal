@@ -473,15 +473,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  threadgroup uint dependency_ready;
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
-      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
-      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    dependency_ready = uint(atomic_load_explicit(&WC[0], memory_order_relaxed) >= wait_for);
+    if (dependency_ready == 0u) {
+      atomic_store_explicit(&WC[2], 1u, memory_order_relaxed);
+    } else {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+        atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (dependency_ready == 0u) return;
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)

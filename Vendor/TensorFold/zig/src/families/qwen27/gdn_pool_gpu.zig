@@ -90,8 +90,8 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..8], 0);
+        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..16], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -108,6 +108,10 @@ pub const Pool = struct {
         return buffers;
     }
 
+    /// Called after completed target GPU work, before picks or state acceptance.
+    pub fn checkCounted(pool: *const Pool) !void {
+        if (pool.scan_words) |words| try @import("counted_norm_status.zig").checkBank(words.slice(u32, 4));
+    }
     pub fn deinit(pool: *Pool) void {
         pool.setResident(null);
         pool.releaseBefore();
