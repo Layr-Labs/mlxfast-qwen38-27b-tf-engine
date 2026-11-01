@@ -6,8 +6,7 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
-/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
-/// encode, and the host encodes the next chunk's layers while the GPU runs that one.
+/// Layers a verify encodes before its first commit: the idle GPU starts after one layer's encode.
 const first_commit = 1;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -275,7 +274,8 @@ pub const Runner = struct {
         };
         // a keep committed behind the forward's last command buffer (stages.after) keeps this round
         if (!accepted and r.after != null) r.active = fingerprint(round);
-        // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
+        // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first layer and is fed layer by layer
+        // (the early commits, as in jungjipdo's cf4bb453, and one after the first layer's norm)
         const early = round.ids.len > 16;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
@@ -590,17 +590,11 @@ pub const Runner = struct {
         value.offset += @as(usize, kv) * 2;
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        // a decoded fused chain (one stream, at most 8 rows, counted projections): the preprocess also packs the prefix's
-        // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
-        const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
-        const decoded: ?attn.Decoded = if (appended) .{ .scratch = &r.scratch, .binding = &r.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
-        var live_plan = plan;
-        live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
         f.mixer_sums = out_sums;
     }
 

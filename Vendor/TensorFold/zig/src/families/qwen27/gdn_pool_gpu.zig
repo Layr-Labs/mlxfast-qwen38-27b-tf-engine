@@ -232,13 +232,7 @@ pub const Pool = struct {
                 try b.encode(b.ptr, scan.encoder);
                 scan.encoder.barrier();
             }
-        } else {
-            // the conv windows' commit reads the history and the projected rows and writes the next windows: nothing the
-            // scan or the gate reads or writes, so it runs beside the scan instead of behind the gate's barrier
-            var early = EarlyCommit{ .inner = beside, .round = prepared };
-            if (!step and inPlace(plan.host) and projectedWindows(plan.host, prepared.p.taps)) early.round.b.next_history = prepared.b.history;
-            try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, if (step) beside else .{ .ptr = &early, .encode = EarlyCommit.encode });
-        }
+        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, beside);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
@@ -249,15 +243,14 @@ pub const Pool = struct {
         errdefer publication.cancel();
         const e = publication.encoder;
         if (pool.marks) |m| try m.convolution(layer, prepared, e, pool.kernels.mark_conv);
-        const commit_done = pool.marks == null; // the commit ran beside the scan (EarlyCommit)
         if (in_place and projectedWindows(plan.host, prepared.p.taps)) {
             // no kept window reads its history: each lands there directly and nothing is left to publish
             var direct = prepared;
             direct.b.next_history = prepared.b.history;
-            if (!commit_done) direct.commitConv(e);
+            direct.commitConv(e);
             return publication.end();
         }
-        if (!commit_done) prepared.commitConv(e);
+        prepared.commitConv(e);
         e.setPipeline(pool.kernels.publish_conv);
         gdn.bind(e, .{prepared.b.next_history}, 0);
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
@@ -519,15 +512,3 @@ fn refSpan(r: Ref, bytes: usize) !gdn.Span {
     if (r.offset > r.buffer.length() or bytes > r.buffer.length() - r.offset) return error.BadGdnBuffer;
     return .{ .buffer = r.buffer, .offset = r.offset, .bytes = bytes };
 }
-
-/// A prompt chain's conv commit encoded beside its scan (after any other beside work), the barrier after the scan ordering
-/// it before the publication that reads the next windows.
-const EarlyCommit = struct {
-    inner: ?gdn.Beside,
-    round: gdn.Round,
-    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
-        const c: *EarlyCommit = @ptrCast(@alignCast(ptr));
-        if (c.inner) |b| try b.encode(b.ptr, e);
-        c.round.commitConvBeside(e);
-    }
-};

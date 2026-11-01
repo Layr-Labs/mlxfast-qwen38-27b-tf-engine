@@ -67,9 +67,9 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
     return runCommittingEarly(device, queues, layers, mode, fam, first, every, false);
 }
 
-/// `runCommittingFrom`; `early` (one lane) also commits after the first layer's mixer and after each of the first three
-/// layers, so a long pass's GPU starts on the first mixer while the CPU encodes the rest of that layer and never waits
-/// for the first `every` layers' encode.
+/// `runCommittingFrom`; `early` (one lane) also commits after the first layer's norm (its pre stage) and mixer and after
+/// each of the first three layers, so a long pass's GPU starts on the first layer while the CPU encodes the rest of it
+/// and never waits for the first `every` layers' encode.
 pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize, early: bool) !f64 {
     try checkUnchecked();
     const n = queues.len;
@@ -139,6 +139,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         }
         pub fn pre(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.pre(&x.lanes[k], i);
+            if (x.early and i == 0 and i + 1 < x.layers) x.commitLane(k);
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);

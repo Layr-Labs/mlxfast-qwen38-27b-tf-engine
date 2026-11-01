@@ -31,18 +31,13 @@ inline void q27_count(device atomic_uint* NC, ushort tid) {
 
 // SG tiles a threadgroup, a simdgroup pair each: both run scores and softmax, one owns each half of the head dim.
 // count_out above 0: the tail behind it shares its barrier interval and waits on PC[0], which every group counts.
-// wait_for above 0: the counted decoded preprocess (q27_head_norm_rope_decoded) shares this launch's barrier interval and
-// every group waits on WC[0] before it reads the packed query or the round's cached keys.
 template <int SG>
 kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* tile_stream [[buffer(4)]],
     device float* PO [[buffer(5)]], device float* PM [[buffer(6)]], device float* PL [[buffer(7)]], device const int* nodes [[buffer(8)]],
     device atomic_uint* PC [[buffer(9)]], constant uint& count_out [[buffer(10)]],
-    device atomic_uint* WC [[buffer(11)]], constant uint& wait_for [[buffer(12)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
-    ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
-  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   const ushort lane = thread_index_in_simdgroup;
   const ushort sg = simdgroup_index_in_threadgroup;
   const int tile = int(threadgroup_position_in_grid.z) * SG + (sg >> 1);
@@ -140,7 +135,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   }
   if (count_out != 0u) q27_count(PC, tid);
 }
-#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, uint3, ushort, ushort, ushort);
 Q27_PREFIX(1)
 Q27_PREFIX(2)
 Q27_PREFIX(3)
