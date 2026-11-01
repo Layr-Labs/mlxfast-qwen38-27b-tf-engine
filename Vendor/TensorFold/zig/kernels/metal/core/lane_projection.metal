@@ -344,6 +344,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
 #define TF_CHAIN_WALK 1
 #endif
+#if defined(TF_SERIAL_SK2)
+#define TF_WAIT_FIRST_SPLIT(s) ((s) == 0)
+#else
+#define TF_WAIT_FIRST_SPLIT(s) 1
+#endif
 #if defined(TF_GU_TURNS)
 [[max_total_threads_per_threadgroup(64)]]
 #elif defined(TF_SWIGLU)
@@ -472,8 +477,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_WAIT)
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
-  // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
-  if (ks == 0 && lane == 0) {
+  if (ks == 0 && lane == 0 && TF_WAIT_FIRST_SPLIT(split)) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {

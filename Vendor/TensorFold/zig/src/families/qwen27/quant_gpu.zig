@@ -13,11 +13,14 @@ pub const Sums = struct { ref: Ref, stride: u32 };
 const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, resid: bool = false, count: bool = false, wait: bool = false, tiles: u32 = 0,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
-    /// (12288) with K split 2, and decoded rows' GDN z|b|a (6240) with K split 4.
+    /// (12288) with K split 2 at K 5120; decoded rows' GDN z|b|a (6240 at K 5120), attention out (5120x6144) and MLP
+    /// down (5120x17408) with K split 4. Every one of them keeps the reduction order its logged K split already had, so
+    /// a shape moves to the chain walk only when its split is 2 or 4 and its rows are the rows8 block.
     fn serialSk2(key: Key) bool {
-        const two = key.slices == 2 and (key.n == 34816 or key.n == 10240 or key.n == 12288);
-        const four = key.slices == 4 and key.n == 6240 and key.rows8;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+        if (key.kind != .projection or key.bits != 4 or key.group != 64 or key.skip != 0 or key.cut[0] != 0 or key.cut[1] != 0 or key.range[1] != 0) return false;
+        const two = key.slices == 2 and key.k == 5120 and (key.n == 34816 or key.n == 10240 or key.n == 12288);
+        const four = key.slices == 4 and key.rows8 and (key.n == 6240 and key.k == 5120 or key.n == 5120 and (key.k == 6144 or key.k == 17408));
+        return two or four;
     }
 };
 
@@ -571,7 +574,6 @@ pub const Kernels = struct {
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
-        if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
     }
@@ -619,7 +621,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .serial_sk2 = key.serialSk2() });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
