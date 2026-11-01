@@ -7,6 +7,16 @@ pub const Prepared = struct {
     words: []u32,
     scales: []u16,
     biases: []u16,
+    /// Code width: 4 for `prepare`, else `prepareBits`' MLX bit stream of `bits`-bit codes.
+    bits: u8 = 4,
+    /// Elements a (scale, bias) pair covers: 64 for `prepare`; `prepareBits` also takes 128.
+    group: u32 = 64,
+    /// `prepareNibbles`: `bits`-bit codes stored one a nibble in `prepare`'s layout (the reg path packs them down).
+    nibbles: bool = false,
+    /// Bits a code takes in `words`.
+    pub fn wordBits(p: Prepared) u8 {
+        return if (p.nibbles) 4 else p.bits;
+    }
     pub fn deinit(p: *Prepared) void {
         p.allocator.free(p.words);
         p.allocator.free(p.scales);
@@ -34,19 +44,100 @@ pub fn prepare(a: std.mem.Allocator, weights: []const u16, n: usize, k: usize) !
     const per = (scales.len + workers - 1) / workers;
     var results: [max_workers]Error!void = @splat({});
     var threads: [max_workers]?std.Thread = @splat(null);
-    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, run, .{ &results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per) }) catch null;
-    run(&results[0], weights, words, scales, biases, 0, @min(scales.len, per));
-    for (1..workers) |w| if (threads[w]) |t| t.join() else run(&results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per));
+    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, run, .{ &results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), 15 }) catch null;
+    run(&results[0], weights, words, scales, biases, 0, @min(scales.len, per), 15);
+    for (1..workers) |w| if (threads[w]) |t| t.join() else run(&results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), 15);
     for (results[0..workers]) |r| try r;
     return .{ .allocator = a, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
 }
-const max_workers = 16;
-const Error = error{ NonFiniteAffineInput, NonFiniteAffineRange };
-fn run(out: *Error!void, weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize) void {
-    out.* = groups(weights, words, scales, biases, first, last);
+/// `prepare`'s layout and rule at 2^bits - 1 levels (bits 2 or 3): codes 0 to 2^bits - 1, one a nibble, the scale the
+/// group's range over those levels.
+pub fn prepareNibbles(a: std.mem.Allocator, weights: []const u16, n: usize, k: usize, bits: u8) !Prepared {
+    if (bits != 2 and bits != 3) return error.BadAffineShape;
+    if (n == 0 or k == 0 or k % 64 != 0 or weights.len != try std.math.mul(usize, n, k)) return error.BadAffineShape;
+    const levels: u32 = (@as(u32, 1) << @intCast(bits)) - 1;
+    const words = try a.alloc(u32, weights.len / 8);
+    errdefer a.free(words);
+    const scales = try a.alloc(u16, weights.len / 64);
+    errdefer a.free(scales);
+    const biases = try a.alloc(u16, scales.len);
+    errdefer a.free(biases);
+    const workers = @min(max_workers, std.Thread.getCpuCount() catch 1, @max(1, scales.len / 4096));
+    const per = (scales.len + workers - 1) / workers;
+    var results: [max_workers]Error!void = @splat({});
+    var threads: [max_workers]?std.Thread = @splat(null);
+    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, run, .{ &results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), levels }) catch null;
+    run(&results[0], weights, words, scales, biases, 0, @min(scales.len, per), levels);
+    for (1..workers) |w| if (threads[w]) |t| t.join() else run(&results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), levels);
+    for (results[0..workers]) |r| try r;
+    return .{ .allocator = a, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .nibbles = true };
 }
-/// Groups [first, last): each group's 64 inputs to one scale, one bias and eight low-bit-first words.
-fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize) Error!void {
+const max_workers = 16;
+/// `prepare` with `bits`-bit codes (2, 3, 4, 5, 6 or 8): the same affine rule at 2^bits - 1 levels, each row's codes one
+/// low-bit-first bit stream (MLX's packed W), so a group of `group` elements owns group * bits / 32 whole words.
+pub fn prepareBits(a: std.mem.Allocator, weights: []const u16, n: usize, k: usize, bits: u8, group: u32) !Prepared {
+    if (bits == 4 and group == 64) return prepare(a, weights, n, k);
+    if (bits < 2 or bits > 8 or bits == 7 or (group != 64 and group != 128)) return error.BadAffineShape;
+    if (n == 0 or k == 0 or k % group != 0 or weights.len != try std.math.mul(usize, n, k)) return error.BadAffineShape;
+    const words = try a.alloc(u32, weights.len / 32 * bits);
+    errdefer a.free(words);
+    const scales = try a.alloc(u16, weights.len / group);
+    errdefer a.free(scales);
+    const biases = try a.alloc(u16, scales.len);
+    errdefer a.free(biases);
+    const workers = @min(max_workers, std.Thread.getCpuCount() catch 1, @max(1, scales.len / 4096));
+    const per = (scales.len + workers - 1) / workers;
+    var results: [max_workers]Error!void = @splat({});
+    var threads: [max_workers]?std.Thread = @splat(null);
+    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, runBits, .{ &results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), bits, group }) catch null;
+    runBits(&results[0], weights, words, scales, biases, 0, @min(scales.len, per), bits, group);
+    for (1..workers) |w| if (threads[w]) |t| t.join() else runBits(&results[w], weights, words, scales, biases, w * per, @min(scales.len, (w + 1) * per), bits, group);
+    for (results[0..workers]) |r| try r;
+    return .{ .allocator = a, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = group };
+}
+fn runBits(out: *Error!void, weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize, bits: u8, size: u32) void {
+    out.* = groupsBits(weights, words, scales, biases, first, last, bits, size);
+}
+fn groupsBits(weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize, bits: u8, size: u32) Error!void {
+    const levels: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+    const per_group = @as(usize, size) * bits / 32;
+    for (first..last) |group| {
+        const values = weights[group * size ..][0..size];
+        for (values) |b| if (!std.math.isFinite(asFloat(b))) return error.NonFiniteAffineInput;
+        var lower: f32 = std.math.inf(f32);
+        var upper: f32 = 0;
+        for (values) |b| {
+            const v = asFloat(b);
+            lower = @min(lower, v);
+            upper = @max(upper, v);
+        }
+        var bias: f32 = if (@abs(lower) > @abs(upper)) lower else upper;
+        var scale: f32 = @max((upper - lower) / levels, @as(f32, 1e-7));
+        if (bias >= 0) scale = -scale;
+        const zero = @round(bias / scale);
+        if (zero != 0) scale = bias / zero else bias = 0;
+        if (!std.math.isFinite(scale) or scale == 0) return error.NonFiniteAffineRange;
+        scales[group] = asBf16(scale);
+        biases[group] = asBf16(bias);
+        const out = words[group * per_group ..][0..per_group];
+        @memset(out, 0);
+        for (values, 0..) |b, index| {
+            const code: u32 = @intFromFloat(@min(levels, @max(@as(f32, 0), @round((asFloat(b) - bias) / scale))));
+            const bit = index * bits;
+            const shift: u5 = @intCast(bit % 32);
+            out[bit / 32] |= code << shift;
+            if (bit % 32 + bits > 32) out[bit / 32 + 1] |= code >> @intCast(32 - @as(u32, shift));
+        }
+    }
+}
+
+const Error = error{ NonFiniteAffineInput, NonFiniteAffineRange };
+fn run(out: *Error!void, weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize, levels: u32) void {
+    out.* = groups(weights, words, scales, biases, first, last, levels);
+}
+/// Groups [first, last): each group's 64 inputs to one scale, one bias and eight low-bit-first words (codes 0 to `levels`).
+fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, first: usize, last: usize, levels_int: u32) Error!void {
+    const levels: f32 = @floatFromInt(levels_int);
     for (first..last) |group| {
         const values = weights[group * 64 ..][0..64];
         for (values) |bits| if (!std.math.isFinite(asFloat(bits))) return error.NonFiniteAffineInput;
@@ -57,8 +148,12 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
             lower = @min(lower, v);
             upper = @max(upper, v);
         }
+        if (levels_int < 15) {
+            try clipped(values, words[group * 8 ..][0..8], &scales[group], &biases[group], lower, upper, levels);
+            continue;
+        }
         var bias: f32 = if (@abs(lower) > @abs(upper)) lower else upper;
-        var scale: f32 = @max((upper - lower) / @as(f32, 15), @as(f32, 1e-7));
+        var scale: f32 = @max((upper - lower) / levels, @as(f32, 1e-7));
         if (bias >= 0) scale = -scale;
         const zero = @round(bias / scale);
         if (zero != 0) scale = bias / zero else bias = 0;
@@ -67,9 +162,55 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
         biases[group] = asBf16(bias);
         @memset(words[group * 8 ..][0..8], 0);
         for (values, 0..) |bits, index| {
-            const code: u32 = @intFromFloat(@min(@as(f32, 15), @max(@as(f32, 0), @round((asFloat(bits) - bias) / scale))));
+            const code: u32 = @intFromFloat(@min(levels, @max(@as(f32, 0), @round((asFloat(bits) - bias) / scale))));
             words[group * 8 + index / 8] |= code << @as(u5, @intCast(4 * (index % 8)));
         }
+    }
+}
+/// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
+/// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
+/// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
+fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
+    const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
+    var best_err: f32 = std.math.inf(f32);
+    var best_scale: u16 = 0;
+    var best_bias: u16 = 0;
+    for (shrinks) |shrink| {
+        const lo = lower * shrink;
+        const hi = upper * shrink;
+        var bias: f32 = if (@abs(lo) > @abs(hi)) lo else hi;
+        var scale: f32 = @max((hi - lo) / levels, @as(f32, 1e-7));
+        if (bias >= 0) scale = -scale;
+        const zero = @round(bias / scale);
+        if (zero != 0) scale = bias / zero else bias = 0;
+        if (!std.math.isFinite(scale) or scale == 0) continue;
+        const s16 = asBf16(scale);
+        const b16 = asBf16(bias);
+        const s = asFloat(s16);
+        const b = asFloat(b16);
+        if (s == 0 or !std.math.isFinite(s)) continue;
+        var err: f32 = 0;
+        for (values) |bits| {
+            const v = asFloat(bits);
+            const code = @min(levels, @max(@as(f32, 0), @round((v - b) / s)));
+            const d = v - (b + s * code);
+            err += d * d;
+        }
+        if (err < best_err) {
+            best_err = err;
+            best_scale = s16;
+            best_bias = b16;
+        }
+    }
+    if (!std.math.isFinite(best_err)) return error.NonFiniteAffineRange;
+    scale_out.* = best_scale;
+    bias_out.* = best_bias;
+    const s = asFloat(best_scale);
+    const b = asFloat(best_bias);
+    @memset(out, 0);
+    for (values, 0..) |bits, index| {
+        const code: u32 = @intFromFloat(@min(levels, @max(@as(f32, 0), @round((asFloat(bits) - b) / s))));
+        out[index / 8] |= code << @as(u5, @intCast(4 * (index % 8)));
     }
 }
 test "q4 shape and finite input checks occur before preparation" {
@@ -94,7 +235,7 @@ test "a threaded preparation gives the serial pass's bytes" {
     defer a.free(scales);
     const biases = try a.alloc(u16, scales.len);
     defer a.free(biases);
-    try groups(w, words, scales, biases, 0, scales.len);
+    try groups(w, words, scales, biases, 0, scales.len, 15);
     try std.testing.expectEqualSlices(u32, words, p.words);
     try std.testing.expectEqualSlices(u16, scales, p.scales);
     try std.testing.expectEqualSlices(u16, biases, p.biases);

@@ -66,6 +66,9 @@ pub const Plan = struct {
     tail_chunks: u32,
     /// Every stream is a chain of rows: the prefix kernel reads each row's own keys itself, so no tail kernel runs.
     fused: bool,
+    /// Rows before this one have no reader (a prompt pass's last layer under a last-row or no head): the prompt kernel and
+    /// merge skip their tiles and rows. Set by the caller after planning.
+    live_from: u32 = 0,
     meta: [global_words + max_streams * stream_words]i32 = @splat(0),
     tile_stream: []i32,
     q_rows: []i32,
