@@ -320,6 +320,30 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
     }
 
+    /// `commitConvKeep` for every linear layer in one launch: the pooled history and projection buffers hold each layer's
+    /// span at a fixed stride, so the depth index replaces the per-layer pipeline and binding (47 fewer launches a round).
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const layers: usize = pool.budget.layers;
+        if (layers == 0 or history.length() % (layers * 2) != 0 or projections.length() % (layers * 2) != 0) return error.BadGdnPoolIndex;
+        const strides = [2]u32{ @intCast(history.length() / layers / 2), @intCast(projections.length() / layers / 2) };
+        e.useResource(history, metal.ResourceUsage.read | metal.ResourceUsage.write);
+        e.useResource(projections, metal.ResourceUsage.read);
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(strides, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = @intCast(layers) }, .{ .width = 256 }); // a channel a thread, a layer a depth
+    }
+
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
     /// the device keep's: the rows tf_delta_gdn_replay would take, in its order) copied behind the pending rows for the next
     /// star scans; unfenced, beside the conv keeps. The keep's completion counts them (decode_round.Runner).
