@@ -44,6 +44,14 @@ pub const Params = extern struct {
 
 pub const Segment = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };
 pub const Keep = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };
+/// A depth-one star verify's deferred replay (tf_delta_gdn_star_pending): its scans apply the first `rows` pending rows
+/// to the committed state before node 0, and `persist` 1 writes the state they leave back over it.
+pub const Deferred = extern struct { rows: u32, persist: u32 };
+/// tf_delta_gdn_stash: the pending row a keep's first kept row lands at, the pending rows left from there, and the log's
+/// and the pending rows a layer.
+pub const Stash = extern struct { base: u32, room: u32, log_rows: u32, pending_rows: u32 };
+/// tf_delta_gdn_unstash: the pending rows, the slot they extend, the pending rows a layer and a layer's committed words.
+pub const Unstash = extern struct { rows: u32, slot: u32, pending_rows: u32, layer_words: u32 };
 
 pub const Shape = struct {
     c: Config,
