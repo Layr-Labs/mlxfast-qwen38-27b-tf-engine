@@ -16,7 +16,9 @@ const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 
     /// (12288) with K split 2, and decoded rows' GDN z|b|a (6240) with K split 4.
     fn serialSk2(key: Key) bool {
         const two = key.slices == 2 and (key.n == 34816 or key.n == 10240 or key.n == 12288);
-        const four = key.slices == 4 and key.n == 6240 and key.rows8;
+        // GDN z|b|a runs its four K halves in parallel slices: a two-row launch has 195 tiles, and one
+        // 32-thread slice per tile leaves the machine idle (measured 57.4 -> 46.8 us a call on this box).
+        const four = false;
         return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
     }
 };
