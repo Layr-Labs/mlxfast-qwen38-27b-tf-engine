@@ -204,6 +204,7 @@ pub const Attention = struct {
     io: [14]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
+    split_tail: ?mtl.Pipeline = null,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -221,11 +222,14 @@ pub const Attention = struct {
             n += 1;
         }
         const units = device.tensorUnits();
-        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units };
+        const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
+        errdefer if (split_tail) |pipe| pipe.deinit();
+        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail };
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
         if (a.prompt) |pipes| for (pipes) |pipe| pipe.deinit();
+        if (a.split_tail) |pipe| pipe.deinit();
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
     fn promptPipelines(device: mtl.Device, library: mtl.Library, units: bool) !?[2]mtl.Pipeline {
@@ -433,7 +437,10 @@ pub const Attention = struct {
             e.barrier();
         }
         if (!plan.fused) {
-            e.setPipeline(a.io[3]);
+            // Small one-chunk trees otherwise expose only four groups per node.
+            // Separate head halves double that grid and halve each compute lane's accumulators.
+            const split = a.split_tail != null and plan.rows <= 8 and plan.tail_chunks == 1;
+            e.setPipeline(if (split) a.split_tail.? else a.io[3]);
             bind(e, .{ scratch.get(.qb), binding.get(.caches) });
             e.setValue(scale, 2);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
@@ -441,7 +448,7 @@ pub const Attention = struct {
                 const r = scratch.get(field);
                 e.setBuffer(r.buffer, 0, i);
             }
-            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
+            e.dispatchGroups(mtl.Size.of(g.kv_heads * @as(u32, if (split) 2 else 1), plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
             e.barrier();
         }
         e.setPipeline(a.io[4]);
@@ -506,12 +513,13 @@ pub const Attention = struct {
         e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 4, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
-    /// `lanes`, each `lane_words` bf16 words; `layers` receives the per-binding table the scatter reuses.
-    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
+    /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding reads; `layers` receives the
+    /// per-binding table the scatter reuses.
+    pub fn keepGatherLayers(a: *const Attention, e: mtl.ComputeEncoder, bindings: []const Binding, kept: u32, map: Ref, layers: []KeepLayer, lanes: mtl.Buffer, lane_words: u32) !void {
         if (bindings.len == 0 or bindings.len > max_keep_layers or layers.len != bindings.len) return error.AttentionKeep;
         for (bindings, layers) |*binding, *layer| {
             if (kept > binding.limits.rows or binding.kept == null or binding.kept.? != kept) return error.AttentionKeep;
-            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(binding.get(.keep_map)) };
+            layer.* = .{ .caches = address(binding.get(.caches)), .meta = address(binding.get(.meta)), .map = address(map) };
         }
         if (kept == 0) return;
         const g = bindings[0].limits.geometry;

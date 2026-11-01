@@ -148,9 +148,11 @@ inline void tf_delta_gdn_pre_rows4(device const bfloat* projection, device const
   for (uint i = 0; i < count; ++i) {
     const uint row = first + i;
     float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // the row's slot read once (row_slot holds p.rows words), not in each history tap's arm: no branch around a tap's load
+    const uint slot = row_slot[row];
     for (uint tap = 0; tap < 4; ++tap) {
       const uint source = windows[row * p.taps + tap];
-      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (row_slot[row] * keep + source) * channels + channel)
+      const bfloat4 input = source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                           : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
       for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
     }
