@@ -10,16 +10,57 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, resid: bool = false, count: bool = false, wait: bool = false, tiles: u32 = 0,
+const Key = struct {
+    kind: Kind,
+    n: u32 = 0,
+    k: u32,
+    slices: u32 = 0,
+    tile: u32 = 0,
+    tmr: u32 = 0,
+    edge: bool = false,
+    skip: u32 = 0,
+    cut: [2]u32 = .{ 0, 0 },
+    range: [2]u32 = .{ 0, 0 },
+    bits: u8 = 4,
+    group: u32 = 64,
+    rows8: bool = false,
+    lean: bool = false,
+    prompt_sr: bool = false,
+    batch: u32 = 1,
+    swiglu: bool = false,
+    sbi: bool = false,
+    sbi12: bool = false,
+    resid: bool = false,
+    count: bool = false,
+    wait: bool = false,
+    tiles: u32 = 0,
+    parallel_sk2: bool = false,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
-    /// (12288) with K split 2, and decoded rows' GDN z|b|a (6240) with K split 4.
+    /// (12288) with K split 2 (GDN z|b|a keeps its four K slices in parallel).
     fn serialSk2(key: Key) bool {
         const two = key.slices == 2 and (key.n == 34816 or key.n == 10240 or key.n == 12288);
-        const four = key.slices == 4 and key.n == 6240 and key.rows8;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+        // GDN z|b|a runs its four K halves in parallel slices: a two-row launch has 195 tiles, and one
+        // 32-thread slice per tile leaves the machine idle (measured 57.4 -> 46.8 us a call on this box).
+        const four = false;
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0 and !key.parallel_sk2;
     }
 };
+
+/// The larger live half-tiles favor parallel SK2 only for these two projection shapes.
+fn wideDecodeSk2(n: u32, input_width: u32, rows: u32, prompt: bool) bool {
+    return !prompt and input_width == 5120 and (n == 34816 or n == 10240) and rows >= 6 and rows <= 8;
+}
+
+test "wide decode SK2 keeps row and phase boundaries distinct" {
+    for ([_]u32{ 34816, 10240 }) |n| {
+        for ([_]u32{ 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 0, 1, 2, 3, 4, 5, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
+        try std.testing.expect(!wideDecodeSk2(n, 5120, 8, true));
+        try std.testing.expect(!wideDecodeSk2(n, 2560, 8, false));
+    }
+    for ([_]u32{ 5120, 12288, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
+}
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
     const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
@@ -35,6 +76,7 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
         .{ "skip", @as(u32, 1) },
         .{ "cut", [2]u32{ 1, 0 } },
         .{ "cut", [2]u32{ 0, 40 } },
+        .{ "parallel_sk2", true },
         .{ "bits", @as(u8, 8) },
         .{ "group", @as(u32, 128) },
     }) |change| {
@@ -349,7 +391,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
