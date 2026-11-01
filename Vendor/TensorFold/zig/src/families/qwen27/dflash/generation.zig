@@ -14,6 +14,9 @@ pub const Proposer = struct { ptr: *anyopaque, call: *const fn (*anyopaque, u32,
 pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, matched: usize, min_rows: u32 = 0, extended: u32 = 0, extension_landed: u32 = 0 };
 /// What the context says follows `path` (the pending token first), at most `max` tokens; borrowed until the next call.
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
+/// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
+const accept_step: f32 = 0.125;
+const precise_below: f32 = 0.95;
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
@@ -29,6 +32,9 @@ pub const Generation = struct {
     picked: ?@import("core").segments.Fence = null, // updated behind a verify's picks; its keep waits on it
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
+    /// Moving share of rounds a sibling landed in (each round's weight `accept_step`): below `precise_below` the frames
+    /// draft on the q4 copies of the linears drafted below 4 bits, which miss fewer siblings where they are missed.
+    accept_share: f32 = 1,
     pub fn init(a: std.mem.Allocator, runner: *Runner, draft: *Draft) !Generation {
         if (runner.model != draft.backend.target or runner.model.config.hidden != draft.graph.config.hidden or runner.model.config.layers != draft.graph.config.target_layers) return error.TargetBinding;
         runner.capture_taps = true;
@@ -132,6 +138,8 @@ pub const Generation = struct {
     }
     pub fn prefill(g: *Generation, ids: []const u32, chunk: usize) !void {
         g.pending = null;
+        g.accept_share = 1;
+        g.draft.backend.precise = false;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
         var first: usize = 0;
@@ -354,6 +362,8 @@ pub const Generation = struct {
         // next round's pending token, as a bonus stop's is, so the next round need not take it from the logits again
         g.pending = accepted.pending orelse accepted.bonus;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+        g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
+        g.draft.backend.precise = g.accept_share < precise_below;
         var landed: u32 = 0;
         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
         const tokens = try g.allocator.dupe(u32, accepted.tokens);
