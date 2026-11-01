@@ -106,6 +106,9 @@ pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, meta
 /// rows, and how many it applies and whether it writes the state back.
 pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
 
+/// The two words a counting launch reports to, left zero by its last waiter.
+pub const Count = struct { words: metal.Buffer };
+
 pub const Round = struct {
     p: abi.Params,
     b: Buffers,
@@ -119,6 +122,9 @@ pub const Round = struct {
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
     star: bool = false,
+    /// The words a counting gate reports its threadgroups to (tf_delta_gdn_post_rows' count_out): the projection after
+    /// the gate shares its barrier interval and waits on that count, the way a counted norm waits on its projection.
+    count: ?Count = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -227,7 +233,9 @@ pub const Round = struct {
     /// `counter` (two words, left zero): with nothing beside the scan and the gate on post_rows, the scan counts its
     /// threadgroups once their rows are stored and the gate waits on that count in the same barrier interval.
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
-    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending) !void {
+    /// `count` on the round: the gate reports its threadgroups (tf_delta_gdn_post_rows' count_out) and this returns that
+    /// count, the wait the projection after the gate takes in the same barrier interval; null: the gate closed the interval.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending) !?u32 {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
@@ -243,9 +251,28 @@ pub const Round = struct {
         }
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 8) * r.p.nv * r.segments));
+        const wait: u32 = @intCast((r.p.dv / 8) * r.p.nv * r.segments);
+        // a counting gate only where the rows kernel runs and one four-row block covers the plan's rows
+        const reports = r.count != null and r.p.dv == 128 and r.p.rows > 0 and r.p.rows <= 8;
+        if (counted) {
+            if (r.count) |c| {
+                if (reports) {
+                    r.gateCounted(e, post_rows, counter.?, wait, c.words);
+                    return r.p.nv * ((r.p.rows + 3) / 4); // the gate's threadgroups: its grid is one group a head and a four-row block
+                }
+            }
+            r.gateAfter(e, post_rows, counter.?, wait);
+            return null;
+        }
         e.barrier();
+        if (r.count) |c| {
+            if (reports) {
+                r.gateCounted(e, post_rows, r.b.output, 0, c.words);
+                return r.p.nv * ((r.p.rows + 3) / 4); // the gate's threadgroups: its grid is one group a head and a four-row block
+            }
+        }
         r.gate(e, post_rows);
+        return null;
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) !void {
@@ -288,6 +315,8 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
+        e.setValue(@as(u32, 0), 9); // count_out: this gate waits, it does not report
+        r.b.output.bind(e, 10); // never read: count_out 0
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
         e.barrier();
     }
@@ -308,9 +337,35 @@ pub const Round = struct {
         if (wide) {
             r.b.output.bind(e, 7); // never read: wait_for 0
             e.setValue(@as(u32, 0), 8);
+            e.setValue(@as(u32, 0), 9); // count_out 0: this gate closes its interval
+            r.b.output.bind(e, 10); // never read: count_out 0
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
+    }
+
+    /// `gate` on post_rows that reports its threadgroups to `words` (count_out) instead of closing the interval: the output
+    /// projection after it is a waiting launch and waits on `nv * ceil(rows/4)` in the same barrier interval. With
+    /// `wait` above 0 it also waits on `counter` first (the star scan's threadgroups), exactly as gateAfter does.
+    /// Only reached where `gateRows()` holds, so the rows kernel is the one bound.
+    pub fn gateCounted(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32, words: metal.Buffer) void {
+        e.setPipeline(rows);
+        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
+        e.setValue(r.p, 3);
+        r.b.output.bind(e, 4);
+        if (r.sums) |w| {
+            w.span.bind(e, 5);
+            e.setValue(w.stride, 6);
+            w.written.* = true;
+        } else {
+            r.b.output.bind(e, 5); // never read: a zero stride writes no sums
+            e.setValue(@as(u32, 0), 6);
+        }
+        e.setBuffer(counter, 0, 7);
+        e.setValue(wait, 8);
+        e.setValue(@as(u32, 1), 9);
+        e.setBuffer(words, 0, 10);
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
         r.commitConvBeside(e);

@@ -104,6 +104,10 @@ pub const Stages = struct {
         // read and cleared before any return, and used only by the block whose GDN gate or attention merge wrote it
         const gated = f.mixer_sums;
         f.mixer_sums = false;
+        // the threadgroups a counting GDN gate reported: this block's out projection waits on them where the gate closed
+        // no barrier, so the projection and the post-norm share that interval
+        const gate_wait = f.mixer_count;
+        f.mixer_count = 0;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -115,7 +119,11 @@ pub const Stages = struct {
         const dims = f.get(if (s.compact) .last_dims else .dims);
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
-        if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
+        if (gate_wait != 0 and gated and !s.compact) {
+            // decoded rows: the gate reported its threadgroups, so the projection waits on them in the gate's interval
+            const counted = try m.kernels.quantCountedAfter(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows, gate_wait);
+            try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+        } else if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
