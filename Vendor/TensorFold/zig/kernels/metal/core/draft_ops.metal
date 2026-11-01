@@ -68,9 +68,6 @@ kernel void tf_draft_swiglu(device const bfloat* G [[buffer(0)]],device const bf
   }
 }
 
-// The same outputs plus the group sums a following q4 projection reads: XS[group * xs_stride + row] holds a group's
-// 64 bf16 output values added in order from zero (tf_lane_xsum's order), and rows past `rows` hold zero, as
-// tf_lane_sums writes them; that projection then dispatches no sums pass and no barrier of its own.
 #define TF_XS_GROUP 64
 #define TF_XS_MAX_WIDTH 5120
 kernel void tf_draft_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& xs_stride [[buffer(5)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
@@ -103,10 +100,8 @@ kernel void tf_draft_rms_xs(device const bfloat* X [[buffer(0)]],device const bf
     if(block.y==0)for(uint r=a.rows;r<xs_stride;r++)XS[size_t(g)*xs_stride+r]=0.0f;
   }
 }
-// One threadgroup a (row, 64-column group): each thread one output as tf_dynamic_conv2, then the group's sum.
 kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],device float* XS [[buffer(6)]],constant uint& xs_stride [[buffer(7)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
   threadgroup bfloat out[TF_XS_GROUP];
-  // the host dispatches whole 64-column groups of real rows only: every thread reaches the barrier
   const uint groups=a.width/a.group,g=index.x/a.group;
   float total=0.0f;
   for(uint lag=0;lag<2;lag++) {
@@ -128,10 +123,8 @@ kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device cons
   }
   if(index.y==0&&t>=1&&t<=xs_stride-a.rows)XS[size_t(group)*xs_stride+a.rows+t-1]=0.0f;
 }
-// One threadgroup a (row, 64-column group): each thread one output as tf_draft_swiglu, then the group's sum.
 kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const bfloat* U [[buffer(1)]],constant Activation& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& xs_stride [[buffer(5)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
   threadgroup bfloat out[TF_XS_GROUP];
-  // the host dispatches whole 64-column groups of real rows only: every thread reaches the barrier
   const float gate=float(G[size_t(index.y)*a.gate_stride+index.x]),up=float(U[size_t(index.y)*a.up_stride+index.x]);
   bfloat y;
   {
@@ -154,9 +147,6 @@ kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const
   }
   if(index.y==0&&t>=1&&t<=xs_stride-a.rows)XS[size_t(group)*xs_stride+a.rows+t-1]=0.0f;
 }
-// A conv with a residual (tf_dynamic_conv2's elements), then the RMS norm of its output with that norm's group sums
-// (tf_draft_rms_xs's sum, scale, outputs and sums), one threadgroup a row: each thread takes the norm's columns, so its
-// squares add in the norm's order, and the conv's output reaches the norm through threadgroup memory, not a launch.
 kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& c [[buffer(4)]],device bfloat* C [[buffer(5)]],device const bfloat* W [[buffer(6)]],constant Norm& a [[buffer(7)]],device bfloat* Y [[buffer(8)]],device float* XS [[buffer(9)]],constant uint& xs_stride [[buffer(10)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
   threadgroup float sums[32],inverse[1];
   threadgroup bfloat out[TF_XS_MAX_WIDTH];
@@ -201,9 +191,6 @@ kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device 
     if(row==0)for(uint r=a.rows;r<xs_stride;r++)XS[size_t(g)*xs_stride+r]=0.0f;
   }
 }
-// A per-head RMS norm (tf_draft_rms's sum, scale and outputs) and the rope that reads its output (tf_full_rope's angle and
-// rotation), one threadgroup a head and row: the norm's threads take its columns, its output reaches the rope through
-// threadgroup memory (and is stored too), and the threads then rotate the head's pairs.
 #define TF_ROPE_MAX_DIM 256
 kernel void tf_draft_rms_rope(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* N [[buffer(3)]],device const ulong* positions [[buffer(4)]],constant Rope& r [[buffer(5)]],device bfloat* Y [[buffer(6)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
   threadgroup float sums[32],inverse[1];

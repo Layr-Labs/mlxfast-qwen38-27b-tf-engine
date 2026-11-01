@@ -72,11 +72,6 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 
 #define TF_G (TF_QH / TF_KVH)
 
-// Split over key chunks: one simdgroup takes one query head for one row and chunk (tg.x = kv head * TF_G + the head
-// within it), so the GPU runs four times the simdgroups; each head's per-key arithmetic is the same as when one
-// simdgroup took all of a KV head's query heads.
-// Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
-// k_stride and v_stride, in elements) instead of from copies behind the context.
 struct tf_own_rows { uint rows, k_stride, v_stride; };
 inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
   return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
@@ -118,7 +113,6 @@ inline const device bfloat* tf_split_row(const device bfloat* C, const device bf
 }
 
 
-// Chunks a merge lane holds: lane c reads chunk c's maximum and total (at most 32 chunks a row per lane pass).
 #define TF_MERGE_TILE 8
 
 // One query head and row: its chunks' partials rescaled to the largest maximum and added in chunk order.
@@ -130,7 +124,6 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
   const uint kh = head / TF_G, g = head % TF_G;
   const device float* first = part + (((size_t)row * TF_KVH + kh) * chunks * TF_G + g) * (TF_D + 2);
   const size_t step = (size_t)TF_G * (TF_D + 2);
-  // every chunk's maximum and total, 32 chunks a pass (one a lane); max is exact in any order
   float maximum = -INFINITY;
   for (uint base = 0; base < chunks; base += 32) {
     const uint c = base + lane;
@@ -144,7 +137,6 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
     const uint mine = base + lane;
     const float m_mine = mine < chunks ? first[mine * step + TF_D] : -INFINITY;
     const float t_mine = mine < chunks ? first[mine * step + TF_D + 1] : 0.0f;
-    // each lane rescales its own chunk: the same exp of the same operands as one chunk at a time
     const float w_mine = m_mine == -INFINITY ? 0.0f : exp(m_mine - maximum);
     const uint count = min(32u, chunks - base);
     for (uint tile = 0; tile < count; tile += TF_MERGE_TILE) {
@@ -170,7 +162,6 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
     O[qi + lane + d * 32] = y[d];
   }
   if (xs) {
-    // the row's 64-column groups of this head (two of them for D 128): their stored values added in column order
     for (uint split = 0; split < TF_D / 64; ++split) {
       float acc = 0.0f;
       for (uint d = 2 * split; d < 2 * split + 2; ++d)
@@ -188,7 +179,6 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
   tf_attention_merge<false>(part, args, O, nullptr, 0, lane, tg);
 }
 
-// The merge plus the group sums a following q4 projection reads (tf_lane_sums' values and layout, rows past `rows` zero).
 [[kernel]] void tf_shared_lane_attention_merge_xs(const device float* part [[buffer(0)]],
     constant tf_context_args& args [[buffer(1)]], device TF_OUT* O [[buffer(2)]],
     device float* XS [[buffer(3)]], constant uint& xs_stride [[buffer(4)]],

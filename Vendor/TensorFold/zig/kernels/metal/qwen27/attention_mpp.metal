@@ -29,8 +29,6 @@ inline void q27_count(device atomic_uint* NC, ushort tid) {
   }
 }
 
-// SG tiles a threadgroup. Each tile uses PARTS simdgroups with identical scores
-// and softmax; each owns D/PARTS output columns. PARTS=4 fills small grids.
 // count_out above 0: the tail behind it shares its barrier interval and waits on PC[0], which every group counts.
 // wait_for above 0: the counted decoded preprocess (q27_head_norm_rope_decoded) shares this launch's barrier interval and
 // every group waits on WC[0] before it reads the packed query or the round's cached keys.
@@ -429,8 +427,6 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   constexpr auto dO = matmul2d_descriptor(16, 128, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<dS, execution_simdgroup> opS;
   matmul2d<dO, execution_simdgroup> opO;
-  // Each node has six query heads; rows 8..15 are padding. Keep only the first
-  // eight rows between steps, restoring zero padding for the unchanged PV product.
   float saved[32];
   for (int i = 0; i < 32; i++) saved[i] = 0.0f;
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;

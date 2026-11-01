@@ -237,13 +237,9 @@ kernel void tf_bf16_topk_tiles(const device Row* picked [[buffer(0)]], const dev
   for (uint at = lane; at < p.slots * 32; at += TF_TOPK_LANES) map[at] = at / 32 < n ? ids[32 * order[at / 32] + at % 32] : 0u;
 }
 
-// Wide rows on more spans: a span's tokens stay in its lanes' registers (at most TF_TOPK_HOLD each), every SIMD group
-// picks its own top k by shuffles, and SIMD group 0 merges the eight sorted lists. The order is the same total order
-// ("before": higher key, then lower token ID), so the entries are the same as the 16-span kernels give.
 #define TF_TOPK_WIDE_SPANS 64
 #define TF_TOPK_HOLD 8
 #define TF_TOPK_GROUPS (TF_TOPK_LANES / 32)
-// The best of a SIMD group's candidates (each lane's `mine`); `taken` is set in the lane whose candidate won.
 inline TfCand tf_simd_pick(TfCand mine, thread bool& taken) {
   const TfCand w = tf_simd_best(mine);
   taken = mine.id == w.id && mine.key == w.key && mine.key != 0u;
@@ -289,7 +285,6 @@ kernel void tf_bf16_topk_wide(const device ushort* logits [[buffer(0)]],
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sg != 0) return;
-  // lane sl: entries 4 * (sl % 4) .. + 3 of SIMD group sl / 4's sorted list
   const uint g = sl / 4, first = 4 * (sl % 4);
   uint cursor = 0;
   for (uint rank = 0; rank < p.k; rank++) {
@@ -302,8 +297,6 @@ kernel void tf_bf16_topk_wide(const device ushort* logits [[buffer(0)]],
   }
 }
 
-// The row's top k from its TF_TOPK_WIDE_SPANS span lists: all of them staged in threadgroup memory, then SIMD group
-// 0 picks rank by rank, lane l taking the heads of lists 2l and 2l + 1.
 kernel void tf_bf16_topk_wide_merge(const device Row* part [[buffer(0)]],
                                    device Row* output [[buffer(1)]], constant Params& p [[buffer(2)]],
                                    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],
@@ -325,7 +318,7 @@ kernel void tf_bf16_topk_wide_merge(const device Row* part [[buffer(0)]],
     output[row].nonfinite = 0; output[row].count = 0;
     for (uint i = 0; i < TF_TOPK_MAX_K; i++) output[row].entries[i] = { 0xffffffffu, 0u };
   }
-  const uint all = tf_tg_or(mask, lane, masks); // its barrier also orders the staged lists
+  const uint all = tf_tg_or(mask, lane, masks);
   if (all != 0) { if (lane == 0) output[row].nonfinite = all; return; }
   if (sg != 0) return;
   uint ca = 0, cb = 0;
