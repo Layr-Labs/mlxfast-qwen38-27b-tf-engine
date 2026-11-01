@@ -197,8 +197,21 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
 #define Q27_HEAD_NORM_ROPE(NAME, PACK) \
 kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
                  device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
-                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]], \
+                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
+                 constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
+                 uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+  if (wait_for != 0u) { \
+    if (t == 0) { \
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed); \
+      } \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  } \
   q27_head_norm_rope_rows<PACK>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
 }
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope, false)
