@@ -13,7 +13,16 @@ const execution = @import("execution.zig");
 const selector = @import("selector.zig");
 const backend_mod = @import("runtime_backend.zig");
 const Cache = backend_mod.Cache;
+const RoundArgs = backend_mod.RoundArgs;
 const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+/// The next round's frame, committed while the verify that admits its taps still runs (Model.prepareNext).
+const Early = struct {
+    block: execution.Prepared,
+    /// What the frame's taps follow.
+    context: op.Context,
+    /// Taps the verify admitted, once the host read it (commitNext).
+    rows: ?u32 = null,
+};
 pub const Model = struct {
     allocator: std.mem.Allocator,
     checkpoint: core.checkpoint_metal.Checkpoint,
@@ -24,6 +33,7 @@ pub const Model = struct {
     tree_block: u32 = 16,
     pending: mtl.Buffer,
     committed_end: u64 = 0,
+    early: ?Early = null,
     pub fn load(a: std.mem.Allocator, io: std.Io, target: *Target, dir: []const u8, mode: op.Mode) !*Model {
         if (mode == .python_q4g64) return error.DraftPreparationUnqualified;
         const path = try std.fs.path.join(a, &.{ dir, "config.json" });
@@ -44,6 +54,7 @@ pub const Model = struct {
         model.allocator = a;
         model.tree_block = 16;
         model.committed_end = 0;
+        model.early = null;
         model.checkpoint = core.checkpoint_metal.Checkpoint.init(a);
         errdefer model.checkpoint.deinit();
         // q4 drafts read their linears only through prepared copies: those stay in the file until prepare reads them
@@ -70,6 +81,7 @@ pub const Model = struct {
     }
     /// After a GPU failure: the frame and any open transaction are dropped, and the context starts empty.
     pub fn recover(m: *Model) !void {
+        m.early = null; // its frame runs out in the release below; the reset drops what it admitted
         m.backend.frame.release();
         m.backend.transaction = null;
         m.backend.staged = null;
@@ -110,6 +122,89 @@ pub const Model = struct {
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
         }
+    }
+    /// Whether prepareNext encodes a 2-row block (a depth-one round's) now: the drafter has every committed tap, nothing
+    /// open, and either count of new taps leaves the frame's launches as they are (runtime_context.sameForEither).
+    pub fn canPrepare(m: *const Model, block: u32) bool {
+        const b = &m.backend;
+        return block == 2 and m.early == null and !b.failed and !b.frame.active and b.transaction == null and b.staged == null and b.batch.len == 0 and m.preparation.mode == .prepared_q4_reference and
+            m.session.ready and m.committed_end == m.session.context.end and @import("runtime_context.zig").sameForEither(m.session.context.end, m.session.context.begin, m.graph.config.window);
+    }
+    /// Encodes and commits the next round's frame while the verify that admits 1 or 2 taps still runs: its taps are the
+    /// ring's next 2 slots (the verify's tail gathers them there), and `lead`, first in the frame, waits for the verify
+    /// and picks the frame's RoundArgs for the count it admitted. False (nothing encoded) unless canPrepare. The host
+    /// then calls commitNext with that count, and proposePolicy drafts from the frame.
+    pub fn prepareNext(m: *Model, lead: backend_mod.Lead, block: u32) !bool {
+        if (!m.canPrepare(block)) return false;
+        const c = m.graph.config;
+        const context = m.session.context;
+        const keys: u32 = @intCast(context.end + 4 - context.begin);
+        const blocks: [*]RoundArgs = @ptrCast(@alignCast(m.backend.args.contents()));
+        for (1..RoundArgs.blocks) |rows| blocks[rows] = RoundArgs.of(c, context, @intCast(rows), keys);
+        var positions = [2]u64{ context.end, context.end + 1 };
+        const stride = @as(usize, c.tapWidth()) * 2;
+        const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, @intCast(context.end % c.window)) * stride }, 2, c.tapWidth());
+        m.backend.early = lead;
+        defer m.backend.early = null;
+        const prepared = try m.session.prepareTreeBlock(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = &positions, .layers = c.taps, .target_end = context.end + 2 }, c.mask, block);
+        m.early = .{ .block = prepared, .context = context };
+        return true;
+    }
+    /// The early frame's bridge spin, behind what the caller committed after the frame (Frame.early).
+    pub fn bridgeNext(m: *Model) void {
+        if (m.early != null) m.backend.frame.launchBridge();
+    }
+    /// After the host read the verify: its tail gathered the `rows` taps it admitted into the ring's next slots (no copy),
+    /// and an early frame admitted them too.
+    pub fn commitNext(m: *Model, rows: u32) !void {
+        if (m.backend.failed or rows == 0 or rows > 2 or m.committed_end % m.graph.config.window + rows > m.graph.config.window) return error.BadCommittedTaps;
+        if (m.early) |*x| {
+            if (x.rows != null or x.context.end != m.committed_end) return error.BadDraftContext;
+            const next = op.Context{ .cache = x.context.cache, .begin = x.context.begin, .end = x.context.end + rows };
+            m.session.context = next;
+            m.backend.context = next;
+            x.rows = rows;
+        }
+        m.committed_end += rows;
+    }
+    /// The early frame's tree, drafted from `pending`: its words must be the ones the host decoded from the verify.
+    fn completeNext(m: *Model, pending: u32, options: selector.Options) !selector.Tree {
+        const x = m.early.?;
+        if (x.rows == null) {
+            try m.drainNext();
+            return error.BadDraftContext;
+        }
+        m.early = null;
+        var lattice = try execution.completeBlock(m.backend.ops(), &m.graph, x.block);
+        defer lattice.deinit();
+        if (!m.admitted(x, pending)) {
+            m.backend.failed = true;
+            return error.DraftFrameMismatch;
+        }
+        return selector.propose(m.allocator, &m.graph, lattice, pending, try std.math.add(u64, m.session.context.end, 1), options);
+    }
+    /// Ends the early frame without drafting from it: the taps it admitted stay admitted. If the host never read the verify
+    /// that admits them (an error path), the backend fails: recover resets it.
+    pub fn drainNext(m: *Model) !void {
+        const x = m.early orelse return;
+        m.early = null;
+        var lattice = execution.completeBlock(m.backend.ops(), &m.graph, x.block) catch |err| {
+            m.backend.failed = true;
+            return err;
+        };
+        lattice.deinit();
+        if (x.rows == null or !m.admitted(x, null)) {
+            m.backend.failed = true;
+            return error.DraftFrameMismatch;
+        }
+    }
+    /// Whether the completed early frame `x` read the block of the count the host admitted, valid, and (`anchor`) its anchor.
+    fn admitted(m: *const Model, x: Early, anchor: ?u32) bool {
+        const blocks: [*]const RoundArgs = @ptrCast(@alignCast(m.backend.args.contents()));
+        const rows = x.rows orelse return false;
+        var want = blocks[rows];
+        want.ids[0] = anchor orelse blocks[0].ids[0];
+        return blocks[0].meta[0] == rows and blocks[0].meta[1] == 0 and std.mem.eql(u8, std.mem.asBytes(&blocks[0]), std.mem.asBytes(&want));
     }
     pub fn setTreeBlock(m: *Model, block: u32) !void {
         if (block == 0 or block > 16 or m.backend.failed or m.backend.frame.active or m.backend.transaction != null) return error.BadRuntimeBlock;
@@ -203,6 +298,11 @@ pub const Model = struct {
     pub fn proposePolicy(m: *Model, pending: u32, policy: @import("selector.zig").Policy) !@import("selector.zig").Tree {
         const block = try policy.block(m.tree_block);
         const nodes: u32 = @intCast(policy.nodes);
+        // the frame prepareNext committed behind the last verify: its tree, or (another block) only the taps it admitted
+        if (m.early != null) {
+            if (block == 2 and pending < m.graph.config.vocab) return m.completeNext(pending, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+            try m.drainNext();
+        }
         if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab) return error.BadDraftOptions;
         if (m.committed_end == 0) return error.DraftContextNotReady;
         if (block < 2) return .{ .gpa = m.allocator, .tokens = &.{}, .parents = &.{}, .scores = &.{} };
