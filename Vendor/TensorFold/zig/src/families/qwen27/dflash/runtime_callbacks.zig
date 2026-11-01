@@ -59,6 +59,13 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         s.encodeArgs(e, call, t.matrix(), input.buf, input.off, output.buf, output.off, if (b.admitting()) try simdArgs(b, t, call) else null);
     } else {
         const key = @intFromPtr(w.bytes.ptr);
+        if (!b.precise and !b.admitting() and x.rows <= 2 and x.width == 17408 and x.stride == x.width) {
+            if (b.sparse_down.weights.get(key)) |weights| {
+                b.input_sums = null;
+                try b.sparse_down.encode(b, e, weights, x, y);
+                return y;
+            }
+        }
         const adapter = (if (readsQ4Copy(b, x.rows)) b.prepared.get(key | Backend.precise_key) else null) orelse b.prepared.get(key) orelse return error.DraftPreparationUnqualified;
         try encodePrepared(b, e, x, y, adapter);
         return y;
@@ -121,6 +128,14 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         }
     }
 }
+fn stackedKV(ptr: *anyopaque, epoch: u64, x: op.View, k: ck.Tensor, mode: op.Mode) !?op.View {
+    const b = backend(ptr);
+    if (mode == .bf16_reference) return null;
+    const adapter = b.prepared.get(@intFromPtr(k.bytes.ptr) | Backend.stacked_kv_bit) orelse return null;
+    const out = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
+    try encodePrepared(b, try b.encoder(epoch), x, out, adapter);
+    return out;
+}
 fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
     const b = backend(ptr);
     if (mode == .bf16_reference or b.fused_count == 0) return null;
@@ -129,6 +144,14 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     errdefer b.input_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
+    if (!readsQ4Copy(b, x.rows)) if (b.gate_up_factors) |factors| {
+        if (factors.key == base + kind) {
+            const mid = try b.frame.alloc(x.rows, @import("gate_up_factors.zig").rank, .bf16);
+            try encodePrepared(b, e, x, mid, factors.right);
+            try encodePrepared(b, e, mid, y, factors.left);
+            return y;
+        }
+    };
     try encodePrepared(b, e, x, y, adapter);
     return y;
 }
@@ -402,4 +425,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
 }
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .stacked_kv = stackedKV, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };

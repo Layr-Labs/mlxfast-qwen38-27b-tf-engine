@@ -37,6 +37,8 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
     try list.appendSlice(a, b.frame.pool.items);
     try list.append(a, b.args);
     for (b.caches) |*c| try fields.append(a, list, c);
+    var sparse = b.sparse_down.weights.valueIterator();
+    while (sparse.next()) |weight| try fields.append(a, list, weight);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| {
         try fields.append(a, list, adapter);
@@ -54,6 +56,8 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.one(b.args, hook, joining);
     if (b.head.plain) |*p| prepared(p, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
+    var sparse = b.sparse_down.weights.valueIterator();
+    while (sparse.next()) |weight| fields.apply(weight, hook, joining);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| prepared(adapter, hook, joining);
     var tiled = b.tiled.valueIterator();
