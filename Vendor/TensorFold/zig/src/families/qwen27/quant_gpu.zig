@@ -10,14 +10,12 @@ pub const Ref = projection.Ref;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, resid: bool = false, count: bool = false,
+const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
 
-    /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
-    /// (12288) with K split 2, and decoded rows' GDN z|b|a (6240) with K split 4.
+    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
     fn serialSk2(key: Key) bool {
-        const two = key.slices == 2 and (key.n == 34816 or key.n == 10240 or key.n == 12288);
-        const four = key.slices == 4 and key.n == 6240 and key.rows8;
-        return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
+        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
+        return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
     }
 };
 
@@ -73,8 +71,6 @@ pub const Kernels = struct {
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
-    /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
-    count_words: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -100,7 +96,6 @@ pub const Kernels = struct {
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
-        if (k.count_words) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -235,39 +230,6 @@ pub const Kernels = struct {
             const hr = lane.Ref{ .buf = out.buffer, .off = out.offset + @as(usize, first) * half * 2 };
             const hsr = lane.Ref{ .buf = out_sums.buffer, .off = out_sums.offset + @as(usize, first) * 4 };
             try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
-        }
-        try span.end();
-        return true;
-    }
-
-    /// Prompt rows of a two-tile 5120-wide output projection with the residual add in its store: `residual` gets `hidden`
-    /// + the output rows, each word as q27_norm_xs forms it, and no output rows are written; the norm after it then reads
-    /// `residual` alone. False (nothing encoded) where the launch has no two-tile prompt form: decoded rows among them.
-    pub fn quantResid(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
-        if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
-        if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
-        const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
-        const tn = promptTiles(key, p.n, 0);
-        if (tn == 1 or key.serialSk2()) return false;
-        var span = profile.begin(k.profiler, input_encoder, .dense);
-        span.shape = .{ .n = p.n, .k = p.k, .sk = sk, .bits = p.bits };
-        errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
-            k.joined(entry.value_ptr);
-        }
-        var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
-            const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
-            const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-            const hr = lane.Ref{ .buf = hidden.buffer, .off = hidden.offset + @as(usize, first) * p.n * 2 };
-            const rr = lane.Ref{ .buf = residual.buffer, .off = residual.offset + @as(usize, first) * p.n * 2 };
-            const sr: ?lane.Sums = if (xs) |g| .{ .ref = .{ .buf = g.ref.buffer, .off = g.ref.offset + @as(usize, first) * 4 }, .stride = g.stride } else null;
-            try entry.value_ptr.encodeResid(span.encoder, xr, w, metadata(p, false), sr, hr, rr, n);
         }
         try span.end();
         return true;
@@ -505,56 +467,9 @@ pub const Kernels = struct {
         const e = span.encoder;
 
         e.setPipeline(try k.get(.{ .kind = if (residual != null) .norm else .input_norm, .k = width }));
-        if (residual) |r| {
-            bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
-            bindAt(e, out, 8); // never read: wait_for 0
-            e.setValue(@as(u32, 0), 9);
-        } else bind(e, .{ h, weight, eps, dims, out, xs });
+        if (residual) |r| bind(e, .{ h, r, weight, eps, dims, combined, out, xs }) else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, padded(rows), 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
-    }
-
-    /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
-    /// threadgroup waits until that launch's `wait_for` threadgroups have counted their fenced stores.
-    pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
-        const words = k.count_words orelse return error.BadCoreProjectionRows;
-        if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        var span = profile.begin(k.profiler, input_encoder, .norm);
-        errdefer span.cancel();
-        const e = span.encoder;
-        e.setPipeline(try k.get(.{ .kind = .norm, .k = width }));
-        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
-        e.setBuffer(words, 0, 8);
-        e.setValue(wait_for, 9);
-        e.dispatchGroups(mtl.Size.of(1, padded(rows), 1), mtl.Size.of(width / 16, 1, 1));
-        try span.end();
-    }
-
-    /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
-    /// stores are fenced (Layout.count), for a normAfter in the same barrier interval. Returns that norm's wait (the
-    /// launch's threadgroups); null: nothing encoded, the caller takes quant.
-    pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
-        if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true };
-        if (key.serialSk2() or p.slices < 2) return null;
-        if (k.count_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
-            k.count_words = b;
-        }
-        var span = profile.begin(k.profiler, input_encoder, .dense);
-        span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
-        errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true });
-            k.joined(entry.value_ptr);
-        }
-        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? });
-        try span.end();
-        return @intCast(entry.value_ptr.tile_count);
     }
 
     /// Prompt rows [base, base + 128) into the Neural Engine's fp16 input planes [hidden][128].
@@ -617,9 +532,6 @@ pub fn padded(rows: u32) u32 {
     return 16 * ((rows + 15) / 16);
 }
 
-fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
-    e.setBuffer(r.buffer, r.offset, index);
-}
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
