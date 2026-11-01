@@ -41,10 +41,16 @@ pub const Stages = struct {
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
+    /// A greedy verify's head runs in its tail through the runner's HeadSieve (its picks, from the final norm's rows and
+    /// sums): the full head is not encoded and no logits row is written.
+    sieve: bool = false,
     tail: ?Tail = null,
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
     after: ?Hook = null,
+    /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
+    /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
+    settle: ?Hook = null,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -191,7 +197,7 @@ pub const Stages = struct {
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
         if (s.head == .all and s.rows > @import("gpu_frame.zig").logit_rows) return error.BadFrameRows;
-        if (s.head != .none) {
+        if (s.head != .none and !(s.sieve and s.head == .all)) {
             var input = f.get(.input);
             var head_sums = sums(f, .sums, s.rows);
             if (s.head == .last) {
@@ -211,6 +217,9 @@ pub const Stages = struct {
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
+    }
+    pub fn beforeCommit(s: *Stages) !void {
+        if (s.settle) |h| try h.run(h.ptr);
     }
 };
 

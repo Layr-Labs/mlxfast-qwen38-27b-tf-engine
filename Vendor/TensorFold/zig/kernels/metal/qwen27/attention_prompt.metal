@@ -128,8 +128,9 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
-  // keys from the group's last live row's own count on are masked for all its rows: those steps change nothing
-  const int first_row = (args.tile0 + int(tg.z) * (SG / 2)) * 16, last_row = min(args.rows * PG, first_row + (SG / 2) * 16) - 1;
+  // Keep the original four-tile key-step limit when a launch splits that group into two pairs.
+  // Keys past its last live row are masked for every row; all FP32 update orders stay unchanged.
+  const int first_row = (args.tile0 + (int(tg.z) * (SG / 2) / 4) * 4) * 16, last_row = min(args.rows * PG, first_row + 4 * 16) - 1;
   const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;
   for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
@@ -148,7 +149,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   }
 }
 #define Q27_PROMPT(SG) template [[host_name("q27_attn_prompt_" #SG)]] kernel void q27_attn_prompt<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant Q27PromptArgs&, device float*, device float*, device float*, uint3, ushort, ushort);
-Q27_PROMPT(8)
+Q27_PROMPT(4)
 
 // A packed row's chunks merged in key order, normalized and written as the row's head output.
 kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device const float* PM [[buffer(1)]], device const float* PL [[buffer(2)]],
