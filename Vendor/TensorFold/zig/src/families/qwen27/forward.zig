@@ -113,20 +113,29 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
+        // decoded rows: the block's closing norm counts its row threadgroups, so the MLP gate/up that reads its rows shares
+        // its barrier interval instead of a barrier between them (normCounted, gateUpCounted's wait)
+        const post_count0: u32 = if (!s.compact and !m.kernels.prompt and m.kernels.gateUpWaits(layer.gu, layer.down, s.rows)) s.rows else 0;
+        var post_count = post_count0;
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+            post_count = 0; // the residual launch's norm is not counted: the gate/up waits on the barrier below
         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
-            try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+            if (post_count != 0) {
+                _ = try m.kernels.normCounted(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+            } else try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
         } else {
             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
-            try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+            if (post_count != 0) {
+                _ = try m.kernels.normCounted(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, 0);
+            } else try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         }
-        e.barrier();
+        if (post_count == 0) e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);
         up.offset += @as(usize, m.config.intermediate) * 2;
@@ -154,13 +163,22 @@ pub const Stages = struct {
             lane.enc.barrier();
             s.pending = f.get(.output);
             return;
-        } else if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
-            try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
-            e.barrier();
-            try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
         }
-        lane.enc.barrier();
-        if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
+        // decoded rows: a counted gate/up shares its barrier interval with the counted down that waits on it, and waits on
+        // the counted norm that wrote its rows when the block's norm counted them
+        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCounted(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows, post_count) else null;
+        if (gu_wait == null) {
+            if (post_count != 0) e.barrier(); // unreachable with a counted norm; keep the fallback ordered if it is not
+            if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
+                try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
+                e.barrier();
+                try m.kernels.mlp(e, f.get(.mixed), up, dims, f.get(.activated), f.get(.act_sums), width, s.rows);
+            }
+            lane.enc.barrier();
+        }
+        if (gu_wait) |n| {
+            s.norm_wait = try m.kernels.quantCountedAfter(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows, n);
+        } else if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
         } else if (if (!s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             s.norm_wait = counted;
