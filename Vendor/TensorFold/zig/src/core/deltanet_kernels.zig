@@ -54,6 +54,8 @@ pub const Kernels = struct {
     stash: metal.Pipeline,
     /// The pending rows replayed into every layer's committed state, one launch.
     unstash: metal.Pipeline,
+    /// tf_delta_gdn_post_rows for a prompt chain: 16 rows a group, its group sums summed a lane a row and group.
+    post_rows16: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -85,6 +87,7 @@ pub const Kernels = struct {
             "star_pending",
             "stash",
             "unstash",
+            "post_rows16",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -93,7 +96,7 @@ pub const Kernels = struct {
             pipelines[index] = try metal.Pipeline.init(device, library, "tf_delta_gdn_" ++ name, false);
             done += 1;
         }
-        inline for (.{ 7, 13, 14, 21, 23, 25 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        inline for (.{ 7, 13, 14, 21, 23, 25, 26 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
         return .{
             .library = library,
             .pipelines = .{
@@ -120,6 +123,7 @@ pub const Kernels = struct {
             .star_pending = pipelines[23],
             .stash = pipelines[24],
             .unstash = pipelines[25],
+            .post_rows16 = pipelines[26],
         };
     }
 
@@ -146,6 +150,7 @@ pub const Kernels = struct {
             k.star_pending,
             k.stash,
             k.unstash,
+            k.post_rows16,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();
