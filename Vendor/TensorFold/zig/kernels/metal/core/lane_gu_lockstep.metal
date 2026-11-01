@@ -1,6 +1,13 @@
 // K64 lockstep G/U scheduler for the guarded decoded indexed GU path. Same two SGs, original split chains and register activation.
 [[max_total_threads_per_threadgroup(64)]]
-kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
+kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],
+#if defined(TF_GU_COUNT)
+ device atomic_uint* GC [[buffer(7)]],
+#endif
+#if defined(TF_GU_WAIT)
+ device atomic_uint* WC [[buffer(8)]],constant uint& wait_for [[buffer(9)]],uint2 tgs [[threadgroups_per_grid]],
+#endif
+ uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
  const int gt=2*int(tg.x)+ks,ut=gt+TF_N/64,gn=gt*32,un=ut*32;
  const int nb=4*(lane&1)+8*((lane>>3)&1),mb=((lane>>1)&3)+4*((lane>>4)&1);
@@ -21,6 +28,29 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const device uint2* ui=(const device uint2*)(tab+TF_SBI)+(un+nb)/4;
 #endif
  float G[16],U[16],G0[16],U0[16];
+#if defined(TF_GU_WAIT)
+ // X and XS come from the post-norm in this launch's barrier interval, whose live rows' threadgroups count themselves on
+ // WC[0] past a device-scope fence. Before the wait every lane touches both splits' first TF_GU_WARM gate and up code
+ // blocks (a SIMD group's 32 coalesced loads cover a block's 1 KiB), so the weight stream runs under the norm and the out
+ // projection's tail; thread 0 then waits on the count (bounded) and passes its own fence before any row is read, and the
+ // last threadgroup to arrive leaves both words zero. A never-true test (wait_for is never zero here) keeps the loads.
+#ifndef TF_GU_WARM
+#define TF_GU_WARM 4
+#endif
+ uint warm=0;
+ for(int split=0;split<2;split++)for(int d=0;d<TF_GU_WARM;d++){
+  const size_t o=(size_t)(split*40+d)*TF_TB*64+lane;warm^=gw[o].x^uw[o].x; // gw and uw already hold +lane
+ }
+ if(ks==0&&lane==0){
+  for(uint spin=0;spin<(1u<<24)&&atomic_load_explicit(&WC[0],memory_order_relaxed)<wait_for;spin++){}
+  atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+  if(atomic_fetch_add_explicit(&WC[1],1u,memory_order_relaxed)+1u==tgs.x*tgs.y){
+   atomic_store_explicit(&WC[0],0u,memory_order_relaxed);atomic_store_explicit(&WC[1],0u,memory_order_relaxed);
+  }
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ if(wait_for==0u&&warm==0x9E3779B9u)Y[0]=bfloat(0.0f);
+#endif
  for(int split=0;split<2;split++){
   const int first=split*40,last=first+40;
   for(int i=0;i<16;i++){G[i]=0.0f;U[i]=0.0f;}
@@ -85,4 +115,10 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  threadgroup_barrier(mem_flags::mem_threadgroup);
  const int t=ks*32+lane;
  for(int m=t;m<stride;m+=64){float acc=0.0f;if(m<M)for(int i=0;i<64;i++)acc+=float(hb[m*64+i]);HS[int(tg.x)*stride+m]=acc;}
+#if defined(TF_GU_COUNT)
+ // the MLP down that reads Y and HS shares this launch's barrier interval: each threadgroup counts itself on GC[0] once its
+ // stores are past a device-scope fence (tf_lane_reg's TF_WAIT)
+ threadgroup_barrier(mem_flags::mem_device);
+ if(t==0){atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);atomic_fetch_add_explicit(GC,1u,memory_order_relaxed);}
+#endif
 }
