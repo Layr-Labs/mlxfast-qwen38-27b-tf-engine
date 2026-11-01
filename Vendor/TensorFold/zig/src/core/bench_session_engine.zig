@@ -226,14 +226,10 @@ pub const EngineDflashBinding = struct {
     }
 };
 
-/// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
-/// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
+/// At most seven siblings of one future position, plus the pending row.
 pub const dflash_width = 7;
-/// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
-/// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-/// Siblings at 0.7-1% land about 2% of the time, a full round each, against about 0.13 ms a row; below 0.7% they
-/// almost never land.
-pub const dflash_floor = 0.007;
+pub const dflash_floor_policy = @import("dflash_floor_policy.zig");
+pub const dflash_floor = dflash_floor_policy.default_floor;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
@@ -243,6 +239,7 @@ pub fn GenerationBinding(comptime generation: type) type {
         chunk: usize,
         host: ?*api.LaneHost = null,
         depth: u8 = 0,
+        floor_policy: dflash_floor_policy.State = .{},
 
         pub fn source(binding: *@This()) DflashSource {
             return .{ .ctx = binding, .seed = seed, .round = round, .reset = reset };
@@ -253,13 +250,15 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (depth != 1) return error.BadDraftDepth;
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
+            const floor = try binding.floor_policy.get();
             try binding.ready();
             try binding.resetNow();
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
-            const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = depth }, &.{}, false, null, 0);
+            const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = floor, .max_depth = depth }, &.{}, false, null, 0);
             defer binding.generation.allocator.free(result.tokens);
             if (result.tokens.len != 1) return error.BadDraftRound;
+            binding.floor_policy.record(floor, true, dflash_width, result.verified, result.matched, result.tokens.len);
             return result.tokens[0];
         }
 
@@ -269,17 +268,19 @@ pub fn GenerationBinding(comptime generation: type) type {
             defer if (binding.host) |host| host.unlock();
             try binding.ready();
             if (binding.depth != 1) return error.SessionNotSeeded;
+            const floor = try binding.floor_policy.get();
             if (binding.generation.journal != null) return error.AuditAlreadyAttached;
             var journal: generation.AuditJournal = .{};
             defer journal.deinit(binding.generation.allocator);
             binding.generation.journal = &journal;
             defer binding.generation.journal = null;
-            const result = try binding.generation.runRound(remaining, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = binding.depth }, &.{}, true, null, 0);
+            const result = try binding.generation.runRound(remaining, .{ .nodes = dflash_width, .children = dflash_width, .floor = floor, .max_depth = binding.depth }, &.{}, true, null, 0);
             defer binding.generation.allocator.free(result.tokens);
             if (result.tokens.len == 0 or result.tokens.len > out.len) return error.BadDraftRound;
             if (result.rounds != 1) return error.BadDraftRound;
             @memcpy(out[0..result.tokens.len], result.tokens);
             try generation.appendTo(&journal, audit, alloc);
+            binding.floor_policy.record(floor, false, dflash_width, result.verified, result.matched, result.tokens.len);
             return @intCast(result.tokens.len);
         }
 

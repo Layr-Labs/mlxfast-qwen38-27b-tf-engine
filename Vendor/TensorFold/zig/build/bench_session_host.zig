@@ -35,4 +35,8 @@ pub fn steps(b: *std.Build, bench_session: *std.Build.Module) void {
         },
     });
     b.step("test-bench-session", "Bench session host tests").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
+    const floor_step = b.step("test-dflash-floor-host", "DFlash floor override and actual bench binding on CPU mocks");
+    floor_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root, .filters = &.{"DFlash floor"} })).step);
+    const floor = b.createModule(.{ .root_source_file = b.path("zig/src/core/dflash_floor_policy.zig"), .target = b.graph.host, .optimize = .Debug, .link_libc = true });
+    floor_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = floor })).step);
 }

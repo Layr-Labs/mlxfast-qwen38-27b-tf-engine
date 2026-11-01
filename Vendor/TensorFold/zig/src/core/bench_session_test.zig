@@ -5,6 +5,87 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const process_memory = @import("process_memory");
 
+const FloorGeneration = struct {
+    pub const AuditJournal = struct {
+        committed: u32 = 0,
+        drafted: u32 = 0,
+        accepted: u32 = 0,
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    pub fn appendTo(j: *const AuditJournal, audit: *bench.DflashAudit, alloc: std.mem.Allocator) !void {
+        try audit.appendRound(alloc, j.committed, j.drafted, j.accepted);
+    }
+    const Reset = struct {
+        resets: usize = 0,
+        pub fn reset(r: *@This()) !void {
+            r.resets += 1;
+        }
+    };
+    const Runner = struct {
+        resets: usize = 0,
+        pub fn reset(r: *@This(), slot: u32) !void {
+            if (slot != 0) return error.WrongSlot;
+            r.resets += 1;
+        }
+    };
+    pub const Generation = struct {
+        allocator: std.mem.Allocator,
+        runner: Runner = .{},
+        draft: Reset = .{},
+        journal: ?*AuditJournal = null,
+        expected_floor: f64,
+        prefills: usize = 0,
+        seeds: usize = 0,
+        rounds: usize = 0,
+        fail_round: bool = false,
+        pub fn settle(_: *@This()) !void {}
+        pub fn prefill(g: *@This(), tokens: []const u32, chunk: usize) !void {
+            if (tokens.len != 2 or chunk != 128) return error.WrongPrefill;
+            g.prefills += 1;
+        }
+        const Result = struct { tokens: []u32, rounds: usize, verified: usize, matched: usize };
+        pub fn runRound(g: *@This(), remaining: u32, policy: anytype, eos: []const u32, delivered: bool, extend: ?*anyopaque, extra: u32) !Result {
+            if (@as(u64, @bitCast(@as(f64, policy.floor))) != @as(u64, @bitCast(g.expected_floor)) or policy.nodes != 7 or policy.children != 7 or policy.max_depth != 1 or eos.len != 0 or extend != null or extra != 0) return error.WrongActualPolicy;
+            if (g.fail_round) return error.InjectedRoundFailure;
+            const n: usize = if (delivered) @min(remaining, 2) else 1;
+            const tokens = try g.allocator.alloc(u32, n);
+            for (tokens, 0..) |*t, i| t.* = @intCast(20 + i);
+            if (delivered) {
+                g.rounds += 1;
+                const j = g.journal orelse return error.MissingJournal;
+                j.* = .{ .committed = @intCast(n), .drafted = 5, .accepted = 1 };
+            } else g.seeds += 1;
+            return .{ .tokens = tokens, .rounds = if (delivered) 1 else 0, .verified = if (delivered) 6 else 0, .matched = if (delivered) 1 else 0 };
+        }
+    };
+};
+
+test "DFlash floor reaches actual seed and round binding with optional engagement" {
+    const a = std.testing.allocator;
+    for ([_]f64{ 0.007, 0.015 }) |floor| for ([_]bool{ false, true }) |report| {
+        var generation = FloorGeneration.Generation{ .allocator = a, .expected_floor = floor };
+        var binding = adapter_mod.GenerationBinding(FloorGeneration){ .generation = &generation, .chunk = 128, .floor_policy = .{ .config = .{ .floor = floor, .report = report } } };
+        const source = binding.source();
+        try std.testing.expectEqual(@as(u32, 20), try source.seed(source.ctx, &.{ 3, 9 }, 1));
+        var audit = bench.DflashAudit.init();
+        defer audit.deinit(a);
+        var out: [2]u32 = undefined;
+        try std.testing.expectEqual(@as(u32, 2), try source.round(source.ctx, 128, &out, &audit, a));
+        try std.testing.expectEqual(@as(usize, 1), generation.seeds);
+        try std.testing.expectEqual(@as(usize, 1), generation.rounds);
+        try std.testing.expectEqual(@as(u64, 5), audit.drafted_total);
+        try std.testing.expectEqual(@as(u64, 1), audit.accepted_total);
+        const C = adapter_mod.dflash_floor_policy.Counts;
+        try std.testing.expectEqualDeep(if (report) C{ .seed_calls = 1, .round_calls = 1, .drafted = 5, .accepted = 1, .committed = 2 } else C{}, binding.floor_policy.counts);
+        generation.fail_round = true;
+        try std.testing.expectError(error.InjectedRoundFailure, source.round(source.ctx, 126, &out, &audit, a));
+        try std.testing.expectEqual(@as(u64, if (report) 1 else 0), binding.floor_policy.counts.round_calls);
+        try std.testing.expect(generation.journal == null);
+        try source.reset(source.ctx);
+        try std.testing.expectError(error.SessionNotSeeded, source.round(source.ctx, 128, &out, &audit, a));
+    };
+}
+
 const Fixture = struct {
     cfg: lanes.Config,
     target: lanes.fake.Fake,
