@@ -76,6 +76,9 @@ pub const Pool = struct {
     /// Read by a deferred star scan, the keep that stashes behind it and unstash only; every other reader of the committed
     /// states runs after the rows land (decode_round.Runner.settleGdn).
     pending: Pending = .{},
+    /// The forward now being encoded admitted its plan once (stage): every layer of one forward reads the same keeps,
+    /// kept rows, segments and windows, so forwardAfter and forwardChain find the admission and the metadata copy done.
+    staged: bool = false,
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -165,6 +168,20 @@ pub const Pool = struct {
         return .{ .buffer = span.buffer, .offset = span.offset };
     }
 
+    /// Admit one forward's plan and put its metadata on the device once: the layer loop of that forward reads the same
+    /// descriptors, so the per-layer admission and copy inside forwardAfter and forwardChain find it already staged.
+    pub fn stage(pool: *Pool, plan: DevicePlan) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        try plan.metadata.upload(plan.host);
+        pool.staged = true;
+    }
+
+    /// Forget the admission: the next forward admits the plan it is handed (decode_round.Runner.verifyImpl stages each
+    /// round before its layers are encoded).
+    pub fn unstage(pool: *Pool) void {
+        pool.staged = false;
+    }
+
     /// `beside`: encoded beside the scan, before the barrier that ends it.
     /// The counted projections a decoded prepare waits on in its barrier interval (Kernels.quantCounted).
     pub const After = struct { counter: metal.Buffer, wait: u32 };
@@ -176,9 +193,9 @@ pub const Pool = struct {
     /// `deferred`: a lone depth-one star verify's scan applies the first `rows` pending rows before node 0
     /// (tf_delta_gdn_star_pending) and, on `persist`, writes the state they leave back over the committed one.
     pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred) !void {
-        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        // one admission and one metadata copy for the whole forward (stage); a lone caller admits its own plan
+        if (!pool.staged) try pool.stage(plan);
         const prepared = try pool.round(layer, plan, refs, false);
-        try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
         if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
@@ -206,7 +223,8 @@ pub const Pool = struct {
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
     pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
-        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        // one admission and one metadata copy for the whole forward (stage); a lone caller admits its own plan
+        if (!pool.staged) try pool.stage(plan);
         for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
             for (0..segment.rows) |row| if (plan.host.parents[segment.first + row] != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
@@ -217,7 +235,6 @@ pub const Pool = struct {
         if (in_place) prepared.b.next_state = prepared.b.state;
         // one row a slot kept in place: its prepare writes the next conv window, so no commit or publication follows
         const step = step_rounds and in_place and !prompt and oneRowSegments(plan.host);
-        try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
         if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
@@ -271,6 +288,8 @@ pub const Pool = struct {
     pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         try plan.metadata.upload(plan.host);
+        // the buffers hold this keep's plan now, not the forward's staged one (stage)
+        pool.staged = false;
         return pool.commitDevice(layer, plan, e);
     }
 

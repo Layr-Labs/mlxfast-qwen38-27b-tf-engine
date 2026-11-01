@@ -249,6 +249,10 @@ pub const Runner = struct {
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
         try r.scratch.upload(attention_plan);
+        // One forward of this round's plan: its keeps, kept rows, segments and windows go to the device once here, not
+        // once a layer inside the forward (every layer of the round reads the same descriptors).
+        r.gdn.unstage();
+        try r.gdn.stage(.{ .host = recurrent, .metadata = r.metadata() });
         r.current_round = round;
         r.current_gdn = &recurrent;
         r.current_attention = &attention_plan;
@@ -342,6 +346,8 @@ pub const Runner = struct {
         defer attention_plan.deinit();
         const m = r.metadata();
         try m.upload(recurrent);
+        // the buffers hold the keep's plan now, not the verify's staged one (stage)
+        r.gdn.unstage();
         const p = @import("core").tree_commit_gpu.Meta{ .rows = @intCast(round.ids.len), .slot = round.slots[0] };
         const keep_ref = @import("core").tree_commit_gpu.Ref{ .buf = m.keeps.buffer, .off = m.keeps.offset };
         const rows = @import("core").tree_commit_gpu.Ref{ .buf = m.kept_rows.buffer, .off = m.kept_rows.offset };
