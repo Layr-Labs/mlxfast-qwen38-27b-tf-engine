@@ -214,16 +214,22 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
   // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
   // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
@@ -716,16 +722,22 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
   // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
   // its own fence, and the last group leaves both words zero for the next pair
   if (wait_for != 0u) {
+    threadgroup uint dependency_ready;
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-      const uint total = groups.x * groups.y * groups.z;
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      dependency_ready = uint(atomic_load_explicit(&NC[0], memory_order_relaxed) >= wait_for);
+      if (dependency_ready == 0u) {
+        atomic_store_explicit(&NC[2], 1u, memory_order_relaxed);
+      } else {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y * groups.z) {
+          atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+          atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dependency_ready == 0u) return;
   }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
