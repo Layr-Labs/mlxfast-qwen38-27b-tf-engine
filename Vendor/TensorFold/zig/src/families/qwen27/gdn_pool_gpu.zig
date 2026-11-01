@@ -64,6 +64,8 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero.
+    scan_words: ?metal.Buffer = null,
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -78,7 +80,9 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..8], 0);
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -99,6 +103,7 @@ pub const Pool = struct {
         pool.releaseBefore();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
+        if (pool.scan_words) |b| b.deinit();
     }
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
@@ -151,15 +156,24 @@ pub const Pool = struct {
     }
 
     /// `beside`: encoded beside the scan, before the barrier that ends it.
+    /// The counted projections a decoded prepare waits on in its barrier interval (Kernels.quantCounted).
+    pub const After = struct { counter: metal.Buffer, wait: u32 };
+
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+        return pool.forwardAfter(layer, plan, refs, e, beside, null);
+    }
+
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.star and prepared.usesSlots()) {
+            try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words);
+        } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
     }
 
@@ -264,6 +278,70 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// Every GDN layer's keep: one replay launch for all layers when no window steps its state in place, otherwise
+    /// the per-layer replay, then tf_delta_gdn_conv_keep_layers writes all layers' conv windows in one launch whose
+    /// grid depth is a layer. History and qkv are one pooled buffer each, a layer apart at a fixed word stride, and
+    /// every layer reads the round's keeps and windows.
+    pub fn keepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (pool.advances(plan.host) or !inPlace(plan.host)) {
+            for (0..pool.budget.layers) |layer| try pool.commitReplay(layer, plan, e);
+        } else try pool.replayLayers(plan, e);
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const qkv = pool.get(.qkv);
+        const layers: u32 = @intCast(pool.budget.layers);
+        const stride = abi.LayerStride{
+            .layers = layers,
+            .history = @intCast(history.length() / (pool.budget.layers * 2)),
+            .qkv = @intCast(qkv.length() / (pool.budget.layers * 2)),
+        };
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(qkv, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(stride, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = pool.budget.layers }, .{ .width = 256 }); // a channel a layer
+    }
+
+    /// Every GDN layer's replay in one launch: the grid depth holds every layer's keeps, and a layer's key, value,
+    /// decay, mixing and state spans start at their own word strides in the pooled buffers. The rounds that take it
+    /// are the ones whose windows all replay (no in-place advance), so no slot copy reads `before`.
+    fn replayLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const state = pool.get(.state);
+        const stride = abi.LayerSpans{
+            .layers = @intCast(pool.budget.layers),
+            .keeps = @intCast(plan.host.keeps.len),
+            .key = @intCast(pool.get(.key).length() / (pool.budget.layers * 2)),
+            .value = @intCast(pool.get(.value).length() / (pool.budget.layers * 2)),
+            .decay = @intCast(pool.get(.decay).length() / (pool.budget.layers * 4)),
+            .mixing = @intCast(pool.get(.mixing).length() / (pool.budget.layers * 2)),
+            .state = @intCast(state.length() / (pool.budget.layers * 4)),
+            .before = 0,
+        };
+        e.setPipeline(pool.kernels.replay_layers);
+        e.setBuffer(pool.get(.key), 0, 0);
+        e.setBuffer(pool.get(.value), 0, 1);
+        e.setBuffer(pool.get(.decay), 0, 2);
+        e.setBuffer(pool.get(.mixing), 0, 3);
+        e.setBuffer(state, 0, 4);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+        e.setValue(p, 7);
+        e.setBuffer(state, 0, 8);
+        e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+        e.setBuffer(state, 0, 10);
+        e.setValue(stride, 11);
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len * pool.budget.layers }, .{ .width = 32, .height = 4 });
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.

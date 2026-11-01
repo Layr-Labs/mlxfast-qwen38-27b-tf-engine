@@ -203,9 +203,28 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this prepare shares its barrier interval with the decoded qkv and zba projections it reads, whose
+  // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
+  // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
@@ -404,6 +423,33 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   }
   if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
+}
+struct TfDeltaLayerSpans { uint layers; uint keeps; uint key; uint value; uint decay; uint mixing; uint state; uint before; };
+kernel void tf_delta_gdn_replay_layers(device const bfloat* key [[buffer(0)]],
+                                  device const bfloat* value [[buffer(1)]],
+                                  device const float* decay [[buffer(2)]],
+                                  device const bfloat* mixing [[buffer(3)]],
+                                  device const float* committed [[buffer(4)]],
+                                  device const uint* kept_rows [[buffer(5)]],
+                                  device const TfDeltaKeep* keeps [[buffer(6)]],
+                                  constant TfDeltaParams& p [[buffer(7)]],
+                                  device float* next [[buffer(8)]],
+                                  device const TfDeltaSegment* segments [[buffer(9)]],
+                                  device const float* before [[buffer(10)]],
+                                  constant TfDeltaLayerSpans& s [[buffer(11)]],
+                                  uint3 position [[thread_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  const uint span = p.nv * s.keeps, layer = position.z / span;
+  if (layer >= s.layers) return;
+  const uint3 at = uint3(position.x, position.y, position.z - layer * span);
+  device const bfloat* k = key + (size_t)layer * s.key;
+  device const bfloat* v = value + (size_t)layer * s.value;
+  device const float* d = decay + (size_t)layer * s.decay;
+  device const bfloat* m = mixing + (size_t)layer * s.mixing;
+  device const float* st = committed + (size_t)layer * s.state;
+  device float* nx = next + (size_t)layer * s.state;
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
+  else tf_delta_gdn_replay_body<0>(k, v, d, m, st, kept_rows, keeps, p, nx, at, lane);
 }
 
 // Accepted chains keep the tree path's delta update and sum order; a prompt chunk differs only in trip count.
@@ -620,9 +666,28 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device bfloat* output [[buffer(4)]],
                          device float* sums [[buffer(5)]],
                          constant uint& sums_stride [[buffer(6)]],
+                         device atomic_uint* NC [[buffer(7)]],
+                         constant uint& wait_for [[buffer(8)]],
                          uint3 group [[threadgroup_position_in_grid]],
+                         uint3 groups [[threadgroups_per_grid]],
+                         uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this gate shares its barrier interval with the star scan that writes `recurrence`, whose threadgroups
+  // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
+  // its own fence, and the last group leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
@@ -690,6 +755,31 @@ kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
   for (uint t = 0; t < held; ++t) {
     const uint source = windows[row * p.taps + t + 1];
     taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
+struct TfDeltaLayerStride { uint layers; uint history; uint qkv; };
+kernel void tf_delta_gdn_conv_keep_layers(device ushort* committed [[buffer(0)]],
+                                     device const ushort* projection [[buffer(1)]],
+                                     device const uint* kept_rows [[buffer(2)]],
+                                     device const TfDeltaKeep* keeps [[buffer(3)]],
+                                     device const uint* windows [[buffer(4)]],
+                                     constant TfDeltaParams& p [[buffer(5)]],
+                                     constant TfDeltaLayerStride& s [[buffer(6)]],
+                                     uint3 position [[thread_position_in_grid]]) {
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
+  const uint layer = position.z;
+  if (item >= channels || layer >= s.layers) return;
+  const TfDeltaKeep keep = keeps[position.y];
+  if (keep.rows == 0) return;
+  device ushort* history = committed + (size_t)layer * s.history;
+  device const ushort* qkv = projection + (size_t)layer * s.qkv;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = history + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : qkv[(source - held) * channels + item];
   }
   for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
 }

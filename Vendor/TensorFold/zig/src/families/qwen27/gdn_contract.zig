@@ -45,6 +45,12 @@ pub const Params = extern struct {
 pub const Segment = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };
 pub const Keep = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };
 
+/// Word strides of the pooled history and qkv spans, and the layer count, for a cross-layer conv keep launch.
+pub const LayerStride = extern struct { layers: u32, history: u32, qkv: u32 };
+
+/// Word strides of one GDN layer's replay spans in the pooled buffers, and the layer and keep counts.
+pub const LayerSpans = extern struct { layers: u32, keeps: u32, key: u32, value: u32, decay: u32, mixing: u32, state: u32, before: u32 };
+
 pub const Shape = struct {
     c: Config,
     qkv: usize,

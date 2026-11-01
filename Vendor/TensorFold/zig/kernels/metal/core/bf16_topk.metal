@@ -202,3 +202,37 @@ kernel void tf_bf16_topk_max(const device ushort* logits [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
+
+// The distinct 32-column tiles of rows' top-k tokens, tile 0 always among them: list[0] their count, list[1 + j] the
+// tiles in increasing order; map[32 j + c] the id of tile list[1 + j]'s column c (ids[32 tile + c]) for each of the
+// launch's `slots` (0 past the count). One threadgroup.
+#define TF_TOPK_TILE_WORDS 256
+#define TF_TOPK_TILE_SLOTS 272
+struct TileParams { uint rows, tiles, slots; };
+kernel void tf_bf16_topk_tiles(const device Row* picked [[buffer(0)]], const device uint* ids [[buffer(1)]],
+                               device uint* list [[buffer(2)]], device uint* map [[buffer(3)]],
+                               constant TileParams& p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]]) {
+  threadgroup atomic_uint marks[TF_TOPK_TILE_WORDS];
+  threadgroup uint order[TF_TOPK_TILE_SLOTS];
+  threadgroup uint found[1];
+  const uint words = (p.tiles + 31) / 32;
+  for (uint i = lane; i < words; i += TF_TOPK_LANES) atomic_store_explicit(&marks[i], i == 0 ? 1u : 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = lane; i < p.rows * TF_TOPK_MAX_K; i += TF_TOPK_LANES) {
+    const device Row& r = picked[i / TF_TOPK_MAX_K];
+    const uint at = i % TF_TOPK_MAX_K, tile = r.entries[at].token / 32;
+    if (at < r.count && tile < p.tiles) atomic_fetch_or_explicit(&marks[tile / 32], 1u << (tile % 32), memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) {
+    uint n = 0;
+    for (uint i = 0; i < words; i++)
+      for (uint m = atomic_load_explicit(&marks[i], memory_order_relaxed); m != 0 && n < p.slots; m &= m - 1) order[n++] = 32 * i + ctz(m);
+    found[0] = n;
+    list[0] = n;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n = found[0];
+  for (uint j = lane; j < n; j += TF_TOPK_LANES) list[1 + j] = order[j];
+  for (uint at = lane; at < p.slots * 32; at += TF_TOPK_LANES) map[at] = at / 32 < n ? ids[32 * order[at / 32] + at % 32] : 0u;
+}
