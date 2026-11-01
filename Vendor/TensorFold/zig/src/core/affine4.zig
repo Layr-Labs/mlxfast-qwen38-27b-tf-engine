@@ -118,3 +118,43 @@ pub fn signature() [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(@embedFile("affine4.zig"), &result, .{});
     return result;
 }
+
+/// `p` re-quantized to 2-bit codes (0..3) in the same 4-bit word format: each group's decoded 4-bit values rounded by the
+/// min/max rule above on 4 levels. For a draft model's decoded rows only (the drafter proposes, the target decides).
+pub fn requant2(a: std.mem.Allocator, p: Prepared) !Prepared {
+    const words = try a.alloc(u32, p.words.len);
+    errdefer a.free(words);
+    const scales = try a.alloc(u16, p.scales.len);
+    errdefer a.free(scales);
+    const biases = try a.alloc(u16, p.biases.len);
+    errdefer a.free(biases);
+    for (0..p.scales.len) |group| {
+        var v: [64]f32 = undefined;
+        const s4 = asFloat(p.scales[group]);
+        const b4 = asFloat(p.biases[group]);
+        var lower: f32 = std.math.inf(f32);
+        var upper: f32 = -std.math.inf(f32);
+        for (0..64) |i| {
+            const code = (p.words[group * 8 + i / 8] >> @as(u5, @intCast(4 * (i % 8)))) & 0xf;
+            v[i] = s4 * @as(f32, @floatFromInt(code)) + b4;
+            lower = @min(lower, v[i]);
+            upper = @max(upper, v[i]);
+        }
+        upper = @max(upper, 0);
+        lower = @min(lower, upper);
+        var bias: f32 = if (@abs(lower) > @abs(upper)) lower else upper;
+        var scale: f32 = @max((upper - lower) / @as(f32, 3), @as(f32, 1e-7));
+        if (bias >= 0) scale = -scale;
+        const zero = @round(bias / scale);
+        if (zero != 0) scale = bias / zero else bias = 0;
+        if (!std.math.isFinite(scale) or scale == 0) return error.NonFiniteAffineRange;
+        scales[group] = asBf16(scale);
+        biases[group] = asBf16(bias);
+        @memset(words[group * 8 ..][0..8], 0);
+        for (v, 0..) |x, index| {
+            const code: u32 = @intFromFloat(@min(@as(f32, 3), @max(@as(f32, 0), @round((x - bias) / scale))));
+            words[group * 8 + index / 8] |= code << @as(u5, @intCast(4 * (index % 8)));
+        }
+    }
+    return .{ .allocator = a, .n = p.n, .k = p.k, .words = words, .scales = scales, .biases = biases };
+}
