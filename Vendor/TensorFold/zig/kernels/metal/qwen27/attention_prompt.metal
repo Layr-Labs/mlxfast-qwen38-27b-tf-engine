@@ -53,20 +53,17 @@ struct Q27PromptRun { q27f8 O[8]; float m0, m1, l0, l1; };
 // One 32-key step at `kt`: S halves summed low first, masked by each row's key count, then softmax and O += PV.
 template <bool EDGE>
 inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const device bfloat* q, const device bfloat* k, const device bfloat* v,
-    threadgroup float (*xs)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
-  q27f8 s0 = 0.0f, s1 = 0.0f;
+    short fm, short fn, int n0, int n1, float scale2) {
+  q27f8 s0 = 0.0f, s1 = 0.0f, t0 = 0.0f, t1 = 0.0f;
   _Pragma("clang loop unroll_count(4)") // whole unrolling hoists every K load ahead of the products and runs slower
   for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
-  _Pragma("clang loop unroll(full)")
-  for (int i = 0; i < 8; i++) { xs[sg][lane][i] = s0[i]; xs[sg][lane][8 + i] = s1[i]; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  _Pragma("clang loop unroll_count(4)")
+  for (int d = 0; d < 8; d++) q27_mma_s(t0, t1, q27_frag<false>(q + PH + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + PH + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + PH + d * 16, PD, fm, fn, kt + 16, kend));
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 8; i++) {
-    const float o0 = xs[sg ^ 1][lane][i], o1 = xs[sg ^ 1][lane][8 + i];
-    s0[i] = h ? o0 + s0[i] : s0[i] + o0;
-    s1[i] = h ? o1 + s1[i] : s1[i] + o1;
+    s0[i] = s0[i] + t0[i];
+    s1[i] = s1[i] + t1[i];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   float x0 = -INFINITY, x1 = -INFINITY;
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 4; i++) {
@@ -116,13 +113,13 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   const int tile = args.tile0 + int(tg.z) * (SG / 2) + (sg >> 1);
   const int hk = int(tg.x), c = int(tg.y);
   const bool live = tile * 16 < args.rp;
-  threadgroup float xs[SG][32][16];
+  if (!live) return;
   const int r0 = tile * 16 + fm, r1 = r0 + 8;
   const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
   const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
   const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.rows);
-  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * PH;
-  const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride + h * PH;
+  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD;
+  const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride;
   const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride + h * PH;
   Q27PromptRun r;
   _Pragma("clang loop unroll(full)")
@@ -132,9 +129,8 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   const int first_row = (args.tile0 + int(tg.z) * (SG / 2)) * 16, last_row = min(args.rows * PG, first_row + (SG / 2) * 16) - 1;
   const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;
-  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
-  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
-  if (!live) return;
+  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, fm, fn, n0, n1, args.scale2);
+  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, fm, fn, n0, n1, args.scale2);
   const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) {
