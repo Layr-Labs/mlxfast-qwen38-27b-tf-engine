@@ -41,7 +41,10 @@ pub const Hook = struct {
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
         }
-        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
+        // decoded rows: the out projection's first code words are read beside the (latency-bound) star scan and gate
+        var ahead = Ahead{ .quant = hook.quant, .out = weight.out };
+        const warmed = warm_out and !hook.accepted_chain and z.tiles == 0 and rows <= 16;
+        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else if (warmed) .{ .ptr = &ahead, .encode = Ahead.encode, .passive = true } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         const xs = frame.get(.sums);
@@ -53,6 +56,19 @@ pub const Hook = struct {
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers) return error.BadGdnHook;
         try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e);
+    }
+};
+
+/// Decoded verify rounds read their out projection's first code words beside the star scan (Kernels.warm).
+pub const warm_out = true;
+
+/// The out projection's code words read ahead (Kernels.warm): it reads only weights and writes only its own sink.
+const Ahead = struct {
+    quant: *Quant,
+    out: Linear,
+    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
+        const a: *Ahead = @ptrCast(@alignCast(ptr));
+        try a.quant.warm(e, a.out);
     }
 };
 

@@ -77,6 +77,51 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// warm's line reader and its private sink (one word a SIMD group, read by nothing).
+    warm_pipeline: ?mtl.Pipeline = null,
+    warm_sink: ?mtl.Buffer = null,
+
+    /// Bytes of a projection's code words `warm` reads ahead of it.
+    pub const warm_bytes: usize = 8 << 20;
+    const warm_groups: usize = 64;
+    const warm_source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\// One word of every 128-byte line of `lines` lines: the lines are fetched into the cache hierarchy while the
+        \\// latency-bound work beside this launch runs. Each SIMD group's sum goes to its own word of `sink`, read by nothing.
+        \\kernel void tf_warm_lines(device const uint* words [[buffer(0)]], device uint* sink [[buffer(1)]],
+        \\                          constant uint& lines [[buffer(2)]], uint gid [[thread_position_in_grid]],
+        \\                          uint grid [[threads_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+        \\                          uint sgs [[simdgroups_per_threadgroup]], uint tg [[threadgroup_position_in_grid]],
+        \\                          uint sl [[thread_index_in_simdgroup]]) {
+        \\  uint s = 0;
+        \\  for (uint i = gid; i < lines; i += grid) s += words[(ulong)i * 32];
+        \\  s = simd_sum(s);
+        \\  if (sl == 0) sink[tg * sgs + sg] = s;
+        \\}
+    ;
+
+    /// Reads the first `warm_bytes` of `w`'s code words one word a 128-byte line, beside latency-bound work, so that the
+    /// projection that follows streams them from the cache. It writes only its own sink, so nothing it runs beside changes.
+    pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, w: projection.Linear) !void {
+        const total = @as(usize, w.n) * w.k * w.bits / 8;
+        const bytes = @min(warm_bytes, total) / 128 * 128;
+        if (bytes == 0) return;
+        if (k.warm_pipeline == null) {
+            const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            const p = try mtl.Pipeline.init(k.device, library, "tf_warm_lines", false);
+            errdefer p.deinit();
+            const sink = try k.device.buffer(warm_groups * 8 * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            k.warm_pipeline = p;
+            k.warm_sink = sink;
+        }
+        e.setPipeline(k.warm_pipeline.?);
+        e.setBuffer(w.words.buffer, w.words.offset, 0);
+        e.setBuffer(k.warm_sink.?, 0, 1);
+        e.setValue(@as(u32, @intCast(bytes / 128)), 2);
+        e.dispatchGroups(mtl.Size.of(warm_groups, 1, 1), mtl.Size.of(256, 1, 1));
+    }
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -104,6 +149,8 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.warm_pipeline) |p| p.deinit();
+        if (k.warm_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
