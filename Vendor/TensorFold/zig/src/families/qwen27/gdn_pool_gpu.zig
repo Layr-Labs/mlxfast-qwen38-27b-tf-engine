@@ -242,7 +242,7 @@ pub const Pool = struct {
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
-        prepared.gate(gate.encoder, pool.kernels.post_rows);
+        if (prompt) prepared.gatePrompt(gate.encoder, pool.kernels.post_rows16, pool.kernels.post_rows) else prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);

@@ -259,7 +259,8 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        // two simdgroups a threadgroup: twice the groups, so the cores' shares of them come out more even
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 2, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
@@ -310,6 +311,25 @@ pub const Round = struct {
             e.setValue(@as(u32, 0), 8);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
+        e.barrier();
+    }
+    /// gate for a prompt chain on `rows16` (tf_delta_gdn_post_rows16: post_rows' words and group sums, 16 rows a group of
+    /// 128); shapes post_rows does not take keep `gate`.
+    pub fn gatePrompt(r: Round, e: metal.ComputeEncoder, rows16: metal.Pipeline, post_rows: metal.Pipeline) void {
+        if (!r.gateRows()) return r.gate(e, post_rows);
+        e.setPipeline(rows16);
+        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
+        e.setValue(r.p, 3);
+        r.b.output.bind(e, 4);
+        if (r.sums) |w| {
+            w.span.bind(e, 5);
+            e.setValue(w.stride, 6);
+            w.written.* = true;
+        } else {
+            r.b.output.bind(e, 5); // never read: a zero stride writes no sums
+            e.setValue(@as(u32, 0), 6);
+        }
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128 });
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
