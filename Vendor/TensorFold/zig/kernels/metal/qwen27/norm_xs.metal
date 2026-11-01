@@ -12,6 +12,8 @@ typedef half float16_t;
   device bfloat16_t* HO [[buffer(5)]],
   device bfloat16_t* XO [[buffer(6)]],
   device float* XS [[buffer(7)]],
+  device atomic_uint* NC [[buffer(8)]],
+  constant uint& wait_for [[buffer(9)]],
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -27,6 +29,22 @@ Q27_SPECIALIZE
   if (int(m) >= M) {
     if ((t & 3) == 0) XS[(t >> 2) * MP + m] = 0.0f;
     return;
+  }
+  // wait_for above 0: this norm shares its barrier interval with the projection that writes R, whose threadgroups count
+  // themselves on NC[0] past a device-scope fence; a row's threadgroup reads R once the count reaches wait_for (bounded),
+  // past its own fence, and the last row's threadgroup leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    threadgroup uint arrived;
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      arrived = atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed);
+      if (arrived + 1u == uint(M)) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   const int base = int(m) * K + int(t) * E;
   float hv[E];
