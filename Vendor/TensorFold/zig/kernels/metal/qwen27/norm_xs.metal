@@ -26,10 +26,12 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  if (int(m) >= M) {
-    if ((t & 3) == 0) XS[(t >> 2) * MP + m] = 0.0f;
-    return;
+  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  if (int(m) == 0) {
+    const int pad = MP - M;
+    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  if (int(m) >= M) return;
   // wait_for above 0: this norm shares its barrier interval with the projection that writes R, whose threadgroups count
   // themselves on NC[0] past a device-scope fence; a row's threadgroup reads R once the count reaches wait_for (bounded),
   // past its own fence, and the last row's threadgroup leaves both words zero for the next pair
@@ -47,15 +49,32 @@ Q27_SPECIALIZE
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   const int base = int(m) * K + int(t) * E;
+  // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
+  // words start 32 bytes apart): HO, XO and XS may alias H, R and Wt as far as the compiler knows, so the scalar loop's
+  // loads each waited for the store before them. The arithmetic is that loop's, word for word and in the same order.
+  bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 hw = ((const device uint4*)(H + base))[j], rw = ((const device uint4*)(R + base))[j];
+    h4[2 * j] = as_type<bfloat4>(hw.xy);
+    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
+    r4[2 * j] = as_type<bfloat4>(rw.xy);
+    r4[2 * j + 1] = as_type<bfloat4>(rw.zw);
+  }
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 ww = ((const device uint4*)(Wt + int(t) * E))[j];
+    w4[2 * j] = as_type<bfloat4>(ww.xy);
+    w4[2 * j + 1] = as_type<bfloat4>(ww.zw);
+  }
   float hv[E];
+  bfloat4 o4[E / 4];
   float ss = 0.0f;
   for (int i = 0; i < E; i++) {
-    bfloat h = H[base + i];
-    h = bfloat(float(h) + float(R[base + i]));
-HO[base + i] = h;
+    const bfloat h = bfloat(float(h4[i / 4][i % 4]) + float(r4[i / 4][i % 4]));
+    o4[i / 4][i % 4] = h;
     hv[i] = float(h);
     ss = fma(hv[i], hv[i], ss);
   }
+  for (int j = 0; j < E / 8; j++) ((device uint4*)(HO + base))[j] = uint4(as_type<uint2>(o4[2 * j]), as_type<uint2>(o4[2 * j + 1]));
   ss = simd_sum(ss);
   if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -63,11 +82,13 @@ HO[base + i] = h;
   for (int i = 0; i < TPG / 32; i++) total += red[i];
   const float inv = metal::rsqrt(total / float(K) + eps[0]);
   float xv[E];
+  bfloat4 x4[E / 4];
   for (int i = 0; i < E; i++) {
-    const bfloat x = bfloat(float(Wt[int(t) * E + i]) * (hv[i] * inv));
-    XO[base + i] = x;
+    const bfloat x = bfloat(float(w4[i / 4][i % 4]) * (hv[i] * inv));
+    x4[i / 4][i % 4] = x;
     xv[i] = float(x);
   }
+  for (int j = 0; j < E / 8; j++) ((device uint4*)(XO + base))[j] = uint4(as_type<uint2>(x4[2 * j]), as_type<uint2>(x4[2 * j + 1]));
   // a group's 64 values summed in order from zero, as the lane projection's sums are: its four threads take turns
   float gs = 0.0f;
   for (uint turn = 0; turn < 4; turn++) {
