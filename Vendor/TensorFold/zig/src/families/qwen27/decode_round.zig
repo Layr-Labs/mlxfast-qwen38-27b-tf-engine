@@ -5,7 +5,7 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+const commit_every = 16;
 /// Layers a verify encodes before its first commit: the idle GPU starts after two layers' encode.
 const first_commit = 2;
 const wts = @import("gpu_weights.zig");
