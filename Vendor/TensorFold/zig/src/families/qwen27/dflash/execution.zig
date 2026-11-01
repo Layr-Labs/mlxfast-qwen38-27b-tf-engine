@@ -169,6 +169,7 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         const normed_keys = try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
         const query = try rotate(ops, frame, normed_query, positions[0..rows], c.heads, c);
         const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
+        if (ops.vtable.part) |pf| try pf(ops.ptr);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);

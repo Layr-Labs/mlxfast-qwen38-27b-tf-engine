@@ -85,6 +85,8 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        // between two layers: commit what is encoded so far so the GPU starts while the host encodes the rest
+        part: ?*const fn (*anyopaque) anyerror!void = null,
     };
 };
 
