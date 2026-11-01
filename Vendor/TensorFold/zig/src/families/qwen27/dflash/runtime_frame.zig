@@ -94,6 +94,15 @@ pub const Frame = struct {
     epoch: u64 = 0,
     active: bool = false,
     completed: bool = false,
+    /// The last command buffer is committed (commitLast); the frame completes at waitLast.
+    committed: bool = false,
+    /// An early frame (runtime_model.prepareNext), encoded and committed behind a verify inside its autorelease pool:
+    /// one command buffer, retained until the frame completes or is released, its bridge spin launched by launchBridge
+    /// behind work committed after it. (On an M4, a command buffer committed behind one that has not started yet starts
+    /// only once that one ends: work committed after the frame starts runs beside it, work committed before it does not.)
+    early: bool = false,
+    /// The bridge's spin is due behind the frame (launchBridge).
+    bridge_due: bool = false,
     cb: mtl.CommandBuffer = undefined,
     encoder: mtl.ComputeEncoder = undefined,
     external: ?Entry = null,
@@ -160,30 +169,47 @@ pub const Frame = struct {
         if (bad) return error.DraftGpuFailure;
     }
     pub fn begin(f: *Frame) !u64 {
+        return f.beginEarly(false);
+    }
+    /// begin, an `early` frame (see Frame.early) when asked.
+    pub fn beginEarly(f: *Frame, early: bool) !u64 {
         if (f.active or f.epoch >= 0x7fffffff) return error.DraftFrameBusy;
         try f.checkUnchecked();
         f.epoch += 1;
         if (f.external_epoch != f.epoch) f.external = null;
         f.cursor = 0;
         f.entries.clearRetainingCapacity();
-        f.cb = f.queue.commandBuffer();
+        f.early = early;
+        f.bridge_due = false;
+        f.cb = f.open();
         f.encoder = f.cb.compute(.concurrent);
         f.active = true;
         f.completed = false;
+        f.committed = false;
         f.part_count = 0;
         f.ops = 0;
         return f.epoch;
     }
+    fn open(f: *Frame) mtl.CommandBuffer {
+        const cb = f.queue.commandBuffer();
+        return if (f.early) cb.retain() else cb;
+    }
+    /// Ends an early frame's hold on its command buffers.
+    fn drop(f: *Frame) void {
+        if (!f.early) return;
+        for (f.parts[0..f.part_count]) |cb| cb.release();
+        f.cb.release();
+    }
     /// Commits the work so far and opens the next buffer behind a fence, so the GPU starts early; between ops only.
     pub fn part(f: *Frame) !void {
-        if (!f.active or f.completed or f.part_count == f.parts.len) return;
+        if (!f.active or f.completed or f.committed or f.early or f.part_count == f.parts.len) return;
         if (f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
         mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
         f.encoder.end();
         f.cb.commit();
         f.parts[f.part_count] = f.cb;
         f.part_count += 1;
-        f.cb = f.queue.commandBuffer();
+        f.cb = f.open();
         f.encoder = f.cb.compute(.concurrent);
         mtl.objc.msg(void, f.encoder.id, "waitForFence:", .{f.fence.?});
     }
@@ -200,7 +226,13 @@ pub const Frame = struct {
         if (f.bridge) |*b| b.end(e);
     }
     fn finishWith(f: *Frame, bridged: bool) !void {
-        if (!f.active or f.completed) return error.DraftFrameNotActive;
+        try f.commitLast(bridged);
+        return f.waitLast();
+    }
+    /// Ends and commits the frame's last command buffer, the bridge's spin behind it when `bridged` (an early frame's at
+    /// launchBridge), without a wait: waitLast returns once the GPU reaches its end. Nothing more is encoded into the frame.
+    pub fn commitLast(f: *Frame, bridged: bool) !void {
+        if (!f.active or f.completed or f.committed) return error.DraftFrameNotActive;
         if (bridged and f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
         if (bridged) mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
         f.encoder.end();
@@ -210,7 +242,19 @@ pub const Frame = struct {
             f.cb.signal(ev, f.poll_value);
         }
         f.cb.commit();
-        if (bridged) f.bridge.?.launch(f.queue, f.fence.?);
+        f.committed = true;
+        f.bridge_due = bridged;
+        if (!f.early) f.launchBridge();
+    }
+    /// The bridge's spin behind a committed frame, if it is due.
+    pub fn launchBridge(f: *Frame) void {
+        if (!f.active or !f.committed or !f.bridge_due) return;
+        f.bridge_due = false;
+        f.bridge.?.launch(f.queue, f.fence.?);
+    }
+    /// After commitLast: returns once the GPU reached the frame's last command (its buffers are checked at the next begin).
+    pub fn waitLast(f: *Frame) !void {
+        if (!f.active or f.completed or !f.committed) return error.DraftFrameNotActive;
         // the frame's tokens gate the next verify's encode: return once the GPU reaches the frame's last command
         if (f.poll_event) |ev| {
             while (ev.value() < f.poll_value and f.cb.status() != .@"error") std.atomic.spinLoopHint();
@@ -221,6 +265,7 @@ pub const Frame = struct {
                 }
                 f.unchecked[f.n_unchecked] = f.cb.retain();
                 f.n_unchecked += 1;
+                f.drop();
                 f.completed = true;
                 return;
             }
@@ -232,6 +277,7 @@ pub const Frame = struct {
         };
         f.cb.wait();
         f.completed = true;
+        defer f.drop();
         for (f.parts[0..f.part_count]) |cb| {
             cb.wait();
             if (failed(cb)) return error.DraftGpuFailure;
@@ -240,18 +286,21 @@ pub const Frame = struct {
     }
     pub fn release(f: *Frame) void {
         if (f.active and !f.completed) {
-            f.encoder.end();
-            // an abandoned frame's buffer still goes to the queue: one left uncommitted holds a queue slot for good, and
-            // enough of them block every later commandBuffer() (a hang, not an error). The caller fails the backend.
-            f.cb.commit();
+            if (!f.committed) {
+                f.encoder.end();
+                // an abandoned frame's buffer still goes to the queue: one left uncommitted holds a queue slot for good,
+                // and enough of them block every later commandBuffer() (a hang, not an error). The caller fails the backend.
+                f.cb.commit();
+            }
             f.cb.wait();
             for (f.parts[0..f.part_count]) |cb| cb.wait(); // committed parts still use the pool
+            f.drop();
         }
         f.active = false;
         f.external = null;
     }
     pub fn require(f: *const Frame, epoch: u64) !void {
-        if (!f.active or f.completed or f.epoch != epoch) return error.DraftFrameNotActive;
+        if (!f.active or f.completed or f.committed or f.epoch != epoch) return error.DraftFrameNotActive;
     }
     pub fn add(f: *Frame, r: Ref, rows: u32, width: u32, stride: u32, dtype: @import("../checkpoint.zig").DType) !op.View {
         const view = op.View{ .handle = (f.epoch << 32) | (f.entries.items.len + 1), .rows = rows, .width = width, .stride = stride, .dtype = dtype };
@@ -262,7 +311,7 @@ pub const Frame = struct {
         return view;
     }
     pub fn alloc(f: *Frame, rows: u32, width: u32, dtype: @import("../checkpoint.zig").DType) !op.View {
-        if (!f.active or f.completed or rows == 0 or width == 0) return error.DraftFrameNotActive;
+        if (!f.active or f.completed or f.committed or rows == 0 or width == 0) return error.DraftFrameNotActive;
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), dtype.size());
         // Each slot keeps less than 64 KiB of spare scratch as context scores grow across rounds.
         const reserved = (try std.math.add(usize, bytes, 65535)) & ~@as(usize, 65535);

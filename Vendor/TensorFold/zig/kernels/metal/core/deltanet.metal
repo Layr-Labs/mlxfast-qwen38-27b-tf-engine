@@ -203,10 +203,35 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
+                        device atomic_uint* PC [[buffer(17)]],
+                        constant uint& count_out [[buffer(18)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
+    }
+  }
 }
 
 // tf_delta_gdn_pre_body<4, true> over 4 simdgroups a head; each lane's 4 squares summed in order before simd_sum.
@@ -620,35 +645,61 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device bfloat* output [[buffer(4)]],
                          device float* sums [[buffer(5)]],
                          constant uint& sums_stride [[buffer(6)]],
+                         device atomic_uint* NC [[buffer(7)]],
+                         constant uint& wait_for [[buffer(8)]],
+                         device atomic_uint* GC [[buffer(9)]],
+                         constant uint& count_out [[buffer(10)]],
                          uint3 group [[threadgroup_position_in_grid]],
+                         uint3 groups [[threadgroups_per_grid]],
+                         uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   const uint row = group.z * 4 + sg, head = group.y;
-  if (row >= p.rows || p.dv != 128) return;
-  const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
-  const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
-  float values[4];
-  float square = 0.0f;
-  for (uint part = 0; part < 4; ++part) {
-    values[part] = float(x[part]);
-    square += values[part] * values[part];
+  if (row < p.rows && p.dv == 128) {
+    const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+    const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
+    float values[4];
+    float square = 0.0f;
+    for (uint part = 0; part < 4; ++part) {
+      values[part] = float(x[part]);
+      square += values[part] * values[part];
+    }
+    square = simd_sum(square);
+    const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+    bfloat4 y;
+    for (uint part = 0; part < 4; ++part) {
+      const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
+      const float z = float(z4[part]);
+      y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    }
+    *(device bfloat4*)(output + at) = y;
+    if (sums_stride != 0) {
+      simdgroup_barrier(mem_flags::mem_device);
+      if ((lane & 15) == 0) {
+        const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
+        float acc = 0.0f;
+        for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
+        sums[g * int(sums_stride) + int(row)] = acc;
+      }
+    }
   }
-  square = simd_sum(square);
-  const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
-  bfloat4 y;
-  for (uint part = 0; part < 4; ++part) {
-    const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
-    const float z = float(z4[part]);
-    y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
-  }
-  *(device bfloat4*)(output + at) = y;
-  if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
-    if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
-      sums[g * int(sums_stride) + int(row)] = acc;
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&GC[0], 1u, memory_order_relaxed);
     }
   }
 }

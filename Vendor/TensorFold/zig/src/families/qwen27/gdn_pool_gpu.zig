@@ -64,6 +64,10 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero.
+    scan_words: ?metal.Buffer = null,
+    /// The decoded prepare's count and its waiting star scan's arrivals (gdn.Round.prepareRowsAfter), left zero.
+    prep_words: ?metal.Buffer = null,
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -78,7 +82,12 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        errdefer scan_words.deinit();
+        @memset(scan_words.contents()[0..8], 0);
+        const prep_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(prep_words.contents()[0..8], 0);
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words, .prep_words = prep_words };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -99,6 +108,8 @@ pub const Pool = struct {
         pool.releaseBefore();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
+        if (pool.scan_words) |b| b.deinit();
+        if (pool.prep_words) |b| b.deinit();
     }
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
@@ -151,16 +162,36 @@ pub const Pool = struct {
     }
 
     /// `beside`: encoded beside the scan, before the barrier that ends it.
+    /// The counted projections a decoded prepare waits on in its barrier interval (Kernels.quantCounted).
+    pub const After = struct { counter: metal.Buffer, wait: u32 };
+
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
+        _ = try pool.forwardAfter(layer, plan, refs, e, beside, null, null);
+    }
+
+    /// `publish` (with `after`, two words the reader leaves zero): a counted star's gate counts its threadgroups there and
+    /// no barrier follows it; returns that count for the out projection that waits on it (0: a barrier follows the gate).
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, publish: ?metal.Buffer) !u32 {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
         try plan.metadata.upload(plan.host);
+        const star = prepared.star and prepared.usesSlots();
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // decoded verify rows on a star: the prepare counts its threadgroups and the scan waits on them in one interval
+        var prep: ?gdn.Wait = null;
+        if (after) |a| {
+            const words = if (star) pool.prep_words else null;
+            const n = try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait, words);
+            if (words) |w| prep = .{ .counter = w, .wait = n };
+        } else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        var published: u32 = 0;
+        if (star) {
+            published = try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, prep, if (after != null) publish else null);
+        } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
+        return published;
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
