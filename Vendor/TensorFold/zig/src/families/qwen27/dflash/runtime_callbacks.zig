@@ -59,6 +59,14 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         s.encodeArgs(e, call, t.matrix(), input.buf, input.off, output.buf, output.off, if (b.admitting()) try simdArgs(b, t, call) else null);
     } else {
         const key = @intFromPtr(w.bytes.ptr);
+        if (!readsQ4Copy(b, x.rows)) if (b.fusion_factors) |factors| {
+            if (key == factors.key) {
+                const mid = try b.frame.alloc(x.rows, @import("fusion_factors.zig").rank, .bf16);
+                try encodePrepared(b, e, x, mid, factors.right);
+                try encodePrepared(b, e, mid, y, factors.left);
+                return y;
+            }
+        };
         const adapter = (if (readsQ4Copy(b, x.rows)) b.prepared.get(key | Backend.precise_key) else null) orelse b.prepared.get(key) orelse return error.DraftPreparationUnqualified;
         try encodePrepared(b, e, x, y, adapter);
         return y;

@@ -174,6 +174,7 @@ pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.Co
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
 
 pub const Backend = struct {
+    fusion_factors: ?@import("fusion_factors.zig").Factors = null,
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
     target: *Target,
@@ -247,6 +248,7 @@ pub const Backend = struct {
     }
 
     pub fn deinit(b: *Backend) void {
+        if (b.fusion_factors) |*factors| factors.deinit();
         b.setResident(null);
         b.frame.deinit();
         var prepared = b.prepared.valueIterator();
@@ -305,6 +307,10 @@ pub const Backend = struct {
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
         const bits: u8 = if (order != null) draftBits(name) else 4;
+        if (bits == 2 and std.mem.eql(u8, name, "fc.weight") and shape[0] == 5120 and shape[1] == 25600) {
+            if (b.fusion_factors != null) return error.DraftTensorCoverage;
+            b.fusion_factors = try @import("fusion_factors.zig").Factors.init(b.allocator, b.target.device, order.?, key, rows, shape[0], shape[1]);
+        }
         var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
         defer prepared_words.deinit();
         if (b.stash) |st| if (shortName(name)) |short| {
