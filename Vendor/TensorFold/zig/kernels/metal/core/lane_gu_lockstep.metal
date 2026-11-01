@@ -1,6 +1,10 @@
 // K64 lockstep G/U scheduler for the guarded decoded indexed GU path. Same two SGs, original split chains and register activation.
 [[max_total_threads_per_threadgroup(64)]]
-kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
+kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],
+#if defined(TF_GU_COUNT)
+ device atomic_uint* GC [[buffer(7)]],
+#endif
+ uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
  const int gt=2*int(tg.x)+ks,ut=gt+TF_N/64,gn=gt*32,un=ut*32;
  const int nb=4*(lane&1)+8*((lane>>3)&1),mb=((lane>>1)&3)+4*((lane>>4)&1);
@@ -85,4 +89,10 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  threadgroup_barrier(mem_flags::mem_threadgroup);
  const int t=ks*32+lane;
  for(int m=t;m<stride;m+=64){float acc=0.0f;if(m<M)for(int i=0;i<64;i++)acc+=float(hb[m*64+i]);HS[int(tg.x)*stride+m]=acc;}
+#if defined(TF_GU_COUNT)
+ // the MLP down that reads Y and HS shares this launch's barrier interval: each threadgroup counts itself on GC[0] once its
+ // stores are past a device-scope fence (tf_lane_reg's TF_WAIT)
+ threadgroup_barrier(mem_flags::mem_device);
+ if(t==0){atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);atomic_fetch_add_explicit(GC,1u,memory_order_relaxed);}
+#endif
 }
