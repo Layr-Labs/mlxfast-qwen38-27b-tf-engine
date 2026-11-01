@@ -224,7 +224,7 @@ pub const Pool = struct {
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
-        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 8 == 0;
+        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 16 == 0;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
