@@ -43,6 +43,7 @@ pub const Session = struct {
     pub fn fingerprint(s: Session) ![32]u8 {
         const r = s.runner;
         if (r.active != null or r.failed or r.offsets[0] == 0) return error.RoundNotReady;
+        try r.settleGdn(); // deferred rows land in the committed states first
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(std.mem.asBytes(&r.offsets[0]));
         for (0..r.gdn.budget.layers) |layer| {
