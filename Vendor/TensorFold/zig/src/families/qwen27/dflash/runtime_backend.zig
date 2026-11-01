@@ -171,6 +171,8 @@ pub const RoundArgs = extern struct {
 /// First in a frame encoded early (Model.prepareNext): waits for the verify's result and writes block 0 of `args`.
 pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
 
+pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
+
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -192,10 +194,20 @@ pub const Backend = struct {
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
     input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
+    /// A conv with a residual held back for the norm that reads its output (one launch for both); the next launch of
+    /// anything else encodes it first, on its own.
+    held_conv: ?struct { x: op.View, p: op.Conv, y: op.View } = null,
+    /// Per-head norms held back for the ropes that read their outputs (one launch for each pair); any other launch
+    /// encodes them first, on their own.
+    held_norms: [8]?HeldNorm = @splat(null),
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
+    /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
+    /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
+    precise: bool = false,
+    precise_count: usize = 0,
     hazards: Hazards = .{},
     /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
@@ -204,8 +216,6 @@ pub const Backend = struct {
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
-    /// An append's step is being encoded (Ops.append_steps): the dispatches between them may be a block's.
-    appending: bool = false,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -287,8 +297,10 @@ pub const Backend = struct {
         };
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
-        if ((if (units) b.prepared.count() - b.fused_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+        if ((if (units) b.prepared.count() - b.fused_count - b.precise_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
     }
+    /// The key bit of a linear's q4 copy beside its copy below 4 bits (no tensor address reaches it).
+    pub const precise_key: usize = 1 << 62;
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
@@ -307,6 +319,23 @@ pub const Backend = struct {
         if (order) |o| {
             const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
+            // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
+            if (bits != 4) {
+                var q4 = try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], 4, 64);
+                defer q4.deinit();
+                if (b.stash) |st| if (shortName(name)) |short| {
+                    const layer = layerOf(name) orelse return error.DraftTensorCoverage;
+                    var buf: [16]u8 = undefined;
+                    const id = try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, std.ascii.toUpper(short[0]) });
+                    const owned = try b.allocator.dupe(u8, id);
+                    errdefer b.allocator.free(owned);
+                    const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
+                    try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
+                };
+                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
+                b.precise_count += 1;
+            }
         } else {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
@@ -385,6 +414,13 @@ pub const Backend = struct {
             try b.fuse(order, st, layer, "kv", 'k', group_kv);
             try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
             try b.fuse(order, st, layer, "gu", 'g', group_gu);
+            // the q4 copies' gate/up group of a layer drafted below 4 bits (stashed as G and U)
+            const before = b.fused_count;
+            try b.fuse(order, st, layer, "GU", 'G', group_gu);
+            if (b.fused_count != before) {
+                b.fused_count -= 1;
+                b.precise_count += 1;
+            }
         }
     }
     /// The draft's linears: its rank-2 weights, which q4 drafts read only through their prepared copies.
@@ -424,7 +460,64 @@ pub const Backend = struct {
             try b.frame.part();
             if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
         }
+        try b.flushHeld(true);
         return b.frame.encoder;
+    }
+    /// `encoder` for a launch that takes or holds a per-head norm: the other held norms stay held.
+    pub fn encoderHolding(b: *Backend, epoch: u64) !mtl.ComputeEncoder {
+        if (b.failed) return error.DraftBackendFailed;
+        try b.frame.require(epoch);
+        b.frame.ops += 1;
+        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) {
+            const parts = b.frame.part_count;
+            try b.frame.part();
+            if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
+        }
+        try b.flushHeld(false);
+        return b.frame.encoder;
+    }
+    /// Encodes the held conv (and with `norms` the held norms) on their own.
+    fn flushHeld(b: *Backend, norms: bool) !void {
+        if (b.held_conv) |h| {
+            b.held_conv = null;
+            try b.encodeConv(b.frame.encoder, h.x, h.p, h.y);
+        }
+        if (!norms) return;
+        for (&b.held_norms) |*slot| {
+            if (slot.*) |h| {
+                slot.* = null;
+                try b.encodeNorm(b.frame.encoder, h.x, h.p, h.y);
+            }
+        }
+    }
+    /// The held norm whose output is `x`, for `heads` heads of `dim`, taken out of its slot.
+    pub fn takeHeldNorm(b: *Backend, x: op.View, heads: u32, dim: u32) ?HeldNorm {
+        for (&b.held_norms) |*slot| {
+            if (slot.*) |h| {
+                if (h.p.heads == heads and h.p.head_dim == dim and std.meta.eql(h.y, x)) {
+                    slot.* = null;
+                    return h;
+                }
+            }
+        }
+        return null;
+    }
+    /// A free held-norm slot.
+    pub fn heldNormSlot(b: *Backend) ?*?HeldNorm {
+        for (&b.held_norms) |*slot| {
+            if (slot.* == null) return slot;
+        }
+        return null;
+    }
+    /// The norm launch of `x` into `y` (tf_draft_rms).
+    pub fn encodeNorm(b: *Backend, e: mtl.ComputeEncoder, x: op.View, p: op.Norm, y: op.View) !void {
+        b.access(e, &.{try b.span(x)}, &.{try b.span(y)});
+        try b.primitives.norm(e, try b.frame.ref(x), try b.weight(p.weight), try b.frame.ref(y), .{ .rows = x.rows, .heads = p.heads, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
+    }
+    /// The conv launch of `x` into `y` (tf_dynamic_conv2).
+    pub fn encodeConv(b: *Backend, e: mtl.ComputeEncoder, x: op.View, p: op.Conv, y: op.View) !void {
+        if (p.residual) |r| b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(r) }, &.{try b.span(y)}) else b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{try b.span(y)});
+        try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
     }
     /// A frame view's bytes, for hazard tracking.
     pub fn span(b: *Backend, v: op.View) !Span {
@@ -442,7 +535,7 @@ pub const Backend = struct {
     }
     /// The frame is an early one's append: its taps' count is the verify's, read from `args`.
     pub fn admitting(b: *const Backend) bool {
-        return b.early != null and b.transaction != null and b.appending;
+        return b.early != null and b.transaction != null;
     }
     pub fn copy(b: *Backend, e: mtl.ComputeEncoder, x: Ref, y: Ref, rows: u32, width: u32, stride: u32) !void {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });

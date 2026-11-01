@@ -89,9 +89,6 @@ pub const Ops = struct {
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
         lattice_end: ?*const fn (*anyopaque, u64, Head, View, View, Config) anyerror!Lattice = null,
-        // what is encoded between this call with true and the one with false is a transaction's append (an early frame
-        // reads the admitted rows' launch words for it); a block's stages may be encoded between an append's steps
-        append_steps: ?*const fn (*anyopaque, bool) void = null,
     };
 };
 

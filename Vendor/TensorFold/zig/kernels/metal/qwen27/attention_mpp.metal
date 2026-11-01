@@ -29,11 +29,10 @@ inline void q27_count(device atomic_uint* NC, ushort tid) {
   }
 }
 
-// SG tiles a threadgroup, a simdgroup pair each: both run scores and softmax, one owns each half of the head dim.
 // count_out above 0: the tail behind it shares its barrier interval and waits on PC[0], which every group counts.
 // wait_for above 0: the counted decoded preprocess (q27_head_norm_rope_decoded) shares this launch's barrier interval and
 // every group waits on WC[0] before it reads the packed query or the round's cached keys.
-template <int SG>
+template <int SG, int PARTS = 2>
 kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* tile_stream [[buffer(4)]],
     device float* PO [[buffer(5)]], device float* PM [[buffer(6)]], device float* PL [[buffer(7)]], device const int* nodes [[buffer(8)]],
@@ -42,11 +41,12 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+  constexpr int OD = D / PARTS, OE = 16 * OD / 32;
   if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   const ushort lane = thread_index_in_simdgroup;
   const ushort sg = simdgroup_index_in_threadgroup;
-  const int tile = int(threadgroup_position_in_grid.z) * SG + (sg >> 1);
-  const bool hi = sg & 1;
+  const int tile = int(threadgroup_position_in_grid.z) * SG + (sg / PARTS);
+  const int part = sg % PARTS;
   const uint hk = threadgroup_position_in_grid.x;
   const uint c = threadgroup_position_in_grid.y;
   const int NCH = meta[1], SGA = meta[2];
@@ -77,13 +77,13 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV((device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8], dextents<int32_t, 2>(D, L), array<int32_t, 2>({1, D}));
   tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tP(myP, dextents<int32_t, 2>(TK, 16));
   constexpr auto dS = matmul2d_descriptor(16, TK, D, false, true, false, matmul2d_descriptor::mode::multiply);
-  constexpr auto dO = matmul2d_descriptor(16, 128, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto dO = matmul2d_descriptor(16, OD, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<dS, execution_simdgroup> opS;
   matmul2d<dO, execution_simdgroup> opO;
   auto aQ = tQ.slice(0, tile * 16);
   auto bV0 = tV.slice(0, 0);
   auto O = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(bV0), float>();
-  for (int i = 0; i < 64; i++) O[i] = 0.0f;
+  for (int i = 0; i < OE; i++) O[i] = 0.0f;
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
   // two chunk widths only in a window across fine_until: a pass a width, the other's rows masked and left unchanged
   for (int w = wa;; w = wb) {
@@ -120,20 +120,20 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
     auto Pc = opS.template get_destination_cooperative_tensor<decltype(aQ), decltype(bK), half>();
     for (int i = 0; i < TK / 2; i++) Pc[i] = half(p[i]);
     auto Pin = opO.template get_left_input_cooperative_tensor<half, bfloat, float>(Pc);
-    for (int i = 0; i < 64; i++) O[i] *= (i & 4) ? f1 : f0;
-    auto bV = tV.slice(hi ? 128 : 0, kt);
+    for (int i = 0; i < OE; i++) O[i] *= (i & 4) ? f1 : f0;
+    auto bV = tV.slice(part * OD, kt);
     opO.run(Pin, bV, O);
   }
   if (w == wb) break;
   }
   const int64_t base = ((int64_t)hk * NCH + c) * RP;
   // rows past the stream's last query row are padding that nothing reads
-  for (int q = 0; q < 16; q++) {
+  for (int q = 0; q < OE / 4; q++) {
     if ((q & 1) ? q1 >= G * NQ : q0 >= G * NQ) continue;
-    device float* dst = PO + (base + tile * 16 + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
+    device float* dst = PO + (base + tile * 16 + fm + (q & 1) * 8) * D + (part * OD) + (q >> 1) * 16 + fn;
     *(device float4*)dst = float4(O[4 * q], O[4 * q + 1], O[4 * q + 2], O[4 * q + 3]);
   }
-  if (!hi && (lane & 9) == 0) {
+  if (part == 0 && (lane & 9) == 0) {
     if (q0 < G * NQ) { PM[base + r0] = m0; PL[base + r0] = l0; }
     if (q1 < G * NQ) { PM[base + r1] = m1; PL[base + r1] = l1; }
   }
@@ -157,6 +157,7 @@ Q27_PREFIX(13)
 Q27_PREFIX(14)
 Q27_PREFIX(15)
 Q27_PREFIX(16)
+template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 
 kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
@@ -316,7 +317,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
   const int NCBS = meta[MG + st * MS + 5];
   const int ra = meta[MG + st * MS + 3] * 16 + (int(r) / G - meta[MG + st * MS + 6]) * G + int(r) % G;
   const int CT = nodes[NW * (int(r) / G) + 3]; // the row's own prefix chunks
-  constexpr int DP = D / 32, MB = 8;
+  constexpr int DP = D / 32, MB = 2;
   const int node = r / G, g = r % G;
   float m = -INFINITY, l = 0.0f, o[DP];
   for (int i = 0; i < DP; i++) o[i] = 0.0f;
@@ -426,8 +427,8 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   constexpr auto dO = matmul2d_descriptor(16, 128, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<dS, execution_simdgroup> opS;
   matmul2d<dO, execution_simdgroup> opO;
-  auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
-  for (int i = 0; i < 64; i++) Olo[i] = 0.0f;
+  float saved[32];
+  for (int i = 0; i < 32; i++) saved[i] = 0.0f;
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
   const int c0 = PT / CK;
   const int c = c0 + int(cb);
@@ -439,7 +440,7 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
       const int row = fm + (q & 1) * 8;
       if (row >= G) continue;
       const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
-      for (int j = 0; j < 4; j++) Olo[4 * q + j] = src[(hi ? 128 : 0) + j];
+      for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
     }
     if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
     if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
@@ -492,7 +493,7 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
         myP[fm * TK + f * 16 + fn + i] = half(p[f * 8 + i]);
         myP[(fm + 8) * TK + f * 16 + fn + i] = half(p[f * 8 + 4 + i]);
       }
-    for (int i = 0; i < 64; i++) { const float f = (i & 4) ? f1 : f0; Olo[i] *= f; }
+    for (int i = 0; i < 32; i++) saved[i] *= f0;
     }
     for (int hv = int(hi); hv < int(hi) + 1; hv++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -506,7 +507,12 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sg == 0) {
+        auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
         opO.run(tP, tVh, Olo);
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
       }
     }
   }
@@ -514,7 +520,7 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
     for (int q = 0; q < 16; q++) {
       device float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
-      *(device float4*)dst = float4(Olo[4 * q], Olo[4 * q + 1], Olo[4 * q + 2], Olo[4 * q + 3]);
+      *(device float4*)dst = (q & 1) ? float4(0.0f) : float4(saved[4 * (q >> 1)], saved[4 * (q >> 1) + 1], saved[4 * (q >> 1) + 2], saved[4 * (q >> 1) + 3]);
     }
     if (!hi && (lane & 9) == 0) {
       PM[base + r0] = m0; PL[base + r0] = l0;
