@@ -90,8 +90,8 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..8], 0);
+        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..16], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -108,6 +108,10 @@ pub const Pool = struct {
         return buffers;
     }
 
+    /// Called after completed target GPU work, before picks or state acceptance.
+    pub fn checkCounted(pool: *const Pool) !void {
+        if (pool.scan_words) |words| try @import("counted_norm_status.zig").checkBank(words.slice(u32, 4));
+    }
     pub fn deinit(pool: *Pool) void {
         pool.setResident(null);
         pool.releaseBefore();
@@ -318,6 +322,26 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// commitConvKeep for every layer of a lone keep in one launch (tf_delta_gdn_conv_keep_layers), unfenced: each layer's
+    /// history and projection spans are a fixed share of the pool's buffers (layerSpan).
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host) or plan.host.keeps.len != 1) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const spans = abi.ConvLayers{ .history_words = @intCast(history.length() / pool.budget.layers / 2), .projection_words = @intCast(projections.length() / pool.budget.layers / 2) };
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(spans, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = pool.budget.layers }, .{ .width = 256 }); // a channel a thread, a layer a row
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,

@@ -218,8 +218,8 @@ pub const Attention = struct {
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
-    /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
-    /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
+    /// The counted decoded chain's words: [0..4) the prefix record, [4..8) the split
+    /// tail record, [8..12) the decoded preprocess record; every record holds count, arrivals, sticky failure and reserved; counts are
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
@@ -241,10 +241,14 @@ pub const Attention = struct {
         const units = device.tensorUnits();
         const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
         errdefer if (split_tail) |pipe| pipe.deinit();
-        const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
+        const chain_words: ?mtl.Buffer = if (units) try device.buffer(48, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
         errdefer if (chain_words) |b| b.deinit();
-        if (chain_words) |b| @memset(b.contents()[0..32], 0);
+        if (chain_words) |b| @memset(b.contents()[0..48], 0);
         return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .chain_words = chain_words };
+    }
+    /// Called after completed target GPU work, before picks or state acceptance.
+    pub fn checkCounted(a: *const Attention) !void {
+        if (a.chain_words) |words| try @import("counted_norm_status.zig").checkBank(words.slice(u32, 12));
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
@@ -325,7 +329,7 @@ pub const Attention = struct {
             bindAt(e, d.scratch.get(.nodes), 13);
             bindAt(e, d.value, 14);
             e.setValue(d.v_stride, 15);
-            e.setBuffer(words, 16, 16);
+            e.setBuffer(words, 32, 16);
             e.setValue(@as(u32, 1), 17);
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
             // no barrier: the prefix waits on this launch's count (encode with `appended`)
@@ -517,7 +521,7 @@ pub const Attention = struct {
             e.setBuffer(scratch.get(.nodes).buffer, 0, 8);
             e.setBuffer(words, 0, 9);
             e.setValue(@as(u32, @intFromBool(chain != null)), 10);
-            e.setBuffer(words, 16, 11);
+            e.setBuffer(words, 32, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(64 * sg, 1, 1));
             if (chain == null) e.barrier();
@@ -534,7 +538,7 @@ pub const Attention = struct {
             if (split) {
                 e.setBuffer(words, 0, 12);
                 e.setValue(if (chain != null) prefix_groups else 0, 13);
-                e.setBuffer(words, 8, 14);
+                e.setBuffer(words, 16, 14);
                 e.setValue(@as(u32, @intFromBool(chain != null)), 15);
             }
             e.dispatchGroups(mtl.Size.of(g.kv_heads * @as(u32, if (split) 2 else 1), plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
@@ -547,7 +551,7 @@ pub const Attention = struct {
         e.setBuffer(xs.buffer, xs.offset, 11);
         e.setValue(@as(u32, if (sums) |s| s.stride else 0), 12);
         // a split tail's count follows the prefix's; a fused chain's merge waits on the prefix's own
-        e.setBuffer(words, if (split) 8 else 0, 13);
+        e.setBuffer(words, if (split) 16 else 0, 13);
         e.setValue(if (chain == null) 0 else if (split) tail_groups else prefix_groups, 14);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
