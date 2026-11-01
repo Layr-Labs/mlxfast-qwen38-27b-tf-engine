@@ -348,8 +348,8 @@ pub const Runner = struct {
         }
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
-        // Each layer replays its state and copies all conv taps before overwriting that channel's history.
-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+        // Every layer replays its state and copies all conv taps in one launch a stage: each layer's span is its own.
+        try r.gdn.commitKeepAll(plan, e);
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();
         const g = r.scratch.limits.geometry;

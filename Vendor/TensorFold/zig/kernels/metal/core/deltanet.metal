@@ -404,6 +404,52 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
 }
 
+struct TfDeltaKeepStrides {
+  ulong key, value, decay, mixing, state, before, history, projection;
+  uint keeps, layers;
+};
+
+kernel void tf_delta_gdn_replay_layers(device const bfloat* key [[buffer(0)]],
+                           device const bfloat* value [[buffer(1)]],
+                           device const float* decay [[buffer(2)]],
+                           device const bfloat* mixing [[buffer(3)]],
+                           device const float* committed [[buffer(4)]],
+                           device const uint* kept_rows [[buffer(5)]],
+                           device const TfDeltaKeep* keeps [[buffer(6)]],
+                           constant TfDeltaParams& p [[buffer(7)]],
+                           device float* next [[buffer(8)]],
+                           device const TfDeltaSegment* segments [[buffer(9)]],
+                           device const float* before [[buffer(10)]],
+                           constant TfDeltaKeepStrides& s [[buffer(11)]],
+                           uint3 position [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  const uint per_layer = p.nv * s.keeps;
+  const uint layer = position.z / per_layer;
+  if (layer >= s.layers) return;
+  const uint3 pos = uint3(position.x, position.y, position.z - layer * per_layer);
+  const ulong l = layer;
+  key += l * s.key;
+  value += l * s.value;
+  decay += l * s.decay;
+  mixing += l * s.mixing;
+  committed += l * s.state;
+  next += l * s.state;
+  before += l * s.before;
+  const uint segment = pos.z / p.nv;
+  if (p.advance != 0 && segments[segment].rows == 1) {
+    const TfDeltaKeep keep = keeps[segment];
+    if (keep.rows == 0) {
+      const uint stride = p.nv * p.dv * p.dk;
+      const uint column = ((pos.z % p.nv) * p.dv + pos.y) * p.dk + lane * 4;
+      for (uint part = 0; part < 4; ++part)
+        next[keep.next_slot * stride + column + part] = before[keep.state_slot * stride + column + part];
+    }
+    return;
+  }
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, pos, lane);
+  else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, pos, lane);
+}
+
 // Accepted chains keep the tree path's delta update and sum order; a prompt chunk differs only in trip count.
 template <uint C>
 inline void tf_delta_gdn_chain_body(device const bfloat* query,
@@ -681,6 +727,32 @@ kernel void tf_delta_gdn_conv_keep(device ushort* committed [[buffer(0)]],
                               uint2 position [[thread_position_in_grid]]) {
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = position.x, held = p.taps - 1;
   const TfDeltaKeep keep = keeps[position.y];
+  if (item >= channels || keep.rows == 0) return;
+  const uint row = kept_rows[keep.first + keep.rows - 1];
+  device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;
+  ushort taken[7];
+  for (uint t = 0; t < held; ++t) {
+    const uint source = windows[row * p.taps + t + 1];
+    taken[t] = source < held ? window[source * channels] : projection[(source - held) * channels + item];
+  }
+  for (uint t = 0; t < held; ++t) window[t * channels] = taken[t];
+}
+
+kernel void tf_delta_gdn_conv_keep_layers(device ushort* committed [[buffer(0)]],
+                              device const ushort* projection [[buffer(1)]],
+                              device const uint* kept_rows [[buffer(2)]],
+                              device const TfDeltaKeep* keeps [[buffer(3)]],
+                              device const uint* windows [[buffer(4)]],
+                              constant TfDeltaParams& p [[buffer(5)]],
+                              constant TfDeltaKeepStrides& s [[buffer(6)]],
+                              uint3 at [[thread_position_in_grid]]) {
+  const uint layer = at.z;
+  if (layer >= s.layers) return;
+  const ulong l = layer;
+  committed += l * s.history;
+  projection += l * s.projection;
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv, item = at.x, held = p.taps - 1;
+  const TfDeltaKeep keep = keeps[at.y];
   if (item >= channels || keep.rows == 0) return;
   const uint row = kept_rows[keep.first + keep.rows - 1];
   device ushort* window = committed + (size_t)keep.state_slot * held * channels + item;

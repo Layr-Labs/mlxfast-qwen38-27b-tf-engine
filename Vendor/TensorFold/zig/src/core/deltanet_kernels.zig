@@ -16,7 +16,7 @@ pub fn markList(rows: u32, marks: []const u32) ![MARKS]u32 {
     return list;
 }
 
-pub const Pipelines = struct { pre: metal.Pipeline, tree: metal.Pipeline, tree_slots: [slot_kernels.len]metal.Pipeline, replay: metal.Pipeline, post: metal.Pipeline, conv_commit: metal.Pipeline };
+pub const Pipelines = struct { pre: metal.Pipeline, tree: metal.Pipeline, tree_slots: [slot_kernels.len]metal.Pipeline, replay: metal.Pipeline, post: metal.Pipeline, conv_commit: metal.Pipeline, replay_layers: metal.Pipeline };
 
 /// Register slots of each tree_slots kernel; a tree takes the first that holds its peak of live states.
 pub const slot_kernels = [_]usize{ 1, 2, 4, 8, 16 };
@@ -48,6 +48,8 @@ pub const Kernels = struct {
     star_pair: metal.Pipeline,
     /// conv_commit for in-place keeps: a thread a channel, the window written straight over history (no publish_conv).
     conv_keep: metal.Pipeline,
+    /// Every GDN layer's conv window for an in-place keep in one grid (see tf_delta_gdn_conv_keep_layers).
+    conv_keep_layers: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -76,6 +78,8 @@ pub const Kernels = struct {
             "tree_pair",
             "star_pair",
             "conv_keep",
+            "replay_layers",
+            "conv_keep_layers",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -94,6 +98,7 @@ pub const Kernels = struct {
                 .replay = pipelines[2],
                 .post = pipelines[3],
                 .conv_commit = pipelines[4],
+                .replay_layers = pipelines[23],
             },
             .publish = pipelines[5],
             .clear = pipelines[6],
@@ -108,6 +113,7 @@ pub const Kernels = struct {
             .tree_pair = pipelines[20],
             .star_pair = pipelines[21],
             .conv_keep = pipelines[22],
+            .conv_keep_layers = pipelines[24],
         };
     }
 
@@ -131,7 +137,9 @@ pub const Kernels = struct {
             k.tree_pair,
             k.star_pair,
             k.conv_keep,
+            k.conv_keep_layers,
         }) |p| p.deinit();
+        k.pipelines.replay_layers.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();
     }

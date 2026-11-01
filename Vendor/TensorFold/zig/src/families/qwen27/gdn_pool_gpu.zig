@@ -266,6 +266,64 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
     }
 
+    /// A round's whole GDN keep in two launches instead of two a layer: every layer's replay and conv window in one grid
+    /// each, the pool's layer spans as element strides, so the per-layer dispatch's offsets, arithmetic and order are
+    /// the kernels' own and layers touch disjoint spans.
+    pub fn commitKeepAll(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const layers = pool.budget.layers;
+        if (layers == 0) return;
+        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        p.advance = @intFromBool(pool.advances(plan.host));
+        const s = try pool.keepStrides(plan.host);
+        const m = plan.metadata;
+        // the same skip the per-layer replay takes: windows the verify stepped in place replay nothing
+        const replays = p.advance == 0 or for (plan.host.segments, plan.host.keeps) |segment, keep| {
+            if (segment.rows > 1 or keep.rows == 0) break true;
+        } else false;
+        if (replays) {
+            const state = try pool.layerSpan(.state, 0);
+            const planes: usize = @as(usize, p.nv) * plan.host.keeps.len * layers;
+            e.setPipeline(pool.kernels.pipelines.replay_layers);
+            e.setBuffer(m.segments.buffer, m.segments.offset, 9);
+            ((try pool.beforeSpan(0, plan.host, p.advance != 0)) orelse state).bind(e, 10);
+            gdn.bind(e, .{ try pool.layerSpan(.key, 0), try pool.layerSpan(.value, 0), try pool.layerSpan(.decay, 0), try pool.layerSpan(.mixing, 0), state }, 0);
+            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 5);
+            e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
+            e.setValue(p, 7);
+            e.setBuffer(state.buffer, state.offset, 8);
+            e.setValue(s, 11);
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = planes }, .{ .width = 32, .height = 4 });
+        }
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        gdn.bind(e, .{ try pool.layerSpan(.history, 0), try pool.layerSpan(.qkv, 0) }, 0);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(s, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = layers }, .{ .width = 256 });
+    }
+
+    /// Every layer's spans as element strides: one layer's buffer run over a pool buffer's extent per layer.
+    fn keepStrides(pool: *const Pool, plan: Plan) !KeepStrides {
+        const layers = pool.budget.layers;
+        const before = if (pool.before) |b| b.length() else pool.get(.state).length();
+        return .{
+            .key = try strideElements(pool.get(.key).length(), layers, 2),
+            .value = try strideElements(pool.get(.value).length(), layers, 2),
+            .decay = try strideElements(pool.get(.decay).length(), layers, 4),
+            .mixing = try strideElements(pool.get(.mixing).length(), layers, 2),
+            .state = try strideElements(pool.get(.state).length(), layers, 4),
+            .before = try strideElements(before, layers, 4),
+            .history = try strideElements(pool.get(.history).length(), layers, 2),
+            .projection = try strideElements(pool.get(.qkv).length(), layers, 2),
+            .keeps = @intCast(plan.keeps.len),
+            .layers = @intCast(layers),
+        };
+    }
+
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
     fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
@@ -424,6 +482,27 @@ const commit_kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16
 fn inPlace(plan: Plan) bool {
     for (plan.keeps) |keep| if (keep.state_slot != keep.next_slot) return false;
     return true;
+}
+
+/// A round's keep as the pool's layer spans: each layer's buffer start sits `field` elements after the last one's.
+/// The layout is the kernels' own `TfDeltaKeepStrides` (deltanet.metal).
+pub const KeepStrides = extern struct {
+    key: u64,
+    value: u64,
+    decay: u64,
+    mixing: u64,
+    state: u64,
+    before: u64,
+    history: u64,
+    projection: u64,
+    keeps: u32,
+    layers: u32,
+};
+
+/// Elements between two layers of a pool buffer of `elem` bytes; the pool's layers split its extent evenly.
+fn strideElements(bytes: usize, layers: usize, comptime elem: usize) !u64 {
+    if (layers == 0 or (bytes / layers) % elem != 0) return error.BadGdnBuffer;
+    return @intCast(bytes / layers / elem);
 }
 
 fn refSpan(r: Ref, bytes: usize) !gdn.Span {
