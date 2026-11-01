@@ -203,9 +203,28 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this prepare shares its barrier interval with the decoded qkv and zba projections it reads, whose
+  // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
+  // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
@@ -620,9 +639,28 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device bfloat* output [[buffer(4)]],
                          device float* sums [[buffer(5)]],
                          constant uint& sums_stride [[buffer(6)]],
+                         device atomic_uint* NC [[buffer(7)]],
+                         constant uint& wait_for [[buffer(8)]],
                          uint3 group [[threadgroup_position_in_grid]],
+                         uint3 groups [[threadgroups_per_grid]],
+                         uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this gate shares its barrier interval with the star scan that writes `recurrence`, whose threadgroups
+  // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
+  // its own fence, and the last group leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
@@ -731,3 +769,4 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+// Second measurement of terrapinelf's submission 42f3db3b-56ab-4e2f-87f9-ebfc2946aad4; code unchanged.

@@ -197,7 +197,9 @@ const prompt_threads = 256;
 /// key_stride: values from one key row to the next (0: kv_heads * dim); strided keys take the fused norm and rope alone.
 /// packed_rows above 0: `query` is the scratch's qa, filled for a one-stream prompt plan of that many packed rows as
 /// q27_attn_pack_a fills it (`encode` with `prepacked`); the fused norm and rope alone.
-pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{} };
+pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{}, after: ?After = null };
+/// Counted projections a decoded preprocess waits on in its barrier interval (quant_gpu.Kernels.quantCounted).
+pub const After = struct { counter: mtl.Buffer, wait: u32 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
@@ -205,6 +207,9 @@ pub const Attention = struct {
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
+    /// The counted decoded chain's words (treeRows): [0..2) the prefix's count and its tail's arrivals, [2..4) the split
+    /// tail's count and its merge's arrivals; each pair is left zero by its last waiter.
+    chain_words: ?mtl.Buffer = null,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -224,12 +229,16 @@ pub const Attention = struct {
         const units = device.tensorUnits();
         const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
         errdefer if (split_tail) |pipe| pipe.deinit();
-        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail };
+        const chain_words: ?mtl.Buffer = if (units) try device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
+        errdefer if (chain_words) |b| b.deinit();
+        if (chain_words) |b| @memset(b.contents()[0..16], 0);
+        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .chain_words = chain_words };
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
         if (a.prompt) |pipes| for (pipes) |pipe| pipe.deinit();
         if (a.split_tail) |pipe| pipe.deinit();
+        if (a.chain_words) |b| b.deinit();
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
     fn promptPipelines(device: mtl.Device, library: mtl.Library, units: bool) !?[2]mtl.Pipeline {
@@ -284,10 +293,18 @@ pub const Attention = struct {
             e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
             e.setBuffer(p.rotated_key.buffer, p.rotated_key.offset, 7);
+            if (p.after) |w| {
+                e.setBuffer(w.counter, 0, 8);
+                e.setValue(w.wait, 9);
+            } else {
+                e.setBuffer(p.qg.buffer, p.qg.offset, 8); // never read: wait_for 0
+                e.setValue(@as(u32, 0), 9);
+            }
             e.dispatchGroups(mtl.Size.of((g.heads + g.kv_heads + 3) / 4, p.rows, 1), mtl.Size.of(128, 1, 1));
             e.barrier();
             return timing.end();
         }
+        if (p.after != null) return error.TargetAttentionShape; // only the one-pass kernel waits on counted projections
         if (key_stride != g.kv_heads * g.dim or p.packed_rows != 0) return error.TargetAttentionShape; // packed keys, rope rows
         e.setPipeline(a.io[7]);
         bind(e, .{ p.qg, p.q_gain });
@@ -365,7 +382,7 @@ pub const Attention = struct {
             e.setPipeline(a.io[0]);
             bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
             e.setValue(args, 3);
-            e.dispatchThreads(mtl.Size.of(g.dim, args.packed_rows, g.kv_heads), mtl.Size.of(32, 4, 1));
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 4, 1)); // eight words a thread
         }
         if (a.promptPath(plan, prompt)) {
             e.barrier();
@@ -416,14 +433,26 @@ pub const Attention = struct {
             e.setPipeline(a.io[1]);
             bind(e, .{ q, scratch.get(.qb) });
             e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1));
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1)); // eight words a thread
         }
         e.barrier();
         const scale: f32 = 0.0625;
+        // Small one-chunk trees otherwise expose only four groups per node.
+        // Separate head halves double that grid and halve each compute lane's accumulators.
+        const split = !plan.fused and a.split_tail != null and plan.rows <= 8 and plan.tail_chunks == 1;
+        // decoded rows behind a prefix, with a split tail or none (a fused chain): the kernels share one barrier interval.
+        // The prefix's groups count their stored partials; a split tail's groups each wait on that count before they read
+        // them, then count their own; every merge group waits on the last count (the tail's groups all waited on the
+        // prefix's first), as the counted norms wait on their projections.
+        const chain = if (plan.prefix_chunks > 0 and plan.rows <= 8 and (plan.fused or split)) a.chain_words else null;
+        const words = chain orelse scratch.get(.nodes).buffer; // never read or written without the chain
+        const tail_groups = g.kv_heads * 2 * plan.tail_chunks * plan.rows;
+        var prefix_groups: u32 = 0;
         if (plan.prefix_chunks > 0) {
             // a pair a tile: a long cache reads each chunk once for six tiles; a short one (under 16 chunks) has too few
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
+            prefix_groups = g.kv_heads * plan.prefix_chunks * ((plan.tiles + sg - 1) / sg);
             e.setPipeline(a.prefix[sg - 1]);
             bind(e, .{ scratch.get(.qa), binding.get(.caches) });
             e.setValue(scale, 2);
@@ -433,13 +462,12 @@ pub const Attention = struct {
             e.setBuffer(scratch.get(.pma).buffer, 0, 6);
             e.setBuffer(scratch.get(.pla).buffer, 0, 7);
             e.setBuffer(scratch.get(.nodes).buffer, 0, 8);
+            e.setBuffer(words, 0, 9);
+            e.setValue(@as(u32, @intFromBool(chain != null)), 10);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(64 * sg, 1, 1));
-            e.barrier();
+            if (chain == null) e.barrier();
         }
         if (!plan.fused) {
-            // Small one-chunk trees otherwise expose only four groups per node.
-            // Separate head halves double that grid and halve each compute lane's accumulators.
-            const split = a.split_tail != null and plan.rows <= 8 and plan.tail_chunks == 1;
             e.setPipeline(if (split) a.split_tail.? else a.io[3]);
             bind(e, .{ scratch.get(.qb), binding.get(.caches) });
             e.setValue(scale, 2);
@@ -448,8 +476,14 @@ pub const Attention = struct {
                 const r = scratch.get(field);
                 e.setBuffer(r.buffer, 0, i);
             }
+            if (split) {
+                e.setBuffer(words, 0, 12);
+                e.setValue(if (chain != null) prefix_groups else 0, 13);
+                e.setBuffer(words, 8, 14);
+                e.setValue(@as(u32, @intFromBool(chain != null)), 15);
+            }
             e.dispatchGroups(mtl.Size.of(g.kv_heads * @as(u32, if (split) 2 else 1), plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
-            e.barrier();
+            if (chain == null) e.barrier();
         }
         e.setPipeline(a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
@@ -457,6 +491,9 @@ pub const Attention = struct {
         const xs = if (sums) |s| s.ref else out;
         e.setBuffer(xs.buffer, xs.offset, 11);
         e.setValue(@as(u32, if (sums) |s| s.stride else 0), 12);
+        // a split tail's count follows the prefix's; a fused chain's merge waits on the prefix's own
+        e.setBuffer(words, if (split) 8 else 0, 13);
+        e.setValue(if (chain == null) 0 else if (split) tail_groups else prefix_groups, 14);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();
     }

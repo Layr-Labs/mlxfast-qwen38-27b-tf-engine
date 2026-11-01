@@ -7,12 +7,16 @@ pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 /// Spans a wide row is split into (TF_TOPK_SPANS in the kernel) and the narrowest row split.
 const spans = 16;
 const wide_vocab = 4096;
+/// Spans of the register-held kernels (TF_TOPK_WIDE_SPANS) and the tokens a lane holds there (TF_TOPK_HOLD): rows of at
+/// most wide_spans * lanes * hold tokens take them.
+const wide_spans = 64;
+const hold = 8;
 /// Threads per threadgroup, in every dispatch (TF_TOPK_LANES in the kernel).
 const lanes = 256;
 comptime {
     @setEvalBranchQuota(100_000);
     // the kernel's arrays, strides, tournament and entry counts are all written with these three
-    for (.{ .{ "TF_TOPK_LANES", lanes }, .{ "TF_TOPK_MAX_K", contract.max_k }, .{ "TF_TOPK_SPANS", spans } }) |named| {
+    for (.{ .{ "TF_TOPK_LANES", lanes }, .{ "TF_TOPK_MAX_K", contract.max_k }, .{ "TF_TOPK_SPANS", spans }, .{ "TF_TOPK_WIDE_SPANS", wide_spans }, .{ "TF_TOPK_HOLD", hold } }) |named| {
         const define = std.fmt.comptimePrint("#define {s} {d}\n", .{ named[0], named[1] });
         if (std.mem.indexOf(u8, source, define) == null) @compileError("bf16_topk.metal's " ++ named[0] ++ " differs from the Zig constant");
     }
@@ -25,6 +29,8 @@ pub const Ops = struct {
     max_pipeline: ?mtl.Pipeline = null,
     span_pipeline: mtl.Pipeline,
     merge_pipeline: mtl.Pipeline,
+    wide_pipeline: mtl.Pipeline,
+    wide_merge_pipeline: mtl.Pipeline,
     /// Every span's top k, between a wide row's two dispatches: one wide top-k may be in flight per Ops.
     part: mtl.Buffer,
     pub fn init(device: mtl.Device) !Ops {
@@ -38,14 +44,21 @@ pub const Ops = struct {
         errdefer span_pipeline.deinit();
         const merge_pipeline = try mtl.Pipeline.init(device, lib, "tf_bf16_topk_merge", false);
         errdefer merge_pipeline.deinit();
-        const part = try device.buffer(contract.max_rows * spans * @sizeOf(contract.Row), options);
-        return .{ .pipeline = pipeline, .max_pipeline = max_pipeline, .span_pipeline = span_pipeline, .merge_pipeline = merge_pipeline, .part = part };
+        const wide_pipeline = try mtl.Pipeline.init(device, lib, "tf_bf16_topk_wide", false);
+        errdefer wide_pipeline.deinit();
+        const wide_merge_pipeline = try mtl.Pipeline.init(device, lib, "tf_bf16_topk_wide_merge", false);
+        errdefer wide_merge_pipeline.deinit();
+        if (wide_pipeline.maxThreads() < lanes or wide_merge_pipeline.maxThreads() < lanes) return error.UnsupportedTopKPipeline;
+        const part = try device.buffer(contract.max_rows * @max(spans, wide_spans) * @sizeOf(contract.Row), options);
+        return .{ .pipeline = pipeline, .max_pipeline = max_pipeline, .span_pipeline = span_pipeline, .merge_pipeline = merge_pipeline, .wide_pipeline = wide_pipeline, .wide_merge_pipeline = wide_merge_pipeline, .part = part };
     }
     pub fn deinit(ops: Ops) void {
         ops.pipeline.deinit();
         if (ops.max_pipeline) |pipeline| pipeline.deinit();
         ops.span_pipeline.deinit();
         ops.merge_pipeline.deinit();
+        ops.wide_pipeline.deinit();
+        ops.wide_merge_pipeline.deinit();
         ops.part.deinit();
     }
     pub fn encode(ops: Ops, e: mtl.ComputeEncoder, logits: Ref, output: Ref, p: contract.Params) !void {
@@ -56,6 +69,20 @@ pub const Ops = struct {
         try check(logits, input_bytes, 2);
         try check(output, output_bytes, 4);
         if (logits.buf.id == output.buf.id and logits.off < output.off + output_bytes and output.off < logits.off + input_bytes) return error.TopKAlias;
+        if (p.k > 1 and p.vocab >= wide_vocab and p.vocab <= wide_spans * lanes * hold) {
+            e.setPipeline(ops.wide_pipeline);
+            e.setBuffer(logits.buf, logits.off, 0);
+            e.setBuffer(ops.part, 0, 1);
+            e.setValue(p, 2);
+            e.dispatchGroups(mtl.Size.of(wide_spans, p.rows, 1), mtl.Size.of(lanes, 1, 1));
+            e.barrier();
+            e.setPipeline(ops.wide_merge_pipeline);
+            e.setBuffer(ops.part, 0, 0);
+            e.setBuffer(output.buf, output.off, 1);
+            e.setValue(p, 2);
+            e.dispatchGroups(mtl.Size.of(p.rows, 1, 1), mtl.Size.of(lanes, 1, 1));
+            return;
+        }
         if (p.k > 1 and p.vocab >= wide_vocab) {
             e.setPipeline(ops.span_pipeline);
             e.setBuffer(logits.buf, logits.off, 0);
