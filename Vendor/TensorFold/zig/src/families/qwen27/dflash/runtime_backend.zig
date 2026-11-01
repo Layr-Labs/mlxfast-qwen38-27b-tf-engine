@@ -152,6 +152,7 @@ pub const Backend = struct {
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
         errdefer head.deinit();
+        if (head_bits < 4 and target.device.tensorUnits()) head.lowBits(a, target.device, &target.checkpoint, head_bits, low_group, low_reg) catch |err| std.log.warn("draft head stays q4: {s}", .{@errorName(err)});
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
         try target.kernels.prepareDecode(head.linear, 1);
@@ -217,7 +218,8 @@ pub const Backend = struct {
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
     fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
-        var prepared_words = try core.affine4.prepare(b.allocator, rows, shape[0], shape[1]);
+        const bits: u8 = if (order != null) draftBits(name) else 4;
+        var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
         defer prepared_words.deinit();
         if (b.stash) |st| if (shortName(name)) |short| {
             const layer = layerOf(name) orelse return error.DraftTensorCoverage;
@@ -225,7 +227,7 @@ pub const Backend = struct {
             const id = try std.fmt.bufPrint(&buf, "{d}{s}", .{ layer, short });
             const owned = try b.allocator.dupe(u8, id);
             errdefer b.allocator.free(owned);
-            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases) };
+            const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = prepared_words.n, .k = prepared_words.k, .words = try b.allocator.dupe(u32, prepared_words.words), .scales = try b.allocator.dupe(u16, prepared_words.scales), .biases = try b.allocator.dupe(u16, prepared_words.biases), .bits = prepared_words.bits, .group = prepared_words.group, .nibbles = prepared_words.nibbles };
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
@@ -235,6 +237,24 @@ pub const Backend = struct {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
         }
+    }
+    /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
+    /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
+    /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
+    /// acceptance at 2 bits, and the down's and the head's 2-bit copies each cost about as many extra rounds as their
+    /// bytes save, so they stay q4.
+    pub const mlp_bits: u8 = 2;
+    /// Code width of the draft head's own copy of the spans' rows (4: the base's q4 copy, no requantized copy).
+    pub const head_bits: u8 = 4;
+    /// Copies below 4 bits on the reg kernel's 2-bit words (prepareNibbles, then lane_projection.halveReg) at 64-element
+    /// groups; false takes MLX bit streams at `low_group` on the plain lane kernel.
+    pub const low_reg: bool = true;
+    /// Elements a (scale, bias) pair covers in the plain kernel's copies below 4 bits (the draft head's included).
+    pub const low_group: u32 = 128;
+    fn draftBits(name: []const u8) u8 {
+        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
+        for (mlp) |m| if (std.mem.endsWith(u8, name, m)) return mlp_bits;
+        return 4;
     }
     fn shortName(name: []const u8) ?[]const u8 {
         const table = [_][2][]const u8{ .{ "self_attn.q_proj.weight", "q" }, .{ "self_attn.k_proj.weight", "k" }, .{ "self_attn.v_proj.weight", "v" }, .{ "mlp.gate_proj.weight", "g" }, .{ "mlp.up_proj.weight", "u" } };
@@ -250,29 +270,37 @@ pub const Backend = struct {
     fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
         var n: usize = 0;
         var k: usize = 0;
+        var bits: u8 = 0;
+        var size: u32 = 0;
+        var nibbles = false;
         var buf: [16]u8 = undefined;
         for (parts) |p| {
             const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })) orelse return;
             n += got.prepared.n;
             if (k != 0 and k != got.prepared.k) return error.DraftPreparationUnqualified;
             k = got.prepared.k;
+            if (bits != 0 and (bits != got.prepared.bits or size != got.prepared.group or nibbles != got.prepared.nibbles)) return;
+            bits = got.prepared.bits;
+            size = got.prepared.group;
+            nibbles = got.prepared.nibbles;
         }
-        const words = try b.allocator.alloc(u32, n * k / 8);
+        const word_bits: usize = if (nibbles) 4 else bits;
+        const words = try b.allocator.alloc(u32, n * k / 32 * word_bits);
         defer b.allocator.free(words);
-        const scales = try b.allocator.alloc(u16, n * k / 64);
+        const scales = try b.allocator.alloc(u16, n * k / size);
         defer b.allocator.free(scales);
-        const biases = try b.allocator.alloc(u16, n * k / 64);
+        const biases = try b.allocator.alloc(u16, n * k / size);
         defer b.allocator.free(biases);
         var at: usize = 0;
         for (parts) |p| {
             const got = st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, p })).?;
-            @memcpy(words[at * k / 8 ..][0..got.prepared.words.len], got.prepared.words);
-            @memcpy(scales[at * k / 64 ..][0..got.prepared.scales.len], got.prepared.scales);
-            @memcpy(biases[at * k / 64 ..][0..got.prepared.biases.len], got.prepared.biases);
+            @memcpy(words[at * k / 32 * word_bits ..][0..got.prepared.words.len], got.prepared.words);
+            @memcpy(scales[at * k / size ..][0..got.prepared.scales.len], got.prepared.scales);
+            @memcpy(biases[at * k / size ..][0..got.prepared.biases.len], got.prepared.biases);
             at += got.prepared.n;
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
-        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
+        const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
         const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
