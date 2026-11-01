@@ -4,7 +4,7 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 constant constexpr int PG = 6, PD = 256, PH = 128, PCK = 512, PTK = 32;
-struct Q27PromptArgs { int start, rows, chunks, rp, key_stride, value_stride; float scale2; };
+struct Q27PromptArgs { int start, rows, chunks, rp, key_stride, value_stride; float scale2; int tile0, row0; };
 typedef vec<float, 8> q27f8;
 typedef vec<bfloat, 8> q27b8;
 typedef vec<half, 8> q27h8;
@@ -112,7 +112,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
     uint3 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
   const short qid = lane >> 2, fm = (qid & 4) | ((lane >> 1) & 3), fn = ((qid & 2) | (lane & 1)) * 4;
   const short h = sg & 1;
-  const int tile = int(tg.z) * (SG / 2) + (sg >> 1);
+  const int tile = args.tile0 + int(tg.z) * (SG / 2) + (sg >> 1);
   const int hk = int(tg.x), c = int(tg.y);
   const bool live = tile * 16 < args.rp;
   threadgroup float xs[SG][32][16];
@@ -128,7 +128,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
   // keys from the group's last live row's own count on are masked for all its rows: those steps change nothing
-  const int first_row = int(tg.z) * (SG / 2) * 16, last_row = min(args.rows * PG, first_row + (SG / 2) * 16) - 1;
+  const int first_row = (args.tile0 + int(tg.z) * (SG / 2)) * 16, last_row = min(args.rows * PG, first_row + (SG / 2) * 16) - 1;
   const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;
   for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
@@ -155,7 +155,7 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     device const bfloat* QG [[buffer(5)]], device float* XS [[buffer(6)]],
     constant uint& sums_stride [[buffer(7)]], constant uint& gated [[buffer(8)]],
     uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-  const int hk = int(tg.x), r = int(tg.y);
+  const int hk = int(tg.x), r = args.row0 + int(tg.y);
   constexpr int DP = PD / 32;
   const int node = r / PG, head = hk * PG + r % PG;
   // Padded sum rows have no attention partial or output address to read.

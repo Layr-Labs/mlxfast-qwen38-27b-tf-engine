@@ -129,10 +129,13 @@ struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta;
 // Lane l holds the norm's threads l and 32 + l (columns 4l.., 128 + 4l..) and their sums; the rope turns the rounded
 // values norm_q and norm_k held, pair d's angle from lane d. PACK: q heads land as q27_attn_pack_a packs one stream of
 // packed_rows (kv head h / g's rows, row r's head h at r * g + h % g, rows * g on repeating row 0's first head).
-template <bool PACK>
+struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
+template <bool PACK, bool DEC>
 inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
                                     device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
-                                    uint2 group, uint sg, uint lane) {
+                                    uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
+                                    device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
+                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
@@ -192,18 +195,86 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
       *(device bfloat4*)(pad + 4 * lane) = ya;
       *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
     }
+  if (DEC && query) {
+    const uint gq = a.heads / a.kv_heads, hq = head / gq;
+    device bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
+    *(device bfloat4*)(packed + 4 * lane) = ya;
+    *(device bfloat4*)(packed + 128 + 4 * lane) = yb;
+    if (row == 0 && head == hq * gq)
+      for (uint r = a.rows * gq; r < a.packed_rows; ++r) {
+        device bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
+        *(device bfloat4*)(pad + 4 * lane) = ya;
+        *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+      }
+  }
+  if (DEC && !query) {
+    const uint hk = head - a.heads;
+    const int st = nodes[4 * row + 1], base = 8 + st * 12;
+    const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
+    device bfloat* key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
+    *(device bfloat4*)(key + 4 * lane) = ya;
+    *(device bfloat4*)(key + 128 + 4 * lane) = yb;
+    device bfloat* value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
+    device const bfloat* source = V + row * v_stride + hk * a.width;
+    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
+    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
+  }
 }
 
 #define Q27_HEAD_NORM_ROPE(NAME, PACK) \
 kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
                  device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
-                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]], \
+                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
+                 constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
+                 uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-  q27_head_norm_rope_rows<PACK>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
+  if (wait_for != 0u) { \
+    if (t == 0) { \
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed); \
+      } \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+  } \
+  q27_head_norm_rope_rows<PACK, false>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
 }
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope, false)
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed, true)
 #undef Q27_HEAD_NORM_ROPE
+
+kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
+                 device atomic_uint* NC [[buffer(8)]], constant uint& wait_for [[buffer(9)]], device bfloat* QA [[buffer(10)]],
+                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
+                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+                 device atomic_uint* PC [[buffer(16)]], constant uint& count_out [[buffer(17)]],
+                 uint2 group [[threadgroup_position_in_grid]], uint2 groups [[threadgroups_per_grid]],
+                 uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  q27_head_norm_rope_rows<false, true>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane, QA, caches, meta, nodes, V, v_stride);
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
+    }
+  }
+}
 
 struct Element { uint width, heads, rows, activation; };
 

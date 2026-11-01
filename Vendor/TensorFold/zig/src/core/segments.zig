@@ -64,6 +64,13 @@ pub fn checkUnchecked() !void {
 }
 
 pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize) !f64 {
+    return runCommittingEarly(device, queues, layers, mode, fam, first, every, false);
+}
+
+/// `runCommittingFrom`; `early` (one lane) also commits after the first layer's mixer and after each of the first three
+/// layers, so a long pass's GPU starts on the first mixer while the CPU encodes the rest of that layer and never waits
+/// for the first `every` layers' encode.
+pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize, early: bool) !f64 {
     try checkUnchecked();
     const n = queues.len;
     if (n == 0 or n > MAX) return error.Segments;
@@ -91,8 +98,23 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         every: usize,
         layers: usize,
         first: usize,
+        early: bool,
         done: *[16]mtl.CommandBuffer,
         n_done: *usize,
+
+        /// Commits the lane's command buffer so far and opens the next behind the lane's fence (one lane only).
+        fn commitLane(x: *const @This(), k: usize) void {
+            if (x.lanes.len != 1 or x.n_done.* == x.done.len) return;
+            const l = &x.lanes[k];
+            l.fence.update(l.enc);
+            l.enc.end();
+            l.cb.commit();
+            x.done[x.n_done.*] = l.cb;
+            x.n_done.* += 1;
+            l.cb = x.queue.commandBuffer();
+            l.enc = l.cb.compute(x.mode);
+            l.fence.wait(l.enc);
+        }
 
         /// Ends the lane's encoder, waits for (or signals) `value` between its encoders, and opens the next behind the fence.
         fn sync(x: *const @This(), l: *Lane, ev: mtl.Event, value: u64, wait_: bool) void {
@@ -120,25 +142,19 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);
+            if (x.early and i == 0 and i + 1 < x.layers) x.commitLane(k);
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
-            if (x.every == 0 or x.lanes.len != 1 or (i + 1 != x.first and (i + 1) % x.every != 0) or i + 1 >= x.layers or x.n_done.* == x.done.len) return;
-            const l = &x.lanes[k];
-            l.fence.update(l.enc);
-            l.enc.end();
-            l.cb.commit();
-            x.done[x.n_done.*] = l.cb;
-            x.n_done.* += 1;
-            l.cb = x.queue.commandBuffer();
-            l.enc = l.cb.compute(x.mode);
-            l.fence.wait(l.enc);
+            if (x.every == 0 or i + 1 >= x.layers) return;
+            if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3)) return;
+            x.commitLane(k);
         }
         pub fn finish(x: *const @This(), k: usize) !void {
             try x.fam.finish(&x.lanes[k]);
         }
     };
-    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queue = queues[0], .every = every, .layers = layers, .first = first, .done = &done, .n_done = &n_done };
+    const x: X = .{ .fam = fam, .lanes = lanes[0..n], .evs = evs[0..n_evs], .mode = mode, .queue = queues[0], .every = every, .layers = layers, .first = first, .early = early, .done = &done, .n_done = &n_done };
     stagger.drive(n, layers, &x) catch |err| { // close the open encoders, drop the open command buffers, let committed chunks finish
         for (lanes[0..n]) |l| l.enc.end();
         for (done[0..n_done]) |cb| cb.wait();

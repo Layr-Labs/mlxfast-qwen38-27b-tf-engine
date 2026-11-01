@@ -100,12 +100,21 @@ pub fn call(p: *const Pipelines, n: usize, k: usize, rows: usize, scalar: bool, 
 pub const Matrix = struct { w: mtl.Buffer, w_off: usize = 0, scales: mtl.Buffer, s_off: usize = 0, biases: mtl.Buffer, b_off: usize = 0, n: usize, k: usize };
 
 pub fn encode(e: mtl.ComputeEncoder, c: Call, m: Matrix, x: mtl.Buffer, x_off: usize, y: mtl.Buffer, y_off: usize) void {
+    encodeArgs(e, c, m, x, x_off, y, y_off, null);
+}
+
+/// Bytes of a buffer from an offset.
+pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
+
+/// encode reading its Args at `args` when given (an earlier dispatch wrote them, with c.args' k and n and at most its
+/// rows): the launch is c's, the rows past the Args' are not stored.
+pub fn encodeArgs(e: mtl.ComputeEncoder, c: Call, m: Matrix, x: mtl.Buffer, x_off: usize, y: mtl.Buffer, y_off: usize, args: ?Ref) void {
     e.setPipeline(c.pipeline);
     e.setBuffer(x, x_off, 0);
     e.setBuffer(m.w, m.w_off, 1);
     e.setBuffer(m.scales, m.s_off, 2);
     e.setBuffer(m.biases, m.b_off, 3);
-    e.setValue(c.args, 4);
+    if (args) |a| e.setBuffer(a.buf, a.off, 4) else e.setValue(c.args, 4);
     e.setBuffer(y, y_off, 5);
     e.dispatchGroups(c.groups, .{ .width = c.threads });
 }

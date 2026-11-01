@@ -203,9 +203,25 @@ kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_rows4(projection, a, b, history, weights, decay_weight, time_bias, windows, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
 }
 
@@ -404,6 +420,62 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
   }
   if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
   else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
+}
+
+struct TfDeltaStash { uint base, room, log_rows, pending_rows; };
+kernel void tf_delta_gdn_stash(device const uint4* key [[buffer(0)]],
+                               device const uint4* value [[buffer(1)]],
+                               device const uint* decay [[buffer(2)]],
+                               device const ushort* mixing [[buffer(3)]],
+                               device const uint* kept_rows [[buffer(4)]],
+                               device const TfDeltaKeep* keeps [[buffer(5)]],
+                               constant TfDeltaParams& p [[buffer(6)]],
+                               constant TfDeltaStash& s [[buffer(7)]],
+                               device uint4* pending_key [[buffer(8)]],
+                               device uint4* pending_value [[buffer(9)]],
+                               device uint* pending_decay [[buffer(10)]],
+                               device ushort* pending_mixing [[buffer(11)]],
+                               uint2 position [[thread_position_in_grid]]) {
+  const uint word = position.x, layer = position.y;
+  const uint keys = p.nk * p.dk / 8, values = p.nv * p.dv / 8;
+  const TfDeltaKeep keep = keeps[0];
+  for (uint step = 0; step < keep.rows && step < s.room; ++step) {
+    const ulong from = ulong(layer) * s.log_rows + kept_rows[keep.first + step];
+    const ulong to = ulong(layer) * s.pending_rows + s.base + step;
+    if (word < keys) pending_key[to * keys + word] = key[from * keys + word];
+    if (word < values) pending_value[to * values + word] = value[from * values + word];
+    if (word < p.nv) {
+      pending_decay[to * p.nv + word] = decay[from * p.nv + word];
+      pending_mixing[to * p.nv + word] = mixing[from * p.nv + word];
+    }
+  }
+}
+
+struct TfDeltaUnstash { uint rows, slot, pending_rows, layer_words; };
+kernel void tf_delta_gdn_unstash(device const bfloat* key [[buffer(0)]],
+                                 device const bfloat* value [[buffer(1)]],
+                                 device const float* decay [[buffer(2)]],
+                                 device const bfloat* mixing [[buffer(3)]],
+                                 device float* state [[buffer(4)]],
+                                 constant TfDeltaParams& p [[buffer(5)]],
+                                 constant TfDeltaUnstash& u [[buffer(6)]],
+                                 uint3 position [[thread_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  const uint layer = position.z / p.nv, head = position.z % p.nv;
+  const uint dimension = position.y, key_head = head / (p.nv / p.nk);
+  device float* words = state + ulong(layer) * u.layer_words + ulong(u.slot) * (p.nv * p.dv * p.dk) + (head * p.dv + dimension) * p.dk + lane * 4;
+  const ulong first = ulong(layer) * u.pending_rows;
+  device const bfloat* layer_key = key + first * (p.nk * p.dk);
+  device const bfloat* layer_value = value + first * (p.nv * p.dv);
+  device const float* layer_decay = decay + first * p.nv;
+  device const bfloat* layer_mixing = mixing + first * p.nv;
+  float state_words[4];
+  for (uint part = 0; part < 4; ++part) state_words[part] = words[part];
+  for (uint row = 0; row < u.rows; ++row) {
+    const uint at = row * p.nv + head;
+    tf_delta_delta_update(state_words, layer_key + (row * p.nk + key_head) * p.dk, layer_decay[at], float(layer_value[at * p.dv + dimension]), float(layer_mixing[at]), lane, 4);
+  }
+  for (uint part = 0; part < 4; ++part) words[part] = state_words[part];
 }
 
 // Accepted chains keep the tree path's delta update and sum order; a prompt chunk differs only in trip count.
@@ -620,9 +692,25 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          device bfloat* output [[buffer(4)]],
                          device float* sums [[buffer(5)]],
                          constant uint& sums_stride [[buffer(6)]],
+                         device atomic_uint* NC [[buffer(7)]],
+                         constant uint& wait_for [[buffer(8)]],
                          uint3 group [[threadgroup_position_in_grid]],
+                         uint3 groups [[threadgroups_per_grid]],
+                         uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   const uint row = group.z * 4 + sg, head = group.y;
   if (row >= p.rows || p.dv != 128) return;
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;

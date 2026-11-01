@@ -7,6 +7,7 @@ struct TfCommitTaps { uint rows, width, capacity, planes; };
 struct TfCommitHead { uint rows, width, stride; };
 struct TfCommitKeep { uint first, rows, state_slot, next_slot; };
 struct TfCommitMap { uint stream, source, destination, row; };
+struct TfCommitSelect { uint rows, words, blocks, token, status, fallback; };
 inline bool tf_commit_valid(device const TfCommitResult& r, uint rows) {
   if (r.status || r.nonfinite || r.reserved || !r.consumed_count || r.consumed_count > rows || r.consumed_count != r.emitted_count || r.path[0] != 0) return false;
   for (uint i = 0; i < r.consumed_count; ++i) if (r.path[i] >= rows || (i && r.path[i] <= r.path[i - 1])) return false;
@@ -28,4 +29,10 @@ kernel void tf_round_keep_head(device const TfCommitResult& result [[buffer(0)]]
   if (!tf_commit_valid(result, p.rows) || column >= p.width) return;
   const uint row = result.path[result.consumed_count - 1];
   logits[column] = logits[ulong(row) * p.stride + column];
+}
+kernel void tf_round_select(device const TfCommitResult& result [[buffer(0)]], device uint* blocks [[buffer(1)]], constant TfCommitSelect& p [[buffer(2)]], uint word [[thread_position_in_grid]]) {
+  if (word >= p.words) return;
+  const bool valid = tf_commit_valid(result, p.rows) && result.consumed_count <= p.blocks;
+  const uint n = valid ? result.consumed_count : 1;
+  blocks[word] = word == p.token ? (valid ? result.tokens[n - 1] : p.fallback) : word == p.status ? uint(!valid) : blocks[ulong(n) * p.words + word];
 }

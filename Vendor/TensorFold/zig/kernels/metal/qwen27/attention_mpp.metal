@@ -6,13 +6,37 @@ using namespace mpp::tensor_ops;
 constant constexpr int G = 6, D = 256, TK = 64, MAXD = 128, MG = 8, MS = 12, NW = 4; // a row's key chunk is its node word 2
 struct Q27AttnReadPtrs { device const bfloat* keys; device const bfloat* values; };
 
+inline void q27_wait_count(device atomic_uint* NC, uint wait_for, uint total, ushort tid) {
+  if (tid == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+      atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+inline void q27_count(device atomic_uint* NC, ushort tid) {
+  threadgroup_barrier(mem_flags::mem_device);
+  if (tid == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    atomic_fetch_add_explicit(&NC[0], 1u, memory_order_relaxed);
+  }
+}
+
 // SG tiles a threadgroup, a simdgroup pair each: both run scores and softmax, one owns each half of the head dim.
 template <int SG>
 kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* tile_stream [[buffer(4)]],
     device float* PO [[buffer(5)]], device float* PM [[buffer(6)]], device float* PL [[buffer(7)]], device const int* nodes [[buffer(8)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
-    ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]]) {
+    device atomic_uint* PC [[buffer(9)]], constant uint& count_out [[buffer(10)]],
+    device atomic_uint* WC [[buffer(11)]], constant uint& wait_for [[buffer(12)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+    ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   const ushort lane = thread_index_in_simdgroup;
   const ushort sg = simdgroup_index_in_threadgroup;
   const int tile = int(threadgroup_position_in_grid.z) * SG + (sg >> 1);
@@ -34,7 +58,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   const int n1 = (q1 < G * NQ) ? min(L, S0 + q1 / G + 1) : 0;
   threadgroup half Ps[16 * TK]; // only gives the probabilities' tensor type
   threadgroup half* myP = Ps;
-  if (tile >= SGA || int(c) >= meta[MG + st * MS + 1]) return;
+  if (tile < SGA && int(c) < meta[MG + st * MS + 1]) {
   // each row's chunk c is its own chunk's (its one-row step's); padding rows take the last row's and mask every key
   const device int* own = nodes + NW * meta[MG + st * MS + 6];
   const int ck0 = own[NW * (min(q0, G * NQ - 1) / G) + 2], ck1 = own[NW * (min(q1, G * NQ - 1) / G) + 2];
@@ -106,8 +130,10 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
     if (q0 < G * NQ) { PM[base + r0] = m0; PL[base + r0] = l0; }
     if (q1 < G * NQ) { PM[base + r1] = m1; PL[base + r1] = l1; }
   }
+  }
+  if (count_out != 0u) q27_count(PC, tid);
 }
-#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, uint3, ushort, ushort);
+#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 Q27_PREFIX(1)
 Q27_PREFIX(2)
 Q27_PREFIX(3)
@@ -269,7 +295,10 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
     device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
     device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
+    device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
+  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
   const uint r = threadgroup_position_in_grid.y;
@@ -343,8 +372,12 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
     device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
     device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+    device atomic_uint* WC [[buffer(12)]], constant uint& wait_for [[buffer(13)]],
+    device atomic_uint* TC [[buffer(14)]], constant uint& count_out [[buffer(15)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
   const ushort lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x / 2;
@@ -354,7 +387,10 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   const int NCB = meta[3], W = meta[4], RPA = meta[5], CA = meta[6];
   const int st = nodes[NW * node + 1];
   const int P = meta[MG + st * MS + 4], PT = meta[MG + st * MS + 0], CK = nodes[NW * node + 2];
-  if (int(cb) >= meta[MG + st * MS + 5]) return;
+  if (int(cb) >= meta[MG + st * MS + 5]) {
+    if (count_out != 0u) q27_count(TC, tid);
+    return;
+  }
   const int la = meta[MG + st * MS + 3] * 16 + (int(node) - meta[MG + st * MS + 6]) * G;
   const int depth = nodes[NW * node];
   const device bfloat* Kb = caches[st].keys;
@@ -463,14 +499,16 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
       }
     }
   }
-  if (sg != 0) return;
-  const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
-  for (int q = 0; q < 16; q++) {
-    device float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
-    *(device float4*)dst = float4(Olo[4 * q], Olo[4 * q + 1], Olo[4 * q + 2], Olo[4 * q + 3]);
+  if (sg == 0) {
+    const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
+    for (int q = 0; q < 16; q++) {
+      device float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
+      *(device float4*)dst = float4(Olo[4 * q], Olo[4 * q + 1], Olo[4 * q + 2], Olo[4 * q + 3]);
+    }
+    if (!hi && (lane & 9) == 0) {
+      PM[base + r0] = m0; PL[base + r0] = l0;
+      PM[base + r1] = m1; PL[base + r1] = l1;
+    }
   }
-  if (!hi && (lane & 9) == 0) {
-    PM[base + r0] = m0; PL[base + r0] = l0;
-    PM[base + r1] = m1; PL[base + r1] = l1;
-  }
+  if (count_out != 0u) q27_count(TC, tid);
 }
