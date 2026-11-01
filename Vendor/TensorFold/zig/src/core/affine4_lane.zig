@@ -12,6 +12,9 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
+    /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
+    prompt: ?lane.Projection = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
         if (prepared.nibbles) {
@@ -57,7 +60,16 @@ pub const Adapter = struct {
             l8.rows8 = true;
             small = try lane.Projection.init(a, device, l8);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small };
+        errdefer if (small) |s| s.deinit();
+        var prompt: ?lane.Projection = null;
+        if (layout.reg and layout.format.bits == 4) {
+            var lp = layout;
+            lp.indexed = false;
+            lp.indexed12 = false;
+            lp.prompt_sr = true;
+            prompt = try lane.Projection.init(a, device, lp);
+        }
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt };
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -81,6 +93,7 @@ pub const Adapter = struct {
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.prompt) |p| p.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
         if (adapter.index) |b| b.deinit();
@@ -90,6 +103,8 @@ pub const Adapter = struct {
         return .{ .buf = adapter.index orelse adapter.metadata };
     }
     pub fn encode(adapter: Adapter, e: mtl.ComputeEncoder, x: lane.Ref, y: lane.Ref, rows: u32) !void {
+        // prompt-sized launches: the prompt loop on the pairs (its words are the indexed launch's)
+        if (rows > 16) if (adapter.prompt) |p| return p.encode(e, x, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, y, rows);
         try adapter.forRows(rows).encode(e, x, .{ .buf = adapter.words }, adapter.meta(), y, rows);
     }
 };

@@ -835,3 +835,4 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+// Second measurement of terrapinelf's submission 42f3db3b-56ab-4e2f-87f9-ebfc2946aad4; code unchanged.
