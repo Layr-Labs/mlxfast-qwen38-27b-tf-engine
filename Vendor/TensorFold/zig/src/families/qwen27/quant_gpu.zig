@@ -12,9 +12,9 @@ pub const Sums = struct { ref: Ref, stride: u32 };
 
 const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false,
 
-    /// The decode projections whose K split is 2: fused gate/up (34816), GDN qkv (10240) and attention query+gate (12288).
+    /// Serial K splits for fused gate/up and attention query+gate; GDN qkv runs its two splits in parallel.
     fn serialSk2(key: Key) bool {
-        const shape = key.n == 34816 or key.n == 10240 or key.n == 12288;
+        const shape = key.n == 34816 or key.n == 12288;
         return key.kind == .projection and key.bits == 4 and key.group == 64 and shape and key.k == 5120 and key.slices == 2 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0;
     }
 };
@@ -22,7 +22,7 @@ const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 
 test "serial SK2 guard and cache keys separate every excluded projection" {
     const eligible = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2 };
     try std.testing.expect(eligible.serialSk2());
-    try std.testing.expect((Key{ .kind = .projection, .n = 10240, .k = 5120, .slices = 2 }).serialSk2());
+    try std.testing.expect(!(Key{ .kind = .projection, .n = 10240, .k = 5120, .slices = 2 }).serialSk2());
     try std.testing.expect((Key{ .kind = .projection, .n = 12288, .k = 5120, .slices = 2 }).serialSk2());
     inline for (.{
         .{ "kind", Kind.mlp },
