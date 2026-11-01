@@ -48,6 +48,8 @@ pub const Kernels = struct {
     star_pair: metal.Pipeline,
     /// conv_commit for in-place keeps: a thread a channel, the window written straight over history (no publish_conv).
     conv_keep: metal.Pipeline,
+    /// star_pair whose last threadgroup of each head runs post_rows' gate for the head's rows.
+    star_pair_gated: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -76,6 +78,7 @@ pub const Kernels = struct {
             "tree_pair",
             "star_pair",
             "conv_keep",
+            "star_pair_gated",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -84,7 +87,7 @@ pub const Kernels = struct {
             pipelines[index] = try metal.Pipeline.init(device, library, "tf_delta_gdn_" ++ name, false);
             done += 1;
         }
-        inline for (.{ 7, 13, 14, 21 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        inline for (.{ 7, 13, 14, 21, 23 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
         return .{
             .library = library,
             .pipelines = .{
@@ -108,6 +111,7 @@ pub const Kernels = struct {
             .tree_pair = pipelines[20],
             .star_pair = pipelines[21],
             .conv_keep = pipelines[22],
+            .star_pair_gated = pipelines[23],
         };
     }
 
@@ -131,6 +135,7 @@ pub const Kernels = struct {
             k.tree_pair,
             k.star_pair,
             k.conv_keep,
+            k.star_pair_gated,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

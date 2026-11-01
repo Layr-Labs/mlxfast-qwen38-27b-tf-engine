@@ -216,6 +216,33 @@ pub const Round = struct {
         r.gate(e, post_rows);
     }
 
+    /// forwardStar with the gate in the star's own launch (tf_delta_gdn_star_pair_gated) where post_rows would gate the
+    /// rows: `counters` holds a zeroed word for each (segment, head), which the launch leaves at zero.
+    pub fn forwardStarGated(r: Round, e: metal.ComputeEncoder, star_gated: metal.Pipeline, star: metal.Pipeline, post_rows: metal.Pipeline, counters: metal.Buffer, beside: ?Beside) !void {
+        var wide = r.p.dv == 128 and r.p.zba_stride % 4 == 0;
+        inline for (.{ r.b.recurrent, r.b.z, r.b.output }) |s| wide = wide and s.offset % 8 == 0; // post_rows' bfloat4 rows
+        if (!wide or counters.length() < @as(usize, r.p.nv) * r.segments * 4) return r.forwardStar(e, star, post_rows, beside);
+        if (!r.star or !r.usesSlots()) return error.BadGdnPlan;
+        e.setPipeline(star_gated);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
+        r.b.segments.bind(e, 7);
+        e.setValue(r.p, 8);
+        r.b.recurrent.bind(e, 9);
+        bind(e, .{ r.b.z, r.b.norm, r.b.output }, 10);
+        if (r.sums) |w| {
+            w.span.bind(e, 13);
+            e.setValue(w.stride, 14);
+            w.written.* = true;
+        } else {
+            r.b.output.bind(e, 13); // never read: a zero stride writes no sums
+            e.setValue(@as(u32, 0), 14);
+        }
+        e.setBuffer(counters, 0, 15);
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        if (beside) |b| try b.encode(b.ptr, e);
+        e.barrier();
+    }
+
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) !void {
         try r.scanChain(e, chain, false, null);
         r.gate(e, post_rows);
@@ -252,12 +279,16 @@ pub const Round = struct {
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
+        r.encodeCommitConv(e);
+        e.barrier();
+    }
+    /// commitConv without its barrier, for work encoded beside it that neither reads nor writes the history.
+    pub fn encodeCommitConv(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.conv_commit);
         bind(e, .{ r.b.history, r.b.qkv, r.b.kept_rows, r.b.keeps, r.b.windows }, 0);
         e.setValue(r.p, 5);
         r.b.next_history.bind(e, 6);
         e.dispatchThreads(.{ .width = r.conv_width, .height = r.segments }, .{ .width = 256 }); // a word a thread
-        e.barrier();
     }
 
     pub fn commit(r: Round, e: metal.ComputeEncoder) void {

@@ -189,7 +189,10 @@ fn cacheBytes(cache: Cache, key: bool, geometry: planning.Geometry) usize {
     return ((@as(usize, geometry.kv_heads) - 1) * stride + @as(usize, cache.capacity) * geometry.dim) * 2;
 }
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    bindFrom(e, refs, 0);
+}
+fn bindFrom(e: mtl.ComputeEncoder, refs: anytype, first: usize) void {
+    inline for (refs, first..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
 /// The prompt kernel's threads a group: eight simdgroups, both kernels (attention_prompt*.metal's SG = 8).
 const prompt_threads = 256;
@@ -197,11 +200,14 @@ const prompt_threads = 256;
 /// key_stride: values from one key row to the next (0: kv_heads * dim); strided keys take the fused norm and rope alone.
 /// packed_rows above 0: `query` is the scratch's qa, filled for a one-stream prompt plan of that many packed rows as
 /// q27_attn_pack_a fills it (`encode` with `prepacked`); the fused norm and rope alone.
-pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{} };
+pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{}, tree: ?TreeCopies = null };
+/// A decoded tree's copies the preprocess does beside its packed queries (q27_head_norm_rope_tree): q27_attn_pack_b's tiles
+/// in `qb`, and q27_attn_append's keys and values into the binding's caches (`caches`, `meta`) at the plan's `nodes`.
+pub const TreeCopies = struct { qb: Ref, caches: Ref, meta: Ref, nodes: Ref, value: Ref, v_stride: u32 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [14]mtl.Pipeline,
+    io: [15]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
@@ -213,10 +219,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [14]mtl.Pipeline = undefined;
+        var io: [15]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_tree" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -275,15 +281,20 @@ pub const Attention = struct {
             if (r.offset % 8 != 0) break false;
         } else true; // bfloat4 rows
         if (rows4) {
-            e.setPipeline(a.io[if (p.packed_rows == 0) 10 else 11]);
+            e.setPipeline(a.io[if (p.tree != null) 14 else if (p.packed_rows == 0) 10 else 11]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
             e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
             e.setBuffer(p.rotated_key.buffer, p.rotated_key.offset, 7);
+            if (p.tree) |t| {
+                bindFrom(e, .{ t.qb, t.caches, t.meta, t.nodes, t.value }, 8);
+                e.setValue(t.v_stride, 13);
+            }
             e.dispatchGroups(mtl.Size.of((g.heads + g.kv_heads + 3) / 4, p.rows, 1), mtl.Size.of(128, 1, 1));
             e.barrier();
             return timing.end();
         }
+        if (p.tree != null) return error.TargetAttentionShape; // the tree form is the bfloat4 rows' kernel only
         if (key_stride != g.kv_heads * g.dim or p.packed_rows != 0) return error.TargetAttentionShape; // packed keys, rope rows
         e.setPipeline(a.io[7]);
         bind(e, .{ p.qg, p.q_gain });
@@ -314,12 +325,27 @@ pub const Attention = struct {
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only. `sums` (decoded rows only): the merge also writes the out
     /// projection's group sums of `out` there, so that projection dispatches no sums pass of its own.
-    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, sums: ?Sums) !void {
+    /// Whether a decoded tree's preprocess takes the tree copies (q27_head_norm_rope_tree): one stream, unfused, off the
+    /// prompt path, on tensor-unit devices.
+    pub fn treeCopies(a: *const Attention, plan: Plan, prompt: bool) bool {
+        return a.units and !a.promptPath(plan, prompt) and !plan.fused and plan.streams == 1;
+    }
+    /// The buffers a pass reaches through the binding's and scratch's GPU addresses, for its encoder.
+    pub fn useBuffers(e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, caches: []const Cache) void {
+        for (scratch.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        for (binding.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        for (caches) |cache| {
+            e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+            e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
+        }
+    }
+    /// `copied`: the preprocess already appended the keys and values and packed qa and qb (treeCopies).
+    pub fn encode(a: *const Attention, input_encoder: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, k: Ref, v: Ref, v_stride: u32, out: Ref, caches: []const Cache, raw_gate: ?Ref, prompt: bool, prepacked: bool, copied: bool, sums: ?Sums) !void {
         try plan.geometry.check();
         const g = plan.geometry;
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
         const kv_bytes = @as(usize, plan.rows) * g.kv_heads * g.dim * 2;
-        if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt))) return error.TargetAttentionShape;
+        if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt)) or (copied and !a.treeCopies(plan, prompt))) return error.TargetAttentionShape;
         const v_bytes = (@as(usize, plan.rows) - 1) * v_stride * 2 + g.kv_heads * g.dim * 2;
         var timing = profile.begin(a.profiler, input_encoder, .attention);
         errdefer timing.cancel();
@@ -346,18 +372,15 @@ pub const Attention = struct {
             try disjoint(cache.keys, cacheBytes(cache, true, plan.geometry), operand.ref, operand.bytes);
             try disjoint(cache.values, cacheBytes(cache, false, plan.geometry), operand.ref, operand.bytes);
         };
-        for (scratch.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        for (binding.buffers) |buffer| e.useResource(buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        for (caches) |cache| {
-            e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-            e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
-        }
+        useBuffers(e, scratch, binding, caches);
         const args = PackArgs{ .rows = plan.rows, .packed_rows = plan.tiles * 16, .heads = g.heads, .kv_heads = g.kv_heads, .dim = g.dim, .group = g.group(), .v_stride = v_stride };
-        e.setPipeline(a.io[2]);
-        bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
-        e.setValue(args, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 4, 1));
-        if (!prepacked) {
+        if (!copied) {
+            e.setPipeline(a.io[2]);
+            bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
+            e.setValue(args, 5);
+            e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 4, 1));
+        }
+        if (!prepacked and !copied) {
             e.setPipeline(a.io[0]);
             bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
             e.setValue(args, 3);
@@ -367,7 +390,7 @@ pub const Attention = struct {
             e.barrier();
             // The merge retains normalized BF16 rounding, then gates and writes ordered group sums.
             try a.promptRows(e, scratch, binding, plan, out, raw_gate, sums);
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, copied, sums);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -406,15 +429,18 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, copied: bool, sums: ?Sums) !void {
         const g = plan.geometry;
-        if (!plan.fused) {
-            e.setPipeline(a.io[1]);
-            bind(e, .{ q, scratch.get(.qb) });
-            e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1));
+        // copied: the preprocess filled qb and the caches, and its barrier ordered them before these reads
+        if (!copied) {
+            if (!plan.fused) {
+                e.setPipeline(a.io[1]);
+                bind(e, .{ q, scratch.get(.qb) });
+                e.setValue(args, 2);
+                e.dispatchThreads(mtl.Size.of(g.dim, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 4, 1));
+            }
+            e.barrier();
         }
-        e.barrier();
         const scale: f32 = 0.0625;
         if (plan.prefix_chunks > 0) {
             // a pair a tile: a long cache reads each chunk once for six tiles; a short one (under 16 chunks) has too few

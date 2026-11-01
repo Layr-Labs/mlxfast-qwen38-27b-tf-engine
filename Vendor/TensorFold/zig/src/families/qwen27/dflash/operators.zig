@@ -85,6 +85,10 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        // norm then rope in one pass (the rope's words from the norm's); null: the two ops
+        norm_rope: ?*const fn (*anyopaque, u64, View, Norm, Rotary) anyerror!?View = null,
+        // a residual conv then a norm of its rows in one pass: [the conv's rows, the norm's]; null: the two ops
+        conv_norm: ?*const fn (*anyopaque, u64, View, Conv, Norm) anyerror!?[2]View = null,
     };
 };
 

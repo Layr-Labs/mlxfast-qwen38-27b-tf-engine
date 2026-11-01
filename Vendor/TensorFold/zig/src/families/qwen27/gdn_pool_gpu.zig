@@ -64,6 +64,8 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
+    /// A zeroed word a (segment, head) for tf_delta_gdn_star_pair_gated's last-threadgroup counts.
+    star_counters: ?metal.Buffer = null,
 
     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
@@ -78,7 +80,10 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels };
+        errdefer kernels.deinit();
+        const counters = try device.buffer(@as(usize, shape.c.v_heads) * 16 * 4, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(counters.contents()[0..counters.length()], 0);
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .star_counters = counters };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -99,6 +104,7 @@ pub const Pool = struct {
         pool.releaseBefore();
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
+        if (pool.star_counters) |b| b.deinit();
     }
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
@@ -159,7 +165,7 @@ pub const Pool = struct {
         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
-        if (prepared.star and prepared.usesSlots()) try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
+        if (prepared.star and prepared.usesSlots()) (if (pool.star_counters) |counters| try prepared.forwardStarGated(scan.encoder, pool.kernels.star_pair_gated, pool.kernels.star_pair, pool.kernels.post_rows, counters, beside) else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside)) else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
     }
 
@@ -184,6 +190,12 @@ pub const Pool = struct {
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
         const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 8 == 0;
+        // windows that all land in the history directly are written beside the scan: the prepare before it has read the
+        // old history, and nothing after it in the layer reads or writes the history
+        const beside_windows = !step and pool.marks == null and in_place and projectedWindows(plan.host, prepared.p.taps);
+        var windows = DirectWindows{ .round = prepared, .beside = beside };
+        windows.round.b.next_history = prepared.b.history;
+        const scan_beside: ?gdn.Beside = if (beside_windows) .{ .ptr = &windows, .encode = DirectWindows.encode } else beside;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
@@ -191,13 +203,13 @@ pub const Pool = struct {
                 try b.encode(b.ptr, scan.encoder);
                 scan.encoder.barrier();
             }
-        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, beside);
+        } else try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, scan_beside);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
         prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
-        if (step) return;
+        if (step or beside_windows) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
         errdefer publication.cancel();
         const e = publication.encoder;
@@ -409,6 +421,16 @@ fn oneRowSegments(plan: Plan) bool {
 }
 
 /// Whether every kept window (a keep's last row's next conv window) reads projected rows alone.
+/// A chain's conv windows written straight to the history beside its scan, after the scan's own beside work.
+const DirectWindows = struct {
+    round: gdn.Round,
+    beside: ?gdn.Beside,
+    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
+        const w: *DirectWindows = @ptrCast(@alignCast(ptr));
+        if (w.beside) |b| try b.encode(b.ptr, e);
+        w.round.encodeCommitConv(e);
+    }
+};
 fn projectedWindows(plan: Plan, taps: u32) bool {
     for (plan.keeps) |keep| {
         if (keep.rows == 0) continue;

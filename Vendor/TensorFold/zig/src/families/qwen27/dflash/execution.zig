@@ -29,6 +29,17 @@ fn rotate(ops: op.Ops, frame: u64, x: op.View, positions: []const u64, heads: u3
     try y.check(x.rows, x.width, .bf16);
     return y;
 }
+/// norm then rotate, in one op where the backend has it (the same words either way)
+fn normRotate(ops: op.Ops, frame: u64, x: op.View, weight: w.Tensor, positions: []const u64, heads: u32, c: Config) !op.View {
+    if (ops.vtable.norm_rope) |f| {
+        if (weight.rank != 1 or weight.shape[0] != c.head_dim or x.width != heads * c.head_dim) return error.DraftOperatorShape;
+        if (try f(ops.ptr, frame, x, .{ .weight = weight, .eps = c.eps, .heads = heads, .head_dim = c.head_dim }, .{ .positions = positions, .heads = heads, .dim = c.head_dim, .theta = c.theta })) |y| {
+            try y.check(x.rows, x.width, .bf16);
+            return y;
+        }
+    }
+    return rotate(ops, frame, try norm(ops, frame, x, weight, c.eps, heads, c.head_dim), positions, heads, c);
+}
 /// `block`: rows a conv window spans; a batched pass stacks several streams' blocks.
 fn convolve(ops: op.Ops, frame: u64, x: op.View, dynamic: op.View, weights: w.Conv, branch: u32, residual: ?op.View, c: Config, block: u32) !op.View {
     try dynamic.check(x.rows, c.dynamicWidth(), .bf16);
@@ -36,6 +47,18 @@ fn convolve(ops: op.Ops, frame: u64, x: op.View, dynamic: op.View, weights: w.Co
     const y = try ops.vtable.conv(ops.ptr, frame, x, .{ .dynamic = dynamic, .base = weights.base, .branch = branch, .group = c.group, .block = block, .residual = residual });
     try y.check(x.rows, c.hidden, .bf16);
     return y;
+}
+
+/// convolve (a residual branch) then norm its rows, in one op where the backend has it: the conv's rows and the norm's
+fn convNorm(ops: op.Ops, frame: u64, x: op.View, dynamic: op.View, weights: w.Conv, branch: u32, residual: op.View, gain: w.Tensor, c: Config, block: u32) !?[2]op.View {
+    const f = ops.vtable.conv_norm orelse return null;
+    if (gain.rank != 1 or gain.shape[0] != c.hidden) return error.DraftOperatorShape;
+    try dynamic.check(x.rows, c.dynamicWidth(), .bf16);
+    try residual.check(x.rows, x.width, .bf16);
+    const r = (try f(ops.ptr, frame, x, .{ .dynamic = dynamic, .base = weights.base, .branch = branch, .group = c.group, .block = block, .residual = residual }, .{ .weight = gain, .eps = c.eps, .heads = 1, .head_dim = c.hidden })) orelse return null;
+    try r[0].check(x.rows, c.hidden, .bf16);
+    try r[1].check(x.rows, c.hidden, .bf16);
+    return r;
 }
 
 pub fn append(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context) !void {
@@ -85,8 +108,7 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
             values[i] = try project(ops, frame, hidden, layer.attention.v, preparation.mode);
         }
     }
-    for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
-    for (g.layers, 0..) |_, i| keys[i] = try rotate(ops, frame, keys[i], positions, c.kv_heads, c);
+    for (g.layers, 0..) |layer, i| keys[i] = try normRotate(ops, frame, keys[i], layer.attention.k_norm, positions, c.kv_heads, c);
     for (g.layers, 0..) |_, i| switch (sink) {
         .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
         .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
@@ -147,9 +169,11 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
     for (given, 1..) |t, i| ids[i] = t;
     var hidden = try ops.vtable.embed(ops.ptr, frame, g.embed, ids[0..rows]);
     try hidden.check(rows, c.hidden, .bf16);
+    var next_input: ?op.View = null; // a layer's input norm, written beside the conv that ends the layer before it
     for (g.layers, 0..) |layer, i| {
         var residual = hidden;
-        const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
+        const xn = next_input orelse try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
+        next_input = null;
         const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
         const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
         // the products, then both norms, then both ropes: independent neighbours for the concurrent encoder
@@ -165,15 +189,20 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
             raw_keys = try project(ops, frame, input, layer.attention.k, preparation.mode);
             values = try project(ops, frame, input, layer.attention.v, preparation.mode);
         }
-        const normed_query = try norm(ops, frame, raw_query, layer.attention.q_norm, c.eps, c.heads, c.head_dim);
-        const normed_keys = try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
-        const query = try rotate(ops, frame, normed_query, positions[0..rows], c.heads, c);
-        const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
+        const query = try normRotate(ops, frame, raw_query, layer.attention.q_norm, positions[0..rows], c.heads, c);
+        const keys = try normRotate(ops, frame, raw_keys, layer.attention.k_norm, positions[0..rows], c.kv_heads, c);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
-        hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
+        const mixed = try project(ops, frame, attended, layer.attention.o, preparation.mode);
+        var post: op.View = undefined;
+        if (try convNorm(ops, frame, mixed, dynamic, layer.attention_conv, 1, residual, layer.post_norm, c, block)) |both| {
+            hidden = both[0];
+            post = both[1];
+        } else {
+            hidden = try convolve(ops, frame, mixed, dynamic, layer.attention_conv, 1, residual, c, block);
+            post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
+        }
         residual = hidden;
-        const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
         const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
         const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
         var gate: op.View = undefined;
@@ -187,7 +216,13 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         }
         const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
         try activated.check(rows, c.intermediate, .bf16);
-        hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
+        const down = try project(ops, frame, activated, layer.mlp.down, preparation.mode);
+        if (i + 1 < g.layers.len) if (try convNorm(ops, frame, down, dyn_mlp, layer.mlp_conv, 1, residual, g.layers[i + 1].input_norm, c, block)) |both| {
+            hidden = both[0];
+            next_input = both[1];
+            continue;
+        };
+        hidden = try convolve(ops, frame, down, dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }
     // one stream heads only its mask rows; a batch heads every row and each stream's lattice skips its anchor
     const masks = if (n == 1) try ops.vtable.mask_rows(ops.ptr, frame, hidden, 1, block - 1) else hidden;

@@ -496,13 +496,17 @@ pub const Runner = struct {
         const mixed = f.get(.mixed);
         var value = mixed;
         value.offset += @as(usize, kv) * 2;
-        // a prompt plan's query goes straight to the prompt kernel's packed rows
+        // a prompt plan's query goes straight to the prompt kernel's packed rows; a decoded tree's preprocess also packs qb
+        // and appends its keys and values (Attention.treeCopies)
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry });
+        const copied = r.attention.treeCopies(plan, r.model.kernels.prompt);
+        if (copied) attn.Attention.useBuffers(e, &r.scratch, &r.bindings[layer], caches);
+        const copies: ?attn.TreeCopies = if (copied) .{ .qb = r.scratch.get(.qb), .caches = r.bindings[layer].get(.caches), .meta = r.bindings[layer].get(.meta), .nodes = r.scratch.get(.nodes), .value = value, .v_stride = 2 * kv } else null;
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked or copied) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked or copied) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .tree = copies });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
-        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, copied, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null);
         f.mixer_sums = out_sums;
     }
 

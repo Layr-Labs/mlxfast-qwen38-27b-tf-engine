@@ -159,3 +159,88 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
     tf_delta_tree_node(n1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0 + 1, lane);
   }
 }
+
+// tf_delta_gdn_star_pair, then tf_delta_gdn_post_rows of each (segment, head) by the last of that head's threadgroups to
+// finish its columns (a threadgroup is four column pairs, dv / 8 of them a head): each threadgroup counts itself past a
+// device-scope fence, and the last reads the head's scan words past another and gates every row of the segment, a
+// simdgroup a row, with post_rows' arithmetic and sums. The counter is left at zero for the next launch.
+kernel void tf_delta_gdn_star_pair_gated(device const bfloat* query [[buffer(0)]],
+                                   device const bfloat* key [[buffer(1)]],
+                                   device const bfloat* value [[buffer(2)]],
+                                   device const float* decay [[buffer(3)]],
+                                   device const bfloat* mixing [[buffer(4)]],
+                                   device const float* committed [[buffer(5)]],
+                                   device const TfDeltaSegment* segments [[buffer(7)]],
+                                   constant TfDeltaParams& p [[buffer(8)]],
+                                   device bfloat* output [[buffer(9)]],
+                                   device const bfloat* gate [[buffer(10)]],
+                                   device const void* norm [[buffer(11)]],
+                                   device bfloat* gated [[buffer(12)]],
+                                   device float* sums [[buffer(13)]],
+                                   constant uint& sums_stride [[buffer(14)]],
+                                   device atomic_uint* counters [[buffer(15)]],
+                                   uint3 position [[thread_position_in_grid]],
+                                   uint3 group [[threadgroup_position_in_grid]],
+                                   uint3 groups [[threadgroups_per_grid]],
+                                   uint sg [[simdgroup_index_in_threadgroup]],
+                                   uint t [[thread_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+  {
+    const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+    const uint d0 = 2 * position.y, key_head = head / (p.nv / p.nk);
+    const TfDeltaSegment span = segments[segment_index];
+    const uint column = (head * p.dv + d0) * p.dk + lane * 4, base = span.state_slot * p.nv * p.dv * p.dk;
+    float4 r0, r1;
+    for (uint part = 0; part < 4; ++part) {
+      r0[part] = committed[base + column + part];
+      r1[part] = committed[base + column + p.dk + part];
+    }
+    const float4 n0 = tf_delta_tree_node(r0, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0, lane);
+    const float4 n1 = tf_delta_tree_node(r1, query, key, value, decay, mixing, p, output, span.first, head, key_head, d0 + 1, lane);
+    for (uint c = 1; c < span.rows; ++c) {
+      tf_delta_tree_node(n0, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0, lane);
+      tf_delta_tree_node(n1, query, key, value, decay, mixing, p, output, span.first + c, head, key_head, d0 + 1, lane);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  threadgroup uint last;
+  if (t == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    last = atomic_fetch_add_explicit(&counters[group.z], 1u, memory_order_relaxed) == groups.y - 1u ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (last == 0u) return;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  if (t == 0) atomic_store_explicit(&counters[group.z], 0u, memory_order_relaxed);
+  const uint head = group.z % p.nv;
+  const TfDeltaSegment span = segments[group.z / p.nv];
+  for (uint i = sg; i < span.rows; i += 4) {
+    const uint row = span.first + i;
+    const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+    const bfloat4 x = *(device const bfloat4*)(output + at), z4 = *(device const bfloat4*)(gate + z_at);
+    float values[4];
+    float square = 0.0f;
+    for (uint part = 0; part < 4; ++part) {
+      values[part] = float(x[part]);
+      square += values[part] * values[part];
+    }
+    square = simd_sum(square);
+    const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+    bfloat4 y;
+    for (uint part = 0; part < 4; ++part) {
+      const float normalized = float(bfloat(tf_delta_weight(norm, lane * 4 + part, p.weight_flags, 3) * (values[part] * inverse)));
+      const float z = float(z4[part]);
+      y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    }
+    *(device bfloat4*)(gated + at) = y;
+    if (sums_stride != 0) {
+      simdgroup_barrier(mem_flags::mem_device);
+      if ((lane & 15) == 0) {
+        const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
+        float acc = 0.0f;
+        for (int i = 0; i < 64; i++) acc += float(gated[(size_t)row * width + g * 64 + i]);
+        sums[g * int(sums_stride) + int(row)] = acc;
+      }
+    }
+  }
+}

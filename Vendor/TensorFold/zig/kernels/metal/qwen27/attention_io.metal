@@ -70,3 +70,43 @@ kernel void q27_attn_scatter_layers(constant Q27KeepLayer* layers [[buffer(0)]],
   l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + destination * 256 + at.x] = K[source];
   l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + destination * 256 + at.x] = V[source];
 }
+
+// A decoded tree's q27_head_norm_rope_packed (one stream) that also does q27_attn_pack_b's and q27_attn_append's copies:
+// a query head's words, as stored in QA, go to QB at (kv head, row, head % g), and a group's first head writes QB's rows
+// g..15 of its tile as zeros; a key head's words, as stored in KY, go to the cache at the row's position, with the row's
+// value words beside them. Every stored word is the word those kernels store.
+kernel void q27_head_norm_rope_tree(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]],
+    device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]],
+    device bfloat* QA [[buffer(6)]], device bfloat* KY [[buffer(7)]], device bfloat* QB [[buffer(8)]],
+    device const Q27CachePtrs* caches [[buffer(9)]], device const int* meta [[buffer(10)]], device const int* nodes [[buffer(11)]],
+    device const bfloat* V [[buffer(12)]], constant uint& v_stride [[buffer(13)]], uint2 group [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  q27_head_norm_rope_rows<true>(Q, K, QW, KW, positions, a, QA, KY, group, sg, lane);
+  const uint head = group.x * 4 + sg, row = group.y;
+  if (head >= a.heads + a.kv_heads) return;
+  const uint g = a.heads / a.kv_heads;
+  if (head < a.heads) {
+    const uint kv_head = head / g, y = head - kv_head * g;
+    device const bfloat* src = QA + (kv_head * a.packed_rows + row * g + y) * a.width;
+    device bfloat* tile = QB + (kv_head * a.rows + row) * 16 * a.width;
+    *(device bfloat4*)(tile + y * a.width + 4 * lane) = *(device const bfloat4*)(src + 4 * lane);
+    *(device bfloat4*)(tile + y * a.width + 128 + 4 * lane) = *(device const bfloat4*)(src + 128 + 4 * lane);
+    if (y == 0)
+      for (uint z = g; z < 16; ++z) {
+        *(device bfloat4*)(tile + z * a.width + 4 * lane) = bfloat4(bfloat(0.0f));
+        *(device bfloat4*)(tile + z * a.width + 128 + 4 * lane) = bfloat4(bfloat(0.0f));
+      }
+    return;
+  }
+  const uint kh = head - a.heads;
+  const int st = nodes[4 * row + 1], base = 8 + st * 12;
+  const uint at = uint(meta[base + 4]) + (row - uint(meta[base + 6]));
+  device const bfloat* ks = KY + (row * a.kv_heads + kh) * a.width;
+  device const bfloat* vs = V + row * v_stride + kh * a.width;
+  device bfloat* kd = caches[st].keys + ulong(kh) * uint(meta[base + 7]) + at * a.width;
+  device bfloat* vd = caches[st].values + ulong(kh) * uint(meta[base + 8]) + at * a.width;
+  *(device bfloat4*)(kd + 4 * lane) = *(device const bfloat4*)(ks + 4 * lane);
+  *(device bfloat4*)(kd + 128 + 4 * lane) = *(device const bfloat4*)(ks + 128 + 4 * lane);
+  *(device bfloat4*)(vd + 4 * lane) = *(device const bfloat4*)(vs + 4 * lane);
+  *(device bfloat4*)(vd + 128 + 4 * lane) = *(device const bfloat4*)(vs + 128 + 4 * lane);
+}
