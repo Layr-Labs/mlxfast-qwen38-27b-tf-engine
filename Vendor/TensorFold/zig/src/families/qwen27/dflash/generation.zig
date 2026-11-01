@@ -178,7 +178,7 @@ pub const Generation = struct {
         shape: ?@import("core").tree_round.Match = null,
         /// The next round's frame is committed behind the verify (Model.prepareNext), its taps gathered into the ring.
         early: bool = false,
-        /// The keep waits for the verify's end to go to the queue (release), behind the early frame.
+        /// The keep waits until the early frame is scheduled before it goes to the queue, so both can run together.
         held: bool = false,
         fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
@@ -224,6 +224,11 @@ pub const Generation = struct {
                 if (prepared) {
                     g.keep = keep_cb.retain();
                     p.held = true;
+                    // On Apple GPUs, work committed behind a command buffer before that buffer is scheduled can wait for
+                    // it to finish. The early frame is already committed here; wait only until Metal schedules it, then
+                    // queue the keep and bridge while the verify's host thread would otherwise still be polling its tail.
+                    while (@backingInt(g.draft.backend.frame.cb.status()) < @backingInt(mtl.types.CommandBufferStatus.scheduled)) std.atomic.spinLoopHint();
+                    p.release();
                     return;
                 }
             }
