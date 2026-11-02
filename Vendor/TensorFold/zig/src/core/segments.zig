@@ -16,6 +16,7 @@ pub const Lane = struct {
     cb: mtl.CommandBuffer,
     enc: mtl.ComputeEncoder,
     fence: Fence, // orders the segment's encoders: buffers are untracked, so encoders could overlap
+    queue: mtl.Queue = undefined, // the segment's queue: its later command buffers come from it
 };
 
 pub const rows = stagger.rows;
@@ -34,6 +35,7 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
 }
 
 /// `runCommitting` whose first commit comes after `first` layers, so the GPU starts while the CPU encodes the rest.
+/// A family that declares `beforeCommit` runs it once, right before the pass's first commit (whichever chunk that is).
 /// A polled single-lane pass signals `poll_event` behind its last command and the host returns once the GPU reaches it,
 /// tens of microseconds before the command buffers report themselves completed. Their waits and failure checks run at
 /// the start of the next pass (`checkUnchecked`); the GPU has finished their work by then, so no buffer is reused early.
@@ -41,6 +43,14 @@ var poll_event: ?mtl.SharedEvent = null;
 var poll_value: u64 = 0;
 var unchecked: [17]mtl.CommandBuffer = undefined;
 var n_unchecked: usize = 0;
+/// A polled single-lane pass's fence, made once for its queue and kept: a pass's first encoder waits on nothing and
+/// each later one on the update just before it, so a kept fence orders a pass exactly as a new one does.
+var poll_fence: ?struct { fence: Fence, queue: mtl.objc.Id } = null;
+
+/// The family's work due right before a pass's first commit, if it declares any (runCommittingFrom).
+fn beforeCommit(fam: anytype) !void {
+    if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "beforeCommit")) try fam.beforeCommit();
+}
 
 /// Waits for and checks the command buffers a polled pass returned before they reported completion.
 pub fn checkUnchecked() !void {
@@ -80,14 +90,20 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
     while (n_evs + 1 < n) : (n_evs += 1) evs[n_evs] = try device.event();
     var lanes: [MAX]Lane = undefined;
     var n_lanes: usize = 0;
-    defer for (lanes[0..n_lanes]) |l| l.fence.deinit();
+    // decoded rows poll one lane (as the poll event and the unchecked buffers above): that lane keeps its queue's fence
+    const kept_fence = n == 1 and (if (poll_fence) |kept| kept.queue == queues[0].id else true) and (if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "polls")) fam.polls() else false);
+    defer if (!kept_fence) for (lanes[0..n_lanes]) |l| l.fence.deinit();
     for (queues) |q| {
-        const fence = try Fence.init(device);
+        const fence = if (kept_fence) (if (poll_fence) |kept| kept.fence else made: {
+            const f = try Fence.init(device);
+            poll_fence = .{ .fence = f, .queue = q.id };
+            break :made f;
+        }) else try Fence.init(device);
         const cb = q.commandBuffer();
-        lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence };
+        lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence, .queue = q };
         n_lanes += 1;
     }
-    var done: [16]mtl.CommandBuffer = undefined;
+    var done: [48]mtl.CommandBuffer = undefined;
     var n_done: usize = 0;
     const X = struct {
         fam: @TypeOf(fam),
@@ -99,19 +115,22 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         layers: usize,
         first: usize,
         early: bool,
-        done: *[16]mtl.CommandBuffer,
+        done: *[48]mtl.CommandBuffer,
         n_done: *usize,
 
-        /// Commits the lane's command buffer so far and opens the next behind the lane's fence (one lane only).
-        fn commitLane(x: *const @This(), k: usize) void {
-            if (x.lanes.len != 1 or x.n_done.* == x.done.len) return;
+        /// Commits the lane's command buffer so far and opens the next on the lane's queue behind the lane's fence; the
+        /// family's beforeCommit runs before the first. Each lane of a staggered pass commits at the same layers.
+        fn commitLane(x: *const @This(), k: usize) !void {
+            // one lane keeps sixteen (its polled pass hands them to `unchecked`); two lanes commit twice as often
+            if (x.n_done.* == (if (x.lanes.len == 1) 16 else x.done.len)) return;
+            if (x.n_done.* == 0) try beforeCommit(x.fam);
             const l = &x.lanes[k];
             l.fence.update(l.enc);
             l.enc.end();
             l.cb.commit();
             x.done[x.n_done.*] = l.cb;
             x.n_done.* += 1;
-            l.cb = x.queue.commandBuffer();
+            l.cb = l.queue.commandBuffer();
             l.enc = l.cb.compute(x.mode);
             l.fence.wait(l.enc);
         }
@@ -142,13 +161,13 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);
-            if (x.early and i == 0 and i + 1 < x.layers) x.commitLane(k);
+            if (x.early and i == 0 and i + 1 < x.layers) try x.commitLane(k);
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
             if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3)) return;
-            x.commitLane(k);
+            try x.commitLane(k);
         }
         pub fn finish(x: *const @This(), k: usize) !void {
             try x.fam.finish(&x.lanes[k]);
@@ -161,6 +180,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         return err;
     };
     for (lanes[0..n]) |l| l.enc.end();
+    if (n_done == 0) try beforeCommit(fam);
     const polled = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "polls")) fam.polls() else false;
     // one polled lane signals the event behind its last command (see poll_event)
     if (polled and n == 1 and poll_event == null) poll_event = device.sharedEvent() catch null;

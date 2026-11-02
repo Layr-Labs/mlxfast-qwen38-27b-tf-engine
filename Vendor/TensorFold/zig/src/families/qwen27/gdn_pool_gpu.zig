@@ -59,7 +59,28 @@ pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null };
+/// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
+/// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
+pub const Own = struct {
+    tails: metal.Buffer,
+    recurrent: metal.Buffer,
+    snapshots: metal.Buffer,
+
+    pub fn init(pool: *const Pool, device: metal.Device) !Own {
+        const tails = try device.buffer(pool.get(.tails).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        errdefer tails.deinit();
+        const recurrent = try device.buffer(pool.get(.recurrent).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        errdefer recurrent.deinit();
+        const snapshots = try device.buffer(pool.get(.snapshots).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
+    }
+    pub fn deinit(o: Own) void {
+        o.tails.deinit();
+        o.recurrent.deinit();
+        o.snapshots.deinit();
+    }
+};
 
 pub const Pool = struct {
     budget: Budget,
@@ -90,8 +111,10 @@ pub const Pool = struct {
         const buffers = try allocateBuffers(device, budget);
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
-        const scan_words = try device.buffer(8, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..8], 0);
+        // words 0-1: the star scan's count and its gate's arrivals; words 2-3 (gdn.star_words): the prepare's count and the
+        // star scan's arrivals
+        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..16], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -170,25 +193,35 @@ pub const Pool = struct {
     pub const After = struct { counter: metal.Buffer, wait: u32 };
 
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
-        return pool.forwardAfter(layer, plan, refs, e, beside, null, null);
+        return pool.forwardAfter(layer, plan, refs, e, beside, null, null, false);
     }
 
     /// `deferred`: a lone depth-one star verify's scan applies the first `rows` pending rows before node 0
     /// (tf_delta_gdn_star_pending) and, on `persist`, writes the state they leave back over the committed one.
-    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred) !void {
-        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+    /// `uploaded`: the caller validated the plan (prepare) and uploads its metadata once before its pass's first
+    /// commit; the layer's launches read that copy.
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred, uploaded: bool) !void {
+        if (!uploaded) try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         const prepared = try pool.round(layer, plan, refs, false);
-        try plan.metadata.upload(plan.host);
+        if (!uploaded) try plan.metadata.upload(plan.host);
+        // decoded star rows: the star scan joins the counted prepare's barrier interval, loading its states (and replaying
+        // any pending rows) while the projections and the prepare run, and reads the prepared rows once they are counted
+        const chained = after != null and pool.profiler == null and pool.scan_words != null and prepared.star and prepared.usesSlots();
+        const wait_prep: u32 = if (chained) prepared.prepareGroups() else 0;
+        // made before the prepare counts itself: a failure past that point would leave the star's words unconsumed
+        const pending: ?gdn.Pending = if (deferred) |d| made: {
+            if (d.rows > pending_rows) return error.BadGdnPending;
+            break :made .{ .key = try pool.layerSpan(.pending_key, layer), .value = try pool.layerSpan(.pending_value, layer), .decay = try pool.layerSpan(.pending_decay, layer), .mixing = try pool.layerSpan(.pending_mixing, layer), .use = d };
+        } else null;
+        if (deferred != null and !(prepared.star and prepared.usesSlots())) return error.BadGdnPlan;
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait, if (chained) pool.scan_words else null) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         if (prepared.star and prepared.usesSlots()) {
-            if (deferred) |d| {
-                if (d.rows > pending_rows) return error.BadGdnPending;
-                const pending = gdn.Pending{ .key = try pool.layerSpan(.pending_key, layer), .value = try pool.layerSpan(.pending_value, layer), .decay = try pool.layerSpan(.pending_decay, layer), .mixing = try pool.layerSpan(.pending_mixing, layer), .use = d };
-                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending);
-            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null);
+            if (pending) |q| {
+                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, q, wait_prep);
+            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, wait_prep);
         } else if (deferred != null) {
             return error.BadGdnPlan;
         } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
@@ -242,7 +275,7 @@ pub const Pool = struct {
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
-        prepared.gate(gate.encoder, pool.kernels.post_rows);
+        if (prompt) prepared.gatePrompt(gate.encoder, pool.kernels.post_rows16, pool.kernels.post_rows) else prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
@@ -432,9 +465,9 @@ pub const Pool = struct {
             .value = try pool.layerSpan(.value, layer),
             .decay = try pool.layerSpan(.decay, layer),
             .mixing = try pool.layerSpan(.mixing, layer),
-            .tails = try refSpan(.{ .buffer = pool.get(.tails) }, bytes.tails),
-            .snapshots = try refSpan(.{ .buffer = pool.get(.snapshots) }, bytes.snapshots),
-            .recurrent = try refSpan(.{ .buffer = pool.get(.recurrent) }, bytes.value),
+            .tails = try refSpan(.{ .buffer = if (refs.own) |o| o.tails else pool.get(.tails) }, bytes.tails),
+            .snapshots = try refSpan(.{ .buffer = if (refs.own) |o| o.snapshots else pool.get(.snapshots) }, bytes.snapshots),
+            .recurrent = try refSpan(.{ .buffer = if (refs.own) |o| o.recurrent else pool.get(.recurrent) }, bytes.value),
             .output = try refSpan(refs.output, bytes.value),
             .next_state = if (inPlace(plan)) try pool.layerSpan(.state, layer) else return error.GdnSlotMoves,
             .next_history = try pool.layerSpan(.next_history, layer),

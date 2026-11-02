@@ -21,6 +21,11 @@ pub const Hook = struct {
     accepted_chain: bool = false,
     /// The round's deferred GDN replay (decode_round.Runner.deferred): its star scans apply the pending rows first.
     deferred: ?@import("gdn_contract.zig").Deferred = null,
+    /// The round's plan was validated (Pool.prepare) and its metadata goes up once before the pass's first commit
+    /// (decode_round.Runner.settleRound): a tree verify's layers read that copy rather than each uploading it again.
+    uploaded: bool = false,
+    /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
+    own: ?pool_gpu.Own = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -44,10 +49,11 @@ pub const Hook = struct {
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
+        gated.own = hook.own;
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
