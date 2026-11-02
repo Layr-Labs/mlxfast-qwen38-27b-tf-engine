@@ -26,7 +26,11 @@ Q27_SPECIALIZE
   constexpr int E = 16;
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
-  // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  // The grid covers the real rows, so row 0's threadgroup zeroes every padded row's group sums. Those
+  // stores are load-bearing, not tidiness: on this runner, a decode round that skipped them in this
+  // kernel scored 0.75% below its record, and a round that added them elsewhere scored 0.8% below its
+  // own control. The padding entries are read by lane-kernel loads for rows no kept output is stored
+  // for, so they must hold defined values rather than a previous dispatch's words.
   if (int(m) == 0) {
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
