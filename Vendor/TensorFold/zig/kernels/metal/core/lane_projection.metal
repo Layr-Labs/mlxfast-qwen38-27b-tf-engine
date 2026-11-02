@@ -591,7 +591,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows: 16 a block. Each tile's words round to bf16 as the unfused store does; SwiGLU reads them as the
   // activation kernel reads the gate/up rows, and each 64-column group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // h (a bf16 word) goes back over its own gate word, which only its thread reads: no separate h buffer
   for (int i = 0; i < 16; i++) {
     const int m = mb + 8 * ((i >> 2) & 1);
     gu16[(ks * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
@@ -604,12 +604,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    gu16[((c >> 5) * 16 + m) * 32 + (c & 31)] = h;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += float(gu16[((i >> 5) * 16 + t16) * 32 + (i & 31)]);
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -852,30 +852,41 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // tf_lane_reg's fused prompt epilogue, with tile t of SIMD group ks as its tile 2 * ks + t: each tile's words round to
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
-  threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
-  TF_UNROLL
-  for (int t = 0; t < TN; t++) {
+  // SIMD group 1 hands its up words (rounded as the store rounds them) to SIMD group 0 in its own register order; group 0's
+  // lane holds the gate words of the same rows and columns, so it forms each h in place and leaves it in the up word's
+  // slot, from which each row's 64 h words are summed in column order.
+  threadgroup bfloat up16[TN * 16 * 32];
+  if (ks == 1) {
     TF_UNROLL
-    for (int i = 0; i < 16; i++) {
-      const int m = mb + 8 * ((i >> 2) & 1);
-      gu16[((2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
+    for (int t = 0; t < TN; t++) {
+      TF_UNROLL
+      for (int i = 0; i < 16; i++) up16[(t * 16 + i) * 32 + lane] = static_cast<bfloat>(C[t][i]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) {
+    TF_UNROLL
+    for (int t = 0; t < TN; t++) {
+      TF_UNROLL
+      for (int i = 0; i < 16; i++) {
+        const int m = mb + 8 * ((i >> 2) & 1), c = t * 32 + nb + 16 * (i >> 3) + (i & 3);
+        const float gf = float(static_cast<bfloat>(C[t][i]));
+        const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(up16[(t * 16 + i) * 32 + lane]));
+        if (m < M) Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+        up16[(t * 16 + i) * 32 + lane] = h;
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t16 = ks * 32 + lane;
-  for (int at = t16; at < 16 * 64; at += 64) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int c = 0; c < 64; c++) {
+      // row t16, column c: tile c / 32, and the register (i, lane) tf_lane_reg's layout puts there
+      const int n = c & 31, i = (n & 3) | (((t16 >> 3) & 1) << 2) | (((n >> 4) & 1) << 3);
+      const int l = ((n >> 2) & 1) | ((t16 & 3) << 1) | (((n >> 3) & 1) << 3) | (((t16 >> 2) & 1) << 4);
+      acc += float(up16[((c >> 5) * 16 + i) * 32 + l]);
+    }
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
