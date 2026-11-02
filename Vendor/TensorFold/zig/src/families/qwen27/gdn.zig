@@ -280,7 +280,7 @@ pub const Round = struct {
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
         // two simdgroups a threadgroup: twice the groups, so the cores' shares of them come out more even
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 2, .depth = 1 }) else r.stateGrid(e);
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 8, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 2, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }

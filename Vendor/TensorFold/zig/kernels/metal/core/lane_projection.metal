@@ -520,9 +520,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_REG_LEAN)
     // no branch around the prefetch: a chain's last group reloads its own codes, which nothing reads
 #if defined(TF_PROMPT_SR)
-    cp += g + 1 < last ? TF_TB * TF_RW : 0;
+    { const int stay = int(g + 1 >= last); cp += (1 - stay) * TF_TB * TF_RW;
     nw0 = cp[0];
-    nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
+    nw1 = TF_BITS == 2 ? uint4(0) : cp[32]; }
 #else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
