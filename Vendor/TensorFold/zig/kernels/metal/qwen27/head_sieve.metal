@@ -18,7 +18,10 @@ using namespace mpp::tensor_ops;
 #define TF_TB 8
 #define TF_SBI 4096
 #define TF_SBI12 1
-#define TF_SIEVE_KAPPA 7.0f
+#define TF_SIEVE_KAPPA 5.0f
+#endif
+#ifndef TF_SIEVE_M
+#define TF_SIEVE_M 16
 #endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
@@ -86,7 +89,7 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto desc = matmul2d_descriptor(TF_SIEVE_M, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto a0 = a.slice(0, 0);
