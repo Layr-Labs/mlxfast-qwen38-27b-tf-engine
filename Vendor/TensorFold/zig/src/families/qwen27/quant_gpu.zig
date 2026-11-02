@@ -526,7 +526,10 @@ pub const Kernels = struct {
 
         e.setPipeline(try k.get(.{ .kind = .xsum, .k = width }));
         bind(e, .{ x, dims, xs });
-        e.dispatchThreads(mtl.Size.of(width / 64, padded(rows), 1), mtl.Size.of(@min(width / 64, 256), 1, 1));
+        // A decode pass is at most eight rows, and a padding row's sums are read only by rows the lane
+        // kernel drops (`m < M` guards every store), so the launch covers the real rows. The stride stays
+        // `padded(rows)` because consumers index XS by it.
+        e.dispatchThreads(mtl.Size.of(width / 64, rows, 1), mtl.Size.of(@min(width / 64, 256), 1, 1));
         try span.end();
     }
 
