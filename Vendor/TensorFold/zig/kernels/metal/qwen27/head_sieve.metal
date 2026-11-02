@@ -1,17 +1,8 @@
-// The greedy verify head's sieve (head_sieve.zig): a 2-bit copy of the vocabulary head's codes (code >> 2, the same
-// scales and biases) gives each (row, column) an approximate logit a and the spread s of the dropped bits' term (the
-// square root of 1.25 times the sum over groups of scale^2 times the group's sum of squares: 1.25 is the variance of a
-// uniform 2-bit residual about its middle 1.5). Each row's first tile (the 32-column tile of its best a) is recomputed
-// exactly by the head's own tile-list launch; the row's threshold is the lower of that tile's exact best and its best a,
-// and every tile whose a + k s reaches some row's threshold is recomputed the same way. Each row's token is the best of
-// those exact words: the highest bf16 logit, ties to the lowest id, tf_round_bf16_argmax's rule. A row's true best u
-// escapes only if its dropped bits' term exceeds both k s_u and that of the first tile's best-a column by k s_u.
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// head_sieve.zig prepends the head's shape and metadata form; the defaults are the 27B head's (12-bit indices).
 #ifndef TF_SIEVE_SHAPED
 #define TF_N 248320
 #define TF_K 5120
@@ -22,13 +13,9 @@ using namespace mpp::tensor_ops;
 #endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
-constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at most, relative to its size
-constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, generously
+constant constexpr float SLACK_REL = 1.0f / 128.0f;
+constant constexpr float SLACK_ABS = 1e-2f;
 
-// One 4-bit (tile, group) block of the head's reg words (TF_TB tiles interleaved by group: a lane's words 0-3, then
-// its words 4-7 32 lanes on) into the 2-bit reg block of tile_batch 1 (lane_projection.halveReg's form): word j keeps
-// codes >> 2 of word j in bits 0-1 of each nibble and those of word j + 4 in bits 2-3, so the 2-bit kernel's two masks
-// give back each word's codes >> 2 in place. One thread a lane's uint4 of a block: tiles * KG * 32 threads.
 kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
   if (t >= uint(TILES * KG * 32)) return;
   const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
@@ -37,8 +24,6 @@ kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4
   W2[t] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
 }
 
-// Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
-// most 8 rows), each group's values added in order from zero; the candidate list and its dispatch words cleared.
 kernel void tf_head_sieve_prep(const device bfloat* X [[buffer(0)]], constant int& rows [[buffer(1)]], device float* XQ [[buffer(2)]],
     device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], uint t [[thread_position_in_grid]]) {
   if (t == 0) {
@@ -74,11 +59,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
 }
 #endif
 
-// The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 2-bit copy through tf_lane_reg's
-// decoded-row loop (rows8, one K split, codes as fp16 subnormals in the tensor op's right input, the head's own
-// metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
-// it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row].
-// dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
 [[max_total_threads_per_threadgroup(32)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
@@ -94,7 +74,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
   const device uint4* sbv = (const device uint4*)SB;
-  // a lane's columns nb + j (C[j], V[j]) and nb + 16 + j (C[4 + j], V[4 + j]) of row mb
   float C[8], V[8];
   for (int i = 0; i < 8; i++) {
     C[i] = 0.0f;
@@ -123,7 +102,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
     const uint4 cw = nw;
     const float x0 = XS[g * stride + mb], xq = XQ[g * 16 + mb];
     for (int w = 0; w < 8; w++) {
-      // codes >> 2 as fp16 subnormals (bits = code, value code * 2^-24); the scales carry the 2^24 back
       const uint word = w < 4 ? (cw[w] & 0x33333333u) : ((cw[w - 4] >> 2) & 0x33333333u);
       const int e = 16 * (w & 1) + 2 * (w >> 1);
       b2[e] = as_type<half2>(word & 0x000F000Fu);
@@ -131,7 +109,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
       b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
       b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
     }
-    // the next group's codes and indices under this one's tensor op (the last group reloads its own, unread)
     {
       const int next = min(g + 1, KG - 1);
       nw = wp[(size_t)next * 32];
@@ -146,23 +123,20 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
-      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
       const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
-      // code = 4 (code >> 2) + 1.5 + r: scale 4 s on the 2-bit product, bias b + 1.5 s on the row sum
       C[j] = fma(4.0f * s0, P[j], fma(fma(1.5f, t0, b0), x0, C[j]));
       C[4 + j] = fma(4.0f * s1, P[8 + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
       V[j] = fma(t0 * t0, xq, V[j]);
       V[4 + j] = fma(t1 * t1, xq, V[4 + j]);
     }
   }
-  // fmax drops a NaN operand: a row of NaN logits keeps -inf here, its first tile 0 and every tile listed
   float hi = -INFINITY, mid = -INFINITY;
   for (int i = 0; i < 8; i++) {
     const float v = C[i], ks = TF_SIEVE_KAPPA * sqrt(1.25f * V[i]);
     hi = fmax(hi, v + ks + fma(fabs(v) + ks, SLACK_REL, SLACK_ABS));
     mid = fmax(mid, v);
   }
-  // the four lanes of row mb differ in lane bits 0 and 3
   hi = fmax(hi, simd_shuffle_xor(hi, 1));
   hi = fmax(hi, simd_shuffle_xor(hi, 8));
   mid = fmax(mid, simd_shuffle_xor(mid, 1));
@@ -173,8 +147,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   }
 }
 
-// Each row's first tile: the tile of its highest best a (ties: the lower tile; none finite: tile 0) into
-// first[1 + row], with first[0] = rows (the tile list the head's tile-list launch reads). One threadgroup of 1024.
 [[max_total_threads_per_threadgroup(1024)]]
 [[kernel]] void tf_head_sieve_top(const device float* HM [[buffer(0)]], constant int& rows [[buffer(1)]], device uint* first [[buffer(2)]],
     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
@@ -186,7 +158,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
     best[r] = -INFINITY;
     at[r] = 0xffffffffu;
   }
-  // each thread's tiles in increasing order: a later equal value never displaces an earlier tile
   for (uint t = tid; t < uint(TILES); t += 1024)
     for (int r = 0; r < 8; r++) {
       const float v = HM[(size_t)t * 16 + 8 + r];
@@ -220,11 +191,6 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   if (tid == 0) first[0] = uint(rows);
 }
 
-// Each row's threshold: the lower of its first tile's exact best (Y1: the tile-list launch's words, row r's first
-// tile at slot r of rows 256 apart; a bound of the row's top logit from below) and that tile's best a; then every tile
-// some row's best a + k s + slack reaches into list (list[0] its count, then the tiles in any order), counted on the
-// indirect dispatch's first word as well. A row's first tile always lands (its best a + k s is its best a or more).
-// Grid TILES / 256 threadgroups of 256.
 kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const device ushort* Y1 [[buffer(1)]], const device uint* first [[buffer(2)]],
     constant int& rows [[buffer(3)]], device atomic_uint* list [[buffer(4)]], device atomic_uint* args [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint group [[threadgroup_position_in_grid]]) {
@@ -256,9 +222,6 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
   if (hit) atomic_store_explicit(list + 1 + base + at, t, memory_order_relaxed);
 }
 
-// Each row's token from the listed tiles' exact words (Y: the tile-list launch's, slot j's 32 columns at 32 j of rows
-// TF_N apart, slot j holding tile list[1 + j]): the highest finite value, ties to the lowest id, and the nonfinite
-// mask (1 NaN, 2 +inf, 4 -inf) of the words read, as tf_round_bf16_argmax picks a full row. A threadgroup of 1024 a row.
 [[max_total_threads_per_threadgroup(1024)]]
 [[kernel]] void tf_head_sieve_pick(const device ushort* Y [[buffer(0)]], const device uint* list [[buffer(1)]], device uint2* picks [[buffer(2)]],
     uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
@@ -277,7 +240,6 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
       id = token;
     }
   }
-  // a finite value is above -inf, so best == m keeps only real candidates (or none: id stays invalid)
   {
     const float m = simd_max(best);
     const uint t = simd_min(best == m ? id : 0xffffffffu);

@@ -146,10 +146,6 @@ inline float tf_delta_delta_read_words(thread const float* state, thread const f
   for (uint part = 0; part < 4; ++part) result += state[part] * query[part];
   return simd_sum(result);
 }
-// tf_delta_delta_update_words / tf_delta_delta_read_words for two adjacent value columns' lane words at once: each
-// column's statements are the same (the same products, fused multiply-adds and in-order lane sums), and the two columns'
-// cross-lane sums go through one simd_sum on a float2, which reduces each component as the scalar simd_sum does, so every
-// column's words and outputs are the scalar forms' words; one cross-lane reduction per step instead of two.
 inline void tf_delta_delta_update_words2(thread float* a, thread float* b, thread const float* key, float forget,
                                          float incoming0, float incoming1, float mix) {
   float remembered0 = 0.0f, remembered1 = 0.0f;
@@ -202,11 +198,6 @@ inline void tf_delta_tree_node_pair(thread float4& s0, thread float4& s1, device
   s0 = float4(a[0], a[1], a[2], a[3]);
   s1 = float4(b[0], b[1], b[2], b[3]);
 }
-// W children of a depth-one star's node 0 (rows `row` .. row + W - 1) for two adjacent value columns: each child is
-// tf_delta_tree_node_pair's arithmetic from node 0's states (the same tf_delta_delta_update_words and
-// tf_delta_delta_read_words on the same row words), with all W rows' loads ahead of the group's updates, reads and
-// output stores, so the W children's steps overlap rather than each row's loads waiting on the last row's stores (device
-// stores the compiler must assume may alias them). The unroll is load-bearing: W = 4 without it ran slower than W = 1.
 template <uint W>
 inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
                                    device const bfloat* value, device const float* decay, device const bfloat* mixing,
@@ -242,7 +233,6 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
       output[at[w] * p.dv + dimension + 1] = bfloat(rb[w]);
     }
 }
-// Every child of node 0 (rows first + 1 .. first + rows - 1), three at a time: each child once, from node 0's states.
 inline void tf_delta_star_leaves(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
                                  device const bfloat* value, device const float* decay, device const bfloat* mixing,
                                  constant TfDeltaParams& p, device bfloat* output, uint first, uint rows, uint head,
@@ -268,8 +258,6 @@ inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3
 // A depth-one star (each segment's node 0, then its other rows as children of node 0) for two adjacent value columns a
 // simdgroup: every node of each column is tf_delta_tree_node's arithmetic from the same parent state as in
 // tf_delta_gdn_tree_slots (tf_delta_tree_node_pair, a row's loads shared by the two columns), so each column's arithmetic
-// is that kernel's; the star needs no slot steps, no parent selects and no kept states. Node 0's children are independent
-// (each from node 0's states), so they run three at a time (tf_delta_star_leaves).
 // Verify rounds only (no advance): no state is written.
 kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const bfloat* key [[buffer(1)]],
@@ -311,10 +299,6 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
 }
 // A deferred replay's rows for the star (tf_delta_gdn_stash's, in keep order) and whether it writes the state back.
 struct TfDeltaPending { uint rows, persist; };
-// N pending rows from `first`, in keep order, for two adjacent value columns' lane words (dk = 128): every row's key,
-// decay, value and mixing words loaded ahead of the N rows' updates, which are tf_delta_delta_update_words on the key
-// words in registers: tf_delta_delta_update's statements on the same words (the same products, fused multiply-adds,
-// in-order lane sums and simd_sum).
 template <uint N>
 inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device const bfloat* key, device const bfloat* value,
                                        device const float* decay, device const bfloat* mixing, constant TfDeltaParams& p,
@@ -334,9 +318,6 @@ inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device 
   }
 }
 // tf_delta_gdn_star_pair from the state the deferred keeps' replays would have left: before node 0 each column's lane
-// words take the pending rows, in keep order, by tf_delta_delta_update's statements (tf_delta_star_pending_rows: up to
-// four rows' words loaded ahead of their updates) with the arguments tf_delta_gdn_replay_body<4> gives a kept row (the
-// same products, sums and simd_sum), so node 0 and its children see that kernel's state words.
 // pending.persist writes them back over the committed words each lane read (its simdgroup's own two columns), before
 // node 0 and so before the threadgroup counts itself.
 kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
@@ -370,7 +351,7 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
     a[part] = committed[base + column + part];
     b[part] = committed[base + column + p.dk + part];
   }
-  uint row = 0; // the pending rows four at a time, then the rest
+  uint row = 0;
   for (; row + 4 <= pending.rows; row += 4) tf_delta_star_pending_rows<4>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
   if (row + 3 == pending.rows) tf_delta_star_pending_rows<3>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);
   else if (row + 2 == pending.rows) tf_delta_star_pending_rows<2>(a, b, pending_key, pending_value, pending_decay, pending_mixing, p, row, head, key_head, d0, lane);

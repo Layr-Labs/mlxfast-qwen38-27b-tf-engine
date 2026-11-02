@@ -24,8 +24,6 @@ pub const Hook = struct {
     /// The round's plan was validated (Pool.prepare) and its metadata goes up once before the pass's first commit
     /// (decode_round.Runner.settleRound): a tree verify's layers read that copy rather than each uploading it again.
     uploaded: bool = false,
-    /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
-    own: ?pool_gpu.Own = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -49,7 +47,6 @@ pub const Hook = struct {
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
-        gated.own = hook.own;
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };

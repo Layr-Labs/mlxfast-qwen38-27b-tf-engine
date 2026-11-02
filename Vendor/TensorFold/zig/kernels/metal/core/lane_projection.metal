@@ -629,7 +629,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t = ks * 32 + lane;
-  // a padded row's sums are read only by rows the lane kernel drops, so only live rows are written
   for (int m = t; m < M; m += 64) {
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += float(hb[m * 64 + i]);

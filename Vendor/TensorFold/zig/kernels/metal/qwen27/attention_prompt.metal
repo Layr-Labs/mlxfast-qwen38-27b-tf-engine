@@ -128,8 +128,6 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
-  // Keep the original four-tile key-step limit when a launch splits that group into two pairs.
-  // Keys past its last live row are masked for every row; all FP32 update orders stay unchanged.
   const int first_row = (args.tile0 + (int(tg.z) * (SG / 2) / 4) * 4) * 16, last_row = min(args.rows * PG, first_row + 4 * 16) - 1;
   const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;

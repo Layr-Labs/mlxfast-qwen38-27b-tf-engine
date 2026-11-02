@@ -129,7 +129,7 @@ pub const HeadSieve = struct {
             cb.wait();
             if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 2-bit copy")) return error.HeadSieveGpuFailure;
         }
-        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
+        std.log.info("qwen27: head sieve: kappa={d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
         return .{ .pack = made[0], .prep = made[1], .scan = made[2], .top = made[3], .select = made[4], .pick = made[5], .head = head, .tiles = tiles, .groups = groups, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
     }
 

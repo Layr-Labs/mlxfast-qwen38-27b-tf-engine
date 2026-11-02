@@ -9,10 +9,6 @@ const commit_every = 16;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
-/// Prompt rows a pass needs before it runs as two staggered segments on two queues (core/stagger.zig): the second
-/// segment's mixer of each layer waits for the first's, so one segment's sequential GDN scan runs beside the other's
-/// projections.
-const stagger_rows = 768;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -97,11 +93,6 @@ pub const Runner = struct {
     /// accepted path's last row's, which tree_commit's keep_head copies there). Any forward with a head clears it, as
     /// its logits replace that row; Session.greedy and fingerprint read it in place of row 0.
     head_token: ?u32 = null,
-    /// A staggered prompt pass's second segment: its rows' frame, attention scratch and bindings, and its queue, made by
-    /// the first prompt pass that splits (staggered).
-    second: ?Second = null,
-    /// The residency set the model's queue holds (residency.zig): the second segment's queue holds it as well.
-    resident_set: ?mtl.ResidencySet = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -222,7 +213,6 @@ pub const Runner = struct {
     pub fn deinit(r: *Runner) void {
         for (0..r.slots) |slot| r.settleSlot(@intCast(slot));
         r.setResident(null);
-        if (r.second) |*second| second.deinit(r.allocator);
         if (r.sieve) |*s| s.deinit();
         r.taps.deinit();
         r.gdn.deinit();
@@ -266,7 +256,6 @@ pub const Runner = struct {
         if (r.head_sieve and !sieved) return error.RoundNotReady;
         if (head != .none) r.head_token = null;
         for (round.slots, round.windows) |slot, window| if (slot >= r.ready or r.offsets[slot] != window.start) return error.CachePositionDiffers;
-        if (r.staggers(round, head, accepted)) return r.staggered(round, head);
         const paths = try r.allocator.alloc([]const u32, round.windows.len);
         defer r.allocator.free(paths);
         @memset(paths, &.{});
@@ -337,90 +326,6 @@ pub const Runner = struct {
         if (accepted) {
             for (round.slots, round.windows) |slot, window| r.offsets[slot] = window.start + @as(u32, @intCast(window.parents.len));
         } else r.active = fingerprint(round);
-    }
-
-    /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
-    fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
-        if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
-        if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
-        if (std.c.getenv("TF_Q27_STAGGER")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
-        return true;
-    }
-
-    /// The second segment's frame, scratch, bindings and queue, made once (their buffers join the runner's residency).
-    fn secondSegment(r: *Runner) !*Second {
-        if (r.second == null) {
-            r.second = try Second.init(r.allocator, r.model, &r.gdn, r.scratch.limits, r.bindings.len, r.model.frame.capacity / 2 + 64);
-            if (r.residency) |f| r.second.?.follow(f, true);
-            if (r.resident_set) |set| r.second.?.queue.addResidencySet(set);
-            std.log.info("qwen27: staggered prompt passes: a second segment of up to {d} rows on its own queue", .{r.second.?.frame.capacity});
-        }
-        return &r.second.?;
-    }
-
-    /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 64) in the model's frame on
-    /// the model's queue, the rest in the second segment's frame on its own queue. Each layer's mixer of the second waits
-    /// for the first's (its GDN states and conv windows, its K/V rows); everything else of the two runs side by side. Each
-    /// segment's rows take the kernels and the arithmetic a prompt chunk of those rows takes, so every word is the one two
-    /// chunks run in order give.
-    fn staggered(r: *Runner, round: *const Round, head: forward.Head) !void {
-        const n: u32 = @intCast(round.ids.len);
-        const na: u32 = n / 2 / 64 * 64;
-        const nb = n - na;
-        const slot = round.slots[0];
-        const start = round.windows[0].start;
-        for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        const second = try r.secondSegment();
-        if (na == 0 or nb > second.frame.capacity) return error.BadFrameRows;
-        const taps: u32 = @intCast(r.model.config.conv_kernel);
-        const vocab: u32 = @intCast(r.model.config.vocab);
-        var ra = try Round.init(r.allocator, &.{.{ .slot = slot, .start = start, .capacity = r.capacity, .ids = round.ids[0..na] }}, taps, r.slots, vocab);
-        defer ra.deinit();
-        var rb = try Round.init(r.allocator, &.{.{ .slot = slot, .start = start + na, .capacity = r.capacity, .ids = round.ids[na..] }}, taps, r.slots, vocab);
-        defer rb.deinit();
-        var chain: [@import("gpu_frame.zig").max_rows]u32 = undefined;
-        for (chain[0..n], 0..) |*v, i| v.* = @intCast(i);
-        r.accepted_chain = true;
-        defer r.accepted_chain = false;
-        var ga = try ra.recurrent(try r.params(na), &.{chain[0..na]});
-        defer ga.deinit();
-        var gb = try rb.recurrent(try r.params(nb), &.{chain[0..nb]});
-        defer gb.deinit();
-        // an accepted chain defers nothing: the caller's pending work and any pending GDN rows land first
-        if (try r.deferGdn(&ra, ga, true) != null) return error.RoundNotReady;
-        r.deferred = null;
-        var pa = try r.attentionPlan(&ra);
-        defer pa.deinit();
-        var pb = try r.attentionPlan(&rb);
-        defer pb.deinit();
-        try r.gdn.prepare(r.model.device, ga, true);
-        try r.gdn.prepare(r.model.device, gb, true);
-        try r.model.frame.setRows(ra.ids, ra.feed_positions);
-        try second.frame.setRows(rb.ids, rb.feed_positions);
-        const placed_a = image_rows.place(&r.model.frame, &r.rope, null, r.model.config.mrope_section, &ra);
-        const placed_b = image_rows.place(&second.frame, &r.rope, null, r.model.config.mrope_section, &rb);
-        try r.scratch.admit(pa);
-        try second.scratch.admit(pb);
-        if (r.capture_taps) r.taps.begin();
-        const pool = mtl.objc.Pool.push();
-        defer pool.pop();
-        // as a prompt chunk's: the last block keeps only the rows a head or a tap reads
-        const terminal_rows = !r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null;
-        var due_a = true;
-        var due_b = true;
-        var seg_a = Segment{ .r = r, .gdn = &ga, .attention = .{ .plan = &pa, .round = &ra, .placed = placed_a, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &due_a, .terminal_head = if (terminal_rows) .none else .all }, .tap_row = 0, .total = n };
-        var seg_b = Segment{ .r = r, .gdn = &gb, .own = second.gdn, .attention = .{ .plan = &pb, .round = &rb, .placed = placed_b, .scratch = &second.scratch, .bindings = second.bindings, .scratch_due = &due_b, .terminal_head = if (terminal_rows) head else .all }, .tap_row = na, .total = n };
-        var first = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = na, .hooks = seg_a.mixer(), .head = .none, .settle = .{ .ptr = r, .run = settleRound } };
-        var last = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = nb, .hooks = seg_b.mixer(), .head = head, .frame = &second.frame, .lane_k = 1, .logits = r.model.frame.get(.logits) };
-        var pair = Pair{ .stages = .{ &first, &last } };
-        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{ r.model.queue, second.queue }, r.model.config.layers, .concurrent, &pair, first_commit, commit_every, true) catch |err| {
-            r.failed = true;
-            r.active = null;
-            return err;
-        };
-        if (r.capture_taps) try r.taps.complete();
-        r.offsets[slot] = start + n;
     }
 
     pub fn keep(r: *Runner, round: *const Round, paths: []const []const u32) !void {
@@ -704,35 +609,17 @@ pub const Runner = struct {
 
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        const pass = AttentionPass{ .plan = r.current_attention orelse return error.RoundNotReady, .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
-        return r.attentionPass(pass, e, block, weights, f, rows);
-    }
-
-    /// What an attention layer of a pass reads and uploads into: the pass's plan and round, its image placement, the
-    /// scratch and per-layer bindings its plan goes up to, and its terminal head (a staggered prompt's segments each
-    /// have their own).
-    const AttentionPass = struct {
-        plan: *const attn.Plan,
-        round: *const Round,
-        placed: image_rows.Placed,
-        scratch: *attn.Scratch,
-        bindings: []attn.Binding,
-        scratch_due: *bool,
-        terminal_head: forward.Head,
-    };
-
-    fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
-        const plan = pass.plan.*;
-        if (pass.scratch_due.*) {
-            try pass.scratch.upload(plan);
-            pass.scratch_due.* = false;
+        const plan = (r.current_attention orelse return error.RoundNotReady).*;
+        if (r.scratch_due) {
+            try r.scratch.upload(plan);
+            r.scratch_due = false;
         }
         const layer = r.attention_index[block];
         var views: [attn.planning.max_streams]attn.Cache = undefined;
-        const caches = r.layerCaches(layer, pass.round, &views);
-        try pass.bindings[layer].upload(plan, caches);
+        const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);
+        try r.bindings[layer].upload(plan, caches);
         // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
-        const dead = if (pass.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (pass.terminal_head == .last) rows - 1 else rows) else 0;
+        const dead = if (r.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (r.terminal_head == .last) rows - 1 else rows) else 0;
         // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
         // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
         // or neither, so the shared counter always returns to zero
@@ -765,128 +652,20 @@ pub const Runner = struct {
         // a decoded fused chain (one stream, at most 8 rows, counted projections): the preprocess also packs the prefix's
         // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
         const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
-        const decoded: ?attn.Decoded = if (appended) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
+        const decoded: ?attn.Decoded = if (appended) .{ .scratch = &r.scratch, .binding = &r.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) r.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
-        try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
+        try r.attention.encode(e, &r.scratch, &r.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
-    }
-};
-
-/// A staggered prompt's second segment's own state: its rows' frame (activations and GDN metadata), the attention scratch
-/// and per-layer bindings its plan goes up to at encode time (the first segment's stay untouched until its kernels have
-/// read them), and its queue.
-const Second = struct {
-    frame: Frame,
-    scratch: attn.Scratch,
-    bindings: []attn.Binding,
-    queue: mtl.Queue,
-    gdn: @import("gdn_pool_gpu.zig").Own,
-
-    fn init(a: std.mem.Allocator, m: *Model, pool: *const GdnPool, limits: attn.Limits, layers: usize, rows: u32) !Second {
-        var frame = try Frame.init(m.device, m.config, 16 * ((rows + 15) / 16));
-        errdefer frame.deinit();
-        var scratch = try attn.Scratch.init(m.device, limits);
-        errdefer scratch.deinit();
-        const bindings = try a.alloc(attn.Binding, layers);
-        var made: usize = 0;
-        errdefer {
-            for (bindings[0..made]) |*b| b.deinit();
-            a.free(bindings);
-        }
-        for (bindings) |*b| {
-            b.* = try attn.Binding.init(m.device, limits);
-            made += 1;
-        }
-        const own = try @import("gdn_pool_gpu.zig").Own.init(pool, m.device);
-        errdefer own.deinit();
-        const queue = try m.device.queue();
-        return .{ .frame = frame, .scratch = scratch, .bindings = bindings, .queue = queue, .gdn = own };
-    }
-
-    pub fn follow(s: *Second, hook: mtl.ResidencySet.Follow, joining: bool) void {
-        const fields = mtl.resident.fields;
-        for (s.frame.buffers) |b| fields.one(b, hook, joining);
-        if (s.frame.standby) |bank| for (bank) |b| fields.one(b, hook, joining);
-        fields.apply(&s.scratch, hook, joining);
-        for (s.bindings) |*b| fields.apply(b, hook, joining);
-        for ([_]mtl.Buffer{ s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
-    }
-
-    fn deinit(s: *Second, a: std.mem.Allocator) void {
-        s.frame.deinit();
-        s.scratch.deinit();
-        for (s.bindings) |*b| b.deinit();
-        a.free(s.bindings);
-        s.gdn.deinit();
-        s.queue.deinit();
-    }
-};
-
-/// One segment of a staggered prompt pass, as its stages' mixer hooks see it: its GDN plan, its attention pass, and
-/// where its rows go in the taps.
-const Segment = struct {
-    r: *Runner,
-    gdn: *const GdnPlan,
-    /// The second segment's own every-layer GDN scratch (null: the pool's).
-    own: ?@import("gdn_pool_gpu.zig").Own = null,
-    attention: Runner.AttentionPass,
-    tap_row: u32,
-    total: u32,
-
-    fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
-    }
-    fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
-        const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
-        try GdnHook.forward(&hook, e, block, weights, frame, rows);
-    }
-    fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
-        const s: *Segment = @ptrCast(@alignCast(ptr));
-        return s.r.attentionPass(s.attention, e, block, weights, f, rows);
-    }
-    fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
-        const s: *Segment = @ptrCast(@alignCast(ptr));
-        try s.r.taps.recordAt(s.r.model.glue, e, layer, hidden, rows, s.tap_row, s.total);
-    }
-};
-
-/// A staggered prompt pass's two segments as one family for core/segments.zig: each hook goes to its lane's stages.
-const Pair = struct {
-    stages: [2]*forward.Stages,
-    const Lane = @import("core").segments.Lane;
-
-    pub fn begin(p: *Pair, lane: *Lane) !void {
-        return p.stages[lane.k].begin(lane);
-    }
-    pub fn wait(_: *Pair, _: usize) @import("core").segments.Wait {
-        return .mixer;
-    }
-    pub fn handoff(_: *Pair, _: *Lane, _: usize) !void {}
-    pub fn pre(p: *Pair, lane: *Lane, index: usize) !void {
-        return p.stages[lane.k].pre(lane, index);
-    }
-    pub fn mixer(p: *Pair, lane: *Lane, index: usize) !void {
-        return p.stages[lane.k].mixer(lane, index);
-    }
-    pub fn post(p: *Pair, lane: *Lane, index: usize) !void {
-        return p.stages[lane.k].post(lane, index);
-    }
-    pub fn finish(p: *Pair, lane: *Lane) !void {
-        return p.stages[lane.k].finish(lane);
-    }
-    pub fn beforeCommit(p: *Pair) !void {
-        return p.stages[0].beforeCommit();
     }
 };
 

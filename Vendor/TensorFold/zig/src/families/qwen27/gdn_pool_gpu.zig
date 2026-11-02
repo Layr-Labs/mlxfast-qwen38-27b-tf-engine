@@ -59,28 +59,7 @@ pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null };
-/// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
-/// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
-pub const Own = struct {
-    tails: metal.Buffer,
-    recurrent: metal.Buffer,
-    snapshots: metal.Buffer,
-
-    pub fn init(pool: *const Pool, device: metal.Device) !Own {
-        const tails = try device.buffer(pool.get(.tails).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        errdefer tails.deinit();
-        const recurrent = try device.buffer(pool.get(.recurrent).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        errdefer recurrent.deinit();
-        const snapshots = try device.buffer(pool.get(.snapshots).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
-    }
-    pub fn deinit(o: Own) void {
-        o.tails.deinit();
-        o.recurrent.deinit();
-        o.snapshots.deinit();
-    }
-};
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null };
 
 pub const Pool = struct {
     budget: Budget,
@@ -465,9 +444,9 @@ pub const Pool = struct {
             .value = try pool.layerSpan(.value, layer),
             .decay = try pool.layerSpan(.decay, layer),
             .mixing = try pool.layerSpan(.mixing, layer),
-            .tails = try refSpan(.{ .buffer = if (refs.own) |o| o.tails else pool.get(.tails) }, bytes.tails),
-            .snapshots = try refSpan(.{ .buffer = if (refs.own) |o| o.snapshots else pool.get(.snapshots) }, bytes.snapshots),
-            .recurrent = try refSpan(.{ .buffer = if (refs.own) |o| o.recurrent else pool.get(.recurrent) }, bytes.value),
+            .tails = try refSpan(.{ .buffer = pool.get(.tails) }, bytes.tails),
+            .snapshots = try refSpan(.{ .buffer = pool.get(.snapshots) }, bytes.snapshots),
+            .recurrent = try refSpan(.{ .buffer = pool.get(.recurrent) }, bytes.value),
             .output = try refSpan(refs.output, bytes.value),
             .next_state = if (inPlace(plan)) try pool.layerSpan(.state, layer) else return error.GdnSlotMoves,
             .next_history = try pool.layerSpan(.next_history, layer),

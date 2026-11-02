@@ -56,26 +56,16 @@ pub const Stages = struct {
     compact: bool = false,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
-    /// The frame these stages' rows live in (null: the model's) and the segment lane they run on: a staggered prompt's
-    /// second segment runs its rows in a frame of its own on the second lane.
-    frame: ?*Frame = null,
-    lane_k: usize = 0,
-    /// Where the head writes its logits (null: this frame's): the model frame's, for a second segment's last row.
-    logits: ?Ref = null,
-    fn rowsFrame(s: *Stages) *Frame {
-        return s.frame orelse &s.model.frame;
-    }
     pub fn begin(s: *Stages, lane: *@import("core").segments.Lane) !void {
         const m = s.model;
-        const fr = s.rowsFrame();
-        if (s.rows == 0 or s.rows > fr.capacity or lane.k != s.lane_k) return error.BadFrameRows;
-        s.hidden = fr.get(.hidden);
-        s.residual = fr.get(.residual);
+        if (s.rows == 0 or s.rows > m.frame.capacity or lane.k != 0) return error.BadFrameRows;
+        s.hidden = m.frame.get(.hidden);
+        s.residual = m.frame.get(.residual);
         if (s.lead) |t| try t.encode(t.ptr, lane.enc);
-        try m.glue.embedding(lane.enc, m.config, m.weights.embed, fr.get(.ids), s.hidden, s.rows);
+        try m.glue.embedding(lane.enc, m.config, m.weights.embed, m.frame.get(.ids), s.hidden, s.rows);
         lane.enc.barrier();
         if (s.images) |rows| {
-            m.glue.imageRows(lane.enc, s.hidden, rows, fr.get(.takes), @intCast(m.config.hidden), s.rows);
+            m.glue.imageRows(lane.enc, s.hidden, rows, m.frame.get(.takes), @intCast(m.config.hidden), s.rows);
             lane.enc.barrier();
         }
     }
@@ -85,7 +75,7 @@ pub const Stages = struct {
     pub fn handoff(_: *Stages, _: *@import("core").segments.Lane, _: usize) !void {}
     pub fn pre(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
-        const f = s.rowsFrame();
+        const f = &m.frame;
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
@@ -103,13 +93,13 @@ pub const Stages = struct {
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
-            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
-            .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, &m.frame, s.rows),
+            .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, &m.frame, s.rows),
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
-        const f = s.rowsFrame();
+        const f = &m.frame;
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
@@ -195,7 +185,7 @@ pub const Stages = struct {
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
         if (s.terminal_rows and s.head == .none) return;
         const m = s.model;
-        const f = s.rowsFrame();
+        const f = &m.frame;
         const e = lane.enc;
         const dims = f.get(if (s.compact) .last_dims else .dims);
         if (s.norm_wait != 0) {
@@ -216,7 +206,7 @@ pub const Stages = struct {
             }
             // a decoded round's rows read the copy whose eight adjacent tiles interleave; a prompt's last row the unbatched one
             const head = if (s.head == .all) m.weights.head_decode else m.weights.head;
-            try m.kernels.quant(e, head, input, head_sums, f.get(.dims), s.logits orelse f.get(.logits), if (s.head == .last) 1 else s.rows);
+            try m.kernels.quant(e, head, input, head_sums, f.get(.dims), f.get(.logits), if (s.head == .last) 1 else s.rows);
         }
         e.barrier();
         if (s.tail) |t| try t.encode(t.ptr, e);
