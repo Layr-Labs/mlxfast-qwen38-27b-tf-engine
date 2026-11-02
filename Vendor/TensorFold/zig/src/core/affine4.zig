@@ -148,7 +148,7 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
             lower = @min(lower, v);
             upper = @max(upper, v);
         }
-        if (levels_int < 15) {
+        if (levels_int <= 15) {
             try clipped(values, words[group * 8 ..][0..8], &scales[group], &biases[group], lower, upper, levels);
             continue;
         }
@@ -167,9 +167,10 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
         }
     }
 }
-/// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
-/// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
-/// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
+/// The full range spends levels on a group's outliers (most at 2 or 3 bits, still some at 4): the same rule (bias at the
+/// extreme of larger magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the
+/// one whose bf16 scale and bias give the least squared error over the group (factor 1 is the full range itself, so no
+/// group's error grows). Codes clamp to the levels, so clipped values saturate.
 fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
     const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
     var best_err: f32 = std.math.inf(f32);
