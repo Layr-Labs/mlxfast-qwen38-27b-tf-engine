@@ -487,15 +487,19 @@ kernel void tf_delta_gdn_unstash(device const bfloat* key [[buffer(0)]],
   const uint dimension = position.y, key_head = head / (p.nv / p.nk);
   device float* words = state + ulong(layer) * u.layer_words + ulong(u.slot) * (p.nv * p.dv * p.dk) + (head * p.dv + dimension) * p.dk + lane * 4;
   const ulong first = ulong(layer) * u.pending_rows;
-  device const bfloat* layer_key = key + first * (p.nk * p.dk);
-  device const bfloat* layer_value = value + first * (p.nv * p.dv);
-  device const float* layer_decay = decay + first * p.nv;
-  device const bfloat* layer_mixing = mixing + first * p.nv;
+  device const bfloat* kr = key + first * (p.nk * p.dk) + key_head * p.dk;
+  device const bfloat* vr = value + first * (p.nv * p.dv) + head * p.dv + dimension;
+  device const float* dr = decay + first * p.nv + head;
+  device const bfloat* mr = mixing + first * p.nv + head;
+  const uint k_step = p.nk * p.dk, v_step = p.nv * p.dv;
   float state_words[4];
   for (uint part = 0; part < 4; ++part) state_words[part] = words[part];
   for (uint row = 0; row < u.rows; ++row) {
-    const uint at = row * p.nv + head;
-    tf_delta_delta_update(state_words, layer_key + (row * p.nk + key_head) * p.dk, layer_decay[at], float(layer_value[at * p.dv + dimension]), float(layer_mixing[at]), lane, 4);
+    tf_delta_delta_update(state_words, kr, dr[0], float(vr[0]), float(mr[0]), lane, 4);
+    kr += k_step;
+    vr += v_step;
+    dr += p.nv;
+    mr += p.nv;
   }
   for (uint part = 0; part < 4; ++part) words[part] = state_words[part];
 }
