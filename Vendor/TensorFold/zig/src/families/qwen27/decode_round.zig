@@ -5,15 +5,16 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 16;
-/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
-/// encode, and the host encodes the next chunk's layers while the GPU runs that one.
-const first_commit = 1;
+const commit_every = 8;
+/// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
+/// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
+/// MLP and the next chunk's layers while the GPU runs them.
+const first_commit = 0;
 /// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
-/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+/// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -73,6 +74,8 @@ pub const Runner = struct {
     settle: ?forward.Hook = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
+    /// A verify's attention plan, made by its first attention layer (planAttention) rather than before its first commit.
+    attention_due: ?struct { plan: *attn.Plan, made: *bool } = null,
     /// The current pass's attention plan goes up to the scratch with its first attention layer, which reads it first.
     scratch_due: bool = false,
     terminal_head: forward.Head = .all,
@@ -289,22 +292,31 @@ pub const Runner = struct {
             try m.check(recurrent);
         }
         const deferred = try r.deferGdn(round, recurrent, accepted);
-        var attention_plan = try r.attentionPlan(round);
-        defer attention_plan.deinit();
+        // a verify's attention plan is made, checked against the scratch and goes up there at its first attention layer,
+        // its first reader (planAttention), after the first commit; an accepted pass's is made here
+        var attention_plan: attn.Plan = undefined;
+        var planned = false;
+        defer if (planned) attention_plan.deinit();
+        if (accepted) {
+            attention_plan = try r.attentionPlan(round);
+            planned = true;
+        }
         try r.gdn.prepare(r.model.device, recurrent, accepted);
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
         // no launch before the first attention layer reads the scratch: its plan goes up there, after the first commit
-        try r.scratch.admit(attention_plan);
+        if (planned) try r.scratch.admit(attention_plan);
         r.current_round = round;
         r.current_gdn = &recurrent;
-        r.current_attention = &attention_plan;
+        r.current_attention = if (planned) &attention_plan else null;
+        r.attention_due = .{ .plan = &attention_plan, .made = &planned };
         r.current_placed = placed;
         r.scratch_due = true;
         defer {
             r.current_round = null;
             r.current_gdn = null;
             r.current_attention = null;
+            r.attention_due = null;
             r.current_placed = .{};
             r.scratch_due = false;
         }
@@ -342,18 +354,16 @@ pub const Runner = struct {
     }
 
     /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
+    /// with none of a verify's hooks around it.
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
         return staggerParts() > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    /// The segments a staggered pass takes.
     fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
-        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(stagger_parts, @import("core").segments.MAX);
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
@@ -707,7 +717,11 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        cb.wait();
+        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -748,8 +762,19 @@ pub const Runner = struct {
 
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        const pass = AttentionPass{ .plan = r.current_attention orelse return error.RoundNotReady, .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
+        const pass = AttentionPass{ .plan = r.current_attention orelse try r.planAttention(), .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
         return r.attentionPass(pass, e, block, weights, f, rows);
+    }
+
+    /// The current verify's attention plan, made by its first attention layer and checked against the scratch it goes up
+    /// to there (attentionPass): verifyImpl leaves it due rather than make it before the pass's first commit.
+    fn planAttention(r: *Runner) !*const attn.Plan {
+        const due = r.attention_due orelse return error.RoundNotReady;
+        due.plan.* = try r.attentionPlan(r.current_round orelse return error.RoundNotReady);
+        due.made.* = true;
+        try r.scratch.admit(due.plan.*);
+        r.current_attention = due.plan;
+        return due.plan;
     }
 
     /// What an attention layer of a pass reads and uploads into: the pass's plan and round, its image placement, the
@@ -816,6 +841,10 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
+        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
+        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -823,6 +852,16 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    }
+};
+
+/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
+const Warm = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    out: @import("projection.zig").Linear,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out);
     }
 };
 
@@ -915,6 +954,10 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
+    }
+    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
+    pub fn polls(_: *const Stagger) bool {
+        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {

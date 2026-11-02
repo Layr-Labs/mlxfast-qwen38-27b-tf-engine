@@ -175,8 +175,12 @@ pub const Model = struct {
             return error.BadDraftContext;
         }
         m.early = null;
+        // the anchor's codebook row heads for the caches while the frame runs, its candidates' rows once the lattice names
+        // them (while the host checks what the frame admitted): hints only, the selector reads every word as before
+        selector.warmAnchor(&m.graph, pending);
         var lattice = try execution.completeBlock(m.backend.ops(), &m.graph, x.block);
         defer lattice.deinit();
+        selector.warmCandidates(&m.graph, lattice);
         if (!m.admitted(x, pending)) {
             m.backend.failed = true;
             return error.DraftFrameMismatch;
