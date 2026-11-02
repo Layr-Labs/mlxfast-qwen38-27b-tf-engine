@@ -14,7 +14,7 @@ const first_commit = 1;
 /// projections.
 const stagger_rows = 768;
 /// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
-const stagger_parts = 3;
+const stagger_parts = 4;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
