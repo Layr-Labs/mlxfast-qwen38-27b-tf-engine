@@ -483,19 +483,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
+  const device float* xp = XS + (size_t)first * stride + mb;
+#if !defined(TF_SBI) && !defined(TF_SBI12)
+  const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
+#endif
+  const device bfloat* xv = X + (size_t)first * GS;
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
     const uint4 q0 = tf_look12a(tab, ni), q1 = tf_look12b(tab, ni);
 #elif defined(TF_SBI)
     const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
-    const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
+    const uint4 q0 = sp[0], q1 = sp[4];
+    sp += TF_N / 4;
 #endif
 #if defined(TF_ROWS8)
-    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], 0.0f};
+    const tf_reg_load cur = {nw0, nw1, q0, q1, xp[0], 0.0f};
 #else
-    const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], XS[g * stride + mb + 8]};
+    const tf_reg_load cur = {nw0, nw1, q0, q1, xp[0], xp[8]};
 #endif
+    xp += stride;
 #endif
 #else
   tf_reg_load next = {};
@@ -540,7 +547,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr);
     xv += GS;
 #else
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + g * GS, dextents<int32_t, 2>(GS, M), xstr);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr);
+    xv += GS;
 #endif
 #else
     auto x = a.slice(g * GS, 0);
