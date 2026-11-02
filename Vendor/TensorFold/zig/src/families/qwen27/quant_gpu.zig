@@ -7,6 +7,29 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+/// Code MiB Kernels.warmNorm reads ahead of the launch behind a decoded norm (the mixer input, the MLP gate/up): what the
+/// norm's idle bus time and its barrier cover at the stream rate.
+const warm_norm_mb = 3;
+/// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
+const warm_groups = 64;
+const warm_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\kernel void tf_q27_warm(const device uint* W [[buffer(0)]], const device uint* M [[buffer(1)]],
+    \\    constant uint2& lines [[buffer(2)]], device uint* sink [[buffer(3)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\  uint acc = 0;
+    \\  for (uint j = i; j < lines.x; j += 4u * n) {
+    \\    const uint a = W[(size_t)j * 32u];
+    \\    const uint b = j + n < lines.x ? W[(size_t)(j + n) * 32u] : 0u;
+    \\    const uint c = j + 2u * n < lines.x ? W[(size_t)(j + 2u * n) * 32u] : 0u;
+    \\    const uint d = j + 3u * n < lines.x ? W[(size_t)(j + 3u * n) * 32u] : 0u;
+    \\    acc ^= a ^ b ^ c ^ d;
+    \\  }
+    \\  for (uint j = i; j < lines.y; j += n) acc ^= M[(size_t)j * 32u];
+    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is stored
+    \\}
+;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
@@ -121,6 +144,11 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// warmNorm's read-only line touch and sink, created on first use.
+    warm_pipe: ?mtl.Pipeline = null,
+    warm_sink: ?mtl.Buffer = null,
+    /// Code bytes warmNorm reads ahead of a decoded norm (TF_Q27_WARM_NORM_MB, default warm_norm_mb).
+    warm_norm_bytes: ?usize = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -148,6 +176,8 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.warm_pipe) |p| p.deinit();
+        if (k.warm_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -631,6 +661,49 @@ pub const Kernels = struct {
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
     pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
         return k.countedKey(p, rows, false) != null;
+    }
+
+    /// Warm the next decoded launch's leading code and metadata lines inside the preceding norm's barrier interval.
+    pub fn warmNorm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
+        return k.warmSized(e, p, k.warmNormBytes(), false);
+    }
+
+    /// warm with its own byte budget `want`: all metadata when requested, else the corresponding share.
+    fn warmSized(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, want: usize, all_meta: bool) !void {
+        if (want == 0 or p.bits != 4 or p.group != 64 or p.runs.len != 0) return;
+        const codes = projection.storedColumns(p.n, p.batch) * p.k / 2;
+        const code_room = p.words.buffer.length() -| p.words.offset;
+        const take = @min(want, codes, code_room);
+        const meta: projection.Ref = p.index orelse p.pairs;
+        const meta_bytes: usize = if (p.index == null) @as(usize, p.n) * (p.k / 64) * 4 else if (p.index12) lane.indexed12Bytes(p.n, p.k, 64) else lane.indexedBytes(p.n, p.k, 64);
+        const meta_share = if (all_meta) meta_bytes else meta_bytes / @max(codes / @max(take, 1), 1);
+        const meta_take = @min(meta_share, meta.buffer.length() -| meta.offset);
+        if (take < 128) return;
+        if (k.warm_pipe == null) {
+            const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            const pipe = try mtl.Pipeline.init(k.device, library, "tf_q27_warm", false);
+            errdefer pipe.deinit();
+            k.warm_sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            k.warm_pipe = pipe;
+        }
+        const lines = [2]u32{ @intCast(take / 128), @intCast(meta_take / 128) };
+        // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
+        const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
+        e.setPipeline(k.warm_pipe.?);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
+        e.setBuffer(meta.buffer, meta.offset, 1);
+        e.setValue(lines, 2);
+        e.setBuffer(k.warm_sink.?, 0, 3);
+        e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    fn warmNormBytes(k: *Kernels) usize {
+        if (k.warm_norm_bytes) |b| return b;
+        var mb: usize = warm_norm_mb;
+        if (std.c.getenv("TF_Q27_WARM_NORM_MB")) |v| mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch warm_norm_mb;
+        k.warm_norm_bytes = mb << 20;
+        return k.warm_norm_bytes.?;
     }
 
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
