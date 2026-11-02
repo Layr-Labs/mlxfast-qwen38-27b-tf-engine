@@ -220,8 +220,10 @@ pub const Backend = struct {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
         errdefer primitives.deinit();
-        const attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
+        var attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
         errdefer attention.deinit();
+        // the split's one launch with its merge, kept only where it writes the split and merge's words on this GPU
+        attention.buildMerged(a, target.device, target.queue) catch |err| std.log.warn("draft attention keeps its merge launch: {s}", .{@errorName(err)});
         const topk = try core.bf16_topk_gpu.Ops.init(target.device);
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
@@ -233,6 +235,8 @@ pub const Backend = struct {
                 low.deinit();
                 head.plain = null;
             };
+            // the line warm beside the head's tile launch (Kernels.warmTiles) compiles here too; without it the warm is off
+            if (head.plain != null) target.kernels.prepareWarmTiles() catch |err| std.log.warn("draft head tile warm off: {s}", .{@errorName(err)});
         }
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
@@ -317,7 +321,9 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            // a dynamic conv's kernel projection also gets its launch with branch 0 of the conv folded in
+            if (std.mem.endsWith(u8, name, "conv.kernel_projection.weight")) b.foldConv(&adapter);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -405,9 +411,151 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        // the decoded gate|up group (below 4 bits) also gets its fused SwiGLU launch (runtime_callbacks.projectSwiglu),
+        // kept only where it writes the words of the group's launch followed by tf_draft_swiglu_xs on this GPU
+        if (kind == group_gu and key_part == 'g') {
+            adapter.draftSwiglu(b.allocator, b.target.device) catch |err| std.log.warn("draft gate/up keeps its SwiGLU launch: {s}", .{@errorName(err)});
+            if (adapter.swiglu) |fused| if (!(b.swigluMatches(adapter) catch false)) {
+                std.log.warn("draft gate/up keeps its SwiGLU launch: the fused launch's words differ on this GPU", .{});
+                fused.deinit();
+                adapter.swiglu = null;
+            };
+        }
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
+    }
+    /// Whether a gate|up group's fused SwiGLU launch (Adapter.swiglu) writes, on two rows of a fixed input, the words its
+    /// rows8 launch followed by tf_draft_swiglu_xs writes: the activated rows and all 16 rows of their group sums (the
+    /// padded rows' zeros too), bit for bit.
+    fn swigluMatches(b: *Backend, adapter: core.affine4_lane.Adapter) !bool {
+        const fused = adapter.swiglu orelse return false;
+        const small = adapter.small orelse return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const device = b.target.device;
+        const rows: u32 = 2;
+        const n = fused.n;
+        const k = fused.k;
+        const half = n / 2;
+        const groups = half / core.draft_ops.sums_group;
+        const x = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer x.deinit();
+        const gu = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer gu.deinit();
+        const h0 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h0.deinit();
+        const h1 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h1.deinit();
+        const s0 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s0.deinit();
+        const s1 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s1.deinit();
+        // a fixed input of moderate values in [-2, 2], every column and both rows different
+        for (x.slice(u16, rows * k), 0..) |*v, i| {
+            const f: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7919 + 13) % 4001)) - 2000)) / 1000.0;
+            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
+        // a NaN pattern neither path writes: a word one path leaves unwritten differs from the other's
+        for ([_]mtl.Buffer{ h0, h1 }) |h| @memset(h.slice(u16, rows * half), 0x7fc1);
+        for ([_]mtl.Buffer{ s0, s1 }) |sb| @memset(sb.slice(u32, groups * 16), 0x7fc00001);
+        // the frame's way: a concurrent encoder, a barrier between each dispatch and the ones that read its words
+        const cb = b.target.queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        var ended = false;
+        errdefer if (!ended) e.end();
+        const sums = try small.encodeSumsOf(e, .{ .buf = x }, rows);
+        e.barrier();
+        try small.encodeSums(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = gu }, rows);
+        e.barrier();
+        try b.primitives.swigluSums(e, .{ .buf = gu }, .{ .buf = gu, .off = half * 2 }, .{ .buf = h0 }, .{ .ref = .{ .buf = s0 }, .stride = 16 }, .{ .rows = rows, .width = @intCast(half), .gate_stride = @intCast(n), .up_stride = @intCast(n), .y_stride = @intCast(half) });
+        try fused.encodeSwiglu(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = h1 }, .{ .buf = s1 }, rows);
+        e.end();
+        ended = true;
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.warn("draft gate/up SwiGLU check: {s}", .{msg});
+            return false;
+        }
+        if (!std.mem.eql(u16, h0.slice(u16, rows * half), h1.slice(u16, rows * half))) return false;
+        return std.mem.eql(u32, s0.slice(u32, groups * 16), s1.slice(u32, groups * 16));
+    }
+    /// Builds a dynamic conv kernel projection's folded launch (Adapter.conv, runtime_callbacks.projectConv), kept only
+    /// where it writes the words of the projection's rows8 launch followed by tf_dynamic_conv2_xs on this GPU.
+    fn foldConv(b: *Backend, adapter: *core.affine4_lane.Adapter) void {
+        adapter.convFold(b.allocator, b.target.device, b.config.group) catch |err| {
+            std.log.warn("draft conv keeps its launch: {s}", .{@errorName(err)});
+            return;
+        };
+        if (b.convMatches(adapter.*) catch false) return;
+        std.log.warn("draft conv keeps its launch: the folded launch's words differ on this GPU", .{});
+        adapter.conv.?.deinit();
+        adapter.conv = null;
+    }
+    /// Whether a conv projection's folded launch (Adapter.conv) writes, on two rows of a fixed input and base kernel, the
+    /// words its rows8 launch followed by tf_dynamic_conv2_xs (branch 0, block 2) writes: the projection's rows, the conv's
+    /// rows and all 16 rows of its group sums, bit for bit, with its arrival counts back to zero.
+    fn convMatches(b: *Backend, adapter: core.affine4_lane.Adapter) !bool {
+        const fold = adapter.conv orelse return false;
+        const small = adapter.small orelse return false;
+        const counts = fold.fold_counts orelse return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const device = b.target.device;
+        const rows: u32 = 2;
+        const n = fold.n;
+        const k = fold.k;
+        const groups = k / core.draft_ops.sums_group;
+        const x = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer x.deinit();
+        const base = try device.buffer(4 * k * 2, mtl.ResourceOptions.shared);
+        defer base.deinit();
+        const d0 = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer d0.deinit();
+        const d1 = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer d1.deinit();
+        const y0 = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer y0.deinit();
+        const y1 = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer y1.deinit();
+        const s0 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s0.deinit();
+        const s1 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s1.deinit();
+        // fixed moderate values, every column and row different; NaN patterns where neither path should leave a word
+        for (x.slice(u16, rows * k), 0..) |*v, i| v.* = bf16Of(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7919 + 13) % 4001)) - 2000)) / 1000.0);
+        for (base.slice(u16, 4 * k), 0..) |*v, i| v.* = bf16Of(@as(f32, @floatFromInt(@as(i32, @intCast((i * 104729 + 7) % 3001)) - 1500)) / 1000.0);
+        for ([_]mtl.Buffer{ d0, d1 }) |buf| @memset(buf.slice(u16, rows * n), 0x7fc1);
+        for ([_]mtl.Buffer{ y0, y1 }) |buf| @memset(buf.slice(u16, rows * k), 0x7fc1);
+        for ([_]mtl.Buffer{ s0, s1 }) |buf| @memset(buf.slice(u32, groups * 16), 0x7fc00001);
+        // the frame's way: a concurrent encoder, a barrier between each dispatch and the ones that read its words
+        const cb = b.target.queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        var ended = false;
+        errdefer if (!ended) e.end();
+        const sums = try small.encodeSumsOf(e, .{ .buf = x }, rows);
+        e.barrier();
+        try small.encodeSums(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = d0 }, rows);
+        try fold.encodeConvFold(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = d1 }, rows, .{ .buf = base }, .{ .buf = y1 }, @intCast(k), .{ .ref = .{ .buf = s1 }, .stride = 16 }, 2);
+        e.barrier();
+        try b.primitives.convSums(e, .{ .buf = x }, .{ .buf = d0 }, .{ .buf = base }, null, .{ .buf = y0 }, .{ .ref = .{ .buf = s0 }, .stride = 16 }, .{ .rows = rows, .width = @intCast(k), .group = b.config.group, .block = 2, .branch = 0, .x_stride = @intCast(k), .dynamic_stride = @intCast(n), .y_stride = @intCast(k) });
+        e.end();
+        ended = true;
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.warn("draft conv fold check: {s}", .{msg});
+            return false;
+        }
+        return std.mem.eql(u16, d0.slice(u16, rows * n), d1.slice(u16, rows * n)) and
+            std.mem.eql(u16, y0.slice(u16, rows * k), y1.slice(u16, rows * k)) and
+            std.mem.eql(u32, s0.slice(u32, groups * 16), s1.slice(u32, groups * 16)) and
+            std.mem.allEqual(u32, counts.slice(u32, k / b.config.group / 32), 0);
+    }
+    /// An f32's bf16 word, truncated.
+    fn bf16Of(f: f32) u16 {
+        return @intCast(@as(u32, @bitCast(f)) >> 16);
     }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {

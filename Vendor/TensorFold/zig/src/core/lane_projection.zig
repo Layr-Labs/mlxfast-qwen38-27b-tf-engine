@@ -194,6 +194,14 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's two SIMD groups each run a gate tile then its up
     /// tile (64 columns); it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// A `swiglu` build for the drafter's decoded gate/up (rows8 on one K chain, sk 1): four one-tile SIMD groups a
+    /// threadgroup, two gate tiles then their two up tiles, storing tf_draft_swiglu_xs' activation and group sums.
+    draft_act: bool = false,
+    /// A drafter dynamic conv's kernel projection (rows8, N = 4 * K / conv_group): its launch also runs branch 0 of the
+    /// conv that reads it, tf_dynamic_conv2_xs over K columns (Projection.encodeConvFold).
+    conv_fold: bool = false,
+    /// conv_fold's columns a dynamic word scales.
+    conv_group: usize = 16,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
     /// `indexed` as lane_projection.indexed12_layout.
@@ -237,7 +245,13 @@ pub const Layout = struct {
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
-        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
+        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1) or (l.draft_act and l.rows8 and !l.serial_sk2 and l.sk == 1);
+        if (l.draft_act and (!l.swiglu or !l.rows8 or l.serial_sk2 or l.sk != 1 or l.prompt_tn != 1)) return error.InvalidSchedule;
+        // conv_fold: the plain rows8 store, whole 32-group tiles of each (branch, lag) quarter and whole 64-column sums
+        if (l.conv_fold and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.count or l.gu_count or l.wait or l.tile_list or
+            l.serial_sk2 or l.cooperative or l.prompt_sr or l.prompt_tn != 1 or l.output != .bf16 or l.ranges.len != 0 or
+            l.groups != null or (l.y_stride != null and l.y_stride.? != l.n) or l.conv_group == 0 or l.k % l.conv_group != 0 or
+            (l.k / l.conv_group) % 32 != 0 or l.n != 4 * (l.k / l.conv_group) or (32 * l.conv_group) % 64 != 0)) return error.InvalidSchedule;
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         // a two-tile SwiGLU launch: SIMD group 0 the gate pair, 1 the up pair, each pair inside one code batch
@@ -287,7 +301,7 @@ pub const Layout = struct {
 
     /// Two-bit reg launches (halveReg's words): lean decode-row launches only, one tile a code batch.
     fn regTwo(l: Layout) bool {
-        return l.format.bits == 2 and l.reg_lean and l.tile_batch == 1 and !l.swiglu and !l.prompt_sr and l.prompt_tn == 1;
+        return l.format.bits == 2 and l.reg_lean and l.tile_batch == 1 and (!l.swiglu or l.draft_act) and !l.prompt_sr and l.prompt_tn == 1;
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
@@ -344,6 +358,8 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
+    if (l.draft_act) try text.appendSlice(a, "#define TF_DRAFT_ACT 1\n");
+    if (l.conv_fold) try text.print(a, "#define TF_CONV_FOLD 1\n#define TF_CF_GROUP {d}\n#define TF_CF_PAIRS {d}\n#define TF_CF_COLS {d}\n#define TF_CF_THREADS (32 * TF_SK)\n", .{ l.conv_group, l.k / l.conv_group / 32, 32 * l.conv_group });
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
@@ -500,6 +516,11 @@ pub const Projection = struct {
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
+    /// Built with Layout.conv_fold: encodeConvFold only.
+    conv_fold: bool = false,
+    /// conv_fold's arrival counts, a u32 a tile pair: zero between launches (each pair's later threadgroup leaves its word
+    /// zero), and the launches that share them are ordered.
+    fold_counts: ?mtl.Buffer = null,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -513,7 +534,9 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        // a swiglu launch's threads: two two-tile SIMD groups (prompt_tn 2, or decoded turns), else four one-tile ones
+        const swiglu_threads: usize = if (l.prompt_tn == 2 or (l.rows8 and !l.draft_act)) 64 else 128;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) swiglu_threads else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -521,11 +544,21 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
+        errdefer if (sums_pipe) |pipe| pipe.deinit();
+        errdefer if (sums_buffer) |buffer| buffer.deinit();
+        var fold_counts: ?mtl.Buffer = null;
+        if (l.conv_fold) {
+            const pairs = l.k / l.conv_group / 32;
+            const counts = try device.buffer(pairs * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(counts.slice(u32, pairs), 0);
+            fold_counts = counts;
+        }
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = swiglu_threads, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .conv_fold = l.conv_fold, .fold_counts = fold_counts };
     }
 
     pub fn deinit(p: Projection) void {
         p.pipe.deinit();
+        if (p.fold_counts) |buffer| buffer.deinit();
         if (p.sums_pipe) |pipe| pipe.deinit();
         if (p.sums_buffer) |buffer| buffer.deinit();
     }
@@ -552,6 +585,27 @@ pub const Projection = struct {
         if (p.count) return error.InvalidSchedule;
         if (dims) |d| try checkRef(d, 8, 4);
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, null, dims);
+    }
+
+    /// A conv_fold projection (Layout.conv_fold) of decoded rows on the group sums of `x` a producer left: `y` gets the
+    /// projection's words, as encodeSums stores them, and `cy` (rows of K columns, `cy_stride` apart) and `cxs` branch 0 of
+    /// the dynamic conv of `x` (contiguous rows) with them: tf_dynamic_conv2_xs' words over `base`, the conv's
+    /// [branch][lag][K] bf16 base kernel, `block` rows a block, and its 64-column group sums at `cxs`' stride, rows past
+    /// `rows` zero.
+    pub fn encodeConvFold(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, base: Ref, cy: Ref, cy_stride: u32, cxs: Sums, block: u32) !void {
+        if (!p.conv_fold) return error.InvalidSchedule;
+        const counts = p.fold_counts orelse return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows or cxs.stride < rows or cxs.stride > 64 or block == 0 or cy_stride < p.k) return error.InvalidRows;
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(base, 2 * p.k * 2, 2);
+        try checkRef(cy, ((rows - 1) * @as(usize, cy_stride) + p.k) * 2, 2);
+        try checkRef(cxs.ref, p.k / 64 * @as(usize, cxs.stride) * 4, 4);
+        e.setBuffer(base.buf, base.off, 11);
+        e.setBuffer(cy.buf, cy.off, 12);
+        e.setBuffer(cxs.ref.buf, cxs.ref.off, 13);
+        e.setValue([4]u32{ block, cy_stride, cxs.stride, 0 }, 14);
+        e.setBuffer(counts, 0, 15);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, null, null);
     }
 
     /// A residual projection (Layout.residual): `ro` gets `h` + the output rows, each word rounded to bf16 first, as
