@@ -753,7 +753,7 @@ pub const Kernels = struct {
         const wide = rows > 16 and width % 1024 == 0;
         e.setPipeline(try k.get(.{ .kind = if (wide) .mlp_wide else .mlp, .k = width, .n = width }));
         bind(e, .{ gate, up, dims, out, xs });
-        e.dispatchGroups(mtl.Size.of(width / @as(u32, if (wide) 1024 else 64), if (wide) padded(rows) else rows, 1), mtl.Size.of(64, 1, 1));
+        e.dispatchGroups(mtl.Size.of(width / @as(u32, if (wide) 1024 else 64), rows, 1), mtl.Size.of(64, 1, 1));
         try span.end();
     }
 };
