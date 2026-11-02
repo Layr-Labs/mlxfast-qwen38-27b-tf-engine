@@ -660,6 +660,114 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 #endif
 
+#if TF_BITS == 2 && defined(TF_REG) && defined(TF_ALU2)
+// TF_ALU2: one or two decoded rows on a 2-bit reg copy (halveReg's words, tf_lane_reg's metadata, sums, bindings and grid)
+// in fp32 FMAs. tf_lane_reg's 16-row tensor tile spends 16 multiply-adds a code, so on these rows it runs at the tensor
+// units' rate, below the 2-bit words' stream; here a code costs one extract, one convert and one FMA a row.
+// Lane word j (0-3) of a group packs the 4-bit layout's words j (bits 0-1 of each nibble) and j + 4 (bits 2-3)
+// (lane_order.metal): nibble v holds column c0 + 8 (j >> 1), then c0 + 16 + 8 (j >> 1), at the group's
+// k = kb + 32 (j & 1) + {0, 2, 16, 18, 1, 3, 17, 19}[v], with c0 = lane bits 1, 2 and 4 and kb = 8 (lane bit 3) + 4 (lane bit 0).
+// The four lanes of a c0 cover a group's 64 k between them; each scales its four columns' partials by the group's scale,
+// one of them adds the bias times the group's row sum, then the four lanes' sums and the K slices' (in slice order).
+inline uint tf_alu_pair(const device bfloat* SB, int g, int col) {
+#if defined(TF_SBI12)
+  const device uint* tab = (const device uint*)SB;
+  const device uint* ix = tab + TF_SBI + ((size_t)g * (TF_N / 32) + col / 32) * 12 + ((col % 16) / 4) * 3;
+  const int bit = 12 * (((col % 32) / 16) * 4 + col % 4), w = bit / 32, off = bit % 32;
+  const uint lo = ix[w] >> off, hi = off > 20 ? ix[w + 1] << (32 - off) : 0u;
+  return tab[(lo | hi) & 0xFFFu];
+#elif defined(TF_SBI)
+  const device uint* tab = (const device uint*)SB;
+  return tab[((const device ushort*)(tab + TF_SBI))[(size_t)g * TF_N + col]];
+#else
+  return ((const device uint*)SB)[(size_t)g * TF_N + col];
+#endif
+}
+inline float tf_alu_bf(uint bits) { return as_type<float>(bits << 16); }
+[[max_total_threads_per_threadgroup(32 * TF_SK)]]
+[[kernel]] void tf_lane_alu2(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const int rows = min(mdims[0], 2), stride = mdims[1];
+  if (rows <= 0) return;
+  const bool two = rows == 2;
+  const int lane = int(lanei), ks = int(sgi), tile = int(tg.x), n0 = tile * NT;
+  const int c0 = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1), kb = 8 * ((lane >> 3) & 1) + 4 * (lane & 1);
+  const float bias_on = (lane & 9) == 0 ? 1.0f : 0.0f;
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+  const device uint4* wl = W + (size_t)tile * KG * TF_RW + lane;
+  const device ushort* xr = (const device ushort*)X + kb;
+  float C0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, C1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // codes two groups ahead; a slice's last groups reload its last, which nothing reads
+  uint4 n1 = 0, n2 = 0;
+  if (first < last) { n1 = wl[(size_t)first * TF_RW]; n2 = wl[(size_t)min(first + 1, last - 1) * TF_RW]; }
+  for (int g = first; g < last; g++) {
+    const uint4 cw = n1;
+    n1 = n2;
+    n2 = wl[(size_t)min(g + 2, last - 1) * TF_RW];
+    float xa[16], xb[16];
+    for (int q = 0; q < 4; q++) {
+      const ushort4 u = *(const device ushort4*)(xr + g * GS + 16 * q);
+      for (int e = 0; e < 4; e++) xa[4 * q + e] = tf_alu_bf(uint(u[e]));
+    }
+    if (two) for (int q = 0; q < 4; q++) {
+      const ushort4 u = *(const device ushort4*)(xr + TF_K + g * GS + 16 * q);
+      for (int e = 0; e < 4; e++) xb[4 * q + e] = tf_alu_bf(uint(u[e]));
+    }
+    float P0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, P1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int j = 0; j < 4; j++) {
+      const uint word = cw[j];
+      const int lo = j >> 1, hi = 2 + (j >> 1), quad = 2 * (j & 1);
+      for (int v = 0; v < 8; v++) {
+        const int xi = 4 * (quad + ((v >> 1) & 1)) + ((v & 1) << 1) + (v >> 2);
+        const float cl = float(extract_bits(word, uint(4 * v), 2u)), ch = float(extract_bits(word, uint(4 * v + 2), 2u));
+        P0[lo] = fma(cl, xa[xi], P0[lo]);
+        P0[hi] = fma(ch, xa[xi], P0[hi]);
+        if (two) {
+          P1[lo] = fma(cl, xb[xi], P1[lo]);
+          P1[hi] = fma(ch, xb[xi], P1[hi]);
+        }
+      }
+    }
+    const float xs0 = XS[g * stride], xs1 = two ? XS[g * stride + 1] : 0.0f;
+    for (int m = 0; m < 4; m++) {
+      const uint pair = tf_alu_pair(SB, g, n0 + c0 + 8 * m);
+      // the pairs' scales carry 2^24 (lane_projection.foldScale); these codes are plain integers
+      const float s = tf_alu_bf(pair & 0xFFFFu) * 5.9604644775390625e-8f, b = tf_alu_bf(pair >> 16) * bias_on;
+      C0[m] = fma(s, P0[m], fma(b, xs0, C0[m]));
+      if (two) C1[m] = fma(s, P1[m], fma(b, xs1, C1[m]));
+    }
+  }
+  for (int m = 0; m < 4; m++) {
+    C0[m] += simd_shuffle_xor(C0[m], 1u);
+    C0[m] += simd_shuffle_xor(C0[m], 8u);
+    C1[m] += simd_shuffle_xor(C1[m], 1u);
+    C1[m] += simd_shuffle_xor(C1[m], 8u);
+  }
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 8 * 32];
+  if (TF_SK > 1) {
+    if (ks > 0) for (int m = 0; m < 4; m++) {
+      part[((ks - 1) * 8 + m) * 32 + lane] = C0[m];
+      part[((ks - 1) * 8 + 4 + m) * 32 + lane] = C1[m];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int m = 0; m < 4; m++) {
+      C0[m] += part[((s2 - 1) * 8 + m) * 32 + lane];
+      C1[m] += part[((s2 - 1) * 8 + 4 + m) * 32 + lane];
+    }
+  }
+  if (ks != 0) return;
+  // each of a c0's four lanes stores one of its columns
+  const int pick = (lane & 1) + 2 * ((lane >> 3) & 1), col = n0 + c0 + 8 * pick;
+  const float y0 = pick == 0 ? C0[0] : pick == 1 ? C0[1] : pick == 2 ? C0[2] : C0[3];
+  Y[col] = static_cast<TF_OUT>(y0);
+  if (two) {
+    const float y1 = pick == 0 ? C1[0] : pick == 1 ? C1[1] : pick == 2 ? C1[2] : C1[3];
+    Y[(size_t)TF_YS + col] = static_cast<TF_OUT>(y1);
+  }
+}
+#endif
+
 #if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN)
 #ifndef TF_TB
 #define TF_TB 1

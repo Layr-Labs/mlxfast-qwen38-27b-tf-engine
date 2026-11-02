@@ -74,17 +74,131 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
 }
 #endif
 
+// The scan of one tile in fp32 FMAs (tf_head_sieve_scan takes it for a share of the tiles spread over the grid): the
+// scan's 16-row tensor tile spends 16 multiply-adds a code at any row count, so it runs at the tensor units' rate, and SIMD
+// groups on these tiles keep the ALUs busy beside it. A lane's 2-bit word j (0-3) holds column c0 + 8 (j >> 1) in bits 0-1
+// of each nibble and c0 + 16 + 8 (j >> 1) in bits 2-3, nibble v at k = kb + 32 (j & 1) + {0, 2, 16, 18, 1, 3, 17, 19}[v]
+// (tf_head_sieve_pack's words in lane_order.metal's lane order; c0 = lane bits 1, 2 and 4, kb = 8 (lane bit 3) + 4 (lane
+// bit 0)); the four lanes of a c0 cover a group's 64 k. Each (row, column) gets the scan's a, sum_g 4 s P + (b + 1.5 s) x_g,
+// and the scan's spread, sum_g s^2 x_g^2, so a tile's best a and best a + k s are the scan's but for f32 rounding.
+inline uint tf_sieve_pair(const device bfloat* SB, int g, int col) {
+#if defined(TF_SBI12)
+  const device uint* tab = (const device uint*)SB;
+  const device uint* ix = tab + TF_SBI + ((size_t)g * (TF_N / 32) + col / 32) * 12 + ((col % 16) / 4) * 3;
+  const int bit = 12 * (((col % 32) / 16) * 4 + col % 4), w = bit / 32, off = bit % 32;
+  const uint lo = ix[w] >> off, hi = off > 20 ? ix[w + 1] << (32 - off) : 0u;
+  return tab[(lo | hi) & 0xFFFu];
+#elif defined(TF_SBI)
+  const device uint* tab = (const device uint*)SB;
+  return tab[((const device ushort*)(tab + TF_SBI))[(size_t)g * TF_N + col]];
+#else
+  return ((const device uint*)SB)[(size_t)g * TF_N + col];
+#endif
+}
+inline float tf_sieve_bf(uint bits) { return as_type<float>(bits << 16); }
+inline void tf_sieve_alu_tile(const device bfloat* X, const device uint4* W, const device bfloat* SB, int M, int stride,
+    device float* HM, const device float* XS, const device float* XQ, int lane, int tile) {
+  const int n0 = tile * NT;
+  const int c0 = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1), kb = 8 * ((lane >> 3) & 1) + 4 * (lane & 1);
+  const float bias_on = (lane & 9) == 0 ? 1.0f : 0.0f;
+  const device uint4* wp = W + (size_t)tile * KG * 32 + lane;
+  const device ushort* xr = (const device ushort*)X + kb;
+  // C: the lane's quarter of each (row, column)'s a; V: each (row, column)'s spread (the same in a c0's four lanes)
+  float C[8][4], V[8][4];
+  for (int r = 0; r < 8; r++) for (int m = 0; m < 4; m++) {
+    C[r][m] = 0.0f;
+    V[r][m] = 0.0f;
+  }
+  uint4 n1 = wp[0], n2 = wp[(size_t)min(1, KG - 1) * 32];
+  for (int g = 0; g < KG; g++) {
+    const uint4 cw = n1;
+    n1 = n2;
+    n2 = wp[(size_t)min(g + 2, KG - 1) * 32];
+    float t[4], bb[4];
+    for (int m = 0; m < 4; m++) {
+      const uint pair = tf_sieve_pair(SB, g, n0 + c0 + 8 * m);
+      t[m] = tf_sieve_bf(pair & 0xFFFFu) * (1.0f / 16777216.0f); // the scales carry 2^24
+      bb[m] = fma(1.5f, t[m], tf_sieve_bf(pair >> 16)) * bias_on;
+    }
+    for (int r = 0; r < 8; r++) {
+      const float xq = XQ[g * 16 + r];
+      for (int m = 0; m < 4; m++) V[r][m] = fma(t[m] * t[m], xq, V[r][m]);
+    }
+    // rows in chunks of four (a fixed bound, so every array index is a constant); the second only past four rows
+    for (int ch = 0; ch < 2; ch++) {
+      if (ch == 1 && M <= 4) break;
+      float P[4][4];
+      for (int r = 0; r < 4; r++) for (int m = 0; m < 4; m++) P[r][m] = 0.0f;
+      // one k quad (kb + 16 qd + 0..3) of the chunk's rows at a time: words j = (qd >> 1) + 2 jj, nibbles of that quad
+      for (int qd = 0; qd < 4; qd++) {
+        float xv[4][4];
+        for (int r = 0; r < 4; r++) {
+          const int row = 4 * ch + r;
+          const ushort4 u = row < M ? *(const device ushort4*)(xr + (size_t)row * TF_K + g * GS + 16 * qd) : ushort4(0);
+          for (int e = 0; e < 4; e++) xv[r][e] = tf_sieve_bf(uint(u[e]));
+        }
+        for (int jj = 0; jj < 2; jj++) {
+          const uint word = cw[(qd >> 1) + 2 * jj];
+          for (int e = 0; e < 4; e++) {
+            // the nibble of k = kb + 16 qd + e: v = 4 (e & 1) + (e >> 1) + 2 (qd & 1)
+            const uint v = uint(4 * (e & 1) + (e >> 1) + 2 * (qd & 1));
+            const float cl = float(extract_bits(word, 4u * v, 2u)), chh = float(extract_bits(word, 4u * v + 2u, 2u));
+            for (int r = 0; r < 4; r++) {
+              P[r][jj] = fma(cl, xv[r][e], P[r][jj]);
+              P[r][2 + jj] = fma(chh, xv[r][e], P[r][2 + jj]);
+            }
+          }
+        }
+      }
+      for (int r = 0; r < 4; r++) {
+        const int row = 4 * ch + r;
+        const float xs = XS[g * stride + row];
+        for (int m = 0; m < 4; m++) C[row][m] = fma(4.0f * t[m], P[r][m], fma(bb[m], xs, C[row][m]));
+      }
+    }
+  }
+  for (int r = 0; r < 8; r++) {
+    float hi = -INFINITY, mid = -INFINITY;
+    for (int m = 0; m < 4; m++) {
+      // the four lanes of a c0 (lane bits 0 and 3) hold one column's four k quarters
+      float v = C[r][m];
+      v += simd_shuffle_xor(v, 1u);
+      v += simd_shuffle_xor(v, 8u);
+      const float ks = TF_SIEVE_KAPPA * sqrt(1.25f * V[r][m]);
+      // fmax drops a NaN as the scan's does
+      hi = fmax(hi, v + ks + fma(fabs(v) + ks, SLACK_REL, SLACK_ABS));
+      mid = fmax(mid, v);
+    }
+    // the tile's eight c0s
+    hi = fmax(hi, simd_shuffle_xor(hi, 2u));
+    hi = fmax(hi, simd_shuffle_xor(hi, 4u));
+    hi = fmax(hi, simd_shuffle_xor(hi, 16u));
+    mid = fmax(mid, simd_shuffle_xor(mid, 2u));
+    mid = fmax(mid, simd_shuffle_xor(mid, 4u));
+    mid = fmax(mid, simd_shuffle_xor(mid, 16u));
+    if (lane == 0 && r < M) {
+      HM[(size_t)tile * 16 + r] = hi;
+      HM[(size_t)tile * 16 + 8 + r] = mid;
+    }
+  }
+}
+
 // The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 2-bit copy through tf_lane_reg's
 // decoded-row loop (rows8, one K split, codes as fp16 subnormals in the tensor op's right input, the head's own
 // metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
 // it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row].
-// dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
+// dims: rows, the sums' stride (16). Grid TILES threadgroups of 32; alu_permille of them take tf_sieve_alu_tile.
 [[max_total_threads_per_threadgroup(32)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
-    uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
+    constant uint& alu_permille [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
+  // alu_permille of every thousand tiles, spread evenly over the grid, so both kinds of SIMD group share every core
+  if ((uint(tile) * alu_permille) % 1000u < alu_permille) {
+    tf_sieve_alu_tile(X, W, SB, M, stride, HM, XS, XQ, lane, tile);
+    return;
+  }
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
