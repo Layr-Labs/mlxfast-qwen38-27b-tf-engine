@@ -359,7 +359,10 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // 20 us sleeps between checks rather than a yield loop that keeps a core busy for the whole request (the CPU and
+        // GPU share one package's power); the acquire load pairs with the engine's release store as before
+        const ts: @import("sys").c.timespec = .{ .sec = 0, .nsec = 20_000 };
+        while (!run.done.load(.acquire)) _ = @import("sys").c.nanosleep(&ts, null);
         if (run.failed) return error.EngineFailed;
     }
 };
