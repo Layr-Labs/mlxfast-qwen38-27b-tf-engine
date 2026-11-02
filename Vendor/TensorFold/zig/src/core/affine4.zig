@@ -171,7 +171,7 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
 /// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
 /// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
 fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
-    const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
+    const shrinks = [_]f32{ 1.0, 0.975, 0.95, 0.925, 0.9, 0.875, 0.85, 0.825, 0.8, 0.775, 0.75, 0.725, 0.7, 0.675, 0.65, 0.625, 0.6, 0.575, 0.55, 0.525, 0.5, 0.475, 0.45, 0.425, 0.4 };
     var best_err: f32 = std.math.inf(f32);
     var best_scale: u16 = 0;
     var best_bias: u16 = 0;
