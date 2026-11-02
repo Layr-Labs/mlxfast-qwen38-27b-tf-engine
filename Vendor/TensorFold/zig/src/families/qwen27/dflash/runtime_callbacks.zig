@@ -18,6 +18,8 @@ fn begin(ptr: *anyopaque) !u64 {
     b.held_conv = null;
     b.held_norms = @splat(null);
     b.hazards.clear();
+    b.warm_last = 0;
+    b.warm_done = true;
     const lead = b.early orelse return b.frame.begin();
     // an early frame: its words are picked from the verify's result before anything reads them
     const epoch = try b.frame.beginEarly(true);
@@ -60,6 +62,7 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
     } else {
         const key = @intFromPtr(w.bytes.ptr);
         const adapter = (if (readsQ4Copy(b, x.rows)) b.prepared.get(key | Backend.precise_key) else null) orelse b.prepared.get(key) orelse return error.DraftPreparationUnqualified;
+        noteProjection(b, adapter.words);
         try encodePrepared(b, e, x, y, adapter);
         return y;
     }
@@ -129,6 +132,7 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     errdefer b.input_sums = null;
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
+    noteProjection(b, adapter.words);
     try encodePrepared(b, e, x, y, adapter);
     return y;
 }
@@ -165,6 +169,7 @@ fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
     const held: @TypeOf(b.held_conv) = if (b.held_conv) |h| (if (p.heads == 1 and p.head_dim == x.width and std.meta.eql(h.y, x)) h else null) else null;
     if (held != null) b.held_conv = null;
     const e = try b.encoder(epoch);
+    warmNext(b, e);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
     if (held) |h| {
         if (try sumsFor(b, x.rows, x.width)) |s| {
@@ -211,9 +216,36 @@ fn embedEarly(b: *Backend, e: @import("metal").ComputeEncoder, ids: []const u32)
     try b.target.glue.embedding(e, b.target.config, b.target.weights.embed, .{ .buffer = tokens.buf, .offset = tokens.off }, .{ .buffer = out.buf, .offset = out.off }, 2);
     return y;
 }
+/// Learns `words` as the successor of the frame's last projection and makes it the last.
+fn noteProjection(b: *Backend, words: @import("metal").Buffer) void {
+    const key = @intFromPtr(words.id);
+    if (b.warm_last != 0) {
+        for (b.warm_next[0..b.warm_n]) |*w| {
+            if (w.key == b.warm_last) {
+                w.next = words;
+                break;
+            }
+        } else if (b.warm_n < b.warm_next.len) {
+            b.warm_next[b.warm_n] = .{ .key = b.warm_last, .next = words };
+            b.warm_n += 1;
+        }
+    }
+    b.warm_last = key;
+    b.warm_done = false;
+}
+/// Beside a latency-bound launch (no barrier): the leading lines of the projection that followed the last one, once a projection.
+fn warmNext(b: *Backend, e: @import("metal").ComputeEncoder) void {
+    if (b.warm_done or b.warm_last == 0) return;
+    b.warm_done = true;
+    for (b.warm_next[0..b.warm_n]) |w| if (w.key == b.warm_last) {
+        b.target.kernels.warmWords(e, w.next, @import("runtime_backend.zig").warm_bytes) catch {};
+        return;
+    };
+}
 fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
+    warmNext(b, e);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
     // a conv with a residual feeds the next norm: held back for it (tf_dynamic_conv2_rms_xs), or encoded by the next launch
     if (p.residual != null and !b.admitting() and x.rows <= sums_stride and x.width % draft_ops.sums_group == 0 and x.width <= draft_ops.sums_max_width) {
@@ -237,6 +269,7 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     // the per-head norm that wrote `x`, held back: it and this rope in one launch
     const held = b.takeHeldNorm(x, p.heads, p.dim);
     const e = if (held != null) try b.encoderHolding(epoch) else try b.encoder(epoch);
+    warmNext(b, e);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
     const rp: draft_ops.Rope = .{ .rows = x.rows, .heads = p.heads, .dim = p.dim, .x_stride = x.stride, .y_stride = y.stride, .theta = @floatCast(p.theta) };
     // an early frame's block (past its append) sits right behind the taps the verify admits: RoundArgs positions
@@ -270,6 +303,7 @@ fn normArgs(h: @import("runtime_backend.zig").HeldNorm) draft_ops.Norm {
 fn swiglu(ptr: *anyopaque, epoch: u64, g: op.View, u: op.View) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
+    warmNext(b, e);
     const y = try b.frame.alloc(g.rows, g.width, .bf16);
     if (try sumsFor(b, g.rows, g.width)) |s| {
         const sums = try b.frame.ref(s);
@@ -335,6 +369,10 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     const y = try b.frame.add(rows_ref, x.rows, slots * 32, Head.rescored_stride, .bf16);
     const input = try b.frame.ref(x);
     b.access(e, &.{ try b.span(x), Span.whole(sums.ref.buffer), try b.span(list) }, &.{try b.span(y)});
+    // beside the tile launch, behind the barrier above: its listed tiles' lines requested at once (Kernels.warmTiles), so
+    // its one SIMD group a tile finds them in the caches as it walks their K groups. Nothing it writes is read; one that
+    // fails to encode only loses its prefetch (the launch below sets its own pipeline and bindings).
+    b.target.kernels.warmTiles(e, b.head.linear, .{ .buffer = list_ref.buf, .offset = list_ref.off }, slots) catch {};
     try b.target.kernels.quantTiles(e, b.head.linear, .{ .buffer = input.buf, .offset = input.off }, sums, .{ .buffer = list_ref.buf, .offset = list_ref.off }, .{ .buffer = rows_ref.buf, .offset = rows_ref.off }, x.rows, slots, Head.rescored_stride);
     return .{ .logits = y, .token_ids = map };
 }

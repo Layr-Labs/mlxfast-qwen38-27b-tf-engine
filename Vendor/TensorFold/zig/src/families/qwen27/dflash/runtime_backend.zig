@@ -173,7 +173,18 @@ pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.Co
 
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
 
+pub const warm_slots = 128;
+pub const WarmNext = struct { key: usize, next: @import("metal").Buffer };
+/// Bytes of the next projection's code lines a drafter warm touches.
+pub const warm_bytes: usize = 8 << 20;
 pub const Backend = struct {
+    /// Drafter-frame warms: for each projection's code buffer, the one encoded after it in the last frame that ran it
+    /// (learned, so prompt catch-ups, early frames and precise copies each keep their own successor), the last one
+    /// encoded in this frame, and whether its successor was warmed since.
+    warm_next: [warm_slots]WarmNext = undefined,
+    warm_n: usize = 0,
+    warm_last: usize = 0,
+    warm_done: bool = false,
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
     target: *Target,
@@ -233,6 +244,8 @@ pub const Backend = struct {
                 low.deinit();
                 head.plain = null;
             };
+            // the line warm beside the head's tile launch (Kernels.warmTiles) compiles here too; without it the warm is off
+            if (head.plain != null) target.kernels.prepareWarmTiles() catch |err| std.log.warn("draft head tile warm off: {s}", .{@errorName(err)});
         }
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
