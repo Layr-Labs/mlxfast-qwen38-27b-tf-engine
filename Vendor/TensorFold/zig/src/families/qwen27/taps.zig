@@ -42,6 +42,19 @@ pub const Taps = struct {
         t.rows = rows;
     }
 
+    /// `record` for one segment of a staggered prompt pass (decode_round.staggered): its `rows` go at row `first` of
+    /// each plane, the pass's `total` rows in all. The segment ending at `total` marks the plane recorded.
+    pub fn recordAt(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32, first: u32, total: u32) !void {
+        if (rows == 0 or total > t.capacity or rows > total - @min(first, total) or first >= total) return error.BadTapShape;
+        const index = std.mem.indexOfScalar(usize, &t.ids, layer) orelse return;
+        var at = try t.plane(index);
+        at.offset += @as(usize, first) * t.width * 2;
+        // unfenced, as record's: the copy runs beside the mixer's projections in the segment's own lane
+        try glue.unstack(e, hidden, at, .{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 });
+        if (first + rows == total) t.seen |= @as(u8, 1) << @intCast(index);
+        t.rows = total;
+    }
+
     pub fn plane(t: Taps, index: usize) !Ref {
         if (index >= layers.len) return error.BadTapIndex;
         return .{ .buffer = t.buffer, .offset = index * @as(usize, t.capacity) * t.width * 2 };
