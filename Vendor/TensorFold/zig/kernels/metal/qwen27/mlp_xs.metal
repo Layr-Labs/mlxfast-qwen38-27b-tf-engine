@@ -18,7 +18,10 @@ Q27_SPECIALIZE
   const uint m = threadgroup_position_in_grid.y;
   const int M = dims[0], MP = dims[1];
   threadgroup bfloat hb[64];
-  // the grid covers the real rows; a padded row's sums are read only for rows the lane kernel drops
+  // The grid covers the real rows, so row 0's threadgroup writes its group's padded rows' sums. They are
+  // read only by rows the lane kernel drops, but leaving them stale measured worse than writing them
+  // (a decode round that skipped padding-sum zeroing in the norm grids scored -0.75% on the runner).
+  if (m == 0 && int(t) < MP - M) XS[g * MP + M + t] = 0.0f;
   if (int(m) >= M) {
     if (t == 0) XS[g * MP + m] = 0.0f;
     return;
