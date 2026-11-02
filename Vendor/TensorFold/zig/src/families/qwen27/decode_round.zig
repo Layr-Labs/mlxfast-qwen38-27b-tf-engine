@@ -5,14 +5,16 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 16;
+const commit_every = 8;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
-/// Prompt rows a pass needs before it runs as two staggered segments on two queues (core/stagger.zig): the second
-/// segment's mixer of each layer waits for the first's, so one segment's sequential GDN scan runs beside the other's
+/// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
+/// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
+/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -97,10 +99,10 @@ pub const Runner = struct {
     /// accepted path's last row's, which tree_commit's keep_head copies there). Any forward with a head clears it, as
     /// its logits replace that row; Session.greedy and fingerprint read it in place of row 0.
     head_token: ?u32 = null,
-    /// A staggered prompt pass's second segment: its rows' frame, attention scratch and bindings, and its queue, made by
-    /// the first prompt pass that splits (staggered).
-    second: ?Second = null,
-    /// The residency set the model's queue holds (residency.zig): the second segment's queue holds it as well.
+    /// A staggered prompt pass's later segments (the first runs in the model's frame on its queue): each one's rows'
+    /// frame, attention scratch and bindings, GDN scratch and queue, made by the first pass that splits that far.
+    second: [@import("core").segments.MAX - 1]?Second = @splat(null),
+    /// The residency set the model's queue holds (residency.zig): the later segments' queues hold it as well.
     resident_set: ?mtl.ResidencySet = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
@@ -222,7 +224,7 @@ pub const Runner = struct {
     pub fn deinit(r: *Runner) void {
         for (0..r.slots) |slot| r.settleSlot(@intCast(slot));
         r.setResident(null);
-        if (r.second) |*second| second.deinit(r.allocator);
+        for (&r.second) |*second| if (second.*) |*s| s.deinit(r.allocator);
         if (r.sieve) |*s| s.deinit();
         r.taps.deinit();
         r.gdn.deinit();
@@ -344,19 +346,27 @@ pub const Runner = struct {
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
-        if (std.c.getenv("TF_Q27_STAGGER")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
-        return true;
+        return staggerParts() > 1;
     }
 
-    /// The second segment's frame, scratch, bindings and queue, made once (their buffers join the runner's residency).
-    fn secondSegment(r: *Runner) !*Second {
-        if (r.second == null) {
-            r.second = try Second.init(r.allocator, r.model, &r.gdn, r.scratch.limits, r.bindings.len, r.model.frame.capacity / 2 + 64);
-            if (r.residency) |f| r.second.?.follow(f, true);
-            if (r.resident_set) |set| r.second.?.queue.addResidencySet(set);
-            std.log.info("qwen27: staggered prompt passes: a second segment of up to {d} rows on its own queue", .{r.second.?.frame.capacity});
+    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    fn staggerParts() usize {
+        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
+        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
+        return @min(n, @import("core").segments.MAX);
+    }
+
+    /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
+    /// residency).
+    fn laterSegment(r: *Runner, k: usize) !*Second {
+        const at = &r.second[k - 1];
+        if (at.* == null) {
+            at.* = try Second.init(r.allocator, r.model, &r.gdn, r.scratch.limits, r.bindings.len, r.model.frame.capacity / 2 + 64);
+            if (r.residency) |f| at.*.?.follow(f, true);
+            if (r.resident_set) |set| at.*.?.queue.addResidencySet(set);
+            std.log.info("qwen27: staggered prompt passes: segment {d} of up to {d} rows on its own queue", .{ k, at.*.?.frame.capacity });
         }
-        return &r.second.?;
+        return &at.*.?;
     }
 
     /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 64) in the model's frame on
@@ -365,56 +375,90 @@ pub const Runner = struct {
     /// segment's rows take the kernels and the arithmetic a prompt chunk of those rows takes, so every word is the one two
     /// chunks run in order give.
     fn staggered(r: *Runner, round: *const Round, head: forward.Head) !void {
+        const max = @import("core").segments.MAX;
         const n: u32 = @intCast(round.ids.len);
-        const na: u32 = n / 2 / 64 * 64;
-        const nb = n - na;
+        const parts = staggerParts();
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        const second = try r.secondSegment();
-        if (na == 0 or nb > second.frame.capacity) return error.BadFrameRows;
+        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        var firsts: [max + 1]u32 = undefined;
+        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        firsts[parts] = n;
+        for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
+        var frames: [max]*Frame = undefined;
+        var scratches: [max]*attn.Scratch = undefined;
+        var bindings: [max][]attn.Binding = undefined;
+        var owns: [max]?@import("gdn_pool_gpu.zig").Own = @splat(null);
+        var queues: [max]mtl.Queue = undefined;
+        frames[0] = &r.model.frame;
+        scratches[0] = &r.scratch;
+        bindings[0] = r.bindings;
+        queues[0] = r.model.queue;
+        for (1..parts) |k| {
+            const later = try r.laterSegment(k);
+            if (firsts[k + 1] - firsts[k] > later.frame.capacity) return error.BadFrameRows;
+            frames[k] = &later.frame;
+            scratches[k] = &later.scratch;
+            bindings[k] = later.bindings;
+            owns[k] = later.gdn;
+            queues[k] = later.queue;
+        }
         const taps: u32 = @intCast(r.model.config.conv_kernel);
         const vocab: u32 = @intCast(r.model.config.vocab);
-        var ra = try Round.init(r.allocator, &.{.{ .slot = slot, .start = start, .capacity = r.capacity, .ids = round.ids[0..na] }}, taps, r.slots, vocab);
-        defer ra.deinit();
-        var rb = try Round.init(r.allocator, &.{.{ .slot = slot, .start = start + na, .capacity = r.capacity, .ids = round.ids[na..] }}, taps, r.slots, vocab);
-        defer rb.deinit();
+        var rounds: [max]Round = undefined;
+        var made_rounds: usize = 0;
+        defer for (rounds[0..made_rounds]) |*x| x.deinit();
+        for (0..parts) |k| {
+            rounds[k] = try Round.init(r.allocator, &.{.{ .slot = slot, .start = start + firsts[k], .capacity = r.capacity, .ids = round.ids[firsts[k]..firsts[k + 1]] }}, taps, r.slots, vocab);
+            made_rounds += 1;
+        }
         var chain: [@import("gpu_frame.zig").max_rows]u32 = undefined;
         for (chain[0..n], 0..) |*v, i| v.* = @intCast(i);
         r.accepted_chain = true;
         defer r.accepted_chain = false;
-        var ga = try ra.recurrent(try r.params(na), &.{chain[0..na]});
-        defer ga.deinit();
-        var gb = try rb.recurrent(try r.params(nb), &.{chain[0..nb]});
-        defer gb.deinit();
+        var plans: [max]GdnPlan = undefined;
+        var made_plans: usize = 0;
+        defer for (plans[0..made_plans]) |*x| x.deinit();
+        for (0..parts) |k| {
+            const rows = firsts[k + 1] - firsts[k];
+            plans[k] = try rounds[k].recurrent(try r.params(rows), &.{chain[0..rows]});
+            made_plans += 1;
+        }
         // an accepted chain defers nothing: the caller's pending work and any pending GDN rows land first
-        if (try r.deferGdn(&ra, ga, true) != null) return error.RoundNotReady;
+        if (try r.deferGdn(&rounds[0], plans[0], true) != null) return error.RoundNotReady;
         r.deferred = null;
-        var pa = try r.attentionPlan(&ra);
-        defer pa.deinit();
-        var pb = try r.attentionPlan(&rb);
-        defer pb.deinit();
-        try r.gdn.prepare(r.model.device, ga, true);
-        try r.gdn.prepare(r.model.device, gb, true);
-        try r.model.frame.setRows(ra.ids, ra.feed_positions);
-        try second.frame.setRows(rb.ids, rb.feed_positions);
-        const placed_a = image_rows.place(&r.model.frame, &r.rope, null, r.model.config.mrope_section, &ra);
-        const placed_b = image_rows.place(&second.frame, &r.rope, null, r.model.config.mrope_section, &rb);
-        try r.scratch.admit(pa);
-        try second.scratch.admit(pb);
+        var attention_plans: [max]attn.Plan = undefined;
+        var made_attention: usize = 0;
+        defer for (attention_plans[0..made_attention]) |*x| x.deinit();
+        for (0..parts) |k| {
+            attention_plans[k] = try r.attentionPlan(&rounds[k]);
+            made_attention += 1;
+        }
+        for (0..parts) |k| try r.gdn.prepare(r.model.device, plans[k], true);
+        var placed: [max]image_rows.Placed = undefined;
+        for (0..parts) |k| {
+            try frames[k].setRows(rounds[k].ids, rounds[k].feed_positions);
+            placed[k] = image_rows.place(frames[k], &r.rope, null, r.model.config.mrope_section, &rounds[k]);
+            try scratches[k].admit(attention_plans[k]);
+        }
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         // as a prompt chunk's: the last block keeps only the rows a head or a tap reads
         const terminal_rows = !r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null;
-        var due_a = true;
-        var due_b = true;
-        var seg_a = Segment{ .r = r, .gdn = &ga, .attention = .{ .plan = &pa, .round = &ra, .placed = placed_a, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &due_a, .terminal_head = if (terminal_rows) .none else .all }, .tap_row = 0, .total = n };
-        var seg_b = Segment{ .r = r, .gdn = &gb, .own = second.gdn, .attention = .{ .plan = &pb, .round = &rb, .placed = placed_b, .scratch = &second.scratch, .bindings = second.bindings, .scratch_due = &due_b, .terminal_head = if (terminal_rows) head else .all }, .tap_row = na, .total = n };
-        var first = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = na, .hooks = seg_a.mixer(), .head = .none, .settle = .{ .ptr = r, .run = settleRound } };
-        var last = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = nb, .hooks = seg_b.mixer(), .head = head, .frame = &second.frame, .lane_k = 1, .logits = r.model.frame.get(.logits) };
-        var pair = Pair{ .stages = .{ &first, &last } };
-        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{ r.model.queue, second.queue }, r.model.config.layers, .concurrent, &pair, first_commit, commit_every, true) catch |err| {
+        var due: [max]bool = @splat(true);
+        var segments: [max]Segment = undefined;
+        var stages: [max]forward.Stages = undefined;
+        var family = Stagger{};
+        for (0..parts) |k| {
+            const last = k + 1 == parts;
+            const segment_head: forward.Head = if (last) head else .none;
+            segments[k] = .{ .r = r, .gdn = &plans[k], .own = owns[k], .attention = .{ .plan = &attention_plans[k], .round = &rounds[k], .placed = placed[k], .scratch = scratches[k], .bindings = bindings[k], .scratch_due = &due[k], .terminal_head = if (terminal_rows) segment_head else .all }, .tap_row = firsts[k], .total = n };
+            stages[k] = .{ .terminal_rows = terminal_rows, .model = r.model, .rows = firsts[k + 1] - firsts[k], .hooks = segments[k].mixer(), .head = segment_head, .frame = frames[k], .lane_k = k, .logits = if (k == 0) null else r.model.frame.get(.logits), .settle = if (k == 0) .{ .ptr = r, .run = settleRound } else null };
+            family.stages[k] = &stages[k];
+        }
+        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, queues[0..parts], r.model.config.layers, .concurrent, &family, first_commit, commit_every, true) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -861,31 +905,31 @@ const Segment = struct {
     }
 };
 
-/// A staggered prompt pass's two segments as one family for core/segments.zig: each hook goes to its lane's stages.
-const Pair = struct {
-    stages: [2]*forward.Stages,
+/// A staggered prompt pass's segments as one family for core/segments.zig: each hook goes to its lane's stages.
+const Stagger = struct {
+    stages: [@import("core").segments.MAX]*forward.Stages = undefined,
     const Lane = @import("core").segments.Lane;
 
-    pub fn begin(p: *Pair, lane: *Lane) !void {
+    pub fn begin(p: *Stagger, lane: *Lane) !void {
         return p.stages[lane.k].begin(lane);
     }
-    pub fn wait(_: *Pair, _: usize) @import("core").segments.Wait {
+    pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
     }
-    pub fn handoff(_: *Pair, _: *Lane, _: usize) !void {}
-    pub fn pre(p: *Pair, lane: *Lane, index: usize) !void {
+    pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
+    pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].pre(lane, index);
     }
-    pub fn mixer(p: *Pair, lane: *Lane, index: usize) !void {
+    pub fn mixer(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].mixer(lane, index);
     }
-    pub fn post(p: *Pair, lane: *Lane, index: usize) !void {
+    pub fn post(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].post(lane, index);
     }
-    pub fn finish(p: *Pair, lane: *Lane) !void {
+    pub fn finish(p: *Stagger, lane: *Lane) !void {
         return p.stages[lane.k].finish(lane);
     }
-    pub fn beforeCommit(p: *Pair) !void {
+    pub fn beforeCommit(p: *Stagger) !void {
         return p.stages[0].beforeCommit();
     }
 };
