@@ -121,6 +121,9 @@ pub const Round = struct {
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
     star: bool = false,
+    /// Encoded right behind a star scan's launch, in its barrier interval (forwardStar): work that reads nothing the scan or
+    /// its gate writes and writes nothing anything reads, so the counted gate stays counted (Kernels.warm).
+    warm: ?Beside = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -263,6 +266,7 @@ pub const Round = struct {
         // shared barrier interval (one a threadgroup at the star wait; four times as many cost 1.2% decode)
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
+        if (r.warm) |w| try w.encode(w.ptr, e);
         if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 16) * r.p.nv * r.segments));
         e.barrier();
         r.gate(e, post_rows);
