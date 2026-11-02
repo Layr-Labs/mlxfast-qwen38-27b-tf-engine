@@ -834,10 +834,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+  const bool full = M == 16; // uniform across the threadgroup: its 16-row block is whole or the launch's last
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+    // a full 16-row tile loads through static extents (no row bound to predicate); a launch's last, partial tile keeps
+    // the dynamic extents. Both read the same 16x64 words into the same registers.
+    if (full)
+      x64.load(tensor<device bfloat, extents<int32_t, TF_GROUP, 16>, tensor_inline>((device bfloat*)xv, extents<int32_t, TF_GROUP, 16>(), xstr));
+    else
+      x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
