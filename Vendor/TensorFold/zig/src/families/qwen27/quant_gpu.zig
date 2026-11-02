@@ -571,6 +571,9 @@ pub const Kernels = struct {
         return ok;
     }
 
+    /// `xsum` covers `padded(rows)` so every entry a lane kernel may address holds a value. The padding
+    /// entries are read by rows no kept output is stored for, but leaving them stale measured worse on
+    /// this runner than writing them (see norm_xs.metal), so the launch keeps the padded bound.
     pub fn sum(k: *Kernels, input_encoder: mtl.ComputeEncoder, x: Ref, dims: Ref, xs: Ref, width: u32, rows: u32) !void {
         var span = profile.begin(k.profiler, input_encoder, .xsum);
         errdefer span.cancel();
