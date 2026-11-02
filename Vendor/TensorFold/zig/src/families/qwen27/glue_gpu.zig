@@ -115,5 +115,5 @@ pub const Kernels = struct {
 };
 
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    e.bindAll(refs, 0);
 }

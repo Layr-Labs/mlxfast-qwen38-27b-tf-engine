@@ -10,6 +10,8 @@ const IndirectCommandBuffer = @import("icb.zig").IndirectCommandBuffer;
 const ResidencySet = @import("residency.zig").ResidencySet;
 
 const Id = objc.Id;
+/// Foundation's NSRange (two NSUIntegers, passed by value in registers on arm64).
+const NSRange = extern struct { location: usize, length: usize };
 const Size = types.Size;
 
 pub const Queue = struct {
@@ -136,6 +138,26 @@ pub const ComputeEncoder = struct {
 
     pub fn setBuffer(self: ComputeEncoder, buffer: Buffer, offset: usize, index: usize) void {
         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
+    }
+
+    /// Buffers at consecutive indices from `start`, each at its offset, in one message (setBuffers:offsets:withRange:):
+    /// the same bindings as one setBuffer a slot.
+    pub fn setBuffers(self: ComputeEncoder, ids: []const Id, offsets: []const usize, start: usize) void {
+        std.debug.assert(ids.len == offsets.len);
+        if (ids.len == 0) return;
+        objc.msg(void, self.id, "setBuffers:offsets:withRange:", .{ ids.ptr, offsets.ptr, NSRange{ .location = start, .length = ids.len } });
+    }
+
+    /// Every ref of `refs` (a tuple of values with `buffer: Buffer` and `offset: usize`) at `start + i`, in one message.
+    pub fn bindAll(self: ComputeEncoder, refs: anytype, start: usize) void {
+        const n = refs.len;
+        var ids: [n]Id = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (refs, 0..) |r, i| {
+            ids[i] = r.buffer.id;
+            offsets[i] = r.offset;
+        }
+        self.setBuffers(&ids, &offsets, start);
     }
 
     /// Small constants copied into the command stream (at most 4 KB).

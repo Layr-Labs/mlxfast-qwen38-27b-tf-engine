@@ -709,12 +709,10 @@ pub const Projection = struct {
             e.barrier();
         };
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        // the activations, codes and metadata in one message, then the output with the group sums when they bind
+        e.setBuffers(&.{ x.buf.id, w.buf.id, sb.buf.id }, &.{ x.off, w.off, sb.off }, 0);
         if (dims) |d| e.setBuffer(d.buf, d.off, 3) else e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
-        e.setBuffer(y.buf, y.off, 4);
-        if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
+        if (given) |g| e.setBuffers(&.{ y.buf.id, g.ref.buf.id }, &.{ y.off, g.ref.off }, 4) else if (p.sums_buffer) |buffer| e.setBuffers(&.{ y.buf.id, buffer.id }, &.{ y.off, 0 }, 4) else e.setBuffer(y.buf, y.off, 4);
         if (hidden) |h| {
             // TF_RESID: the hidden rows in, the residual rows (`y`) out
             e.setBuffer(h.buf, h.off, 6);

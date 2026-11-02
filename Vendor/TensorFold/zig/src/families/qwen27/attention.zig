@@ -194,7 +194,7 @@ fn cacheBytes(cache: Cache, key: bool, geometry: planning.Geometry) usize {
     return ((@as(usize, geometry.kv_heads) - 1) * stride + @as(usize, cache.capacity) * geometry.dim) * 2;
 }
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    e.bindAll(refs, 0);
 }
 fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
     e.setBuffer(r.buffer, r.offset, index);

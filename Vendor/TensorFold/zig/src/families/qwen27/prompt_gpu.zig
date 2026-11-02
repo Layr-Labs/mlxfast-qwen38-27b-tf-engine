@@ -67,5 +67,5 @@ pub const Kernels = struct {
 };
 
 fn bind(e: metal.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, index| e.setBuffer(r.buffer, r.offset, index);
+    e.bindAll(refs, 0);
 }

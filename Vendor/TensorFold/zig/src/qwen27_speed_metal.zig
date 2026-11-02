@@ -156,6 +156,10 @@ pub const ComputeEncoder = struct {
     pub fn setBuffer(e: ComputeEncoder, b: Buffer, offset: usize, at: usize) void {
         e.record.bindings[at] = .{ .buffer = b, .offset = offset };
     }
+    /// metal.ComputeEncoder.bindAll: each ref recorded at its slot, as setBuffer records it.
+    pub fn bindAll(e: ComputeEncoder, refs: anytype, start: usize) void {
+        inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, start + i);
+    }
     pub fn setValue(e: ComputeEncoder, value: anytype, _: usize) void {
         if (@sizeOf(@TypeOf(value)) == @sizeOf(Params)) @memcpy(std.mem.asBytes(&e.record.params), std.mem.asBytes(&value));
     }

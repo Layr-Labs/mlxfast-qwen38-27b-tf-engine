@@ -777,7 +777,7 @@ fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
     e.setBuffer(r.buffer, r.offset, index);
 }
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    e.bindAll(refs, 0);
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the

@@ -390,5 +390,5 @@ pub const Round = struct {
 };
 
 pub fn bind(e: metal.ComputeEncoder, buffers: anytype, start: usize) void {
-    inline for (buffers, 0..) |buffer, index| buffer.bind(e, start + index);
+    e.bindAll(buffers, start);
 }
