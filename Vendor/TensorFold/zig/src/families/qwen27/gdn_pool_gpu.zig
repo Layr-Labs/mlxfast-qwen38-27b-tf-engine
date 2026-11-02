@@ -333,24 +333,31 @@ pub const Pool = struct {
 
     /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
     /// history by tf_delta_gdn_conv_keep (a thread a channel reads every source tap before it writes), so the keep
-    /// needs no next_history staging, no publish_conv launch and no fence between the two.
-    pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitReplay(layer, plan, e);
-        try pool.commitConvKeep(layer, plan, e);
+    /// needs no next_history staging, no publish_conv launch and no fence between the two. Each layer replays its own
+    /// state; every layer's window lands in one launch.
+    pub fn commitKeep(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        for (0..pool.budget.layers) |layer| try pool.commitReplay(layer, plan, e);
+        try pool.commitConvKeep(plan, e);
     }
 
-    /// commitKeep's conv window alone (a keep whose replay `stash` defers), unfenced.
-    pub fn commitConvKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+    /// commitKeep's conv window alone (a keep whose replay `stash` defers), unfenced: z is the layer, the grid's
+    /// (item, keep) planes are the per-layer dispatch's, and each layer's spans sit `strides` elements apart.
+    pub fn commitConvKeep(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
         const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         const m = plan.metadata;
+        const history = try pool.layerSpan(.history, 0);
+        const qkv = try pool.layerSpan(.qkv, 0);
+        // layerSpan's equal per-layer extents, in bf16 elements
+        const strides = [2]u32{ @intCast(history.bytes / 2), @intCast(qkv.bytes / 2) };
         e.setPipeline(pool.kernels.conv_keep);
-        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
+        gdn.bind(e, .{ history, qkv }, 0);
         e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
         e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
-        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+        e.setValue(strides, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = pool.budget.layers }, .{ .width = 256, .height = 1, .depth = 1 }); // a channel a thread, z the layer
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
