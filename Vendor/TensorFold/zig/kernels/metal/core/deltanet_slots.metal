@@ -213,19 +213,26 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
                                    constant TfDeltaParams& p, device bfloat* output, uint row, uint head, uint key_head,
                                    uint dimension, uint lane) {
   float kf[W][4], qf[W][4], forget[W], mix[W], incoming0[W], incoming1[W];
-  uint at[W];
+  device const bfloat* k = key + (row * p.nk + key_head) * p.dk + lane * 4;
+  device const bfloat* q = query + (row * p.nk + key_head) * p.dk + lane * 4;
+  device const bfloat* v = value + (row * p.nv + head) * p.dv + dimension;
+  device const float* g = decay + row * p.nv + head;
+  device const bfloat* m = mixing + row * p.nv + head;
+  const uint k_step = p.nk * p.dk, v_step = p.nv * p.dv;
   _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
-    at[w] = (row + w) * p.nv + head;
-    device const bfloat* k = key + ((row + w) * p.nk + key_head) * p.dk + lane * 4;
-    device const bfloat* q = query + ((row + w) * p.nk + key_head) * p.dk + lane * 4;
     for (uint part = 0; part < 4; ++part) {
       kf[w][part] = float(k[part]);
       qf[w][part] = float(q[part]);
     }
-    forget[w] = decay[at[w]];
-    mix[w] = float(mixing[at[w]]);
-    incoming0[w] = float(value[at[w] * p.dv + dimension]);
-    incoming1[w] = float(value[at[w] * p.dv + dimension + 1]);
+    forget[w] = g[0];
+    mix[w] = float(m[0]);
+    incoming0[w] = float(v[0]);
+    incoming1[w] = float(v[1]);
+    k += k_step;
+    q += k_step;
+    v += v_step;
+    g += p.nv;
+    m += p.nv;
   }
   float ra[W], rb[W];
   _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
@@ -236,11 +243,14 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
     ra[w] = rab.x;
     rb[w] = rab.y;
   }
-  if (lane == 0)
+  if (lane == 0) {
+    device bfloat* o = output + (row * p.nv + head) * p.dv + dimension;
     _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
-      output[at[w] * p.dv + dimension] = bfloat(ra[w]);
-      output[at[w] * p.dv + dimension + 1] = bfloat(rb[w]);
+      o[0] = bfloat(ra[w]);
+      o[1] = bfloat(rb[w]);
+      o += v_step;
     }
+  }
 }
 // Every child of node 0 (rows first + 1 .. first + rows - 1), three at a time: each child once, from node 0's states.
 inline void tf_delta_star_leaves(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
@@ -320,14 +330,21 @@ inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device 
                                        device const float* decay, device const bfloat* mixing, constant TfDeltaParams& p,
                                        uint first, uint head, uint key_head, uint dimension, uint lane) {
   float kf[N][4], forget[N], mix[N], incoming0[N], incoming1[N];
+  device const bfloat* k = key + (first * p.nk + key_head) * p.dk + lane * 4;
+  device const bfloat* v = value + (first * p.nv + head) * p.dv + dimension;
+  device const float* g = decay + first * p.nv + head;
+  device const bfloat* m = mixing + first * p.nv + head;
+  const uint k_step = p.nk * p.dk, v_step = p.nv * p.dv;
   _Pragma("clang loop unroll(full)") for (uint i = 0; i < N; ++i) {
-    const uint at = (first + i) * p.nv + head;
-    device const bfloat* k = key + ((first + i) * p.nk + key_head) * p.dk + lane * 4;
     for (uint part = 0; part < 4; ++part) kf[i][part] = float(k[part]);
-    forget[i] = decay[at];
-    mix[i] = float(mixing[at]);
-    incoming0[i] = float(value[at * p.dv + dimension]);
-    incoming1[i] = float(value[at * p.dv + dimension + 1]);
+    forget[i] = g[0];
+    mix[i] = float(m[0]);
+    incoming0[i] = float(v[0]);
+    incoming1[i] = float(v[1]);
+    k += k_step;
+    v += v_step;
+    g += p.nv;
+    m += p.nv;
   }
   _Pragma("clang loop unroll(full)") for (uint i = 0; i < N; ++i) {
     tf_delta_delta_update_words2(a, b, kf[i], forget[i], incoming0[i], incoming1[i], mix[i]);
