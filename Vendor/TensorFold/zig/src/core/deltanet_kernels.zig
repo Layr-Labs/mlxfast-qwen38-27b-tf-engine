@@ -40,6 +40,9 @@ pub const Kernels = struct {
     pre_step: metal.Pipeline,
     /// tf_delta_gdn_pre past 16 rows (128-wide heads, 4 taps): 4 simdgroups a head, 4 rows each, conv weights read once.
     pre_rows: metal.Pipeline,
+    /// pre_rows for a decoded launch behind counted projections: the reads from outside its barrier interval made before
+    /// its wait (tf_delta_gdn_pre_rows_held).
+    pre_rows_held: metal.Pipeline,
     /// tf_delta_gdn_post for 128-wide heads on bfloat4 rows: a simdgroup a row, 4 rows a group.
     post_rows: metal.Pipeline,
     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
@@ -88,6 +91,7 @@ pub const Kernels = struct {
             "stash",
             "unstash",
             "post_rows16",
+            "pre_rows_held",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -96,7 +100,7 @@ pub const Kernels = struct {
             pipelines[index] = try metal.Pipeline.init(device, library, "tf_delta_gdn_" ++ name, false);
             done += 1;
         }
-        inline for (.{ 7, 13, 14, 21, 23, 25, 26 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        inline for (.{ 7, 13, 14, 21, 23, 25, 26, 27 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
         return .{
             .library = library,
             .pipelines = .{
@@ -124,6 +128,7 @@ pub const Kernels = struct {
             .stash = pipelines[24],
             .unstash = pipelines[25],
             .post_rows16 = pipelines[26],
+            .pre_rows_held = pipelines[27],
         };
     }
 
@@ -151,6 +156,7 @@ pub const Kernels = struct {
             k.stash,
             k.unstash,
             k.post_rows16,
+            k.pre_rows_held,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

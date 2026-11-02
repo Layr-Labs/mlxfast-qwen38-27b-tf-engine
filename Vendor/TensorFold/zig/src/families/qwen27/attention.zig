@@ -218,7 +218,7 @@ pub const After = struct { counter: mtl.Buffer, wait: u32 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [15]mtl.Pipeline,
+    io: [17]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
@@ -227,6 +227,10 @@ pub const Attention = struct {
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
+    /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
+    warm: ?Warm = null,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -236,10 +240,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [15]mtl.Pipeline = undefined;
+        var io: [17]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded", "q27_head_norm_rope_held", "q27_head_norm_rope_packed_held" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -340,7 +344,9 @@ pub const Attention = struct {
             return timing.end();
         };
         if (rows4) {
-            e.setPipeline(a.io[if (p.packed_rows == 0) 10 else 11]);
+            // a launch behind counted projections takes the held kernels (their reads from outside the interval before
+            // the wait); prompt rows and every launch with no wait take the record's
+            e.setPipeline(a.io[if (p.after != null) (if (p.packed_rows == 0) @as(usize, 15) else 16) else if (p.packed_rows == 0) @as(usize, 10) else 11]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
             e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
@@ -533,6 +539,7 @@ pub const Attention = struct {
             e.setBuffer(words, 16, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
+            if (a.warm) |w| try w.encode(w.ptr, e);
             if (chain == null) e.barrier();
         }
         if (!plan.fused) {
