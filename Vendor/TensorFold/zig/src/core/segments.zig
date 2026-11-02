@@ -103,7 +103,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence, .queue = q };
         n_lanes += 1;
     }
-    var done: [48]mtl.CommandBuffer = undefined;
+    var done: [96]mtl.CommandBuffer = undefined;
     var n_done: usize = 0;
     const X = struct {
         fam: @TypeOf(fam),
@@ -115,7 +115,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         layers: usize,
         first: usize,
         early: bool,
-        done: *[48]mtl.CommandBuffer,
+        done: *[96]mtl.CommandBuffer,
         n_done: *usize,
 
         /// Commits the lane's command buffer so far and opens the next on the lane's queue behind the lane's fence; the
