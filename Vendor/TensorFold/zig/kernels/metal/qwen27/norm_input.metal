@@ -27,6 +27,8 @@ Q27_SPECIALIZE
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  // Padding sums stay defined for the same reason as norm_xs: lane kernels address them for rows no
+  // kept output is stored for, and leaving them stale measured worse than writing them.
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
   float hv[E];
