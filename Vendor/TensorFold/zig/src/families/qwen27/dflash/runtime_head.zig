@@ -8,6 +8,7 @@ pub const width = 98592;
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
 pub const Head = struct {
     allocator: std.mem.Allocator,
+    sparse: ?@import("sparse_vocabulary.zig").Search = null,
     linear: projection.Linear,
     ids: ?mtl.Buffer = null,
     owned: std.ArrayList(mtl.Buffer) = .empty,
@@ -122,7 +123,7 @@ pub const Head = struct {
         };
         return head;
     }
-    fn allocate(h: *Head, device: mtl.Device, bytes: usize) !mtl.Buffer {
+    pub fn allocate(h: *Head, device: mtl.Device, bytes: usize) !mtl.Buffer {
         const buffer = try device.buffer(bytes, options);
         h.owned.append(h.allocator, buffer) catch |err| {
             buffer.deinit();
@@ -173,6 +174,12 @@ pub const Head = struct {
         const order = if (reg) try lane.RegOrder.init(device) else null;
         defer if (order) |o| o.deinit();
         h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.split(width, k), order);
+        if (k == 5120 and bits == 2 and reg and h.ids != null) {
+            h.sparse = @import("sparse_vocabulary.zig").Search.init(h, device, w, sc, bi) catch |err| blk: {
+                std.log.warn("draft vocabulary uses its regular shortlist: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
     }
     /// The spans' rows of `name` ([rows][row_bytes] in the checkpoint), packed in span order into `out`.
     fn spanRows(ck: *const @import("core").checkpoint_metal.Checkpoint, name: []const u8, rows: usize, row_bytes: usize, out: []u8) !void {
@@ -189,6 +196,7 @@ pub const Head = struct {
         }
     }
     pub fn deinit(h: *Head) void {
+        if (h.sparse) |sparse| sparse.deinit();
         if (h.plain) |p| p.deinit();
         for (h.owned.items) |buffer| buffer.deinit();
         h.owned.deinit(h.allocator);

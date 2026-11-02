@@ -12,7 +12,6 @@ pub fn appendRunner(r: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.B
 }
 
 fn runnerBuffers(r: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
-    if (r.second) |*second| second.follow(hook, joining);
     fields.apply(&r.scratch, hook, joining);
     for (r.bindings) |*binding| fields.apply(binding, hook, joining);
     fields.apply(&r.taps, hook, joining);
@@ -38,6 +37,8 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
     try list.appendSlice(a, b.frame.pool.items);
     try list.append(a, b.args);
     for (b.caches) |*c| try fields.append(a, list, c);
+    var sparse = b.sparse_down.weights.valueIterator();
+    while (sparse.next()) |weight| try fields.append(a, list, weight);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| {
         try fields.append(a, list, adapter);
@@ -55,6 +56,8 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.one(b.args, hook, joining);
     if (b.head.plain) |*p| prepared(p, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
+    var sparse = b.sparse_down.weights.valueIterator();
+    while (sparse.next()) |weight| fields.apply(weight, hook, joining);
     var adapters = b.prepared.valueIterator();
     while (adapters.next()) |adapter| prepared(adapter, hook, joining);
     var tiled = b.tiled.valueIterator();
@@ -162,7 +165,6 @@ pub fn hold(h: anytype, io: std.Io) !void {
     if (h.resident) |*r| {
         h.model.kernels.setResident(r.follow());
         h.runner.setResident(r.follow());
-        h.runner.resident_set = r.held.set;
         setBack(h.back, r.follow());
         if (h.draft) |d| d.model.backend.setResident(r.follow());
     }
@@ -172,8 +174,6 @@ pub fn hold(h: anytype, io: std.Io) !void {
 pub fn drop(h: anytype) void {
     h.model.kernels.setResident(null);
     h.runner.setResident(null);
-    if (h.runner.resident_set) |set| if (h.runner.second) |second| second.queue.removeResidencySet(set);
-    h.runner.resident_set = null;
     setBack(h.back, null);
     if (h.draft) |d| d.model.backend.setResident(null);
     if (h.resident) |*r| r.deinit();

@@ -203,6 +203,8 @@ pub const Backend = struct {
     tiled: std.AutoHashMapUnmanaged(usize, Tiled) = .empty,
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
+    sparse_down: @import("sparse_down.zig").Set = .{},
+    gate_up_factors: ?@import("gate_up_factors.zig").Factors = null,
     fused_count: usize = 0,
     /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
     /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
@@ -249,6 +251,8 @@ pub const Backend = struct {
     pub fn deinit(b: *Backend) void {
         b.setResident(null);
         b.frame.deinit();
+        b.sparse_down.deinit(b.allocator);
+        if (b.gate_up_factors) |*factors| factors.deinit();
         var prepared = b.prepared.valueIterator();
         while (prepared.next()) |adapter| adapter.deinit();
         b.prepared.deinit(b.allocator);
@@ -297,7 +301,26 @@ pub const Backend = struct {
         };
         const expected = b.config.linearCount();
         if (b.stash != null) try b.buildGroups(order, &stash);
+        if (order) |o| if (mlp_bits == 2 and b.config.hidden == 5120 and b.config.intermediate == 17408)
+            try b.prepareGateUp(o);
         if ((if (units) b.prepared.count() - b.fused_count - b.precise_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
+    }
+    fn prepareGateUp(b: *Backend, order: core.lane_projection.RegOrder) !void {
+        const names = [_][]const u8{ "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight" };
+        const n = b.config.intermediate;
+        const k = b.config.hidden;
+        const values = try b.allocator.alloc(u16, 2 * n * k);
+        defer b.allocator.free(values);
+        var key: usize = 0;
+        for (names, 0..) |name, i| {
+            const t = try get(b, name);
+            if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != n or t.shape[1] != k) return error.DraftTensorCoverage;
+            if (i == 0) key = @intFromPtr(t.bytes.ptr) + group_gu;
+            const dest = std.mem.sliceAsBytes(values[i * n * k ..][0 .. n * k]);
+            if (b.checkpoint.deferred.contains(name)) try b.checkpoint.read(name, 0, dest) else @memcpy(dest, t.bytes);
+        }
+        if (!b.prepared.contains(key) or b.gate_up_factors != null) return error.DraftTensorCoverage;
+        b.gate_up_factors = try @import("gate_up_factors.zig").Factors.init(b.allocator, b.target.device, order, key, values, 2 * n, k);
     }
     /// The key bit of a linear's q4 copy beside its copy below 4 bits (no tensor address reaches it).
     pub const precise_key: usize = 1 << 62;
@@ -307,6 +330,8 @@ pub const Backend = struct {
         const bits: u8 = if (order != null) draftBits(name) else 4;
         var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
         defer prepared_words.deinit();
+        if (order != null and bits == 4 and shape[0] == 5120 and shape[1] == 17408 and std.mem.endsWith(u8, name, "mlp.down_proj.weight"))
+            try b.sparse_down.prepare(b.allocator, b.target.device, key, prepared_words);
         if (b.stash) |st| if (shortName(name)) |short| {
             const layer = layerOf(name) orelse return error.DraftTensorCoverage;
             var buf: [16]u8 = undefined;
@@ -409,7 +434,40 @@ pub const Backend = struct {
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
+    pub const stacked_kv_bit: usize = 1 << 61;
+    /// Stack the existing group-64 codes in layer-major K,V order; keep the per-layer reduction split.
+    fn prepareStackedKV(b: *Backend, order: core.lane_projection.RegOrder, st: *Stash) !void {
+        const first = st.get("0k") orelse return;
+        const ref = first.prepared;
+        const count = 2 * b.config.layers;
+        const a = b.allocator;
+        const n = count * ref.n;
+        if (ref.k != b.config.hidden or ref.n != b.config.kvWidth() or ref.bits != 4 or ref.group != 64) return;
+        const words = try a.alloc(u32, count * ref.words.len);
+        defer a.free(words);
+        const scales = try a.alloc(u16, count * ref.scales.len);
+        defer a.free(scales);
+        const biases = try a.alloc(u16, count * ref.biases.len);
+        defer a.free(biases);
+        for (0..count) |i| {
+            var name: [16]u8 = undefined;
+            const item = st.get(try std.fmt.bufPrint(&name, "{d}{c}", .{ i / 2, "kv"[i % 2] })) orelse return;
+            const part = item.prepared;
+            if (part.n != ref.n or part.k != ref.k or part.bits != ref.bits or part.group != ref.group or part.nibbles != ref.nibbles) return;
+            @memcpy(words[i * ref.words.len ..][0..ref.words.len], part.words);
+            @memcpy(scales[i * ref.scales.len ..][0..ref.scales.len], part.scales);
+            @memcpy(biases[i * ref.biases.len ..][0..ref.biases.len], part.biases);
+        }
+        const joined_kv = core.affine4.Prepared{ .allocator = a, .n = n, .k = ref.k, .words = words, .scales = scales, .biases = biases, .bits = ref.bits, .group = ref.group, .nibbles = ref.nibbles };
+        const reduction = try @import("../projection.zig").split(2 * ref.n, ref.k);
+        const key = first.key | stacked_kv_bit;
+        if (b.prepared.contains(key)) return error.DraftTensorCoverage;
+        const adapter = try core.affine4_lane.Adapter.init(a, b.target.device, joined_kv, reduction, order);
+        try @import("../residency.zig").putPrepared(b, key, adapter);
+        b.fused_count += 1;
+    }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
+        if (order) |o| if (b.config.layers == 5 and b.config.hidden == 5120) try b.prepareStackedKV(o, st);
         for (0..b.config.layers) |layer| {
             try b.fuse(order, st, layer, "kv", 'k', group_kv);
             try b.fuse(order, st, layer, "qkv", 'q', group_qkv);

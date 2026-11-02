@@ -463,14 +463,6 @@ pub const Kernels = struct {
         try t.encodeTiles(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots);
     }
 
-    /// quantTiles over only the list's own tiles: `args` holds the list's count, 1, 1 (written by the dispatch that wrote
-    /// the list), the threadgroups of an indirect launch; `slots` bounds the count and the room `y` has a row.
-    pub fn quantTilesIndirect(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32, args: Ref) !void {
-        if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        const t = try k.tileList(p, stride);
-        try t.encodeTilesIndirect(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots, .{ .buf = args.buffer, .off = args.offset });
-    }
-
     /// Compiles at load the pipeline quantTiles of `p` at `stride` takes.
     pub fn prepareTiles(k: *Kernels, p: projection.Linear, stride: u32) !void {
         _ = try k.tileList(p, stride);

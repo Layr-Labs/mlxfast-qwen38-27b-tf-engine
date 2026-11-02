@@ -657,20 +657,6 @@ pub const Projection = struct {
     /// A tile-list projection (Layout.tile_list): `slots` threadgroups, threadgroup j computing tile list[1 + j] while j <
     /// list[0] (u32 words an earlier dispatch wrote, at most `slots` tiles) into columns [32 j, 32 j + 32) of `y`'s rows.
     pub fn encodeTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
-        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots);
-        e.dispatchGroups(mtl.Size.of(slots, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
-    }
-
-    /// encodeTiles over the threadgroups `args` names (three u32 words an earlier dispatch wrote: the list's count, 1, 1;
-    /// the count at most `slots`): no threadgroup past the list's count, so a list far shorter than its room costs only
-    /// its own tiles. `y` must hold `slots` slots a row.
-    pub fn encodeTilesIndirect(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32, args: Ref) !void {
-        try checkRef(args, 12, 4);
-        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots);
-        e.dispatchIndirect(args.buf, args.off, mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
-    }
-
-    fn bindTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
         if (!p.tile_list) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         if (slots == 0 or @as(usize, slots) * 32 > p.y_stride) return error.InvalidSchedule;
@@ -688,6 +674,7 @@ pub const Projection = struct {
         e.setBuffer(y.buf, y.off, 4);
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(list.buf, list.off, 7);
+        e.dispatchGroups(mtl.Size.of(slots, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {

@@ -498,3 +498,33 @@ test "a probability floor drops unlikely siblings but always offers the best one
     try std.testing.expectEqualSlices(u32, &.{0}, lone.tokens);
     try std.testing.expectError(error.BadDraftSelector, selector.propose(a, &graph, lattice, 3, 2, .{ .nodes = 7, .floor = 1 }));
 }
+
+test "stacked context projection slices each layer's keys then values before committing" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var g = try store.graph(a);
+    defer g.deinit();
+    var fake = Fake{};
+    var table = fake.fusedOps().vtable.*;
+    const Combined = struct {
+        fn project(ptr: *anyopaque, _: u64, x: op.View, _: ck.Tensor, _: op.Mode) !?op.View {
+            const c = fixtures.toy;
+            try x.check(x.rows, c.hidden, .bf16);
+            return Fake.self(ptr).view(x.rows, 2 * c.layers * c.kvWidth());
+        }
+        fn slice(ptr: *anyopaque, frame: u64, x: op.View, offset: u32, width: u32) !op.View {
+            try std.testing.expectEqual(fixtures.toy.kvWidth(), width);
+            try std.testing.expectEqual(Fake.self(ptr).fused_slices * width, offset);
+            return Fake.sliceCols(ptr, frame, x, offset, width);
+        }
+    };
+    table.stacked_kv = Combined.project;
+    table.slice_cols = Combined.slice;
+    var state = try session.Session.init(fixtures.toy, 1, 0);
+    try state.absorb(.{ .ptr = &fake, .vtable = &table }, &g, .{ .mode = .bf16_reference }, batch());
+    try std.testing.expectEqual(2 * fixtures.toy.layers, fake.fused_slices);
+    try std.testing.expectEqual(fixtures.toy.layers, fake.appends);
+    try std.testing.expectEqual(@as(u32, 1), fake.commits);
+    try std.testing.expectEqual(@as(u32, 0), fake.fused_groups);
+}

@@ -16,7 +16,6 @@ pub const Lane = struct {
     cb: mtl.CommandBuffer,
     enc: mtl.ComputeEncoder,
     fence: Fence, // orders the segment's encoders: buffers are untracked, so encoders could overlap
-    queue: mtl.Queue = undefined, // the segment's queue: its later command buffers come from it
 };
 
 pub const rows = stagger.rows;
@@ -100,10 +99,10 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             break :made f;
         }) else try Fence.init(device);
         const cb = q.commandBuffer();
-        lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence, .queue = q };
+        lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence };
         n_lanes += 1;
     }
-    var done: [48]mtl.CommandBuffer = undefined;
+    var done: [16]mtl.CommandBuffer = undefined;
     var n_done: usize = 0;
     const X = struct {
         fam: @TypeOf(fam),
@@ -115,14 +114,13 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         layers: usize,
         first: usize,
         early: bool,
-        done: *[48]mtl.CommandBuffer,
+        done: *[16]mtl.CommandBuffer,
         n_done: *usize,
 
-        /// Commits the lane's command buffer so far and opens the next on the lane's queue behind the lane's fence; the
-        /// family's beforeCommit runs before the first. Each lane of a staggered pass commits at the same layers.
+        /// Commits the lane's command buffer so far and opens the next behind the lane's fence (one lane only); the
+        /// family's beforeCommit runs before the first.
         fn commitLane(x: *const @This(), k: usize) !void {
-            // one lane keeps sixteen (its polled pass hands them to `unchecked`); two lanes commit twice as often
-            if (x.n_done.* == (if (x.lanes.len == 1) 16 else x.done.len)) return;
+            if (x.lanes.len != 1 or x.n_done.* == x.done.len) return;
             if (x.n_done.* == 0) try beforeCommit(x.fam);
             const l = &x.lanes[k];
             l.fence.update(l.enc);
@@ -130,7 +128,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             l.cb.commit();
             x.done[x.n_done.*] = l.cb;
             x.n_done.* += 1;
-            l.cb = l.queue.commandBuffer();
+            l.cb = x.queue.commandBuffer();
             l.enc = l.cb.compute(x.mode);
             l.fence.wait(l.enc);
         }
@@ -166,7 +164,15 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
-            if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3)) return;
+            const end = i + 1;
+            const paced = if (comptime @hasField(std.meta.Child(@TypeOf(x.fam)), "pace_verify")) x.fam.pace_verify else false;
+            if (paced and x.lanes.len == 1 and end != x.first) {
+                if (end % 4 != 0) return;
+                // Keep one buffer queued behind the one executing. Poll only the
+                // penultimate submission. Each 16th layer is an unconditional handoff.
+                const submitted = x.n_done.*;
+                if (end % 16 != 0 and submitted >= 2 and x.done[submitted - 2].status() != .completed) return;
+            } else if (end != x.first and end % x.every != 0 and !(x.early and i < 3)) return;
             try x.commitLane(k);
         }
         pub fn finish(x: *const @This(), k: usize) !void {
