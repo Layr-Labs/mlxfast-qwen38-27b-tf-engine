@@ -242,14 +242,15 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
       output[at[w] * p.dv + dimension + 1] = bfloat(rb[w]);
     }
 }
-// Every child of node 0 (rows first + 1 .. first + rows - 1), three at a time: each child once, from node 0's states.
+// Every child of node 0 (rows first + 1 .. first + rows - 1), four at a time: each child once, from node 0's states.
 inline void tf_delta_star_leaves(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
                                  device const bfloat* value, device const float* decay, device const bfloat* mixing,
                                  constant TfDeltaParams& p, device bfloat* output, uint first, uint rows, uint head,
                                  uint key_head, uint dimension, uint lane) {
   uint c = 1;
-  for (; c + 3 <= rows; c += 3) tf_delta_star_children<3>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
-  if (c + 2 == rows) tf_delta_star_children<2>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+  for (; c + 4 <= rows; c += 4) tf_delta_star_children<4>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+  if (c + 3 == rows) tf_delta_star_children<3>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
+  else if (c + 2 == rows) tf_delta_star_children<2>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
   else if (c + 1 == rows) tf_delta_star_children<1>(r0, r1, query, key, value, decay, mixing, p, output, first + c, head, key_head, dimension, lane);
 }
 inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3 groups, uint t) {
@@ -269,7 +270,7 @@ inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3
 // simdgroup: every node of each column is tf_delta_tree_node's arithmetic from the same parent state as in
 // tf_delta_gdn_tree_slots (tf_delta_tree_node_pair, a row's loads shared by the two columns), so each column's arithmetic
 // is that kernel's; the star needs no slot steps, no parent selects and no kept states. Node 0's children are independent
-// (each from node 0's states), so they run three at a time (tf_delta_star_leaves).
+// (each from node 0's states), so they run four at a time (tf_delta_star_leaves).
 // Verify rounds only (no advance): no state is written.
 kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const bfloat* key [[buffer(1)]],
