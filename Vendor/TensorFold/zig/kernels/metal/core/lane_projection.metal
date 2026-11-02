@@ -461,11 +461,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
   uint3 ni = 0;
   if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+  const device packed_uint3* ip = ixs + (size_t)first * (TF_N / 8);
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+  const device uint2* ip = ixs + (size_t)first * (TF_N / 4);
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
@@ -526,9 +528,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
+#if defined(TF_CHAIN_WALK)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
+#else
+    { const int stay = int(g + 1 >= end); ip += (1 - stay) * (TF_N / 8); ni = ip[0]; }
+#endif
 #elif defined(TF_SBI)
+#if defined(TF_CHAIN_WALK)
     { const size_t gi = (size_t)min(g + 1, end - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#else
+    { const int stay = int(g + 1 >= end); ip += (1 - stay) * (TF_N / 4); ni0 = ip[0]; ni1 = ip[4]; }
+#endif
 #endif
 #endif
 #else
