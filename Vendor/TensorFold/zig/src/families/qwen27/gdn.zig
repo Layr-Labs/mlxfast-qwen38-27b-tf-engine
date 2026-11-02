@@ -121,6 +121,10 @@ pub const Round = struct {
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
     star: bool = false,
+    /// Encoded right after the star scan's launch, in its barrier interval, before the gate (gdn_hook.Warm: a read-only
+    /// touch of the next projection's leading weights while the scan's sequential rows leave memory idle). Unlike
+    /// `beside` it keeps the counted gate: it writes nothing anything reads.
+    warm: ?Beside = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -262,6 +266,7 @@ pub const Round = struct {
         // eight simdgroups a threadgroup: half the threadgroups, so half the pollers on the prepare's count in this
         // shared barrier interval (one a threadgroup at the star wait; four times as many cost 1.2% decode)
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
+        if (r.warm) |w| try w.encode(w.ptr, e);
         if (beside) |b| try b.encode(b.ptr, e);
         if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 16) * r.p.nv * r.segments));
         e.barrier();

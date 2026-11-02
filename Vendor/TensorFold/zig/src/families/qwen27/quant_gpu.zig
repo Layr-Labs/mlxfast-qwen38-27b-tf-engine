@@ -7,6 +7,20 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+/// Threadgroups of Kernels.warm's touch: a few a GPU core, each thread a strided run of 128-byte lines.
+const warm_groups = 64;
+const touch_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\kernel void tf_q27_touch(const device uint* W [[buffer(0)]], const device uint* P [[buffer(1)]],
+    \\    constant uint2& lines [[buffer(2)]], device uint* sink [[buffer(3)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\  uint acc = 0;
+    \\  for (uint j = i; j < lines.x; j += n) acc ^= W[(size_t)j * 32];
+    \\  for (uint j = i; j < lines.y; j += n) acc ^= P[(size_t)j * 32];
+    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is written
+    \\}
+;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
@@ -121,6 +135,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// warm's read-only touch kernel and the word it could write (never does), made on first use.
+    touch: ?mtl.Pipeline = null,
+    touch_sink: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -148,6 +165,8 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.touch) |p| p.deinit();
+        if (k.touch_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -626,6 +645,35 @@ pub const Kernels = struct {
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
+    }
+
+    /// Reads one word of every 128-byte line of `p`'s first `word_bytes` code bytes and of the matching share of its
+    /// scale/bias pairs, with no barrier: encoded in a latency-bound kernel's barrier interval, it pulls lines the next
+    /// launch of `p` reads into the system cache ahead of it. It writes nothing anything reads (the sink store's condition
+    /// is never true), so it adds no hazard and changes no result.
+    pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, word_bytes: usize) !void {
+        if (p.bits != 4 or p.group != 64 or p.runs.len != 0 or p.index != null) return; // the plain q4 layout only
+        const codes: usize = @as(usize, p.n) * p.k / 2;
+        const pairs: usize = @as(usize, p.n) * (p.k / 64) * 4; // a bf16 scale and bias a 64-wide group
+        const take = @min(word_bytes, codes);
+        if (take == 0) return;
+        if (p.words.buffer.length() < p.words.offset + codes or p.pairs.buffer.length() < p.pairs.offset + pairs) return;
+        if (k.touch == null) {
+            const library = try mtl.Library.fromSource(k.device, touch_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            const pipeline = try mtl.Pipeline.init(k.device, library, "tf_q27_touch", false);
+            errdefer pipeline.deinit();
+            const sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            k.touch = pipeline;
+            k.touch_sink = sink;
+        }
+        const lines = [2]u32{ @intCast(take / 128), @intCast(pairs * take / codes / 128) };
+        e.setPipeline(k.touch.?);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
+        e.setBuffer(p.pairs.buffer, p.pairs.offset, 1);
+        e.setValue(lines, 2);
+        e.setBuffer(k.touch_sink.?, 0, 3);
+        e.dispatchGroups(mtl.Size.of(warm_groups, 1, 1), mtl.Size.of(256, 1, 1));
     }
 
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
