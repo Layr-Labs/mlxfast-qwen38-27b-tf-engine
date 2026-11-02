@@ -12,6 +12,9 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// 2-bit reg adapters' build for launches of at most 2 rows on fp32 FMAs (Layout.alu), on the same words and
+    /// metadata: the drafter's 1- and 2-row blocks and its head's picks, where the tensor op's 16-row tile is mostly padding.
+    tiny: ?lane.Projection = null,
     /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
     /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
     prompt: ?lane.Projection = null,
@@ -61,6 +64,14 @@ pub const Adapter = struct {
             small = try lane.Projection.init(a, device, l8);
         }
         errdefer if (small) |s| s.deinit();
+        var tiny: ?lane.Projection = null;
+        if (layout.reg and layout.format.bits == 2) {
+            var l2 = layout;
+            l2.rows8 = true;
+            l2.alu = true;
+            tiny = try lane.Projection.init(a, device, l2);
+        }
+        errdefer if (tiny) |t| t.deinit();
         var prompt: ?lane.Projection = null;
         if (layout.reg and layout.format.bits == 4) {
             var lp = layout;
@@ -69,7 +80,7 @@ pub const Adapter = struct {
             lp.prompt_sr = true;
             prompt = try lane.Projection.init(a, device, lp);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt };
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .tiny = tiny, .prompt = prompt };
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -85,14 +96,17 @@ pub const Adapter = struct {
         const projection = try lane.Projection.init(a, device, layout);
         return .{ .projection = projection, .words = words, .metadata = metadata };
     }
-    /// The projection a launch of `rows` takes: the rows8 build for at most 8 rows where there is one.
+    /// The projection a launch of `rows` takes: the fp32 build for at most 2 rows, else the rows8 build for at most 8 rows,
+    /// where there is one.
     pub fn forRows(adapter: Adapter, rows: u32) lane.Projection {
+        if (rows <= 2) if (adapter.tiny) |t| return t;
         if (rows <= 8) if (adapter.small) |s| return s;
         return adapter.projection;
     }
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.tiny) |t| t.deinit();
         if (adapter.prompt) |p| p.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
