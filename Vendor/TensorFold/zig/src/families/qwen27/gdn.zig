@@ -121,6 +121,9 @@ pub const Round = struct {
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
     star: bool = false,
+    /// Encoded right before a star scan's launch, in its barrier interval (forwardStar): work that reads nothing the scan or
+    /// its gate writes and writes nothing anything reads, so the counted gate stays counted (Kernels.warm).
+    warm: ?Beside = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -246,6 +249,8 @@ pub const Round = struct {
     pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32) !void {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1) or (wait_prep != 0 and counter == null)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
+        // ahead of the star's groups: the warm's few groups are placed first and are done before the gate's interval ends
+        if (r.warm) |w| try w.encode(w.ptr, e);
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
         r.b.segments.bind(e, 7);

@@ -227,6 +227,10 @@ pub const Attention = struct {
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// Encoded right before a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
+    /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
+    warm: ?Warm = null,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -512,6 +516,8 @@ pub const Attention = struct {
         const tail_groups = g.kv_heads * 2 * plan.tail_chunks * plan.rows;
         var prefix_groups: u32 = 0;
         if (plan.prefix_chunks > 0) {
+            // ahead of the prefix's groups: the warm's few groups are placed first and are done before the merge's ends
+            if (a.warm) |w| try w.encode(w.ptr, e);
             // a pair a tile: a long cache reads each chunk once for six tiles; a short one (under 16 chunks) has too few
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
