@@ -92,7 +92,10 @@ pub const Generation = struct {
                 };
                 e.end();
                 cb.commit();
-                cb.wait();
+                while (true) switch (cb.status()) {
+                    .completed, .@"error" => break,
+                    else => std.atomic.spinLoopHint(),
+                };
                 if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
                 r.end.* += rows;
                 if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
