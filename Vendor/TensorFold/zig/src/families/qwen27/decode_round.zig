@@ -349,6 +349,24 @@ pub const Runner = struct {
         return staggerParts() > 1;
     }
 
+    /// Segment k's first row before rounding, of n rows in `parts`: the row shares grow by a quarter from each segment to
+    /// the next (two parts: 4/9 and 5/9; three: 16/61, 20/61, 25/61; four: 64/369, 80/369, 100/369, 125/369).
+    fn staggerStart(n: u32, parts: usize, k: usize) u64 {
+        // shares 4^(parts-1-j) * 5^j over their sum
+        var weight: [@import("core").segments.MAX]u64 = undefined;
+        var total: u64 = 0;
+        for (0..parts) |j| {
+            var share: u64 = 1;
+            for (0..parts - 1 - j) |_| share *= 4;
+            for (0..j) |_| share *= 5;
+            weight[j] = share;
+            total += share;
+        }
+        var before: u64 = 0;
+        for (0..k) |j| before += weight[j];
+        return @as(u64, n) * before / total;
+    }
+
     /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
     fn staggerParts() usize {
         const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
@@ -381,9 +399,10 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row, down to a multiple of 64; the last runs to n. Later segments take more rows: their
+        // attention reads every earlier row and each one starts behind the one before it, while the first starts alone.
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        for (0..parts) |k| firsts[k] = @intCast(staggerStart(n, parts, k) / 64 * 64);
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
