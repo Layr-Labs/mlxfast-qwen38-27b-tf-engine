@@ -170,6 +170,8 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
 /// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
 /// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
 /// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
+/// The kept range's codes then fix a least-squares line (the scale and bias of least squared error for those codes),
+/// rounded to bf16 and kept while it lowers the error, the codes drawn again from each kept fit (at most four fits).
 fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
     const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
     var best_err: f32 = std.math.inf(f32);
@@ -203,6 +205,45 @@ fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, low
         }
     }
     if (!std.math.isFinite(best_err)) return error.NonFiniteAffineRange;
+    var fit: usize = 0;
+    while (fit < 4) : (fit += 1) {
+        const s0 = asFloat(best_scale);
+        const b0 = asFloat(best_bias);
+        var sum_c: f32 = 0;
+        var sum_v: f32 = 0;
+        var sum_cc: f32 = 0;
+        var sum_cv: f32 = 0;
+        for (values) |bits| {
+            const v = asFloat(bits);
+            const code = @min(levels, @max(@as(f32, 0), @round((v - b0) / s0)));
+            sum_c += code;
+            sum_v += v;
+            sum_cc += code * code;
+            sum_cv += code * v;
+        }
+        const count: f32 = @floatFromInt(values.len);
+        const det = count * sum_cc - sum_c * sum_c;
+        if (!(det > 0)) break;
+        const fit_scale = (count * sum_cv - sum_c * sum_v) / det;
+        const fit_bias = (sum_v - fit_scale * sum_c) / count;
+        if (!std.math.isFinite(fit_scale) or !std.math.isFinite(fit_bias) or fit_scale == 0) break;
+        const s16 = asBf16(fit_scale);
+        const b16 = asBf16(fit_bias);
+        const s = asFloat(s16);
+        const b = asFloat(b16);
+        if (s == 0 or !std.math.isFinite(s) or !std.math.isFinite(b)) break;
+        var err: f32 = 0;
+        for (values) |bits| {
+            const v = asFloat(bits);
+            const code = @min(levels, @max(@as(f32, 0), @round((v - b) / s)));
+            const d = v - (b + s * code);
+            err += d * d;
+        }
+        if (!(err < best_err)) break;
+        best_err = err;
+        best_scale = s16;
+        best_bias = b16;
+    }
     scale_out.* = best_scale;
     bias_out.* = best_bias;
     const s = asFloat(best_scale);
