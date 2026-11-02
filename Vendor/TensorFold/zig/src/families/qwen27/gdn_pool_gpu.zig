@@ -296,7 +296,7 @@ pub const Pool = struct {
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(prepared.p, 2);
         gdn.bind(e, .{prepared.b.history}, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 }); // a word a thread
         e.barrier();
         try publication.end();
     }
@@ -328,7 +328,7 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.setBuffer(next_history.buffer, next_history.offset, 6);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 }); // a word a thread
     }
 
     /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
@@ -350,7 +350,7 @@ pub const Pool = struct {
         e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
-        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 32 }); // a channel a thread
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
@@ -370,7 +370,7 @@ pub const Pool = struct {
         e.setValue(abi.Stash{ .base = pool.pending.rows, .room = pending_rows - pool.pending.rows, .log_rows = @intCast(pool.budget.rows), .pending_rows = pending_rows }, 7);
         inline for (pending_fields, 8..) |field, index| e.setBuffer(pool.get(field), 0, index);
         // a thread a 16-byte word of the key and value rows and a word of the gates, a layer a row of threads
-        e.dispatchThreads(.{ .width = @max(c.k_heads * c.dk / 8, pool.budget.shape.value / 8, c.v_heads), .height = pool.budget.layers }, .{ .width = 256 });
+        e.dispatchThreads(.{ .width = @max(c.k_heads * c.dk / 8, pool.budget.shape.value / 8, c.v_heads), .height = pool.budget.layers }, .{ .width = 32 });
     }
 
     /// The pending rows replayed into their slot's committed state of every layer, in place and in keep order, each by
@@ -423,7 +423,7 @@ pub const Pool = struct {
         e.setBuffer(plan.metadata.keeps.buffer, plan.metadata.keeps.offset, 1);
         e.setValue(p, 2);
         e.setBuffer(history.buffer, history.offset, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
+        e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 32 }); // a word a thread
     }
 
     pub fn clearSlot(pool: *Pool, slot: u32, e: metal.ComputeEncoder) !void {
