@@ -853,7 +853,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // h (a bf16 word) goes back over its own gate word, which only its thread reads: no separate h buffer
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
@@ -870,12 +870,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    gu16[((c >> 5) * 16 + m) * 32 + (c & 31)] = h;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += float(gu16[((i >> 5) * 16 + t16) * 32 + (i & 31)]);
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
