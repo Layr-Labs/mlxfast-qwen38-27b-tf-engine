@@ -483,7 +483,9 @@ pub const Attention = struct {
         e.setBuffer(xs.buffer, xs.offset, 6);
         e.setValue(@as(u32, if (sums) |s| s.stride else 0), 7);
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 8);
-        // Padded sum rows return before reading partials or addressing the output buffer.
+        // Padded sum rows return before reading partials or addressing the output buffer. This launch is
+        // load-bearing: the out projection's 16-row build reads mb + 8, so the padding sum rows it zeroes
+        // are live. Removing it fails the teacher-forced golden (measured on the record base).
         const merge_rows = if (sums) |s| s.stride else plan.rows;
         if (merge_rows * g.group() > live * g.group()) e.dispatchGroups(mtl.Size.of(g.kv_heads, (merge_rows - live) * g.group(), 1), mtl.Size.of(32, 1, 1));
         e.barrier();

@@ -25,8 +25,12 @@ Q27_SPECIALIZE
   // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
   if (int(m) == 0) {
     const int pad = MP - M;
-    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
+    // A launch that builds the 16-row form (prompt, M > 8) reads a padded row's sums; a decoded round
+    // builds rows8 and reads mb < 8 only. Measured against its own record in the same hour.
+    if (pad > 0 and M > 8) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  // Padding sums stay defined for the same reason as norm_xs: lane kernels address them for rows no
+  // kept output is stored for, and leaving them stale measured worse than writing them.
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
   float hv[E];
