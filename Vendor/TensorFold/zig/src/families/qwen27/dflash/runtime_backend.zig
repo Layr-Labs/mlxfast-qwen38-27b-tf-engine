@@ -356,7 +356,7 @@ pub const Backend = struct {
     /// Elements a (scale, bias) pair covers in the plain kernel's copies below 4 bits (the draft head's included).
     pub const low_group: u32 = 128;
     fn draftBits(name: []const u8) u8 {
-        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
+        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight", "mlp.down_proj.weight" };
         for (mlp) |m| if (std.mem.endsWith(u8, name, m)) return mlp_bits;
         return 4;
     }
