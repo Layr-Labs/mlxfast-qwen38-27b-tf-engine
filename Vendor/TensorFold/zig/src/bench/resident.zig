@@ -77,7 +77,13 @@ pub fn serveConnected(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: ben
     return serveClient(alloc, fd, session, resolved);
 }
 
+/// The thread that encodes and polls every request runs at user-interactive QoS, so it keeps a full-clock P-core
+/// through the host stretches between GPU work (plan, first-layer encode, polls).
+extern "c" fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) c_int;
+const qos_class_user_interactive: c_uint = 0x21; // <sys/qos.h> QOS_CLASS_USER_INTERACTIVE
+
 fn serveClient(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: bench.BenchSession, config: Config) !void {
+    if (comptime builtin.os.tag == .macos) _ = pthread_set_qos_class_self_np(qos_class_user_interactive, 0);
     try sendHello(alloc, fd, config);
     const first_timeout_ms = @min(config.timeout_ms, handshake_timeout_ms);
     const first = (try client.receiveFrameWithTransferTimeout(alloc, fd, first_timeout_ms, config.timeout_ms)) orelse
