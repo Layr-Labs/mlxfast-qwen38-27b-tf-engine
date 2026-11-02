@@ -17,6 +17,21 @@ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []co
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
 const precise_below: f32 = 0.95;
+/// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
+fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+    const m: *@import("../model.zig").Model = @ptrCast(@alignCast(ptr));
+    if (m.weights.layers.len == 0) return;
+    switch (m.weights.layers[0].mixer) {
+        .linear => |g| {
+            try m.kernels.warmAll(e, g.qkv);
+            try m.kernels.warmAll(e, g.zba);
+        },
+        .attention => |at| {
+            try m.kernels.warmAll(e, at.q);
+            try m.kernels.warmAll(e, at.kv);
+        },
+    }
+}
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
@@ -50,6 +65,8 @@ pub const Generation = struct {
         // the greedy verify head's sieve: its 2-bit copy now, not in the first timed round; one that fails to build
         // leaves the full head
         if (runner.headSieve()) |_| {} else |err| std.log.warn("qwen27: head sieve off: {t}", .{err});
+        // the bridge spin behind each early frame first streams the next verify's first input projections into the system cache
+        if (draft.backend.frame.bridge) |*bridge| bridge.warm = .{ .ptr = runner.model, .encode = warmFirstLayer };
         return .{ .allocator = a, .runner = runner, .draft = draft, .kept = kept, .taps = taps, .matcher = matcher, .commit = commit };
     }
     pub fn deinit(g: Generation) void {
