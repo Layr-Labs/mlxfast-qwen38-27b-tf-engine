@@ -231,7 +231,7 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+pub const dflash_floor = 0.020;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
@@ -359,7 +359,14 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // Short sleeps instead of yield-spinning a core for the whole request (the CPU and GPU share one package's power);
+        // TF_BENCH_WAIT=yield: the yield loop; TF_BENCH_WAIT_US: the sleep between checks in microseconds (10)
+        const sys = @import("sys").c;
+        if (!std.mem.eql(u8, std.mem.span(sys.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
+            const us: u32 = if (sys.getenv("TF_BENCH_WAIT_US")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 10 else 10;
+            const req: sys.timespec = .{ .sec = 0, .nsec = @intCast(@as(u64, @min(us, 999_999)) * std.time.ns_per_us) };
+            while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
+        } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
     }
 };
