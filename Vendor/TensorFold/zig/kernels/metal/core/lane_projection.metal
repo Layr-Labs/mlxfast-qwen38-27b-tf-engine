@@ -474,7 +474,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
   if (ks == 0 && lane == 0) {
+#if defined(TF_WAIT_BACKOFF)
+    // a short dependent ALU run between polls: many waiting threadgroups load the word less often
+    uint bx = uint(tg.x) + 0x9e3779b9u;
+    for (uint spin = 0; spin < (1u << 22) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++)
+      for (uint k = 0; k < 8; k++) { bx ^= bx << 13; bx ^= bx >> 17; bx ^= bx << 5; }
+    if (bx == 0u) atomic_store_explicit(&WC[1], bx, memory_order_relaxed); // keeps the run: xorshift from a nonzero seed never reaches 0
+#else
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+#endif
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
       atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);

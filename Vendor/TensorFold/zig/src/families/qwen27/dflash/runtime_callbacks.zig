@@ -18,10 +18,25 @@ fn begin(ptr: *anyopaque) !u64 {
     b.held_conv = null;
     b.held_norms = @splat(null);
     b.hazards.clear();
-    const lead = b.early orelse return b.frame.begin();
+    const lead = b.early orelse {
+        const epoch = try b.frame.begin();
+        // the frame's count words start at zero: no counted launch runs before this barrier
+        b.resetCounts(b.frame.encoder) catch |err| {
+            b.frame.release();
+            b.failed = true;
+            return err;
+        };
+        b.barrier(b.frame.encoder);
+        return epoch;
+    };
     // an early frame: its words are picked from the verify's result before anything reads them
     const epoch = try b.frame.beginEarly(true);
     lead.encode(lead.ptr, b.frame.encoder, .{ .buf = b.args }) catch |err| {
+        b.frame.release();
+        b.failed = true;
+        return err;
+    };
+    b.resetCounts(b.frame.encoder) catch |err| {
         b.frame.release();
         b.failed = true;
         return err;
@@ -99,8 +114,16 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         const dims: ?@import("core").lane_projection.Ref = if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "dims") } else null;
         if (b.input_sums) |s| {
             if (early and s.sums.stride != 16) return error.DraftDeviceRound;
-            b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            if (chainable(b, adapter, x, early)) {
+                const wait = if (waitsOnChain(b, adapter)) chainWait(b, e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys}) else blk: {
+                    b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
+                    break :blk null;
+                };
+                try encodeChained(b, e, adapter, x, s.sums, input, output, ys, wait);
+            } else {
+                b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
+                try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            }
         } else if (cacheable) {
             // the sums, a barrier, the product: no barrier behind it, so independent work runs beside it
             const sums_span = Span.whole(p.sums_buffer.?);
@@ -108,7 +131,10 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             const sums = try p.encodeSumsOfAt(e, .{ .buf = input.buf, .off = input.off }, x.rows, if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "count") } else null);
             if (early and sums.stride != 16) return error.DraftDeviceRound;
             b.access(e, &.{ xs, sums_span }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            if (chainable(b, adapter, x, early))
+                try encodeChained(b, e, adapter, x, sums, input, output, ys, null)
+            else
+                try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
@@ -120,6 +146,86 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             }
         }
     }
+}
+/// Whether a block's decoded projection (at most 8 rows, outside an early frame's append, a reg adapter with both counted
+/// builds, a free count slot) of the block's own shapes takes the counted chain: the conv-kernel projections, q|k|v, out
+/// and down.
+fn chainable(b: *Backend, adapter: @import("core").affine4_lane.Adapter, x: op.View, early: bool) bool {
+    if (early or x.rows == 0 or x.rows > 8 or b.count_next >= @import("runtime_backend.zig").count_slots) return false;
+    if (adapter.small_count == null or adapter.small_wait == null) return false;
+    const c = b.config;
+    const n = adapter.projection.n;
+    return n == c.hidden or n == c.qWidth() + 2 * c.kvWidth() or n == c.dynamicWidth();
+}
+/// Whether a chainable projection waits on the chain rather than a barrier: the narrow ones only (the conv-kernel
+/// projections, 40 tiles, and q|k|v, 192): out and down count for their tiny readers but read behind barriers, since a wide
+/// waiting launch (gate/up's 1088 groups, down's 640) measured far slower than the barriers it saved.
+fn waitsOnChain(b: *Backend, adapter: @import("core").affine4_lane.Adapter) bool {
+    const c = b.config;
+    const n = adapter.projection.n;
+    return n == c.qWidth() + 2 * c.kvWidth() or n == c.dynamicWidth();
+}
+/// The next count slot of the frame (two u32: the launch's count, and the arrivals of a counted projection that waits on
+/// it), or null when the frame's slots are spent.
+fn nextSlot(b: *Backend) ?Ref {
+    if (b.count_next >= @import("runtime_backend.zig").count_slots) return null;
+    const r = Ref{ .buf = b.counts, .off = @as(usize, b.count_next) * 8 };
+    b.count_next += 1;
+    return r;
+}
+/// `b.access` for a launch that may read the open interval's counted chain: reads of the chain's writes need no barrier,
+/// and the launch gets the chain's last count to wait on; any other conflict places the barrier as before (null).
+fn chainWait(b: *Backend, e: @import("metal").ComputeEncoder, reads: []const Span, writes: []const Span) ?@import("core").draft_ops.Wait {
+    const c = &b.chain;
+    const ref = c.ref orelse {
+        b.access(e, reads, writes);
+        return null;
+    };
+    if (c.epoch != b.hazards.epoch) {
+        b.access(e, reads, writes);
+        return null;
+    }
+    if (!b.hazards.orderChained(e, reads, writes, c.spans[0..c.n])) return null;
+    return .{ .ref = ref, .value = c.groups };
+}
+/// Records a counted launch (its writes, count word and threadgroups) on the chain: behind the chain when it waited on it,
+/// else as a new chain; past the chain's capacity it starts over.
+fn chainPush(b: *Backend, waited: bool, writes: []const Span, ref: Ref, groups: u32) void {
+    const c = &b.chain;
+    if (!waited or c.epoch != b.hazards.epoch or c.n + writes.len > c.spans.len) c.n = 0;
+    @memcpy(c.spans[c.n..][0..writes.len], writes);
+    c.n += writes.len;
+    c.ref = ref;
+    c.groups = groups;
+    c.epoch = b.hazards.epoch;
+}
+/// A chainable projection on the adapter's counted build: waiting on `wait` (the chain's last count) when given, then
+/// counting its threadgroups on a fresh slot, which the chain then ends with.
+fn encodeChained(b: *Backend, e: @import("metal").ComputeEncoder, adapter: @import("core").affine4_lane.Adapter, x: op.View, sums: @import("core").lane_projection.Sums, input: Ref, output: Ref, ys: Span, wait: ?@import("core").draft_ops.Wait) !void {
+    const slot = nextSlot(b) orelse return error.DraftDeviceRound; // chainable checked a slot is free
+    const xin = @import("core").lane_projection.Ref{ .buf = input.buf, .off = input.off };
+    const yout = @import("core").lane_projection.Ref{ .buf = output.buf, .off = output.off };
+    const counter = @import("core").lane_projection.Ref{ .buf = slot.buf, .off = slot.off };
+    const p = if (wait != null) adapter.small_wait.? else adapter.small_count.?;
+    if (wait) |w| {
+        try p.encodeCountedAfter(e, xin, .{ .buf = adapter.words }, adapter.meta(), sums, yout, x.rows, counter, .{ .buf = w.ref.buf, .off = w.ref.off }, w.value);
+    } else try p.encodeCounted(e, xin, .{ .buf = adapter.words }, adapter.meta(), sums, yout, x.rows, counter);
+    chainPush(b, wait != null, &.{ys}, slot, @intCast(p.tile_count));
+}
+/// A sums launch's chain step: the wait it reads (chainWait) and a fresh count word for its own threadgroups, both set on
+/// the primitives for its encode (the caller clears them after, and pushes the launch with chainStep's result).
+fn chainStep(b: *Backend, e: @import("metal").ComputeEncoder, reads: []const Span, writes: []const Span) ?Ref {
+    b.primitives.wait = chainWait(b, e, reads, writes);
+    const slot = nextSlot(b);
+    b.primitives.count = slot;
+    return slot;
+}
+/// After a chain step's encode: the launch joins the chain (or starts one) and the primitives forget the step.
+fn chainDone(b: *Backend, slot: ?Ref, writes: []const Span, groups: u32) void {
+    const waited = b.primitives.wait != null;
+    b.primitives.wait = null;
+    b.primitives.count = null;
+    if (slot) |r| chainPush(b, waited, writes, r, groups) else b.chain.ref = null;
 }
 fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
     const b = backend(ptr);
@@ -170,7 +276,9 @@ fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
         if (try sumsFor(b, x.rows, x.width)) |s| {
             const sums = try b.frame.ref(s);
             const r = h.p.residual.?;
-            b.access(e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &.{ try b.span(h.y), try b.span(y), try b.span(s) });
+            const writes = [_]Span{ try b.span(h.y), try b.span(y), try b.span(s) };
+            const slot = chainStep(b, e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &writes);
+            defer chainDone(b, slot, &writes, x.rows); // one threadgroup a row
             try b.primitives.convNormSums(e, try b.frame.ref(h.x), try b.frame.ref(h.p.dynamic), try b.weight(h.p.base), try b.frame.ref(r), try b.frame.ref(h.y), .{ .rows = h.x.rows, .width = h.x.width, .group = h.p.group, .block = h.p.block, .branch = h.p.branch, .residual = 1, .x_stride = h.x.stride, .dynamic_stride = h.p.dynamic.stride, .y_stride = h.y.stride }, try b.weight(p.weight), try b.frame.ref(y), .{ .ref = sums, .stride = sums_stride }, .{ .rows = x.rows, .heads = 1, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
             offerSums(b, y, sums);
             return y;
@@ -223,7 +331,9 @@ fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     // a conv without a residual feeds a projection: it writes that projection's group sums too
     if (p.residual == null) if (try sumsFor(b, x.rows, x.width)) |s| {
         const sums = try b.frame.ref(s);
-        b.access(e, &.{ try b.span(x), try b.span(p.dynamic) }, &.{ try b.span(y), try b.span(s) });
+        const writes = [_]Span{ try b.span(y), try b.span(s) };
+        const slot = chainStep(b, e, &.{ try b.span(x), try b.span(p.dynamic) }, &writes);
+        defer chainDone(b, slot, &writes, x.width / draft_ops.sums_group * x.rows); // a threadgroup a (row, group)
         try b.primitives.convSums(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), null, try b.frame.ref(y), .{ .ref = sums, .stride = sums_stride }, .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = 0, .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
         offerSums(b, y, sums);
         return y;
@@ -243,7 +353,8 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     if (b.early != null and b.transaction == null) {
         if (x.rows != 2) return error.DraftDeviceRound;
         if (held) |h| {
-            b.access(e, &.{try b.span(h.x)}, &.{ try b.span(h.y), try b.span(y) });
+            b.primitives.wait = chainWait(b, e, &.{try b.span(h.x)}, &.{ try b.span(h.y), try b.span(y) });
+            defer b.primitives.wait = null;
             try b.primitives.normRope(e, try b.frame.ref(h.x), try b.weight(h.p.weight), try b.frame.ref(h.y), b.roundArg("positions"), try b.frame.ref(y), normArgs(h), rp);
             return y;
         }
@@ -255,7 +366,8 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     const r = try b.frame.ref(positions);
     @memcpy(r.buf.slice(u64, p.positions.len), p.positions);
     if (held) |h| {
-        b.access(e, &.{ try b.span(h.x), try b.span(positions) }, &.{ try b.span(h.y), try b.span(y) });
+        b.primitives.wait = chainWait(b, e, &.{ try b.span(h.x), try b.span(positions) }, &.{ try b.span(h.y), try b.span(y) });
+        defer b.primitives.wait = null;
         try b.primitives.normRope(e, try b.frame.ref(h.x), try b.weight(h.p.weight), try b.frame.ref(h.y), r, try b.frame.ref(y), normArgs(h), rp);
         return y;
     }

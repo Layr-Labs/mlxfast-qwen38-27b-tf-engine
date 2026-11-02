@@ -12,6 +12,11 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// `small` built with Layout.count: the same launch, each threadgroup adding one to a counter word once its rows are
+    /// stored, so a launch that reads them can share its barrier interval (lane.Projection.encodeCounted).
+    small_count: ?lane.Projection = null,
+    /// `small_count` that first waits on its input's producer's count (Layout.wait, encodeCountedAfter).
+    small_wait: ?lane.Projection = null,
     /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
     /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
     prompt: ?lane.Projection = null,
@@ -55,12 +60,24 @@ pub const Adapter = struct {
         const projection = try lane.Projection.init(a, device, layout);
         errdefer projection.deinit();
         var small: ?lane.Projection = null;
+        var small_count: ?lane.Projection = null;
+        var small_wait: ?lane.Projection = null;
         if (layout.reg) {
             var l8 = layout;
             l8.rows8 = true;
             small = try lane.Projection.init(a, device, l8);
+            var lc = l8;
+            lc.count = true;
+            // a layout the counted build refuses keeps the uncounted launch only
+            small_count = lane.Projection.init(a, device, lc) catch null;
+            var lw = lc;
+            lw.wait = true;
+            lw.wait_backoff = true;
+            small_wait = lane.Projection.init(a, device, lw) catch null;
         }
         errdefer if (small) |s| s.deinit();
+        errdefer if (small_count) |s| s.deinit();
+        errdefer if (small_wait) |s| s.deinit();
         var prompt: ?lane.Projection = null;
         if (layout.reg and layout.format.bits == 4) {
             var lp = layout;
@@ -69,7 +86,7 @@ pub const Adapter = struct {
             lp.prompt_sr = true;
             prompt = try lane.Projection.init(a, device, lp);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt };
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .small_count = small_count, .small_wait = small_wait, .prompt = prompt };
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -93,6 +110,8 @@ pub const Adapter = struct {
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.small_count) |s| s.deinit();
+        if (adapter.small_wait) |s| s.deinit();
         if (adapter.prompt) |p| p.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
