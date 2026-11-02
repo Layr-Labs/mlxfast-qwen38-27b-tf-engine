@@ -778,8 +778,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_RESID)
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg_in [[threadgroup_position_in_grid]],
+    uint2 groups [[threadgroups_per_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
+  // Morton order inside full 8x8 macro-tiles of (column range, 16-row block): consecutive groups share a column range's
+  // weight words across 8 row blocks and a row block's activations across 8 column ranges, instead of sweeping every
+  // weight column before the next row block. A bijection on the full region; the ragged right and bottom edges keep the
+  // linear position. Every group still computes exactly one (column range, row block) with unchanged arithmetic.
+  uint2 tg = tg_in;
+  {
+    const uint fx = groups.x & ~7u, fy = groups.y & ~7u;
+    if (tg_in.x < fx && tg_in.y < fy) {
+      const uint at = tg_in.y * fx + tg_in.x, macro = at >> 6, i = at & 63u, mx = fx >> 3;
+      const uint dx = (i & 1u) | ((i >> 1) & 2u) | ((i >> 2) & 4u), dy = ((i >> 1) & 1u) | ((i >> 2) & 2u) | ((i >> 3) & 4u);
+      tg = uint2((macro % mx) * 8u + dx, (macro / mx) * 8u + dy);
+    }
+  }
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
