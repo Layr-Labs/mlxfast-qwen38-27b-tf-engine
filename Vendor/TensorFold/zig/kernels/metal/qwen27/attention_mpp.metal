@@ -29,8 +29,23 @@ inline void q27_count(device atomic_uint* NC, ushort tid) {
   }
 }
 
+// The quarter prefix's shared scores (SG 1, PARTS 4: the group's four simdgroups are one tile's four parts): simdgroup
+// j < 2 scores key tile k + TK j (when below kend) with the parts' own score op and stores each lane's 32 words in slot j
+// of SS, lane-major (word i of lane l in float4 (TK / 8 j + i / 4) 32 + l), where every part reads back the words its own
+// op held: the same op on the same inputs, and a lane's destination elements depend on the lane alone.
+template <typename OpS, typename TA, typename TT>
+inline void q27_score_pair(thread OpS& opS, thread TA& aQ, thread TT& tK, int k, int kend, int sg, ushort lane, threadgroup float4* SS) {
+  if (sg >= 2 || k + sg * TK >= kend) return;
+  auto bK = tK.slice(0, k + sg * TK);
+  auto S = opS.template get_destination_cooperative_tensor<TA, decltype(bK), float>();
+  opS.run(aQ, bK, S);
+  for (int q = 0; q < TK / 8; q++) SS[(sg * (TK / 8) + q) * 32 + lane] = float4(S[4 * q], S[4 * q + 1], S[4 * q + 2], S[4 * q + 3]);
+}
+
 // SG tiles a threadgroup. Each tile uses PARTS simdgroups with identical scores
 // and softmax; each owns D/PARTS output columns. PARTS=4 fills small grids.
+// SG 1 with PARTS 4 (the quarter) scores each pair of key tiles once for its four parts (q27_score_pair: the first pass's
+// first pair before O is live, a later pair once every part has read the last); the softmax and P.V are each part's own.
 // count_out above 0: the tail behind it shares its barrier interval and waits on PC[0], which every group counts.
 // wait_for above 0: the counted decoded preprocess (q27_head_norm_rope_decoded) shares this launch's barrier interval and
 // every group waits on WC[0] before it reads the packed query or the round's cached keys.
@@ -44,6 +59,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
   constexpr int OD = D / PARTS, OE = 16 * OD / 32;
+  constexpr bool SHARE = SG == 1 && PARTS == 4;
   if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   const ushort lane = thread_index_in_simdgroup;
   const ushort sg = simdgroup_index_in_threadgroup;
@@ -65,6 +81,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   const int n0 = (q0 < G * NQ) ? min(L, S0 + q0 / G + 1) : 0;
   const int n1 = (q1 < G * NQ) ? min(L, S0 + q1 / G + 1) : 0;
   threadgroup half Ps[16 * TK]; // only gives the probabilities' tensor type
+  threadgroup float4 SS[SHARE ? 2 * (TK / 8) * 32 : 1]; // a pair of key tiles' scores (q27_score_pair)
   threadgroup half* myP = Ps;
   // a pair past the plan's tiles or chunks computes nothing; with count_out every group still reaches its count
   if (tile < SGA && int(c) < meta[MG + st * MS + 1]) {
@@ -83,6 +100,10 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   matmul2d<dS, execution_simdgroup> opS;
   matmul2d<dO, execution_simdgroup> opO;
   auto aQ = tQ.slice(0, tile * 16);
+  if (SHARE) {
+    q27_score_pair(opS, aQ, tK, int(c) * wa, min(int(c) * wa + wa, L), int(sg), lane, SS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   auto bV0 = tV.slice(0, 0);
   auto O = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(bV0), float>();
   for (int i = 0; i < OE; i++) O[i] = 0.0f;
@@ -95,7 +116,18 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   for (int kt = kbeg; kt < kend; kt += TK) {
     auto bK = tK.slice(0, kt);
     auto S = opS.template get_destination_cooperative_tensor<decltype(aQ), decltype(bK), float>();
-    opS.run(aQ, bK, S);
+    if (SHARE) {
+      const int j = ((kt - kbeg) / TK) & 1; // this tile's slot in its pair
+      if (j == 0 && (w != wa || kt != kbeg)) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        q27_score_pair(opS, aQ, tK, kt, kend, int(sg), lane, SS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      for (int q = 0; q < TK / 8; q++) {
+        const float4 v = SS[(j * (TK / 8) + q) * 32 + lane];
+        S[4 * q] = v.x; S[4 * q + 1] = v.y; S[4 * q + 2] = v.z; S[4 * q + 3] = v.w;
+      }
+    } else opS.run(aQ, bK, S);
     float s[TK / 2];
     for (int i = 0; i < TK / 2; i++) {
       const int key = kt + (i >> 3) * 16 + fn + (i & 3);
@@ -161,6 +193,20 @@ Q27_PREFIX(15)
 Q27_PREFIX(16)
 template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 
+// One staged K or V block of a tail tile, 128 threads: this thread's slots kv[128 j] (j < 8) take rows q0 + STEP j of the
+// cache at `src` (the thread's column; rows D apart). Rows before P come from the cache through a pointer stepped STEP rows a
+// slot, rows in [P, nmax) are the node's own (row P + path[row - P]), later rows are zero: each slot holds the 16 bytes the
+// per-slot select (row < P, row < nmax) gave it, without a row division, compare chain or 64-bit row product of its own.
+template <int STEP>
+inline void q27_stage(threadgroup vec<bfloat, 8>* kv, const device bfloat* src, int q0, int P, int nmax, const threadgroup int* path) {
+  const int context = min(int(uint(max(P - q0 + STEP - 1, 0)) / STEP), 8), own = min(int(uint(max(nmax - q0 + STEP - 1, 0)) / STEP), 8);
+  const device vec<bfloat, 8>* row = (const device vec<bfloat, 8>*)(src + (int64_t)q0 * D);
+  int j = 0;
+  for (; j < context; ++j, row += STEP * D / 8) kv[128 * j] = *row;
+  for (; j < own; ++j) kv[128 * j] = *(const device vec<bfloat, 8>*)(src + (int64_t)(P + path[q0 + STEP * j - P]) * D);
+  for (; j < 8; ++j) kv[128 * j] = vec<bfloat, 8>(0);
+}
+
 kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
     device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
@@ -189,9 +235,11 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   const int n1 = r1 < G ? nmax : 0;
   threadgroup half myP[16 * TK];
   threadgroup bfloat KV[32 * D];
+  threadgroup int path[MAXD];
+  // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
+  if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  const int64_t kstep = D, vstep = D;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -223,14 +271,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
     float sraw[TK / 2];
     for (int h = 0; h < TK / 32; h++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < 32 * D / 8; e += 128) {
-        const int row = int(e) / (D / 8), col = (int(e) % (D / 8)) * 8;
-        const int q = kt + h * 32 + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(kbase + phys * kstep + col) : vec<bfloat, 8>(0);
-      }
+      // slot tid + 128 j: key row kt + 32 h + tid / 32 + 4 j, columns 8 (tid % 32) on
+      q27_stage<4>((threadgroup vec<bfloat, 8>*)KV + tid, kbase + (tid & 31) * 8, kt + h * 32 + (tid >> 5), P, nmax, path);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sg == 0) {
         auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
@@ -271,14 +313,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
     }
     for (int hv = 0; hv < 2; hv++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < TK * 128 / 8; e += 128) {
-        const int row = int(e) / 16, col = hv * 128 + (int(e) % 16) * 8;
-        const int q = kt + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(vbase + phys * vstep + col) : vec<bfloat, 8>(0);
-      }
+      // slot tid + 128 j: value row kt + tid / 16 + 8 j, columns 128 hv + 8 (tid % 16) on
+      q27_stage<8>((threadgroup vec<bfloat, 8>*)KV + tid, vbase + hv * 128 + (tid & 15) * 8, kt + (tid >> 4), P, nmax, path);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sg == 0) {
         if (hv == 0) opO.run(tP, tVh, Olo);
@@ -301,7 +337,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
 
 // A row's chunk partials combined in key order, a block of loads ahead; `gated` applies the query gate (q27_gate).
 // wait_for above 0: the counted split tail shares this launch's barrier interval (it waited on the counted prefix before it
-// counted itself), so a group reads both partials once the tail's count on NC[0] reaches wait_for.
+// counted itself), so a group reads both partials once the tail's count on NC[0] reaches wait_for. The plan words come
+// first: nothing in the barrier interval writes them.
 kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const float* PMA [[buffer(1)]], device const float* PLA [[buffer(2)]],
     device const float* POB [[buffer(3)]], device const float* PMB [[buffer(4)]], device const float* PLB [[buffer(5)]],
     device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
@@ -310,7 +347,6 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
-  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
   const uint r = threadgroup_position_in_grid.y;
@@ -319,6 +355,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
   const int NCBS = meta[MG + st * MS + 5];
   const int ra = meta[MG + st * MS + 3] * 16 + (int(r) / G - meta[MG + st * MS + 6]) * G + int(r) % G;
   const int CT = nodes[NW * (int(r) / G) + 3]; // the row's own prefix chunks
+  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
   constexpr int DP = D / 32, MB = 2;
   const int node = r / G, g = r % G;
   float m = -INFINITY, l = 0.0f, o[DP];
@@ -381,6 +418,8 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
 // Independent output halves preserve the original tail arithmetic; used for small one-chunk trees.
 // wait_for above 0: the counted prefix shares this launch's barrier interval; every group waits on WC[0] before it reads the
 // prefix partials. count_out above 0: every group counts itself on TC[0] once stored, for the merge that waits on it.
+// A group's plan words, its first key tile's K and V staging and its scores read nothing the prefix writes (the round's own
+// rows were appended behind an earlier barrier), so they come before the wait; the partial and the softmax come after it.
 [[max_total_threads_per_threadgroup(128)]]
 kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
@@ -391,17 +430,18 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
-  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
   const ushort lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x / 2;
   const bool hi = threadgroup_position_in_grid.x & 1;
   const uint cb = threadgroup_position_in_grid.y;
   const uint node = threadgroup_position_in_grid.z;
+  const uint groups = threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z;
   const int NCB = meta[3], W = meta[4], RPA = meta[5], CA = meta[6];
   const int st = nodes[NW * node + 1];
   const int P = meta[MG + st * MS + 4], PT = meta[MG + st * MS + 0], CK = nodes[NW * node + 2];
   if (int(cb) >= meta[MG + st * MS + 5]) {
+    if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
     if (count_out != 0u) q27_count(TC, tid);
     return;
   }
@@ -418,9 +458,11 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   const int n1 = r1 < G ? nmax : 0;
   threadgroup half myP[16 * TK];
   threadgroup bfloat KV[32 * D];
+  threadgroup int path[MAXD];
+  // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
+  if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  const int64_t kstep = D, vstep = D;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -438,36 +480,43 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   const int c = c0 + int(cb);
   const int kbeg = max(c * CK, PT);
   const int kend = min((c + 1) * CK, nmax);
-  if (sg == 0 && cb == 0 && PT > c0 * CK) {
-    const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + la;
-    for (int q = 0; q < 16; q++) {
-      const int row = fm + (q & 1) * 8;
-      if (row >= G) continue;
-      const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
-      for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
-    }
-    if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
-    if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
-  }
-  for (int kt = kbeg; kt < kend; kt += TK) {
+  // a pass a tile, and a last pass without one; the first pass waits on the prefix between its loads and its softmax
+  for (int kt = kbeg;; kt += TK) {
+    const bool tile = kt < kend;
     float sraw[TK / 2];
-    for (int h = 0; h < TK / 32; h++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < 32 * D / 8; e += 128) {
-        const int row = int(e) / (D / 8), col = (int(e) % (D / 8)) * 8;
-        const int q = kt + h * 32 + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(kbase + phys * kstep + col) : vec<bfloat, 8>(0);
+    if (tile) {
+      for (int h = 0; h < TK / 32; h++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // slot tid + 128 j: key row kt + 32 h + tid / 32 + 4 j, columns 8 (tid % 32) on
+        q27_stage<4>((threadgroup vec<bfloat, 8>*)KV + tid, kbase + (tid & 31) * 8, kt + h * 32 + (tid >> 5), P, nmax, path);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
+          opS.run(tQ, tK32, S);
+          for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+        }
       }
+      // this group's value half, staged before the softmax (KV against myP and registers: nothing shared)
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sg == 0) {
-        auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
-        opS.run(tQ, tK32, S);
-        for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+      // slot tid + 128 j: value row kt + tid / 16 + 8 j, columns 128 hi + 8 (tid % 16) on
+      q27_stage<8>((threadgroup vec<bfloat, 8>*)KV + tid, vbase + int(hi) * 128 + (tid & 15) * 8, kt + (tid >> 4), P, nmax, path);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (kt == kbeg) {
+      if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
+      if (sg == 0 && cb == 0 && PT > c0 * CK) {
+        const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + la;
+        for (int q = 0; q < 16; q++) {
+          const int row = fm + (q & 1) * 8;
+          if (row >= G) continue;
+          const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
+          for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
+        }
+        if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
+        if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
       }
     }
+    if (!tile) break;
     if (sg == 0) {
     float s[TK / 2];
     for (int i = 0; i < TK / 2; i++) {
@@ -499,25 +548,14 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
       }
     for (int i = 0; i < 32; i++) saved[i] *= f0;
     }
-    for (int hv = int(hi); hv < int(hi) + 1; hv++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < TK * 128 / 8; e += 128) {
-        const int row = int(e) / 16, col = hv * 128 + (int(e) % 16) * 8;
-        const int q = kt + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(vbase + phys * vstep + col) : vec<bfloat, 8>(0);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sg == 0) {
-        auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
-        _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
-        opO.run(tP, tVh, Olo);
-        _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
-      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
+      opO.run(tP, tVh, Olo);
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
     }
   }
   if (sg == 0) {
