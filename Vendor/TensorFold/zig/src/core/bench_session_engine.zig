@@ -231,7 +231,9 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+/// The cutoff sits at 0.7%: logged depth-one rounds put siblings in the 0.7-1% band at a 2.1% landing rate and those
+/// below 0.2% at 0.02%, so the band the old 1.5% cutoff dropped is the last one whose landings pay for its verify rows.
+pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
