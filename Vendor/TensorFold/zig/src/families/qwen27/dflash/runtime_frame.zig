@@ -64,7 +64,7 @@ pub const Bridge = struct {
         b.epoch +%= 1;
         const cb = queue.commandBuffer();
         const e = cb.compute(.serial);
-        mtl.objc.msg(void, e.id, "waitForFence:", .{fence});
+        e.waitFence(fence);
         e.setPipeline(b.spin);
         e.setBuffer(b.flag, 0, 0);
         e.setValue([2]u32{ bound, b.epoch }, 1);
@@ -204,14 +204,14 @@ pub const Frame = struct {
     pub fn part(f: *Frame) !void {
         if (!f.active or f.completed or f.committed or f.early or f.part_count == f.parts.len) return;
         if (f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
-        mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
+        f.encoder.updateFence(f.fence.?);
         f.encoder.end();
         f.cb.commit();
         f.parts[f.part_count] = f.cb;
         f.part_count += 1;
         f.cb = f.open();
         f.encoder = f.cb.compute(.concurrent);
-        mtl.objc.msg(void, f.encoder.id, "waitForFence:", .{f.fence.?});
+        f.encoder.waitFence(f.fence.?);
     }
     pub fn finish(f: *Frame) !void {
         return f.finishWith(false);
@@ -234,7 +234,7 @@ pub const Frame = struct {
     pub fn commitLast(f: *Frame, bridged: bool) !void {
         if (!f.active or f.completed or f.committed) return error.DraftFrameNotActive;
         if (bridged and f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
-        if (bridged) mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
+        if (bridged) f.encoder.updateFence(f.fence.?);
         f.encoder.end();
         if (f.poll_event == null) f.poll_event = f.device.sharedEvent() catch null;
         if (f.poll_event) |ev| {

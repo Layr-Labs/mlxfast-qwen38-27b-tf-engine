@@ -83,7 +83,12 @@ pub const Device = struct {
         return objc.msg(bool, self.id, "respondsToSelector:", .{objc.sel(selector)});
     }
 
+    /// A command queue: Metal 4's (mtl4.zig) where the OS and device have it and TF_MTL4 is not "0", else classic.
     pub fn queue(self: Device) Error!command.Queue {
+        if (@import("mtl4.zig").enabled(self.id)) {
+            if (@import("mtl4.zig").Queue.init(std.heap.c_allocator, self.id)) |q| return .{ .id = q.queue, .m4 = q };
+            std.log.warn("metal4: queue setup failed: classic queue", .{});
+        }
         return .{ .id = objc.msg(?Id, self.id, "newCommandQueue", .{}) orelse return error.NoQueue };
     }
 
