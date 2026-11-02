@@ -228,7 +228,7 @@ pub const EngineDflashBinding = struct {
 
 /// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
 /// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
-pub const dflash_width = 7;
+pub const dflash_width = 6;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
 pub const dflash_floor = 0.015;
