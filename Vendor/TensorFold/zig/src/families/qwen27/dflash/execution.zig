@@ -15,6 +15,8 @@ fn group(ops: op.Ops, frame: u64, x: op.View, first: w.Tensor, kind: u32, mode: 
     const y = (try f(ops.ptr, frame, x, first, kind, mode)) orelse return null;
     return y;
 }
+/// Code bytes of the out projection read ahead beside a draft attention (Ops.warm): its whole 2-bit copy.
+const warm_o: usize = 8 << 20;
 fn cols(ops: op.Ops, frame: u64, x: op.View, first: u32, width: u32) !op.View {
     return (ops.vtable.slice_cols orelse return error.DraftOperatorShape)(ops.ptr, frame, x, first, width);
 }
@@ -205,6 +207,8 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
+        // the out projection's leading code lines go to the system cache beside the attention, while it holds the bus idle
+        if (preparation.mode != .bf16_reference) if (ops.vtable.warm) |warm| try warm(ops.ptr, frame, layer.attention.o, 0, warm_o);
         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
         residual = hidden;
         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);

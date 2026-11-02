@@ -121,6 +121,19 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         }
     }
 }
+/// The leading code lines (`want` bytes) of the copy a later decoded launch of `w` reads (its `kind` group's where it is
+/// fused, else its own) and their share of its metadata, read into the system cache beside the latency-bound launch just
+/// encoded. It writes nothing a launch reads, so it takes no hazard, no barrier and no op count (the frame's parts stay
+/// where they were).
+fn warm(ptr: *anyopaque, epoch: u64, w: ck.Tensor, kind: u32, want: usize) !void {
+    const b = backend(ptr);
+    if (b.failed) return error.DraftBackendFailed;
+    try b.frame.require(epoch);
+    const base = @intFromPtr(w.bytes.ptr);
+    const adapter = (if (b.precise) (b.prepared.get((base | Backend.precise_key) + kind) orelse b.prepared.get(base | Backend.precise_key)) else null) orelse
+        b.prepared.get(base + kind) orelse b.prepared.get(base) orelse return;
+    try b.target.kernels.warmWords(b.frame.encoder, adapter.words, adapter.meta().buf, want);
+}
 fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
     const b = backend(ptr);
     if (mode == .bf16_reference or b.fused_count == 0) return null;
@@ -402,4 +415,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
 }
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd, .warm = warm };

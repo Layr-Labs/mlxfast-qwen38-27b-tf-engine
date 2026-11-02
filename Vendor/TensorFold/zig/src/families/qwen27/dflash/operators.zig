@@ -89,6 +89,9 @@ pub const Ops = struct {
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
         lattice_end: ?*const fn (*anyopaque, u64, Head, View, View, Config) anyerror!Lattice = null,
+        // a later launch's leading code lines (a `kind` group's or a linear's, `want` bytes) read into the system cache
+        // beside the latency-bound launch just encoded; null: no warms
+        warm: ?*const fn (*anyopaque, u64, ck.Tensor, u32, usize) anyerror!void = null,
     };
 };
 
