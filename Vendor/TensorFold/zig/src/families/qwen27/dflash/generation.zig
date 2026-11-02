@@ -17,6 +17,24 @@ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []co
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
 const precise_below: f32 = 0.95;
+/// A round whose own draft the drafter gave less than this probability (its first position's best candidate among its
+/// top k) has the frame committed behind its verify draft on the q4 copies too, before any landing share moves.
+const confident_above: f64 = 0.5;
+/// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
+fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+    const m: *@import("../model.zig").Model = @ptrCast(@alignCast(ptr));
+    if (m.weights.layers.len == 0) return;
+    switch (m.weights.layers[0].mixer) {
+        .linear => |g| {
+            try m.kernels.warmAll(e, g.qkv);
+            try m.kernels.warmAll(e, g.zba);
+        },
+        .attention => |at| {
+            try m.kernels.warmAll(e, at.q);
+            try m.kernels.warmAll(e, at.kv);
+        },
+    }
+}
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
@@ -50,6 +68,8 @@ pub const Generation = struct {
         // the greedy verify head's sieve: its 2-bit copy now, not in the first timed round; one that fails to build
         // leaves the full head
         if (runner.headSieve()) |_| {} else |err| std.log.warn("qwen27: head sieve off: {t}", .{err});
+        // the bridge spin behind each early frame first streams the next verify's first input projections into the system cache
+        if (draft.backend.frame.bridge) |*bridge| bridge.warm = .{ .ptr = runner.model, .encode = warmFirstLayer };
         return .{ .allocator = a, .runner = runner, .draft = draft, .kept = kept, .taps = taps, .matcher = matcher, .commit = commit };
     }
     pub fn deinit(g: Generation) void {
@@ -92,7 +112,10 @@ pub const Generation = struct {
                 };
                 e.end();
                 cb.commit();
-                cb.wait();
+                while (true) switch (cb.status()) {
+                    .completed, .@"error" => break,
+                    else => std.atomic.spinLoopHint(),
+                };
                 if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
                 r.end.* += rows;
                 if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
@@ -398,6 +421,8 @@ pub const Generation = struct {
         // a depth-one round's keep (keepDevice, behind the verify) stashes its GDN rows for the next verifies' star scans
         g.runner.defer_gdn = (policy.max_depth orelse 0) == 1;
         defer g.runner.defer_gdn = false;
+        // the frame committed behind this verify drafts precise if the share is low or this round's draft was unsure
+        g.draft.backend.precise = g.accept_share < precise_below or tree.confidence < confident_above;
         const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos, early);
         // a depth-bounded round that takes its whole budget stops at its length with the bonus emitted: that pick is the
         // next round's pending token, as a bonus stop's is, so the next round need not take it from the logits again

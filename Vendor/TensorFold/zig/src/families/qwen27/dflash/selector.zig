@@ -41,6 +41,8 @@ pub const Tree = struct {
     tokens: []u32,
     parents: []i32,
     scores: []f64,
+    /// The drafter's own probability of its first position's best candidate among its top k (1: no lattice read).
+    confidence: f64 = 1,
     pub fn deinit(t: *Tree) void {
         t.gpa.free(t.tokens);
         t.gpa.free(t.parents);
@@ -83,14 +85,45 @@ fn edges(g: *const weights.Graph, lattice: op.Lattice, parent: u32, token: u32, 
 const max_rank = 256;
 fn parentTerms(g: *const weights.Graph, lattice: op.Lattice, parent: u32, depth: u32, out: *[max_rank]f64) !void {
     @setFloatMode(.strict);
-    for (0..g.config.rank) |r| out[r] = (try native(g.predecessor, parent, @intCast(r))) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]);
+    const row = try codebookRow(g, g.predecessor, parent);
+    for (0..g.config.rank) |r| {
+        const bits = std.mem.readInt(u16, row[r * 2 ..][0..2], .little);
+        if (bits & 0x7F80 == 0x7F80) return error.DraftCodebookFinite;
+        const value: f32 = @bitCast(@as(u32, bits) << 16);
+        out[r] = @as(f64, value) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]);
+    }
 }
-/// edges, the parent's terms given: the same products and sum in the same order.
-fn edgesFrom(g: *const weights.Graph, terms: *const [max_rank]f64, token: u32) !f64 {
+/// A codebook's row (`rank` bf16 words), bounds-checked once for the whole row.
+fn codebookRow(g: *const weights.Graph, t: weights.Tensor, row: u32) ![]const u8 {
+    const rank: usize = g.config.rank;
+    const at = (try std.math.mul(usize, row, t.shape[1])) * 2;
+    if (t.shape[1] < rank or at + rank * 2 > t.bytes.len) return error.DraftCodebookShape;
+    return t.bytes[at..][0 .. rank * 2];
+}
+/// edges for every candidate of a row at once, the parent's terms given, four candidates at a time: each candidate's
+/// products and sum exactly as edges makes them (its own accumulator, term by term in rank order), the four sums
+/// interleaved; a non-finite codebook word is the same error.
+fn edgesOf(g: *const weights.Graph, terms: *const [max_rank]f64, tokens: []const u32, out: []f64) !void {
     @setFloatMode(.strict);
-    var sum: f64 = 0;
-    for (0..g.config.rank) |r| sum += terms[r] * (try native(g.successor, token, @intCast(r)));
-    return sum;
+    const rank: usize = g.config.rank;
+    var first: usize = 0;
+    while (first < tokens.len) : (first += 4) {
+        const n = @min(4, tokens.len - first);
+        var rows: [4][]const u8 = undefined;
+        for (0..4) |k| rows[k] = try codebookRow(g, g.successor, tokens[first + @min(k, n - 1)]);
+        var sums: [4]f64 = @splat(0);
+        var bad: u16 = 0;
+        for (0..rank) |r| {
+            inline for (0..4) |k| {
+                const bits = std.mem.readInt(u16, rows[k][r * 2 ..][0..2], .little);
+                bad |= @intFromBool(bits & 0x7F80 == 0x7F80);
+                const value: f32 = @bitCast(@as(u32, bits) << 16);
+                sums[k] += terms[r] * @as(f64, value);
+            }
+        }
+        if (bad != 0) return error.DraftCodebookFinite;
+        for (0..n) |k| out[first + k] = sums[k];
+    }
 }
 fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first: u64, parent_token: u32, parent: i32, depth: u32, cumulative: f64, frontier: *std.ArrayList(Node)) !void {
     @setFloatMode(.strict);
@@ -102,9 +135,11 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     var terms: [max_rank]f64 = undefined;
     const shared = g.config.rank <= max_rank;
     if (shared) try parentTerms(g, lattice, parent_token, depth, &terms);
+    var edge_of: [16]f64 = undefined;
+    if (shared) try edgesOf(g, &terms, lattice.candidates[row..][0..lattice.topk], edge_of[0..lattice.topk]);
     for (0..lattice.topk) |i| {
         const token = lattice.candidates[row + i];
-        const edge = if (shared) try edgesFrom(g, &terms, token) else try edges(g, lattice, parent_token, token, depth);
+        const edge = if (shared) edge_of[i] else try edges(g, lattice, parent_token, token, depth);
         var score = @as(f64, lattice.unary[row + i]) / temperature + options.edge * edge / temperature;
         if (options.noise) |n| score += options.noise_weight * try n.draw(n.ptr, try std.math.add(u64, first, depth), token);
         score /= options.tau;
@@ -175,11 +210,15 @@ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Latt
         count += 1;
         if (node.depth + 1 < lattice.depth) try expand(g, lattice, options, first_position, node.token, @intCast(me), node.depth + 1, node.score, &frontier);
     }
+    var top: f64 = -std.math.inf(f64);
+    for (lattice.unary[0..lattice.topk]) |u| top = @max(top, @as(f64, u));
+    var total: f64 = 0;
+    for (lattice.unary[0..lattice.topk]) |u| total += @exp(@as(f64, u) - top);
     const out_tokens = try gpa.dupe(u32, tokens[0..count]);
     errdefer gpa.free(out_tokens);
     const out_parents = try gpa.dupe(i32, parents[0..count]);
     errdefer gpa.free(out_parents);
-    return .{ .gpa = gpa, .tokens = out_tokens, .parents = out_parents, .scores = try gpa.dupe(f64, scores[0..count]) };
+    return .{ .gpa = gpa, .tokens = out_tokens, .parents = out_parents, .scores = try gpa.dupe(f64, scores[0..count]), .confidence = 1 / total };
 }
 
 test "draft roots shift to pending row while descendants retain topology" {

@@ -59,7 +59,8 @@ pub const DevicePlan = struct { host: Plan, metadata: Metadata };
 pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null };
+/// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
@@ -202,7 +203,8 @@ pub const Pool = struct {
     /// commit; the layer's launches read that copy.
     pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred, uploaded: bool) !void {
         if (!uploaded) try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
-        const prepared = try pool.round(layer, plan, refs, false);
+        var prepared = try pool.round(layer, plan, refs, false);
+        prepared.warm = refs.warm;
         if (!uploaded) try plan.metadata.upload(plan.host);
         // decoded star rows: the star scan joins the counted prepare's barrier interval, loading its states (and replaying
         // any pending rows) while the projections and the prepare run, and reads the prepared rows once they are counted
@@ -385,7 +387,7 @@ pub const Pool = struct {
         e.setValue(p, 5);
         const layer_words = std.math.cast(u32, pool.budget.slots * pool.budget.shape.state) orelse return error.BadGdnPending;
         e.setValue(abi.Unstash{ .rows = pool.pending.rows, .slot = pool.pending.slot, .pending_rows = pending_rows, .layer_words = layer_words }, 6);
-        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 4 });
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 8 });
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
@@ -409,7 +411,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
-            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 8 });
         }
     }
 
