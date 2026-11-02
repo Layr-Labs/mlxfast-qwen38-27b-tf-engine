@@ -5,6 +5,10 @@ using namespace mpp::tensor_ops;
 
 // 1-16 bf16 rows share each group's weight read; every row's sums and split-K order hold at every width.
 
+#ifndef TF_GU_HOLD_WORDS
+#define TF_GU_HOLD_WORDS 3072
+#endif
+inline int t16_hold(int lane) { return lane; }
 #ifndef TF_SIMD_FRAGS
 #define TF_SIMD_FRAGS 0
 #endif
@@ -854,6 +858,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
   threadgroup float hb16[16 * 64];
+#if TF_GU_HOLD_WORDS > 0
+  // threadgroup memory held only to cap how many gate/up threadgroups share a core (no word of it is read)
+  threadgroup float hold[TF_GU_HOLD_WORDS];
+  if (stride < 0) hold[t16_hold(lane)] = 0.0f;
+#endif
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
