@@ -60,8 +60,14 @@ pub const Runner = struct {
     after: ?forward.Hook = null,
     /// Encoded first in the next verify's first command buffer, then cleared by its caller.
     lead: ?forward.Tail = null,
+    /// Run once before the next verify's first GPU work (its first commit, or a deferred GDN replay it lands first),
+    /// then cleared: work its caller left pending (Generation: the last round's keep), so planning and encoding overlap
+    /// it.
+    settle: ?forward.Hook = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
+    /// The current pass's attention plan goes up to the scratch with its first attention layer, which reads it first.
+    scratch_due: bool = false,
     terminal_head: forward.Head = .all,
     current_placed: image_rows.Placed = .{},
     /// Each slot's rows' M-RoPE layout from its stream's images (empty: text, plain rope at the cache row).
@@ -248,16 +254,19 @@ pub const Runner = struct {
         try r.gdn.prepare(r.model.device, recurrent, accepted);
         try r.model.frame.setRows(round.ids, round.feed_positions);
         const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
-        try r.scratch.upload(attention_plan);
+        // no launch before the first attention layer reads the scratch: its plan goes up there, after the first commit
+        try r.scratch.admit(attention_plan);
         r.current_round = round;
         r.current_gdn = &recurrent;
         r.current_attention = &attention_plan;
         r.current_placed = placed;
+        r.scratch_due = true;
         defer {
             r.current_round = null;
             r.current_gdn = null;
             r.current_attention = null;
             r.current_placed = .{};
+            r.scratch_due = false;
         }
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
@@ -266,7 +275,7 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .images = placed.images };
+        var stages = forward.Stages{ .pace_verify = !accepted and r.tail != null and round.ids.len <= 8, .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .tail = r.tail, .lead = r.lead, .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -413,6 +422,21 @@ pub const Runner = struct {
         e.barrier();
     }
 
+    /// The caller's pending work (settle), at most once a verify.
+    fn settleCaller(r: *Runner) !void {
+        const h = r.settle orelse return;
+        r.settle = null;
+        try h.run(h.ptr);
+    }
+
+    /// Right before a verify's first commit: the caller's pending work lands (settle); a tree verify's GDN metadata
+    /// then goes up once, and every layer's scan reads that copy in place (gdn_pool_gpu.Pool.forwardAfter, `uploaded`).
+    fn settleRound(ptr: *anyopaque) anyerror!void {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        try r.settleCaller();
+        if (!r.accepted_chain) try r.metadata().upload((r.current_gdn orelse return error.RoundNotReady).*);
+    }
+
     /// Whether every row's parent is the row before it (a chain), so any kept path is a prefix of the rows.
     fn chainWindow(parents: []const i32) bool {
         for (parents, 0..) |parent, row| if (parent != @as(i32, @intCast(row)) - 1) return false;
@@ -470,7 +494,11 @@ pub const Runner = struct {
     fn deferGdn(r: *Runner, round: *const Round, plan: GdnPlan, accepted: bool) !?abi.Deferred {
         const pending = &r.gdn.pending;
         const star = !accepted and r.defer_gdn and round.windows.len == 1 and r.gdn.starPlan(plan);
-        if (!star or (pending.rows != 0 and pending.slot != round.slots[0])) try r.settleGdn();
+        if (!star or (pending.rows != 0 and pending.slot != round.slots[0])) {
+            // the caller's pending work (a keep that may stash pending rows) lands before a replay reads them
+            try r.settleCaller();
+            try r.settleGdn();
+        }
         if (!star) return null;
         pending.slot = round.slots[0];
         // the K-th round since the last write-back writes back, or one whose keep might not fit behind the pending rows
@@ -548,13 +576,17 @@ pub const Runner = struct {
 
     fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred };
+        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         const plan = (r.current_attention orelse return error.RoundNotReady).*;
+        if (r.scratch_due) {
+            try r.scratch.upload(plan);
+            r.scratch_due = false;
+        }
         const layer = r.attention_index[block];
         var views: [attn.planning.max_streams]attn.Cache = undefined;
         const caches = r.layerCaches(layer, r.current_round orelse return error.RoundNotReady, &views);

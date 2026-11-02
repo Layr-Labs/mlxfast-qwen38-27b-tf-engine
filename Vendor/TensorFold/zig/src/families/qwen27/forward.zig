@@ -45,8 +45,12 @@ pub const Stages = struct {
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
     after: ?Hook = null,
+    /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
+    /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
+    settle: ?Hook = null,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
+    pace_verify: bool = false,
     compact: bool = false,
     /// An image prompt's rows: the frame's `takes` rows take theirs over their placeholders' embeddings.
     images: ?Ref = null,
@@ -211,6 +215,9 @@ pub const Stages = struct {
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
+    }
+    pub fn beforeCommit(s: *Stages) !void {
+        if (s.settle) |h| try h.run(h.ptr);
     }
 };
 

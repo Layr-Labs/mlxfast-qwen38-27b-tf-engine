@@ -97,7 +97,7 @@ pub const Params = extern struct {
     advance: u32,
 };
 pub const Recorder = struct {
-    bindings: [16]?Binding = @splat(null),
+    bindings: [19]?Binding = @splat(null),
     pipeline: usize = 0,
     params: Params = undefined,
     restores: usize = 0,
