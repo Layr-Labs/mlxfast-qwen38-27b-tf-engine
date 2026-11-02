@@ -335,6 +335,10 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     const y = try b.frame.add(rows_ref, x.rows, slots * 32, Head.rescored_stride, .bf16);
     const input = try b.frame.ref(x);
     b.access(e, &.{ try b.span(x), Span.whole(sums.ref.buffer), try b.span(list) }, &.{try b.span(y)});
+    // beside the tile launch, behind the barrier above: its listed tiles' lines requested at once (Kernels.warmTiles), so
+    // its one SIMD group a tile finds them in the caches as it walks their K groups. Nothing it writes is read; one that
+    // fails to encode only loses its prefetch (the launch below sets its own pipeline and bindings).
+    b.target.kernels.warmTiles(e, b.head.linear, .{ .buffer = list_ref.buf, .offset = list_ref.off }, slots) catch {};
     try b.target.kernels.quantTiles(e, b.head.linear, .{ .buffer = input.buf, .offset = input.off }, sums, .{ .buffer = list_ref.buf, .offset = list_ref.off }, .{ .buffer = rows_ref.buf, .offset = rows_ref.off }, x.rows, slots, Head.rescored_stride);
     return .{ .logits = y, .token_ids = map };
 }
