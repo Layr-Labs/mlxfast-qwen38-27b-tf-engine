@@ -692,6 +692,27 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_EARLY(t)
 #define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
 #endif
+// TF_PROMPT_R2: a SIMD group runs two 16-row blocks (rows r0 .. r0 + 15 and r0 + 16 .. r0 + 31) through each tile's
+// unpacked codes: the second block's K = 32 products run on the same right operand right after the first's, and its
+// sums take the same FMA chain from its own row sums, so every output word is the one its own 16-row launch gives.
+#if defined(TF_PROMPT_R2)
+#define TF_R2_M if (hb) opm.run(xl0b, cbl, Pb);
+#define TF_R2_A if (hb) opa.run(xl1b, cbl, Pb);
+#define TF_R2_FMA(t) if (hb) { \
+      TF_UNROLL \
+      for (int j = 0; j < 4; j++) { \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        D[t][j] = fma(s0, Pb[j], fma(b0, x0b, D[t][j])); \
+        D[t][4 + j] = fma(s0, Pb[4 + j], fma(b0, x1b, D[t][4 + j])); \
+        D[t][8 + j] = fma(s1, Pb[8 + j], fma(b1, x0b, D[t][8 + j])); \
+        D[t][12 + j] = fma(s1, Pb[12 + j], fma(b1, x1b, D[t][12 + j])); \
+      } }
+#else
+#define TF_R2_M
+#define TF_R2_A
+#define TF_R2_FMA(t)
+#endif
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
@@ -707,6 +728,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
       TF_STREAM_EARLY(t) \
       opm.run(xl0,cbl,P); \
+      TF_R2_M \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
         const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
@@ -717,6 +739,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
       TF_STREAM_LATE(t) \
       opa.run(xl1,cbl,P); \
+      TF_R2_A \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
@@ -726,6 +749,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
         C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
+      TF_R2_FMA(t) \
 }
 #else
 #define TF_TN_TILE(t) { \
@@ -780,7 +804,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
+#if defined(TF_PROMPT_R2)
+#if TF_PROMPT_TN != 2 || defined(TF_SWIGLU)
+#error "two row blocks a SIMD group take the two-tile streamed launch without SwiGLU"
+#endif
+  const int r0 = int(tg.y) * 32, rows = mdims[0] - r0;
+#else
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+#endif
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
 #if defined(TF_SWIGLU)
@@ -815,6 +846,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto cbh = TF_TN_RIGHT;
 #endif
   auto P = TF_TN_DEST;
+#if defined(TF_PROMPT_R2)
+  const bool hb = rows > 16;            // the second block holds rows (uniform across the SIMD group)
+  const int Mb = hb ? min(rows - 16, 16) : 1;
+  auto xl0b = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto xl1b = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto Pb = TF_TN_DEST;
+  float D[TN][16];
+  TF_UNROLL
+  for (int t = 0; t < TN; t++) {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) D[t][i] = 0.0f;
+  }
+#endif
   const half2 bias = half2(1024.0h);
 #if defined(TF_SWIGLU)
   const int first = TF_G0, last = TF_G0 + TF_GN; // one K split: the threadgroup's SIMD groups are the gate and up pairs
@@ -836,11 +880,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
+#if defined(TF_PROMPT_R2)
+    const float x0b = hb ? xp[16] : 0.0f, x1b = hb ? xp[24] : 0.0f;
+#endif
     xp += stride;
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#if defined(TF_PROMPT_R2)
+    if (hb) {
+      x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)(xv - GS) + 16 * TF_K, dextents<int32_t, 2>(GS, Mb), xstr));
+      TF_UNROLL
+      for (int i = 0; i < 16; i++) { xl0b[i] = x64[i]; xl1b[i] = x64[16 + i]; }
+    }
+#endif
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
@@ -915,6 +969,43 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       }
     }
   }
+#if defined(TF_PROMPT_R2)
+  // the second block: the same K split reduction (its own partials, in slice order) and stores, rows 16 apart
+  threadgroup float partb[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+  if (TF_SK > 1) {
+    if (ks > 0) {
+      TF_UNROLL
+      for (int t = 0; t < TN; t++) {
+        TF_UNROLL
+        for (int i = 0; i < 16; i++) partb[(((ks - 1) * TN + t) * 16 + i) * 32 + lane] = D[t][i];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+      for (int s2 = 1; s2 < TF_SK; s2++) {
+        TF_UNROLL
+        for (int t = 0; t < TN; t++) {
+          TF_UNROLL
+          for (int i = 0; i < 16; i++) D[t][i] += partb[(((s2 - 1) * TN + t) * 16 + i) * 32 + lane];
+        }
+      }
+    }
+  }
+  if (ks == 0 && hb) {
+    TF_UNROLL
+    for (int t = 0; t < TN; t++) {
+      TF_UNROLL
+      for (int i = 0; i < 16; i++) {
+        const int m = mb + 8 * ((i >> 2) & 1), n = (tile0 + t) * NT + nb + 16 * (i >> 3) + (i & 3);
+#if defined(TF_RESID)
+        if (m < Mb && n < TF_N) RO[(size_t)(16 + m) * TF_YS + n] = bfloat(float(H[(size_t)(16 + m) * TF_YS + n]) + float(static_cast<bfloat>(D[t][i])));
+#else
+        if (m < Mb && n < TF_N) Y[(size_t)(16 + m) * TF_YS + n] = static_cast<TF_OUT>(D[t][i]);
+#endif
+      }
+    }
+  }
+#endif
 #endif
 }
 #endif
