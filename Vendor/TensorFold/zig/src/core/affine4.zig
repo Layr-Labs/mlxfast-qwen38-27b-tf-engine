@@ -119,6 +119,9 @@ fn groupsBits(weights: []const u16, words: []u32, scales: []u16, biases: []u16, 
         if (!std.math.isFinite(scale) or scale == 0) return error.NonFiniteAffineRange;
         scales[group] = asBf16(scale);
         biases[group] = asBf16(bias);
+        if (bits == 4) refit(values, &scales[group], &biases[group], levels);
+        scale = asFloat(scales[group]);
+        bias = asFloat(biases[group]);
         const out = words[group * per_group ..][0..per_group];
         @memset(out, 0);
         for (values, 0..) |b, index| {
@@ -128,6 +131,58 @@ fn groupsBits(weights: []const u16, words: []u32, scales: []u16, biases: []u16, 
             out[bit / 32] |= code << shift;
             if (bit % 32 + bits > 32) out[bit / 32 + 1] |= code >> @intCast(32 - @as(u32, shift));
         }
+    }
+}
+
+/// Least-squares steps after the min-max fit of a 4-bit drafter group: the closed-form (scale, bias) for the current
+/// codes, then the nearest codes for the new pair; a step is kept only if the group's squared error with the bf16 pair
+/// falls (akki-rock05's drafter refit on the CUDA track, adeef663).
+pub const refit_steps: usize = 3;
+fn refit(values: []const u16, scale_io: *u16, bias_io: *u16, levels: f32) void {
+    var s0 = asFloat(scale_io.*);
+    var b0 = asFloat(bias_io.*);
+    if (s0 == 0 or !std.math.isFinite(s0)) return;
+    var best: f32 = 0;
+    for (values) |bits| {
+        const v = asFloat(bits);
+        const d = v - (b0 + s0 * @min(levels, @max(@as(f32, 0), @round((v - b0) / s0))));
+        best += d * d;
+    }
+    var step: usize = 0;
+    while (step < refit_steps) : (step += 1) {
+        var sc: f64 = 0;
+        var sv: f64 = 0;
+        var scc: f64 = 0;
+        var scv: f64 = 0;
+        for (values) |bits| {
+            const v = asFloat(bits);
+            const c: f64 = @min(levels, @max(@as(f32, 0), @round((v - b0) / s0)));
+            sc += c;
+            sv += v;
+            scc += c * c;
+            scv += c * v;
+        }
+        const n: f64 = @floatFromInt(values.len);
+        const den = n * scc - sc * sc;
+        if (den <= 0) return;
+        const s_fit: f64 = (n * scv - sc * sv) / den;
+        const s16 = asBf16(@floatCast(s_fit));
+        const b16 = asBf16(@floatCast((sv - s_fit * sc) / n));
+        const s1 = asFloat(s16);
+        const b1 = asFloat(b16);
+        if (s1 == 0 or !std.math.isFinite(s1) or !std.math.isFinite(b1)) return;
+        var err: f32 = 0;
+        for (values) |bits| {
+            const v = asFloat(bits);
+            const d = v - (b1 + s1 * @min(levels, @max(@as(f32, 0), @round((v - b1) / s1))));
+            err += d * d;
+        }
+        if (!(err < best)) return;
+        best = err;
+        scale_io.* = s16;
+        bias_io.* = b16;
+        s0 = s1;
+        b0 = b1;
     }
 }
 

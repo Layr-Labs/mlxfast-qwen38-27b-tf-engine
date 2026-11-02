@@ -13,7 +13,7 @@ const first_commit = 1;
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
-/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+/// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -342,18 +342,16 @@ pub const Runner = struct {
     }
 
     /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
+    /// with none of a verify's hooks around it.
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
         return staggerParts() > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    /// The segments a staggered pass takes.
     fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
-        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(stagger_parts, @import("core").segments.MAX);
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
@@ -816,6 +814,10 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
+        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
+        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -823,6 +825,16 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    }
+};
+
+/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
+const Warm = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    out: @import("projection.zig").Linear,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out);
     }
 };
 

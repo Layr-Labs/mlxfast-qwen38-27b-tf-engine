@@ -121,6 +121,9 @@ pub const Round = struct {
     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
     /// Every segment a depth-one star (node 0, the rest its children) on a verify that steps no state: forwardStar.
     star: bool = false,
+    /// Encoded right behind a star scan's launch, in its barrier interval (forwardStar): work that reads nothing the scan or
+    /// its gate writes and writes nothing anything reads, so the counted gate stays counted (Kernels.warm).
+    warm: ?Beside = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -213,7 +216,7 @@ pub const Round = struct {
         r.b.slot_steps.bind(e, 11);
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         r.gate(e, post_rows);
@@ -261,9 +264,10 @@ pub const Round = struct {
         e.setValue(wait_prep, 18);
         // eight simdgroups a threadgroup: half the threadgroups, so half the pollers on the prepare's count in this
         // shared barrier interval (one a threadgroup at the star wait; four times as many cost 1.2% decode)
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 16, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 16) * r.p.nv * r.segments));
+        if (r.warm) |w| try w.encode(w.ptr, e);
+        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 32) * r.p.nv * r.segments));
         e.barrier();
         r.gate(e, post_rows);
     }
@@ -309,7 +313,8 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
+        // eight rows a group: half the groups waiting on the star's count (one poller a group), as the star's own wait
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 7) / 8 }, .{ .width = 256 });
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
@@ -385,7 +390,7 @@ pub const Round = struct {
     }
 
     fn stateGrid(r: Round, e: metal.ComputeEncoder) void {
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
     }
 };
 

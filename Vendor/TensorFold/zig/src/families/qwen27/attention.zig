@@ -227,6 +227,10 @@ pub const Attention = struct {
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
+    /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
+    warm: ?Warm = null,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -246,7 +250,7 @@ pub const Attention = struct {
         const units = device.tensorUnits();
         const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
         errdefer if (split_tail) |pipe| pipe.deinit();
-        const prefix_quarter: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prefix_quarter_1", false) else null;
+        const prefix_quarter: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prefix_eighth_1", false) else null;
         errdefer if (prefix_quarter) |pipe| pipe.deinit();
         const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
         errdefer if (chain_words) |b| b.deinit();
@@ -516,7 +520,7 @@ pub const Attention = struct {
             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
             prefix_groups = g.kv_heads * plan.prefix_chunks * ((plan.tiles + sg - 1) / sg);
-            // Sparse prefix grids benefit from four narrower accumulator owners.
+            // Sparse prefix grids take eight narrower accumulator owners (32 output columns a SIMD group).
             // Keep the original partition once the grid has enough groups to fill the GPU.
             const quarter = sg == 1 and prefix_groups < 128 and a.prefix_quarter != null;
             e.setPipeline(if (quarter) a.prefix_quarter.? else a.prefix[sg - 1]);
@@ -532,7 +536,8 @@ pub const Attention = struct {
             e.setValue(@as(u32, @intFromBool(chain != null)), 10);
             e.setBuffer(words, 16, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
-            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
+            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 256 else 64 * sg, 1, 1));
+            if (a.warm) |w| try w.encode(w.ptr, e);
             if (chain == null) e.barrier();
         }
         if (!plan.fused) {
