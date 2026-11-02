@@ -34,6 +34,8 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: Buffer) void {
+        // a later buffer may take this object's address: encoders forget the bindings they skip rebinding (command.zig)
+        command.forgetBindings();
         objc.release(self.id);
     }
 };
