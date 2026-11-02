@@ -245,7 +245,7 @@ pub const Round = struct {
     /// each group loads its committed words and replays its pending rows, then waits on that many prepare groups.
     pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32) !void {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1) or (wait_prep != 0 and counter == null)) return error.BadGdnPlan;
-        const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
+        const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 32 == 0;
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
         r.b.segments.bind(e, 7);
@@ -259,11 +259,11 @@ pub const Round = struct {
         }
         if (wait_prep != 0) e.setBuffer(counter.?, star_words, 17) else r.b.recurrent.bind(e, 17); // never read: wait_prep 0
         e.setValue(wait_prep, 18);
-        // eight simdgroups a threadgroup: half the threadgroups, so half the pollers on the prepare's count in this
+        // sixteen simdgroups a threadgroup: a quarter of the threadgroups, so a quarter of the pollers on the prepare's count in this
         // shared barrier interval (one a threadgroup at the star wait; four times as many cost 1.2% decode)
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 16, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 16) * r.p.nv * r.segments));
+        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 32) * r.p.nv * r.segments));
         e.barrier();
         r.gate(e, post_rows);
     }
