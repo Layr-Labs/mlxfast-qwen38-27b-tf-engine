@@ -20,6 +20,9 @@ using namespace mpp::tensor_ops;
 #define TF_SBI12 1
 #define TF_SIEVE_KAPPA 7.0f
 #endif
+#ifndef TF_SIEVE_M
+#define TF_SIEVE_M 16
+#endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
 constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at most, relative to its size
@@ -86,7 +89,8 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto desc = matmul2d_descriptor(TF_SIEVE_M, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr int PS = TF_SIEVE_M == 8 ? 4 : 8;
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto a0 = a.slice(0, 0);
@@ -150,7 +154,7 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
       const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
       // code = 4 (code >> 2) + 1.5 + r: scale 4 s on the 2-bit product, bias b + 1.5 s on the row sum
       C[j] = fma(4.0f * s0, P[j], fma(fma(1.5f, t0, b0), x0, C[j]));
-      C[4 + j] = fma(4.0f * s1, P[8 + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
+      C[4 + j] = fma(4.0f * s1, P[PS + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
       V[j] = fma(t0 * t0, xq, V[j]);
       V[4 + j] = fma(t1 * t1, xq, V[4 + j]);
     }
