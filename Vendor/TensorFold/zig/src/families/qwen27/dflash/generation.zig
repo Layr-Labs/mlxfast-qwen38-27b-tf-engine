@@ -17,6 +17,30 @@ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []co
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
 const precise_below: f32 = 0.95;
+/// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
+fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+    const m: *@import("../model.zig").Model = @ptrCast(@alignCast(ptr));
+    if (m.weights.layers.len == 0) return;
+    switch (m.weights.layers[0].mixer) {
+        .linear => |g| {
+            try m.kernels.warmAll(e, g.qkv);
+            try m.kernels.warmAll(e, g.zba);
+        },
+        .attention => |at| {
+            try m.kernels.warmAll(e, at.q);
+            try m.kernels.warmAll(e, at.kv);
+        },
+    }
+}
+/// The drafter's fusion projection (fc), the first weights its next frame streams (quant_gpu.Kernels.warmDrafter), from
+/// inside the verify head sieve: the copy runtime_callbacks.project reads for that frame's taps (terrapinelf's ee36d834).
+fn warmDraftFusion(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+    const d: *Draft = @ptrCast(@alignCast(ptr));
+    const b = &d.backend;
+    const key = @intFromPtr(d.graph.fusion.bytes.ptr);
+    const copy = (if (b.precise) b.prepared.get(key | @import("runtime_backend.zig").Backend.precise_key) else null) orelse b.prepared.get(key) orelse return;
+    try b.target.kernels.warmDrafter(e, copy.words);
+}
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
@@ -50,6 +74,8 @@ pub const Generation = struct {
         // the greedy verify head's sieve: its 2-bit copy now, not in the first timed round; one that fails to build
         // leaves the full head
         if (runner.headSieve()) |_| {} else |err| std.log.warn("qwen27: head sieve off: {t}", .{err});
+        // the bridge spin behind each early frame first streams the next verify's first input projections into the system cache
+        if (draft.backend.frame.bridge) |*bridge| bridge.warm = .{ .ptr = runner.model, .encode = warmFirstLayer };
         return .{ .allocator = a, .runner = runner, .draft = draft, .kept = kept, .taps = taps, .matcher = matcher, .commit = commit };
     }
     pub fn deinit(g: Generation) void {
@@ -199,7 +225,7 @@ pub const Generation = struct {
             const width: u32 = @intCast(g.runner.model.config.vocab);
             const shape = if (p.sieve) sieved: {
                 const sieve = if (g.runner.sieve) |*s| s else return error.DraftKeepGpuFailure;
-                try sieve.encode(e, g.runner.model, @intCast(p.ids.len), g.matcher.picks());
+                try sieve.encode(e, g.runner.model, @intCast(p.ids.len), g.matcher.picks(), .{ .ptr = g.draft, .encode = warmDraftFusion });
                 e.barrier();
                 break :sieved try g.matcher.encodePicked(e, p.ids, p.parents, width, p.budget, p.eos);
             } else try g.matcher.encode(e, .{ .buf = logits.buffer, .off = logits.offset }, p.ids, p.parents, width, p.budget, p.eos);
