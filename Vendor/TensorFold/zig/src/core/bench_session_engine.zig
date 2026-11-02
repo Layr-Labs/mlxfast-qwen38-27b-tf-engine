@@ -231,7 +231,11 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+/// The 8-row tile's weight stream is paid either way (rows8: the tile does not grow with its rows), so a row's marginal
+/// cost is its tree step alone -- one row of a round whose 13.5 GB of weights it does not re-read. A sibling in
+/// [0.007, 0.015) therefore still pays: it adds its own chance to land to the round, which moves the round from one
+/// emitted token to two without a second pass over the weights.
+pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
