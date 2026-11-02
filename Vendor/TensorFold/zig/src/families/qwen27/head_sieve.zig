@@ -142,6 +142,19 @@ pub const HeadSieve = struct {
         return .{ .buffer = s.scratch, .offset = offset };
     }
 
+    /// Tiles in a thousand the scan computes in fp32 FMAs (tf_sieve_alu_tile) for `rows` decoded rows, the rest on the
+    /// tensor units. The tensor tile costs the same at any row count, the fp32 form about one FMA a code and row plus a
+    /// fixed unpack, so the ALUs' share falls as rows grow; the shares stay below the balance point, so the tensor tiles
+    /// remain the longer part.
+    pub fn aluPermille(rows: u32) u32 {
+        return switch (rows) {
+            0, 1, 2 => 380,
+            3, 4 => 300,
+            5, 6 => 220,
+            else => 180,
+        };
+    }
+
     /// A greedy verify's picks over `rows` of the frame's final normed rows (`input`, with the norm's group sums), behind
     /// the barrier that follows that norm: each row's token and nonfinite mask into `picks` (tree_round.Pick a row), as
     /// the full head's argmax would write them under the sieve's kappa condition. The frame's logits buffer takes the
@@ -172,6 +185,8 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_hm, 4);
         e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
         e.setBuffer(s.scratch, s.o_xq, 6);
+        // a share of the tiles, spread over the grid, take the scan's fp32 form (tf_sieve_alu_tile) beside the tensor ones
+        e.setValue(aluPermille(rows), 7);
         e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
         e.barrier();
         // 3: each row's first tile
