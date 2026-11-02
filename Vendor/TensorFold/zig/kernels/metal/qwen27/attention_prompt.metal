@@ -150,6 +150,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
 }
 #define Q27_PROMPT(SG) template [[host_name("q27_attn_prompt_" #SG)]] kernel void q27_attn_prompt<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant Q27PromptArgs&, device float*, device float*, device float*, uint3, ushort, ushort);
 Q27_PROMPT(4)
+Q27_PROMPT(8)
 
 // A packed row's chunks merged in key order, normalized and written as the row's head output.
 kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device const float* PM [[buffer(1)]], device const float* PL [[buffer(2)]],

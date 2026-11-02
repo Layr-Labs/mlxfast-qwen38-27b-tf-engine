@@ -262,7 +262,9 @@ pub const Attention = struct {
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
     fn promptPipelines(device: mtl.Device, library: mtl.Library, units: bool) !?[2]mtl.Pipeline {
-        const chunks = try mtl.Pipeline.init(device, library, if (units) "q27_attn_prompt_4" else "q27_attn_prompt_sg_8", false);
+        // On tensor-unit silicon the prompt chunks kernel runs 8 simdgroups a threadgroup (256 threads): half the
+        // threadgroups, so the per-step threadgroup barriers are amortized over twice the tiles a launch.
+        const chunks = try mtl.Pipeline.init(device, library, if (units) "q27_attn_prompt_8" else "q27_attn_prompt_sg_8", false);
         if (!units and chunks.maxThreads() < prompt_threads) {
             std.log.info("qwen27: the prompt attention kernel runs {d} threads a group here, not {d}; prompt rows take the decode path", .{ chunks.maxThreads(), prompt_threads });
             chunks.deinit();
@@ -458,7 +460,7 @@ pub const Attention = struct {
         // before M5 (no shared prefix) the partials take the tail's buffers, which hold every chunk's packed rows
         const parts = if (g.shared_prefix) [3]Field{ .poa, .pma, .pla } else [3]Field{ .pob, .pmb, .plb };
         if (!g.shared_prefix and @as(usize, chunks) * plan.tiles * 16 > @as(usize, scratch.tail_chunks) * scratch.limits.rows * 16) return error.AttentionLimits;
-        const threads: u32 = if (a.units) 128 else prompt_threads;
+        const threads: u32 = if (a.units) 256 else prompt_threads;
         const pairs = threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
         // rows before plan.live_from have no reader: start at the tile group holding the first live packed row
         const live = if (a.units) @min(plan.live_from, plan.rows) else 0; // the M5 kernel and merge take the offsets
