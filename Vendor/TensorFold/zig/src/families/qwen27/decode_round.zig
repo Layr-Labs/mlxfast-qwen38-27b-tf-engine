@@ -13,7 +13,7 @@ const first_commit = 1;
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
-/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+/// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -342,18 +342,16 @@ pub const Runner = struct {
     }
 
     /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
+    /// with none of a verify's hooks around it.
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
         return staggerParts() > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    /// The segments a staggered pass takes.
     fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
-        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(stagger_parts, @import("core").segments.MAX);
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
