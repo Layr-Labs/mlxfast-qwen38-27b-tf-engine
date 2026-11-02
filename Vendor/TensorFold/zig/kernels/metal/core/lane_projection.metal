@@ -834,13 +834,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+  // the next group's 16 x 64 activations load right after this group's are copied into its operands, so the load
+  // overlaps this group's products instead of starting the next iteration (the same words, the same operands)
+  if (first < last) x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+    if (g + 1 < last) x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
