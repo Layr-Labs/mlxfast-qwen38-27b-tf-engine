@@ -359,7 +359,14 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // Short sleeps instead of yield-spinning a core for the whole request (the CPU and GPU share one package's power);
+        // TF_BENCH_WAIT=yield: the yield loop; TF_BENCH_WAIT_US: the sleep between checks in microseconds (20)
+        const sys = @import("sys").c;
+        if (!std.mem.eql(u8, std.mem.span(sys.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
+            const us: u32 = if (sys.getenv("TF_BENCH_WAIT_US")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 20 else 20;
+            const req: sys.timespec = .{ .sec = 0, .nsec = @intCast(@as(u64, @min(us, 999_999)) * std.time.ns_per_us) };
+            while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
+        } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
     }
 };
