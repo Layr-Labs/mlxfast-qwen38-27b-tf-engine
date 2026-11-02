@@ -229,9 +229,14 @@ pub const EngineDflashBinding = struct {
 /// Depth-one siblings a DFlash round verifies: the pending row and 7 drafts fill the 8-row decode projections, whose
 /// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
 pub const dflash_width = 7;
-/// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
-/// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+/// A sibling the drafter gives less than this probability is left out, and the width bound is what makes the trade
+/// one-sided: the floor can only *widen* the flat depth-one tree toward dflash_width, never past it (selector.Policy
+/// with max_depth 1 admits roots only, so the offered frontier is the tree). A round already pays for all eight rows —
+/// the decode projections are rows8, head.rescored_rows is 8, the sieve scans a fixed eight rows — so a sibling added
+/// below 0.015 buys its chance to land for the marginal GDN tree step and attention row alone, not for any weight read.
+/// The round's best draft is always verified. At 0.015 the tail of the drafter's top-k that falls between the two
+/// cutoffs left rows empty; at 0.007 they are filled and each fill is one more candidate the exact pass can match.
+pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
