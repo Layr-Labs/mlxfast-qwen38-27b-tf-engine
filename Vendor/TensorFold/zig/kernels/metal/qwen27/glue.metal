@@ -237,7 +237,7 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
   if (wait_for != 0u) { \
     if (t == 0) { \
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
+      for (uint spin = 0, pause = 0u; spin < (1u << 24) + uint(pause == 0x9e3779b9u) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) for (uint k = 0; k < 32u; k++) pause = pause * 1664525u + 1013904223u; \
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
       if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
@@ -268,7 +268,7 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
                  uint lane [[thread_index_in_simdgroup]]) {
   if (wait_for != 0u) {
     if (t == 0) {
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      for (uint spin = 0, pause = 0u; spin < (1u << 24) + uint(pause == 0x9e3779b9u) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) for (uint k = 0; k < 32u; k++) pause = pause * 1664525u + 1013904223u;
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
       if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);

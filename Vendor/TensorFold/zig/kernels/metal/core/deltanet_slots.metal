@@ -255,7 +255,7 @@ inline void tf_delta_star_leaves(float4 r0, float4 r1, device const bfloat* quer
 inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3 groups, uint t) {
   if (wait_prep == 0u) return;
   if (t == 0) {
-    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&PC[0], memory_order_relaxed) < wait_prep; spin++) {}
+    for (uint spin = 0, pause = 0u; spin < (1u << 24) + uint(pause == 0x9e3779b9u) && atomic_load_explicit(&PC[0], memory_order_relaxed) < wait_prep; spin++) for (uint k = 0; k < 32u; k++) pause = pause * 1664525u + 1013904223u;
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     const uint total = groups.x * groups.y * groups.z;
     if (atomic_fetch_add_explicit(&PC[1], 1u, memory_order_relaxed) + 1u == total) {
