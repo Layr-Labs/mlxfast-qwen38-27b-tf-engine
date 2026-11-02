@@ -66,6 +66,9 @@ pub const Own = struct {
     tails: metal.Buffer,
     recurrent: metal.Buffer,
     snapshots: metal.Buffer,
+    /// One layer's qkv projection rows: a segment that projects before it waits for the segment ahead (stagger.Wait.scan)
+    /// must not write the pool's span that segment's prepare is still reading.
+    projected: metal.Buffer,
 
     pub fn init(pool: *const Pool, device: metal.Device) !Own {
         const tails = try device.buffer(pool.get(.tails).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
@@ -73,9 +76,12 @@ pub const Own = struct {
         const recurrent = try device.buffer(pool.get(.recurrent).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
         errdefer recurrent.deinit();
         const snapshots = try device.buffer(pool.get(.snapshots).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
+        errdefer snapshots.deinit();
+        const projected = try device.buffer(pool.get(.qkv).length() / pool.budget.layers, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots, .projected = projected };
     }
     pub fn deinit(o: Own) void {
+        o.projected.deinit();
         o.tails.deinit();
         o.recurrent.deinit();
         o.snapshots.deinit();
@@ -449,7 +455,7 @@ pub const Pool = struct {
         const zs: usize = refs.zba_stride;
         const heads = pool.budget.shape.c.v_heads;
         const b = gdn.Buffers{
-            .qkv = try pool.layerSpan(.qkv, layer),
+            .qkv = if (refs.own) |o| .{ .buffer = o.projected, .offset = 0, .bytes = o.projected.length() } else try pool.layerSpan(.qkv, layer),
             .a = try refSpan(refs.a, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .b = try refSpan(refs.b, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .z = try refSpan(refs.z, if (zs == 0) bytes.value else ((p.rows - 1) * zs + pool.budget.shape.value) * 2),

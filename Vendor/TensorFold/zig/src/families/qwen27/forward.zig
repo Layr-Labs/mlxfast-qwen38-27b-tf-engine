@@ -13,6 +13,12 @@ pub const Mixer = struct {
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+    /// A mixer split around a staggered segment's wait (core/stagger.Wait.scan): its own input projections, then the rest.
+    /// Both or neither per kind; without them `front` encodes nothing and `back` is the whole mixer.
+    gdn_front: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void = null,
+    gdn_back: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void = null,
+    attention_front: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void = null,
+    attention_back: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void = null,
 };
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
@@ -105,6 +111,20 @@ pub const Stages = struct {
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+        }
+    }
+    pub fn front(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        const m = s.model;
+        switch (m.weights.layers[index].mixer) {
+            .linear => |g| if (s.hooks.gdn_front != null and s.hooks.gdn_back != null) try s.hooks.gdn_front.?(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
+            .attention => |a| if (s.hooks.attention_front != null and s.hooks.attention_back != null) try s.hooks.attention_front.?(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+        }
+    }
+    pub fn back(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        const m = s.model;
+        switch (m.weights.layers[index].mixer) {
+            .linear => |g| if (s.hooks.gdn_front != null and s.hooks.gdn_back != null) try s.hooks.gdn_back.?(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows) else try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
+            .attention => |a| if (s.hooks.attention_front != null and s.hooks.attention_back != null) try s.hooks.attention_back.?(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows) else try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {

@@ -28,7 +28,26 @@ pub const Hook = struct {
     own: ?pool_gpu.Own = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
-        const hook: *Hook = @ptrCast(@alignCast(ptr));
+        return run(@ptrCast(@alignCast(ptr)), e, block, weight, frame, rows, .all);
+    }
+    /// A staggered prompt segment's own input projections (qkv into `projectedRef`, b and a or all of zba into its frame),
+    /// encoded before it waits for the segment ahead: they read only this segment's norm rows and the weights.
+    pub fn front(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
+        return run(@ptrCast(@alignCast(ptr)), e, block, weight, frame, rows, .front);
+    }
+    /// The rest after the wait: prepare, scan (z beside it), gate and conv commit, which read the pool's shared state.
+    pub fn back(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
+        return run(@ptrCast(@alignCast(ptr)), e, block, weight, frame, rows, .back);
+    }
+    pub const Part = enum { all, front, back };
+
+    /// Where this layer's qkv rows go: a segment's own rows (gdn_pool_gpu.Own.projected) or the pool's layer span.
+    fn projectedRef(hook: *const Hook, layer: usize) !@import("projection.zig").Ref {
+        if (hook.own) |o| return .{ .buffer = o.projected, .offset = 0 };
+        return hook.pool.projected(layer);
+    }
+
+    fn run(hook: *Hook, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32, part: Part) !void {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
@@ -37,15 +56,19 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
-            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
+        const counted = !hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows);
+        // counted projections stay in the back, in their consumer's barrier interval
+        if (counted) {
+            if (part == .front) return;
+            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.projectedRef(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
-        } else {
-            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
+        } else if (part != .back) {
+            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.projectedRef(layer), rows);
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
         }
+        if (part == .front) return;
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);

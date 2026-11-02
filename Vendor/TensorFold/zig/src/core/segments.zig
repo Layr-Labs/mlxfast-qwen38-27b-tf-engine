@@ -163,6 +163,14 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             try x.fam.mixer(&x.lanes[k], i);
             if (x.early and i == 0 and i + 1 < x.layers) try x.commitLane(k);
         }
+        /// A family that waits at `scan` (stagger.Wait): its mixer split around the wait for the segment before.
+        pub fn front(x: *const @This(), k: usize, i: usize) !void {
+            if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "front")) try x.fam.front(&x.lanes[k], i);
+        }
+        pub fn back(x: *const @This(), k: usize, i: usize) !void {
+            if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "back")) try x.fam.back(&x.lanes[k], i) else try x.fam.mixer(&x.lanes[k], i);
+            if (x.early and i == 0 and i + 1 < x.layers) try x.commitLane(k);
+        }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;

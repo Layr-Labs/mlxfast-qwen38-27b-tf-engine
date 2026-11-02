@@ -766,7 +766,24 @@ pub const Runner = struct {
     };
 
     fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        return r.attentionPart(pass, e, block, weights, f, rows, .all);
+    }
+
+    /// `.front`: only the uncounted q+gate and k|v projections into this pass's own frame (a staggered segment encodes them
+    /// before it waits for the segment ahead); `.back`: everything else, after that wait.
+    fn attentionPart(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32, part: GdnHook.Part) !void {
         const plan = pass.plan.*;
+        // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
+        const dead = if (pass.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (pass.terminal_head == .last) rows - 1 else rows) else 0;
+        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
+        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
+        // or neither, so the shared counter always returns to zero
+        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
+        const counted = !promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows);
+        if (part == .front) {
+            if (!counted) try r.attentionProject(e, weights, f, rows, dead);
+            return;
+        }
         if (pass.scratch_due.*) {
             try pass.scratch.upload(plan);
             pass.scratch_due.* = false;
@@ -775,30 +792,12 @@ pub const Runner = struct {
         var views: [attn.planning.max_streams]attn.Cache = undefined;
         const caches = r.layerCaches(layer, pass.round, &views);
         try pass.bindings[layer].upload(plan, caches);
-        // the terminal block's other queries have no reader: their stale rows only reach the rows post drops
-        const dead = if (pass.terminal_head != .all and block + 1 == r.model.config.layers and r.attention.promptPath(plan, r.model.kernels.prompt)) (if (pass.terminal_head == .last) rows - 1 else rows) else 0;
-        // decoded verify rows: q+gate and k|v count their threadgroups past a device fence and the preprocess that reads them
-        // waits on that count in the same barrier interval, as the record's norms wait on their projections; both are counted
-        // or neither, so the shared counter always returns to zero
         var after: ?attn.After = null;
-        const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
-        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+        if (counted) {
             const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
             const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
             after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
-        } else {
-            if (dead < rows) {
-                var input = f.get(.input);
-                input.offset += @as(usize, dead) * weights.q.k * 2;
-                var query_sums = forward.sums(f, .sums, rows);
-                query_sums.ref.offset += @as(usize, dead) * 4;
-                var query = f.get(.q_gate);
-                query.offset += @as(usize, dead) * weights.q.n * 2;
-                try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
-            }
-            try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
-            e.barrier();
-        }
+        } else if (part == .all) try r.attentionProject(e, weights, f, rows, dead);
         // keys and values read in place from the [key | value] rows
         const kv: u32 = @intCast(r.model.config.kvDim());
         const mixed = f.get(.mixed);
@@ -818,6 +817,21 @@ pub const Runner = struct {
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
+    }
+
+    /// The uncounted q+gate (live rows only) and k|v projections, then the barrier their readers need.
+    fn attentionProject(r: *Runner, e: mtl.ComputeEncoder, weights: wts.Attention, f: *Frame, rows: u32, dead: u32) !void {
+        if (dead < rows) {
+            var input = f.get(.input);
+            input.offset += @as(usize, dead) * weights.q.k * 2;
+            var query_sums = forward.sums(f, .sums, rows);
+            query_sums.ref.offset += @as(usize, dead) * 4;
+            var query = f.get(.q_gate);
+            query.offset += @as(usize, dead) * weights.q.n * 2;
+            try r.model.kernels.quant(e, weights.q, input, query_sums, f.get(.dims), query, rows - dead);
+        }
+        try r.model.kernels.quant(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.dims), f.get(.mixed), rows);
+        e.barrier();
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
@@ -863,7 +877,7 @@ const Second = struct {
         if (s.frame.standby) |bank| for (bank) |b| fields.one(b, hook, joining);
         fields.apply(&s.scratch, hook, joining);
         for (s.bindings) |*b| fields.apply(b, hook, joining);
-        for ([_]mtl.Buffer{ s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
+        for ([_]mtl.Buffer{ s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots, s.gdn.projected }) |b| fields.one(b, hook, joining);
     }
 
     fn deinit(s: *Second, a: std.mem.Allocator) void {
@@ -888,22 +902,50 @@ const Segment = struct {
     total: u32,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null, .gdn_front = gdnFront, .gdn_back = gdnBack, .attention_front = attentionFront, .attention_back = attentionBack };
     }
-    fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+    fn gdnPart(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32, comptime part: GdnHook.Part) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
         var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
-        try GdnHook.forward(&hook, e, block, weights, frame, rows);
+        try switch (part) {
+            .all => GdnHook.forward(&hook, e, block, weights, frame, rows),
+            .front => GdnHook.front(&hook, e, block, weights, frame, rows),
+            .back => GdnHook.back(&hook, e, block, weights, frame, rows),
+        };
+    }
+    fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        return gdnPart(ptr, e, block, weights, frame, rows, .all);
+    }
+    fn gdnFront(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        return gdnPart(ptr, e, block, weights, frame, rows, .front);
+    }
+    fn gdnBack(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        return gdnPart(ptr, e, block, weights, frame, rows, .back);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
         return s.r.attentionPass(s.attention, e, block, weights, f, rows);
+    }
+    fn attentionFront(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        return s.r.attentionPart(s.attention, e, block, weights, f, rows, .front);
+    }
+    fn attentionBack(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        return s.r.attentionPart(s.attention, e, block, weights, f, rows, .back);
     }
     fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
         try s.r.taps.recordAt(s.r.model.glue, e, layer, hidden, rows, s.tap_row, s.total);
     }
 };
+
+/// TF_Q27_STAGGER_WAIT=mixer: a staggered segment waits for the one ahead before its whole mixer (its input projections
+/// too), as before the scan-point wait.
+fn waitAtMixer() bool {
+    const v = std.c.getenv("TF_Q27_STAGGER_WAIT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "mixer");
+}
 
 /// A staggered prompt pass's segments as one family for core/segments.zig: each hook goes to its lane's stages.
 const Stagger = struct {
@@ -913,8 +955,11 @@ const Stagger = struct {
     pub fn begin(p: *Stagger, lane: *Lane) !void {
         return p.stages[lane.k].begin(lane);
     }
+    /// Each segment's own input projections run before it waits for the segment ahead; its prepare, scan and gate (or
+    /// attention preprocess and kernels), which read and write the pool's state and the KV cache rows, after.
+    /// TF_Q27_STAGGER_WAIT=mixer keeps the whole mixer behind the wait (A/B switch).
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
-        return .mixer;
+        return if (waitAtMixer()) .mixer else .scan;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
@@ -922,6 +967,12 @@ const Stagger = struct {
     }
     pub fn mixer(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].mixer(lane, index);
+    }
+    pub fn front(p: *Stagger, lane: *Lane, index: usize) !void {
+        return p.stages[lane.k].front(lane, index);
+    }
+    pub fn back(p: *Stagger, lane: *Lane, index: usize) !void {
+        return p.stages[lane.k].back(lane, index);
     }
     pub fn post(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].post(lane, index);
