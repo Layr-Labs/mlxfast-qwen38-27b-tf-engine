@@ -50,6 +50,9 @@ pub const Hook = struct {
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         gated.own = hook.own;
+        // decoded verify rows: the star scan's interval also touches the out projection's leading weights (Warm)
+        var warm = Warm{ .quant = hook.quant, .out = weight.out };
+        if (!hook.accepted_chain and Warm.enabled()) gated.warm = .{ .ptr = &warm, .encode = Warm.encode };
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
@@ -59,6 +62,27 @@ pub const Hook = struct {
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers) return error.BadGdnHook;
         try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e);
+    }
+};
+
+/// Bytes of the out projection's codes a decoded star scan's interval touches ahead of the gate (about 6 MB of its 15.7 MB
+/// 5120 x 6144 q4 codes, with the matching share of its scale/bias pairs): a few tens of microseconds of the memory
+/// bandwidth the sequential scan leaves idle, small enough to stay in the system cache until the projection reads it.
+const warm_bytes: usize = 6 << 20;
+
+/// The out projection's leading weights read into the system cache while the decoded star scan runs (Kernels.warm),
+/// encoded after the scan's launch and before its gate in the same barrier interval. TF_Q27_WARM=0 turns it off.
+/// (Repeat measurement r2 of this lever, 11-02: the first official run stopped at the box's quiescence gate, unscored.)
+const Warm = struct {
+    quant: *Quant,
+    out: Linear,
+    fn enabled() bool {
+        const v = @import("std").c.getenv("TF_Q27_WARM") orelse return true;
+        return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    }
+    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out, warm_bytes);
     }
 };
 
