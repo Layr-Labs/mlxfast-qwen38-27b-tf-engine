@@ -168,16 +168,29 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
     }
 }
 /// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
-/// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
-/// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
+/// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, and on the ranges with each
+/// end shrunk on its own (an outlier is usually on one side), keeping the one whose bf16 scale and bias give the least
+/// squared error over the group. Codes clamp to the levels, so clipped values saturate.
 fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
     const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
+    // the 13 shrinks of the whole range, then each end on its own (every 0.1 from 1 to 0.4) where they differ
+    const sides = [_]f32{ 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4 };
+    var pairs: [shrinks.len + sides.len * sides.len][2]f32 = undefined;
+    var n_pairs: usize = 0;
+    for (shrinks) |f| {
+        pairs[n_pairs] = .{ f, f };
+        n_pairs += 1;
+    }
+    for (sides) |fl| for (sides) |fh| if (fl != fh) {
+        pairs[n_pairs] = .{ fl, fh };
+        n_pairs += 1;
+    };
     var best_err: f32 = std.math.inf(f32);
     var best_scale: u16 = 0;
     var best_bias: u16 = 0;
-    for (shrinks) |shrink| {
-        const lo = lower * shrink;
-        const hi = upper * shrink;
+    for (pairs[0..n_pairs]) |pair| {
+        const lo = lower * pair[0];
+        const hi = upper * pair[1];
         var bias: f32 = if (@abs(lo) > @abs(hi)) lo else hi;
         var scale: f32 = @max((hi - lo) / levels, @as(f32, 1e-7));
         if (bias >= 0) scale = -scale;
