@@ -6,6 +6,9 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 16;
+/// Layers a staggered prompt pass commits between: its lanes run beside each other, so finer chunks let one lane's
+/// sequential GDN scan run beside another lane's projections more often (a single lane keeps `commit_every`).
+const stagger_commit = 4;
 /// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
 /// encode, and the host encodes the next chunk's layers while the GPU runs that one.
 const first_commit = 1;
@@ -381,9 +384,28 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: the running sum of weights 4^(parts-1-j) * 5^j over j < k, as a share of their total,
+        // down to a multiple of 64; the last runs to n. Later segments -- the ones whose attention reads every earlier
+        // row and each of which starts behind the one before -- take a larger share (two parts 4/9, 5/9; three
+        // 16/61, 20/61, 25/61; four 64/369, 80/369, 100/369, 125/369) instead of k n / parts, so the queues' layer
+        // intervals line up more often. Integer weights, so the split is exact for any window length.
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        {
+            var weights: [max]u64 = undefined;
+            var total: u64 = 0;
+            for (0..parts) |j| {
+                var w: u64 = 1;
+                for (0..parts - 1 - j) |_| w *= 4;
+                for (0..j) |_| w *= 5;
+                weights[j] = w;
+                total += w;
+            }
+            var share: u64 = 0;
+            for (0..parts) |k| {
+                firsts[k] = @intCast(share * n / total / 64 * 64);
+                share += weights[k];
+            }
+        }
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
@@ -458,7 +480,7 @@ pub const Runner = struct {
             stages[k] = .{ .terminal_rows = terminal_rows, .model = r.model, .rows = firsts[k + 1] - firsts[k], .hooks = segments[k].mixer(), .head = segment_head, .frame = frames[k], .lane_k = k, .logits = if (k == 0) null else r.model.frame.get(.logits), .settle = if (k == 0) .{ .ptr = r, .run = settleRound } else null };
             family.stages[k] = &stages[k];
         }
-        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, queues[0..parts], r.model.config.layers, .concurrent, &family, first_commit, commit_every, true) catch |err| {
+        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, queues[0..parts], r.model.config.layers, .concurrent, &family, first_commit, stagger_commit, true) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -546,13 +568,14 @@ pub const Runner = struct {
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         if (r.deferred != null) {
-            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans
+            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans,
+            // and every layer's conv window lands in one more
             try r.gdn.stash(plan, e);
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
+            try r.gdn.commitConvKeep(plan, e);
         } else {
             if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
-            // Each layer replays its state and copies all conv taps before overwriting that channel's history.
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+            // Each layer replays its state; every layer's conv window lands in one launch.
+            try r.gdn.commitKeep(plan, e);
         }
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();
