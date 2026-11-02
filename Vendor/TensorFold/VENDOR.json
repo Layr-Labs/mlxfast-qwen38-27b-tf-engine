@@ -1,0 +1,8 @@
+[
+  {
+    "kind": "repeat-measurement",
+    "repeats": "b4f6e0f5-e777-422e-bb67-e372dfbb15c4",
+    "reason": "b4f6e0f5 (the same tree and lever) never got measured: its official run stopped at the Benchmark step on an infrastructure gate, SERIAL-CONTROL-LEG-FAILED: QUIESCENCE-TIMEOUT (the box did not reach quiescence before the control leg's prefill). This submission repeats it on the same record, 05a60bc5.",
+    "lever": "staggered prompt pass: 64-row segment boundaries rounded up instead of down (1065 rows: 384/384/297 instead of 320/384/361)"
+  }
+]
