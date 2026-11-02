@@ -381,9 +381,28 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: the running sum of weights 4^(parts-1-j) * 5^j over j < k, as a share of their total,
+        // down to a multiple of 64; the last runs to n. Later segments -- the ones whose attention reads every earlier
+        // row and each of which starts behind the one before -- take a larger share (two parts 4/9, 5/9; three
+        // 16/61, 20/61, 25/61; four 64/369, 80/369, 100/369, 125/369) instead of k n / parts, so the queues' layer
+        // intervals line up more often. Integer weights, so the split is exact for any window length.
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        {
+            var weights: [max]u64 = undefined;
+            var total: u64 = 0;
+            for (0..parts) |j| {
+                var w: u64 = 1;
+                for (0..parts - 1 - j) |_| w *= 4;
+                for (0..j) |_| w *= 5;
+                weights[j] = w;
+                total += w;
+            }
+            var share: u64 = 0;
+            for (0..parts) |k| {
+                firsts[k] = @intCast(share * n / total / 64 * 64);
+                share += weights[k];
+            }
+        }
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;

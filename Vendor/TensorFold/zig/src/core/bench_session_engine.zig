@@ -230,8 +230,11 @@ pub const EngineDflashBinding = struct {
 /// weight reads and tensor-op tiles do not grow with the rows (rows8), so each further sibling only adds its chance to land.
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
-/// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+/// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified. At 0.7 %
+/// the tile's marginal row is dominated by the sibling's chance to land: the width-8 projections' weight reads, the GDN
+/// tree step's parent rows and the attention row's cache line are already paid by the best draft's row, so a sibling
+/// between 0.7 % and 1.5 % buys accepted tokens per round at a fraction of a row's cost.
+pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
