@@ -366,7 +366,8 @@ pub const Runner = struct {
     /// chunks run in order give.
     fn staggered(r: *Runner, round: *const Round, head: forward.Head) !void {
         const n: u32 = @intCast(round.ids.len);
-        const na: u32 = n / 2 / 64 * 64;
+        // the later segment's rows attend over a longer causal context, so it takes the smaller share (9/16 : 7/16)
+        const na: u32 = n * 9 / 16 / 64 * 64;
         const nb = n - na;
         const slot = round.slots[0];
         const start = round.windows[0].start;
