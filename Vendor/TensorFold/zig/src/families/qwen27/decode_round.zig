@@ -15,6 +15,9 @@ const first_commit = 1;
 const stagger_rows = 768;
 /// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
 const stagger_parts = 3;
+/// Rows a staggered segment should hold at least when the count follows the pass's rows (no TF_Q27_STAGGER): n / 320
+/// segments, 2 to core/stagger.MAX, so 768-959 rows take two, 960-1279 three (stagger_parts) and 1280 and on four.
+const stagger_segment_rows = 320;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -346,14 +349,38 @@ pub const Runner = struct {
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
-        return staggerParts() > 1;
+        return staggerParts(round.ids.len) > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
-    fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
+    /// The segments a staggered pass of `rows` rows takes: TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none),
+    /// or by default rows / stagger_segment_rows, 2 to core/stagger.MAX (stagger_parts where that is not a number).
+    fn staggerParts(rows: usize) usize {
+        const max = @import("core").segments.MAX;
+        const by_rows = std.math.clamp(rows / stagger_segment_rows, 2, max);
+        const v = std.c.getenv("TF_Q27_STAGGER") orelse return by_rows;
         const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(n, max);
+    }
+
+    /// Segment k's first row of an n-row staggered pass in `parts` segments: an asymmetric split, segment k weighted
+    /// 8 parts + parts - 1 - 2 k (17 : 15 for two, 26 : 24 : 22 for three, 35 : 33 : 31 : 29 for four), each first row
+    /// at the nearest multiple of 64. The later segments attend over a longer prefix and the last runs its final
+    /// layers alone once the others finish, so they take the smaller shares; the rows and their order are unchanged.
+    /// False when the rounded split leaves a segment under 64 rows (the caller then splits evenly).
+    fn staggerFirsts(n: u32, parts: usize, firsts: []u32) bool {
+        const p: u64 = parts;
+        const total: u64 = p * (8 * p + p - 1) - p * (p - 1); // the weights' sum
+        var cum: u64 = 0;
+        firsts[0] = 0;
+        for (1..parts) |k| {
+            const prev: u64 = k - 1;
+            cum += 8 * p + p - 1 - 2 * prev;
+            const at = (@as(u64, n) * cum + total / 2) / total; // the weighted boundary, rounded
+            firsts[k] = @intCast((at + 32) / 64 * 64);
+        }
+        firsts[parts] = n;
+        for (0..parts) |k| if (firsts[k + 1] < firsts[k] + 64) return false;
+        return true;
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
@@ -377,14 +404,17 @@ pub const Runner = struct {
     fn staggered(r: *Runner, round: *const Round, head: forward.Head) !void {
         const max = @import("core").segments.MAX;
         const n: u32 = @intCast(round.ids.len);
-        const parts = staggerParts();
+        const parts = staggerParts(n);
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: staggerFirsts' asymmetric split, or k n / parts down to a multiple of 64 where that
+        // leaves a segment under 64 rows; the last runs to n
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
-        firsts[parts] = n;
+        if (!staggerFirsts(n, parts, &firsts)) {
+            for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+            firsts[parts] = n;
+        }
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
         var scratches: [max]*attn.Scratch = undefined;
