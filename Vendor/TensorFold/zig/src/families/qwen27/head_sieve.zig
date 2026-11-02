@@ -9,7 +9,7 @@
 //! id's by less than kappa spreads. Statistical (kappa spreads), not a certified bound, as on the CUDA track.
 //! No logits row is written: the round's picks go straight to the matcher, and Runner.head_token stands in for the
 //! accepted row's logits that tree_commit's keep_head would have left in row 0.
-//! kappa is 7.
+//! kappa is 6.
 const std = @import("std");
 const mtl = @import("metal");
 const projection = @import("projection.zig");
@@ -64,7 +64,7 @@ pub const HeadSieve = struct {
             std.log.info("qwen27: head sieve off: head n {d} k {d} batch {d}", .{ head.n, head.k, head.batch });
             return null;
         }
-        const kappa: f32 = 7.0;
+        const kappa: f32 = 6.0;
         const tiles: u32 = head.n / 32;
         const groups: u32 = head.k / 64;
         // the head's shape and metadata form ahead of the kernels; kappa a literal (each value its own library)

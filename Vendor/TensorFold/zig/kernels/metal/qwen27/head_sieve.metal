@@ -18,7 +18,7 @@ using namespace mpp::tensor_ops;
 #define TF_TB 8
 #define TF_SBI 4096
 #define TF_SBI12 1
-#define TF_SIEVE_KAPPA 7.0f
+#define TF_SIEVE_KAPPA 6.0f
 #endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
