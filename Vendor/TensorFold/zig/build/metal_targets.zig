@@ -476,6 +476,7 @@ pub fn metalEngineModules(b: *std.Build, target: std.Build.ResolvedTarget, optim
         .link_libc = true,
     });
     metal.linkFramework("Metal", .{});
+    metal.linkFramework("Accelerate", .{});
     metal.linkFramework("Foundation", .{});
     metal.linkFramework("IOSurface", .{}); // the Neural Engine's prompt share passes IOSurfaces
     metal.linkSystemLibrary("objc", .{});
