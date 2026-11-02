@@ -167,9 +167,10 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
         }
     }
 }
-/// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
-/// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
-/// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
+/// Below 4 bits the full range wastes levels on a group's outliers: the bias at the extreme of larger magnitude and the
+/// scale spanning the range shrunk by each factor below (no zero point snapped to an integer: at 2 or 3 bits an exact
+/// zero code costs more error than it saves), keeping the one whose bf16 scale and bias give the least squared error
+/// over the group. Codes clamp to the levels, so clipped values saturate.
 fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
     const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
     var best_err: f32 = std.math.inf(f32);
@@ -178,11 +179,9 @@ fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, low
     for (shrinks) |shrink| {
         const lo = lower * shrink;
         const hi = upper * shrink;
-        var bias: f32 = if (@abs(lo) > @abs(hi)) lo else hi;
+        const bias: f32 = if (@abs(lo) > @abs(hi)) lo else hi;
         var scale: f32 = @max((hi - lo) / levels, @as(f32, 1e-7));
         if (bias >= 0) scale = -scale;
-        const zero = @round(bias / scale);
-        if (zero != 0) scale = bias / zero else bias = 0;
         if (!std.math.isFinite(scale) or scale == 0) continue;
         const s16 = asBf16(scale);
         const b16 = asBf16(bias);
