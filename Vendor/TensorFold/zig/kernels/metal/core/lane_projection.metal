@@ -684,7 +684,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
-#define TF_STREAM_PF 0
+#define TF_STREAM_PF 1
 #if TF_STREAM_PF
 #define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
 #define TF_STREAM_LATE(t)
