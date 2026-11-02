@@ -18,10 +18,15 @@ using namespace mpp::tensor_ops;
 #define TF_TB 8
 #define TF_SBI 4096
 #define TF_SBI12 1
-#define TF_SIEVE_KAPPA 7.0f
+#define TF_SIEVE_KAPPA 6.0f
+#endif
+#ifndef TF_SIEVE_M
+#define TF_SIEVE_M 16
 #endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
+// top's first pass: each block of TBLK tiles' highest best a a row, as tf_sieve_key's order (BK[block * 8 + row])
+constant constexpr int TBLK = 256, BLOCKS = (TILES + TBLK - 1) / TBLK;
 constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at most, relative to its size
 constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, generously
 
@@ -38,15 +43,17 @@ kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4
 }
 
 // Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
-// most 8 rows), each group's values added in order from zero; the candidate list and its dispatch words cleared.
+// most 8 rows), each group's values added in order from zero; the candidate list, its dispatch words and the scan's
+// block keys cleared. max(KG * 16, BLOCKS * 8) threads.
 kernel void tf_head_sieve_prep(const device bfloat* X [[buffer(0)]], constant int& rows [[buffer(1)]], device float* XQ [[buffer(2)]],
-    device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], device uint* BK [[buffer(5)]], uint t [[thread_position_in_grid]]) {
   if (t == 0) {
     list[0] = 0;
     args[0] = 0;
     args[1] = 1;
     args[2] = 1;
   }
+  if (t < uint(BLOCKS * 8)) BK[t] = 0;
   if (t >= uint(KG * 16)) return;
   const int g = int(t) / 16, row = int(t) % 16;
   float acc = 0.0f;
@@ -74,54 +81,74 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
 }
 #endif
 
+// A best a as a word whose unsigned order is the value's (-0 as +0, which compare equal): atomic_max keeps a block's
+// highest, and equal words are equal values. Never called on NaN (the scan's maxima start at -inf and fmax drops NaN).
+inline uint tf_sieve_key(float v) {
+  const uint b = as_type<uint>(v == 0.0f ? 0.0f : v);
+  return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+
 // The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 2-bit copy through tf_lane_reg's
 // decoded-row loop (rows8, one K split, codes as fp16 subnormals in the tensor op's right input, the head's own
 // metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
-// it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row].
+// it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row], and
+// that best a (when finite) into its block's key BK[(tile / TBLK) * 8 + row] (atomic max of tf_sieve_key).
 // dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
 [[max_total_threads_per_threadgroup(32)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
-    uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
+    device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto desc = matmul2d_descriptor(TF_SIEVE_M, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto a0 = a.slice(0, 0);
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
-  const device uint4* sbv = (const device uint4*)SB;
   // a lane's columns nb + j (C[j], V[j]) and nb + 16 + j (C[4 + j], V[4 + j]) of row mb
   float C[8], V[8];
   for (int i = 0; i < 8; i++) {
     C[i] = 0.0f;
     V[i] = 0.0f;
   }
-  const device uint4* wp = W + (size_t)tile * KG * 32 + lane;
-  uint4 nw = wp[0];
+  // each group's words by 32-bit offsets that advance a fixed step a group from the tile's first group: the codes (wo),
+  // the metadata (io), the row sums (xo, qo) and the rows' group columns (xv), the same words as the products
+  // tile * KG * 32 + g * 32, g * TF_N, g * stride, g * 16 and g * GS index (all below 2^32 for the heads fits() takes)
+  uint wo = uint(tile) * uint(KG * 32) + uint(lane);
+  uint4 nw = W[wo];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
+  uint io = 0;
   uint3 ni = ixs[0];
 #elif defined(TF_SBI)
+  // a lane's two quads of 16-bit indices as ushort4s (the uint2 pairs' bytes): each index goes to its table load as is
   const device uint* tab = (const device uint*)SB;
-  const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
-  uint2 ni0 = ixs[0], ni1 = ixs[4];
+  const device ushort4* ixs = (const device ushort4*)(tab + TF_SBI) + (n0 + nb) / 4;
+  uint io = 0;
+  ushort4 ni0 = ixs[0], ni1 = ixs[4];
+#else
+  const device uint4* sbv = (const device uint4*)SB;
+  uint io = uint(n0 + nb) / 4;
 #endif
+  uint xo = uint(mb), qo = uint(mb), xv = 0;
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = 0; g < KG; g++) {
 #if defined(TF_SBI12)
     const uint4 q0 = tf_sieve_look12a(tab, ni), q1 = tf_sieve_look12b(tab, ni);
 #elif defined(TF_SBI)
-    const uint4 q0 = tf_sieve_look(tab, ni0), q1 = tf_sieve_look(tab, ni1);
+    const uint4 q0 = uint4(tab[ni0.x], tab[ni0.y], tab[ni0.z], tab[ni0.w]), q1 = uint4(tab[ni1.x], tab[ni1.y], tab[ni1.z], tab[ni1.w]);
 #else
-    const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
+    const uint4 q0 = sbv[io], q1 = sbv[io + 4];
+    io += uint(TF_N / 4);
 #endif
     const uint4 cw = nw;
-    const float x0 = XS[g * stride + mb], xq = XQ[g * 16 + mb];
+    const float x0 = XS[xo], xq = XQ[qo];
+    xo += uint(stride);
+    qo += 16u;
     for (int w = 0; w < 8; w++) {
       // codes >> 2 as fp16 subnormals (bits = code, value code * 2^-24); the scales carry the 2^24 back
       const uint word = w < 4 ? (cw[w] & 0x33333333u) : ((cw[w - 4] >> 2) & 0x33333333u);
@@ -133,16 +160,20 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
     }
     // the next group's codes and indices under this one's tensor op (the last group reloads its own, unread)
     {
-      const int next = min(g + 1, KG - 1);
-      nw = wp[(size_t)next * 32];
+      const uint step = uint(g + 1 < KG);
+      wo += step * 32u;
+      nw = W[wo];
 #if defined(TF_SBI12)
-      ni = ixs[(size_t)next * (TF_N / 8)];
+      io += step * uint(TF_N / 8);
+      ni = ixs[io];
 #elif defined(TF_SBI)
-      ni0 = ixs[(size_t)next * (TF_N / 4)];
-      ni1 = ixs[(size_t)next * (TF_N / 4) + 4];
+      io += step * uint(TF_N / 4);
+      ni0 = ixs[io];
+      ni1 = ixs[io + 4];
 #endif
     }
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + g * GS, dextents<int32_t, 2>(GS, M), xstr);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> x((device bfloat*)X + xv, dextents<int32_t, 2>(GS, M), xstr);
+    xv += uint(GS);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
@@ -170,54 +201,42 @@ inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
   if ((lane & 9) == 0 && mb < M) {
     HM[(size_t)tile * 16 + mb] = hi;
     HM[(size_t)tile * 16 + 8 + mb] = mid;
+    // top never takes a tile whose best a is -inf, so neither does a block key
+    if (mid > -INFINITY) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + mb, tf_sieve_key(mid), memory_order_relaxed);
   }
 }
 
 // Each row's first tile: the tile of its highest best a (ties: the lower tile; none finite: tile 0) into
-// first[1 + row], with first[0] = rows (the tile list the head's tile-list launch reads). One threadgroup of 1024.
-[[max_total_threads_per_threadgroup(1024)]]
+// first[1 + row], with first[0] = rows (the tile list the head's tile-list launch reads). Row r's SIMD group takes the
+// highest of the scan's block keys (BK[block * 8 + r]; 0: no finite best a anywhere) and the lowest block holding it,
+// then that block's lowest tile whose best a has that key: equal keys are equal values, so this is the tile a pass over
+// every tile in order keeps. One threadgroup of 256 (SIMD group r: row r).
+[[max_total_threads_per_threadgroup(256)]]
 [[kernel]] void tf_head_sieve_top(const device float* HM [[buffer(0)]], constant int& rows [[buffer(1)]], device uint* first [[buffer(2)]],
-    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float bv[32][8];
-  threadgroup uint bt[32][8];
-  float best[8];
-  uint at[8];
-  for (int r = 0; r < 8; r++) {
-    best[r] = -INFINITY;
-    at[r] = 0xffffffffu;
-  }
-  // each thread's tiles in increasing order: a later equal value never displaces an earlier tile
-  for (uint t = tid; t < uint(TILES); t += 1024)
-    for (int r = 0; r < 8; r++) {
-      const float v = HM[(size_t)t * 16 + 8 + r];
-      if (r < rows && v > best[r]) {
-        best[r] = v;
-        at[r] = t;
-      }
-    }
-  for (int r = 0; r < 8; r++) {
-    const float m = simd_max(best[r]);
-    const uint t = simd_min(best[r] == m ? at[r] : 0xffffffffu);
-    if (lane == 0) {
-      bv[sg][r] = m;
-      bt[sg][r] = t;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < uint(rows) && tid < 8) {
-    float m = bv[0][tid];
-    uint t = bt[0][tid];
-    for (int s = 1; s < 32; s++) {
-      const float o = bv[s][tid];
-      const uint ot = bt[s][tid];
-      if (o > m || (o == m && ot < t)) {
-        m = o;
-        t = ot;
-      }
-    }
-    first[1 + tid] = t == 0xffffffffu ? 0u : t;
-  }
+    const device uint* BK [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const int r = int(sg);
   if (tid == 0) first[0] = uint(rows);
+  if (r >= rows || r >= 8) return;
+  uint best = 0;
+  for (uint b = lane; b < uint(BLOCKS); b += 32) best = max(best, BK[b * 8 + r]);
+  const uint m = simd_max(best);
+  if (m == 0u) {
+    if (lane == 0) first[1 + r] = 0u;
+    return;
+  }
+  uint at = 0xffffffffu;
+  for (uint b = lane; b < uint(BLOCKS); b += 32)
+    if (BK[b * 8 + r] == m) at = min(at, b);
+  const uint b0 = simd_min(at);
+  // each lane's tiles of the block in increasing order: the first with key m is its lowest
+  uint t = 0xffffffffu;
+  for (uint i = lane; i < uint(TBLK); i += 32) {
+    const uint tl = b0 * TBLK + i;
+    if (t == 0xffffffffu && tl < uint(TILES) && tf_sieve_key(HM[(size_t)tl * 16 + 8 + r]) == m) t = tl;
+  }
+  t = simd_min(t);
+  if (lane == 0) first[1 + r] = t;
 }
 
 // Each row's threshold: the lower of its first tile's exact best (Y1: the tile-list launch's words, row r's first
@@ -289,16 +308,14 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) {
-    float m = bv[0];
-    uint t = bi[0], k = bm[0];
-    for (int s = 1; s < 32; s++) {
-      if (bi[s] != 0xffffffffu && (t == 0xffffffffu || bv[s] > m || (bv[s] == m && bi[s] < t))) {
-        m = bv[s];
-        t = bi[s];
-      }
-      k |= bm[s];
-    }
-    picks[row] = uint2(k != 0 ? 0xffffffffu : t, k);
+  // the 32 SIMD groups' bests by SIMD group 0: a group's best is finite exactly when its id is valid (else -inf and no
+  // id), so the highest valid value and the lowest id holding it are those of a pass over the groups in order
+  if (sg == 0) {
+    const uint ti = bi[lane];
+    const float tv = ti != 0xffffffffu ? bv[lane] : -INFINITY;
+    const float m = simd_max(tv);
+    const uint t = simd_min(ti != 0xffffffffu && tv == m ? ti : 0xffffffffu);
+    const uint k = simd_or(bm[lane]);
+    if (lane == 0) picks[row] = uint2(k != 0 ? 0xffffffffu : t, k);
   }
 }

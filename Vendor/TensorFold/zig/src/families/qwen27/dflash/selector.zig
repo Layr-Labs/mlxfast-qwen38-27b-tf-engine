@@ -83,14 +83,87 @@ fn edges(g: *const weights.Graph, lattice: op.Lattice, parent: u32, token: u32, 
 const max_rank = 256;
 fn parentTerms(g: *const weights.Graph, lattice: op.Lattice, parent: u32, depth: u32, out: *[max_rank]f64) !void {
     @setFloatMode(.strict);
-    for (0..g.config.rank) |r| out[r] = (try native(g.predecessor, parent, @intCast(r))) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]);
+    const row = try codebookRow(g, g.predecessor, parent);
+    for (0..g.config.rank) |r| {
+        const bits = std.mem.readInt(u16, row[r * 2 ..][0..2], .little);
+        if (bits & 0x7F80 == 0x7F80) return error.DraftCodebookFinite;
+        const value: f32 = @bitCast(@as(u32, bits) << 16);
+        out[r] = @as(f64, value) * @as(f64, lattice.projected[@as(usize, depth) * lattice.rank + r]);
+    }
 }
-/// edges, the parent's terms given: the same products and sum in the same order.
-fn edgesFrom(g: *const weights.Graph, terms: *const [max_rank]f64, token: u32) !f64 {
+/// A codebook's row (`rank` bf16 words), bounds-checked once for the whole row.
+fn codebookRow(g: *const weights.Graph, t: weights.Tensor, row: u32) ![]const u8 {
+    const rank: usize = g.config.rank;
+    const at = (try std.math.mul(usize, row, t.shape[1])) * 2;
+    if (t.shape[1] < rank or at + rank * 2 > t.bytes.len) return error.DraftCodebookShape;
+    return t.bytes[at..][0 .. rank * 2];
+}
+/// The candidates edgesOf takes at once, one f64 vector lane each: all of a lattice row's (propose bounds topk by it).
+const lanes = 16;
+/// edges for every candidate of a row at once, the parent's terms given: one f64 vector lane a candidate (never a rank
+/// position), each lane's product and sum exactly as edges makes them (its own accumulator from 0, then one product and
+/// one sum a rank position, in rank order: strict, so no fused multiply-add). A non-finite codebook word is the same
+/// error; of a short row and a non-finite word, the one candidates taken four at a time in order would meet first.
+fn edgesOf(g: *const weights.Graph, terms: *const [max_rank]f64, tokens: []const u32, out: []f64) !void {
     @setFloatMode(.strict);
-    var sum: f64 = 0;
-    for (0..g.config.rank) |r| sum += terms[r] * (try native(g.successor, token, @intCast(r)));
-    return sum;
+    const rank: usize = g.config.rank;
+    if (tokens.len == 0) return;
+    if (tokens.len > lanes or out.len < tokens.len) return error.DraftLatticeShape;
+    const Sums = @Vector(lanes, f64);
+    const Words = @Vector(lanes, u32);
+    // rows a group of four candidates at a time, a lane past the last candidate on the last candidate's row; `groups`
+    // ends before the first group with a short row
+    var rows: [lanes][*]const u8 = undefined;
+    var groups: usize = (tokens.len + 3) / 4;
+    const short = rowsOf(g, tokens, &rows, &groups);
+    if (groups == 0) return error.DraftCodebookShape;
+    for (groups * 4..lanes) |lane| rows[lane] = rows[0]; // read and discarded
+    const exponent: Words = @splat(0x7F80);
+    var sums: Sums = @splat(0);
+    var bad: Words = @splat(0);
+    for (0..rank) |r| {
+        var bits: Words = undefined;
+        inline for (0..lanes) |k| bits[k] = std.mem.readInt(u16, rows[k][r * 2 ..][0..2], .little);
+        bad |= @select(u32, bits & exponent == exponent, @as(Words, @splat(1)), @as(Words, @splat(0)));
+        const values: @Vector(lanes, f32) = @bitCast(bits << @splat(16));
+        sums += @as(Sums, @splat(terms[r])) * @as(Sums, @floatCast(values));
+    }
+    const flags: [lanes]u32 = bad;
+    for (0..groups) |group| for (flags[group * 4 ..][0..4]) |flag| if (flag != 0) return error.DraftCodebookFinite;
+    if (short) return error.DraftCodebookShape;
+    const edges_of: [lanes]f64 = sums;
+    @memcpy(out[0..tokens.len], edges_of[0..tokens.len]);
+}
+/// edgesOf's successor rows, a group of four candidates at a time in order (the last group's spare lanes on its last
+/// candidate's row), until a short row: whether one was met, `groups` lowered to the groups before it.
+fn rowsOf(g: *const weights.Graph, tokens: []const u32, rows: *[lanes][*]const u8, groups: *usize) bool {
+    for (0..groups.*) |group| for (0..4) |k| {
+        const lane = group * 4 + k;
+        const row = codebookRow(g, g.successor, tokens[@min(lane, tokens.len - 1)]) catch {
+            groups.* = group;
+            return true;
+        };
+        rows[lane] = row.ptr;
+    };
+    return false;
+}
+/// A codebook row's cache lines requested ahead of its reader (a hint: nothing is read here, and a row out of bounds is
+/// left alone).
+fn warmRow(g: *const weights.Graph, t: weights.Tensor, row: u32) void {
+    const bytes = codebookRow(g, t, row) catch return;
+    var at: usize = 0;
+    while (at < bytes.len) : (at += 128) @prefetch(bytes.ptr + at, .{ .locality = 3 });
+    @prefetch(bytes.ptr + bytes.len - 1, .{ .locality = 3 });
+}
+/// The anchor's predecessor row on its way to the caches, before the lattice that parentTerms multiplies it by.
+pub fn warmAnchor(g: *const weights.Graph, anchor: u32) void {
+    if (anchor < g.config.vocab and g.config.rank <= max_rank) warmRow(g, g.predecessor, anchor);
+}
+/// Every candidate's successor row on its way to the caches, once the lattice names them: edgesOf then reads them
+/// from there rather than waiting on each row in turn.
+pub fn warmCandidates(g: *const weights.Graph, lattice: op.Lattice) void {
+    if (g.config.rank > max_rank) return;
+    for (lattice.candidates) |token| if (token < g.config.vocab) warmRow(g, g.successor, token);
 }
 fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first: u64, parent_token: u32, parent: i32, depth: u32, cumulative: f64, frontier: *std.ArrayList(Node)) !void {
     @setFloatMode(.strict);
@@ -102,9 +175,11 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     var terms: [max_rank]f64 = undefined;
     const shared = g.config.rank <= max_rank;
     if (shared) try parentTerms(g, lattice, parent_token, depth, &terms);
+    var edge_of: [16]f64 = undefined;
+    if (shared) try edgesOf(g, &terms, lattice.candidates[row..][0..lattice.topk], edge_of[0..lattice.topk]);
     for (0..lattice.topk) |i| {
         const token = lattice.candidates[row + i];
-        const edge = if (shared) try edgesFrom(g, &terms, token) else try edges(g, lattice, parent_token, token, depth);
+        const edge = if (shared) edge_of[i] else try edges(g, lattice, parent_token, token, depth);
         var score = @as(f64, lattice.unary[row + i]) / temperature + options.edge * edge / temperature;
         if (options.noise) |n| score += options.noise_weight * try n.draw(n.ptr, try std.math.add(u64, first, depth), token);
         score /= options.tau;
