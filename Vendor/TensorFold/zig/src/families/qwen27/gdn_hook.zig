@@ -47,7 +47,15 @@ pub const Hook = struct {
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred);
+        if (hook.accepted_chain) {
+            try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside);
+        } else {
+            // the gate reports its threadgroups when the out projection's decoded launch waits on them in the same
+            // interval; a round whose gate cannot report returns null and the projection takes its own barrier
+            var count: ?gdn.Count = null;
+            if (z.tiles == 0 and rows <= 8 and block + 1 != hook.linear_index.len) if (try hook.quant.gateWords(weight.out, rows)) |words| count = .{ .words = words };
+            frame.mixer_count = (try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, count)) orelse 0;
+        }
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

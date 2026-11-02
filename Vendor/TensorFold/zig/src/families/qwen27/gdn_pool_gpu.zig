@@ -170,29 +170,34 @@ pub const Pool = struct {
     pub const After = struct { counter: metal.Buffer, wait: u32 };
 
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
-        return pool.forwardAfter(layer, plan, refs, e, beside, null, null);
+        _ = try pool.forwardAfter(layer, plan, refs, e, beside, null, null, null, null);
     }
 
     /// `deferred`: a lone depth-one star verify's scan applies the first `rows` pending rows before node 0
     /// (tf_delta_gdn_star_pending) and, on `persist`, writes the state they leave back over the committed one.
-    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred) !void {
+    /// `count`: the round's star gate reports its threadgroups to those words instead of closing its barrier interval; the
+    /// result is the wait the decoded output projection takes there (null: the gate closed the interval).
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred, count: ?gdn.Count) !?u32 {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
-        const prepared = try pool.round(layer, plan, refs, false);
+        var prepared = try pool.round(layer, plan, refs, false);
+        if (count) |c| prepared.count = c;
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
         if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows, a.counter, a.wait) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
+        var gate_count: ?u32 = null;
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         if (prepared.star and prepared.usesSlots()) {
             if (deferred) |d| {
                 if (d.rows > pending_rows) return error.BadGdnPending;
                 const pending = gdn.Pending{ .key = try pool.layerSpan(.pending_key, layer), .value = try pool.layerSpan(.pending_value, layer), .decay = try pool.layerSpan(.pending_decay, layer), .mixing = try pool.layerSpan(.pending_mixing, layer), .use = d };
-                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending);
-            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null);
+                gate_count = try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, pending);
+            } else gate_count = try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null);
         } else if (deferred != null) {
             return error.BadGdnPlan;
         } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
+        return gate_count;
     }
 
     /// Whether a verify of `plan` scans one depth-one star window (gdn.Round's `star` and usesSlots on one segment): the
@@ -318,6 +323,30 @@ pub const Pool = struct {
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
         e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+    }
+
+    /// `commitConvKeep` for every linear layer in one launch: the pooled history and projection buffers hold each layer's
+    /// span at a fixed stride, so the depth index replaces the per-layer pipeline and binding (47 fewer launches a round).
+    pub fn commitConvKeepLayers(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+        if (!inPlace(plan.host)) return error.GdnSlotMoves;
+        const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
+        const m = plan.metadata;
+        const history = pool.get(.history);
+        const projections = pool.get(.qkv);
+        const layers: usize = pool.budget.layers;
+        if (layers == 0 or history.length() % (layers * 2) != 0 or projections.length() % (layers * 2) != 0) return error.BadGdnPoolIndex;
+        const strides = [2]u32{ @intCast(history.length() / layers / 2), @intCast(projections.length() / layers / 2) };
+        e.useResource(history, metal.ResourceUsage.read | metal.ResourceUsage.write);
+        e.useResource(projections, metal.ResourceUsage.read);
+        e.setPipeline(pool.kernels.conv_keep_layers);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projections, 0, 1);
+        e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
+        e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
+        e.setBuffer(m.windows.buffer, m.windows.offset, 4);
+        e.setValue(p, 5);
+        e.setValue(strides, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = @intCast(layers) }, .{ .width = 256 }); // a channel a thread, a layer a depth
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
