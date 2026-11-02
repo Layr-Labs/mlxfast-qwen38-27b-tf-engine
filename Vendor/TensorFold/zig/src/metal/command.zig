@@ -43,7 +43,9 @@ pub const CommandBuffer = struct {
     id: Id,
 
     pub fn compute(self: CommandBuffer, dispatch: types.DispatchType) ComputeEncoder {
-        return .{ .id = objc.msg(Id, self.id, "computeCommandEncoderWithDispatchType:", .{@backingInt(dispatch)}) };
+        const e: ComputeEncoder = .{ .id = objc.msg(Id, self.id, "computeCommandEncoderWithDispatchType:", .{@backingInt(dispatch)}) };
+        bound.reset(e.id);
+        return e;
     }
 
     /// A blit encoder on this buffer, for copies between buffers on the GPU.
@@ -127,6 +129,35 @@ pub const BlitEncoder = struct {
     }
 };
 
+/// The buffer bindings this thread last set on its current compute encoder, so a setBuffer that repeats one (same encoder,
+/// index, buffer and offset) is not sent again. Metal keeps an encoder's buffer bindings across pipeline changes and
+/// dispatches; a setBytes at an index replaces its buffer binding (the slot is forgotten), and an encoder's slots are
+/// forgotten when it is created or ended (an ended encoder's id can be reused by the next one).
+const Bound = struct {
+    const slots = 32;
+    enc: ?Id = null,
+    buffer: [slots]?Id = @splat(null),
+    offset: [slots]usize = @splat(0),
+    fn reset(b: *Bound, e: ?Id) void {
+        b.enc = e;
+        b.buffer = @splat(null);
+    }
+    /// Whether `buffer` at `offset` is already bound at `index` on `e`; records it as bound either way.
+    fn same(b: *Bound, e: Id, buffer: Id, offset: usize, index: usize) bool {
+        if (b.enc == null or b.enc.? != e) b.reset(e);
+        if (index >= slots) return false;
+        if (b.buffer[index]) |held| if (held == buffer and b.offset[index] == offset) return true;
+        b.buffer[index] = buffer;
+        b.offset[index] = offset;
+        return false;
+    }
+    fn forget(b: *Bound, e: Id, index: usize) void {
+        if (b.enc == null or b.enc.? != e) b.reset(e);
+        if (index < slots) b.buffer[index] = null;
+    }
+};
+threadlocal var bound: Bound = .{};
+
 pub const ComputeEncoder = struct {
     id: Id,
 
@@ -135,11 +166,13 @@ pub const ComputeEncoder = struct {
     }
 
     pub fn setBuffer(self: ComputeEncoder, buffer: Buffer, offset: usize, index: usize) void {
+        if (bound.same(self.id, buffer.id, offset, index)) return;
         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
     }
 
     /// Small constants copied into the command stream (at most 4 KB).
     pub fn setBytes(self: ComputeEncoder, bytes: []const u8, index: usize) void {
+        bound.forget(self.id, index);
         objc.msg(void, self.id, "setBytes:length:atIndex:", .{ bytes.ptr, bytes.len, index });
     }
 
@@ -177,10 +210,12 @@ pub const ComputeEncoder = struct {
     }
 
     pub fn execute(self: ComputeEncoder, icb: IndirectCommandBuffer, first: usize, count: usize) void {
+        bound.reset(self.id); // indirect commands may leave the encoder's bindings changed
         objc.msg(void, self.id, "executeCommandsInBuffer:withRange:", .{ icb.id, types.Range{ .location = first, .length = count } });
     }
 
     pub fn end(self: ComputeEncoder) void {
+        bound.reset(null);
         objc.msg(void, self.id, "endEncoding", .{});
     }
 };
