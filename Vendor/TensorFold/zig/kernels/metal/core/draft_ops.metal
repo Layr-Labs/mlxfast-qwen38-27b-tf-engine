@@ -1,5 +1,19 @@
 #include <metal_stdlib>
 using namespace metal;
+// A launch that reads a counted projection's rows in the projection's own barrier interval: every threadgroup of the
+// projection adds one to WC[0] once its stores are past a device-scope fence (lane_projection's TF_COUNT), and thread 0 of
+// each threadgroup here waits (bounded) until all `wait_for` of them have, then passes its own fence before any thread
+// reads. wait_for 0: the rows were written before a barrier, nothing to wait for.
+inline void tf_draft_wait(device atomic_uint* WC,uint wait_for,uint t){
+  if(wait_for==0u)return;
+  if(t==0u){
+    for(uint spin=0;spin<(1u<<22)&&atomic_load_explicit(WC,memory_order_relaxed)<wait_for;spin++){}
+    atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// The frame's count words, zeroed before any counted launch of the frame.
+kernel void tf_draft_zero(device uint* W [[buffer(0)]],uint i [[thread_position_in_grid]]){W[i]=0u;}
 struct Linear { uint rows,n,k,x_stride,w_stride,y_stride; };
 kernel void tf_bf16_linear(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Linear& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],uint2 block [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) {
   const uint col=block.x*8+sg,row=block.y;
@@ -104,7 +118,8 @@ kernel void tf_draft_rms_xs(device const bfloat* X [[buffer(0)]],device const bf
   }
 }
 // One threadgroup a (row, 64-column group): each thread one output as tf_dynamic_conv2, then the group's sum.
-kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],device float* XS [[buffer(6)]],constant uint& xs_stride [[buffer(7)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
+kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],device float* XS [[buffer(6)]],constant uint& xs_stride [[buffer(7)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]],device atomic_uint* WC [[buffer(14)]],constant uint& wait_for [[buffer(15)]]) {
+  tf_draft_wait(WC,wait_for,t);
   threadgroup bfloat out[TF_XS_GROUP];
   // the host dispatches whole 64-column groups of real rows only: every thread reaches the barrier
   const uint groups=a.width/a.group,g=index.x/a.group;
@@ -129,7 +144,8 @@ kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device cons
   if(index.y==0&&t>=1&&t<=xs_stride-a.rows)XS[size_t(group)*xs_stride+a.rows+t-1]=0.0f;
 }
 // One threadgroup a (row, 64-column group): each thread one output as tf_draft_swiglu, then the group's sum.
-kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const bfloat* U [[buffer(1)]],constant Activation& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& xs_stride [[buffer(5)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
+kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const bfloat* U [[buffer(1)]],constant Activation& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& xs_stride [[buffer(5)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]],device atomic_uint* WC [[buffer(14)]],constant uint& wait_for [[buffer(15)]]) {
+  tf_draft_wait(WC,wait_for,t);
   threadgroup bfloat out[TF_XS_GROUP];
   // the host dispatches whole 64-column groups of real rows only: every thread reaches the barrier
   const float gate=float(G[size_t(index.y)*a.gate_stride+index.x]),up=float(U[size_t(index.y)*a.up_stride+index.x]);
@@ -157,7 +173,8 @@ kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const
 // A conv with a residual (tf_dynamic_conv2's elements), then the RMS norm of its output with that norm's group sums
 // (tf_draft_rms_xs's sum, scale, outputs and sums), one threadgroup a row: each thread takes the norm's columns, so its
 // squares add in the norm's order, and the conv's output reaches the norm through threadgroup memory, not a launch.
-kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& c [[buffer(4)]],device bfloat* C [[buffer(5)]],device const bfloat* W [[buffer(6)]],constant Norm& a [[buffer(7)]],device bfloat* Y [[buffer(8)]],device float* XS [[buffer(9)]],constant uint& xs_stride [[buffer(10)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& c [[buffer(4)]],device bfloat* C [[buffer(5)]],device const bfloat* W [[buffer(6)]],constant Norm& a [[buffer(7)]],device bfloat* Y [[buffer(8)]],device float* XS [[buffer(9)]],constant uint& xs_stride [[buffer(10)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]],device atomic_uint* WC [[buffer(14)]],constant uint& wait_for [[buffer(15)]]) {
+  tf_draft_wait(WC,wait_for,t);
   threadgroup float sums[32],inverse[1];
   threadgroup bfloat out[TF_XS_MAX_WIDTH];
   const uint row=block.y,groups=c.width/c.group;
@@ -205,7 +222,8 @@ kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device 
 // rotation), one threadgroup a head and row: the norm's threads take its columns, its output reaches the rope through
 // threadgroup memory (and is stored too), and the threads then rotate the head's pairs.
 #define TF_ROPE_MAX_DIM 256
-kernel void tf_draft_rms_rope(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* N [[buffer(3)]],device const ulong* positions [[buffer(4)]],constant Rope& r [[buffer(5)]],device bfloat* Y [[buffer(6)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+kernel void tf_draft_rms_rope(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* N [[buffer(3)]],device const ulong* positions [[buffer(4)]],constant Rope& r [[buffer(5)]],device bfloat* Y [[buffer(6)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]],device atomic_uint* WC [[buffer(14)]],constant uint& wait_for [[buffer(15)]]) {
+  tf_draft_wait(WC,wait_for,t);
   threadgroup float sums[32],inverse[1];
   threadgroup bfloat normed[TF_ROPE_MAX_DIM];
   float value=0.0f;
