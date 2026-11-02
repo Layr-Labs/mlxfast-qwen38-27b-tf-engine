@@ -41,7 +41,7 @@ pub fn storedColumns(n: usize, batch: u32) usize {
 
 /// Prompt-row K splits fastest at 128 rows on an M5; prompt rows may differ in bits from decoded rows.
 pub fn promptSplit(n: usize, k: usize) ?u32 {
-    const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 34816, .k = 5120, .sk = 1 }, .{ .n = 10240, .k = 5120, .sk = 1 }, .{ .n = 5120, .k = 17408, .sk = 2 }, .{ .n = 5120, .k = 6144, .sk = 2 }, .{ .n = 12288, .k = 5120, .sk = 2 } };
+    const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 34816, .k = 5120, .sk = 1 }, .{ .n = 10240, .k = 5120, .sk = 1 }, .{ .n = 5120, .k = 17408, .sk = 1 }, .{ .n = 5120, .k = 6144, .sk = 1 }, .{ .n = 12288, .k = 5120, .sk = 1 } };
     for (table) |t| if (t.n == n and t.k == k) return t.sk;
     return null;
 }
