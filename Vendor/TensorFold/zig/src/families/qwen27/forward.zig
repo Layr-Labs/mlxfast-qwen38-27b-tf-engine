@@ -92,6 +92,11 @@ pub const Stages = struct {
         if (s.norm_wait != 0) {
             try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
         } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        // decoded rows: the mixer input's leading code lines go to the system cache while the norm holds the bus idle
+        if (s.polls()) try m.kernels.warmNorm(e, switch (layer.mixer) {
+            .linear => |g| g.qkv,
+            .attention => |a| a.q,
+        });
         e.barrier();
         s.norm_wait = 0;
         s.summed = false;
@@ -137,6 +142,8 @@ pub const Stages = struct {
         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
             try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+            // and the MLP gate/up's leading code lines go to the system cache while that norm holds the bus idle
+            try m.kernels.warmNorm(e, layer.gu);
         } else {
             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
