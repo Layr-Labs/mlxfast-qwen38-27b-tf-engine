@@ -40,6 +40,8 @@ pub const Hook = struct {
         if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
+            // the out projection's lines warm while the prepare, star scan and gate keep DRAM idle (Kernels.warm)
+            hook.glue.warm(e, weight.out);
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
         } else {
             try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);

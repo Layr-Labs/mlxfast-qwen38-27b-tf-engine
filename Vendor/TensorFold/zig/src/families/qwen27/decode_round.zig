@@ -785,6 +785,8 @@ pub const Runner = struct {
         if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
             const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
             const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
+            // the out projection's lines warm while the preprocess and attention keep DRAM idle (glue Kernels.warm)
+            r.model.glue.warm(e, weights.out);
             after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
         } else {
             if (dead < rows) {

@@ -1,4 +1,5 @@
 //! Small operators use borrowed buffers and caller-owned encoders; copies never reinterpret activations.
+const std = @import("std");
 const mtl = @import("metal");
 const source = @import("qwen_runtime_sources");
 const Config = @import("config.zig").Config;
@@ -18,6 +19,7 @@ pub const Kernels = struct {
     add: mtl.Pipeline,
     gather: mtl.Pipeline,
     take: mtl.Pipeline,
+    touch: mtl.Pipeline,
     profiler: ?*profile.Trace = null,
 
     pub fn init(device: mtl.Device) !Kernels {
@@ -36,11 +38,35 @@ pub const Kernels = struct {
         const gather = try mtl.Pipeline.init(device, copy, "q27_tap_gather", false);
         errdefer gather.deinit();
         const take = try mtl.Pipeline.init(device, copy, "q27_take", false);
-        return .{ .embed = embed, .head = head, .slice = slice, .add = add, .gather = gather, .take = take };
+        errdefer take.deinit();
+        const touch = try mtl.Pipeline.init(device, copy, "q27_touch", false);
+        return .{ .embed = embed, .head = head, .slice = slice, .add = add, .gather = gather, .take = take, .touch = touch };
     }
 
     pub fn deinit(k: Kernels) void {
-        inline for (.{ k.embed, k.head, k.slice, k.add, k.gather, k.take }) |p| p.deinit();
+        inline for (.{ k.embed, k.head, k.slice, k.add, k.gather, k.take, k.touch }) |p| p.deinit();
+    }
+
+    /// Warms `w`'s leading bytes (codes, then scale/bias pairs) into the GPU's caches: encoded without a barrier beside
+    /// a decoded latency-bound kernel (the GDN scan, attention), so the projection that follows it reads those lines from
+    /// the system-level cache instead of DRAM. It writes nothing and nothing waits on it; up to touchBudget() bytes.
+    pub fn warm(k: Kernels, e: mtl.ComputeEncoder, w: projection.Linear) void {
+        var budget = touchBudget();
+        if (budget == 0 or w.runs.len != 0) return;
+        const words = @as(usize, w.n) * w.k * w.bits / 8;
+        const pairs: usize = if (w.index == null) @as(usize, w.k / w.group) * w.n * 4 else 0;
+        inline for (.{ .{ w.words, words }, .{ w.pairs, pairs } }) |span| {
+            const bytes = @min(span[1], budget);
+            budget -= bytes;
+            const lines: u32 = @intCast(bytes / 128);
+            if (lines != 0 and span[0].offset % 16 == 0) {
+                e.setPipeline(k.touch);
+                e.setBuffer(span[0].buffer, span[0].offset, 0);
+                e.setValue([4]u32{ lines, 0x9E3779B9, 0xFFFFFFFF, 0 }, 1);
+                e.setBuffer(span[0].buffer, span[0].offset, 2); // the never-taken store's target: never written
+                e.dispatchThreads(mtl.Size.of(lines, 1, 1), mtl.Size.of(256, 1, 1));
+            }
+        }
     }
 
     /// Each row whose `takes` entry names an image row gets that row's bits from `images` over its embedding.
@@ -117,3 +143,11 @@ pub const Kernels = struct {
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
+
+/// Bytes a warm may touch: TF_Q27_TOUCH_MB (0 turns warming off), by default touch_mb.
+fn touchBudget() usize {
+    const mb = if (std.c.getenv("TF_Q27_TOUCH_MB")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch touch_mb else touch_mb;
+    return mb << 20;
+}
+/// Default warm span: an M5 Max mixer output projection's codes (5120 x 6144 at 4 bits, 15 MiB) and most of its pairs.
+const touch_mb = 24;

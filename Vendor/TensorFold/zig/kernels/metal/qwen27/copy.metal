@@ -39,3 +39,14 @@ struct Take { uint rows, width; };
   if (t.x >= p.width || t.y >= p.rows || take[t.y] < 0) return;
   X[t.y * p.width + t.x] = R[ulong(take[t.y]) * p.width + t.x];
 }
+
+// Pulls a weight span's 128-byte lines into the GPU's caches ahead of its projection, while a latency-bound kernel
+// leaves DRAM idle (the decoded GDN scan, decoded attention): one 16-byte load a line fetches the whole line. The guard
+// (host values: key, never) is never true, as thread i < lines < never, but the compiler cannot prove it, so the loads
+// stay and nothing is ever written.
+kernel void q27_touch(device const uint4* W [[buffer(0)]], constant uint4& p [[buffer(1)]], device uint* sink [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+  if (i >= p.x) return; // p.x: lines, p.y: key, p.z: never
+  const uint4 v = W[(size_t)i * 8];
+  if (i == p.z && (v.x ^ v.y ^ v.z ^ v.w) == p.y) sink[0] = v.x;
+}
