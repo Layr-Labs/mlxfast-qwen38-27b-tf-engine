@@ -13,7 +13,7 @@ const first_commit = 1;
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
-/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+/// The staggered prompt pass uses three segments (core/stagger.MAX).
 const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -342,18 +342,34 @@ pub const Runner = struct {
     }
 
     /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
+    /// with none of a verify's hooks around it.
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
         return staggerParts() > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    /// Segment k's first row before rounding, of n rows in `parts`: the row shares grow by a quarter from each segment to
+    /// the next (two parts: 4/9 and 5/9; three: 16/61, 20/61, 25/61; four: 64/369, 80/369, 100/369, 125/369).
+    fn staggerStart(n: u32, parts: usize, k: usize) u64 {
+        // shares 4^(parts-1-j) * 5^j over their sum
+        var weight: [@import("core").segments.MAX]u64 = undefined;
+        var total: u64 = 0;
+        for (0..parts) |j| {
+            var share: u64 = 1;
+            for (0..parts - 1 - j) |_| share *= 4;
+            for (0..j) |_| share *= 5;
+            weight[j] = share;
+            total += share;
+        }
+        var before: u64 = 0;
+        for (0..k) |j| before += weight[j];
+        return @as(u64, n) * before / total;
+    }
+
+    /// The segments a staggered pass takes.
     fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
-        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(stagger_parts, @import("core").segments.MAX);
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
@@ -381,9 +397,10 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row, down to a multiple of 64; the last runs to n. Later segments take more rows: their
+        // attention reads every earlier row and each one starts behind the one before it, while the first starts alone.
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        for (0..parts) |k| firsts[k] = @intCast(staggerStart(n, parts, k) / 64 * 64);
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
@@ -816,6 +833,10 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: warm the out projection behind the prefix, as in #621
+        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
+        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -823,6 +844,16 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    }
+};
+
+/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
+const Warm = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    out: @import("projection.zig").Linear,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out);
     }
 };
 
