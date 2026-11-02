@@ -7,6 +7,50 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+/// Code MiB Kernels.warm reads ahead of a decoded out projection: about three fifths of its 15 MiB, as much as a star
+/// scan's or an attention prefix's idle bus time covers at the stream rate.
+const warm_mb = 10;
+/// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
+const warm_groups = 64;
+const warm_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\kernel void tf_q27_warm(const device uint* W [[buffer(0)]], const device uint* M [[buffer(1)]],
+    \\    constant uint2& lines [[buffer(2)]], device uint* sink [[buffer(3)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\  uint acc = 0;
+    \\  for (uint j = i; j < lines.x; j += 4u * n) {
+    \\    const uint a = W[(size_t)j * 32u];
+    \\    const uint b = j + n < lines.x ? W[(size_t)(j + n) * 32u] : 0u;
+    \\    const uint c = j + 2u * n < lines.x ? W[(size_t)(j + 2u * n) * 32u] : 0u;
+    \\    const uint d = j + 3u * n < lines.x ? W[(size_t)(j + 3u * n) * 32u] : 0u;
+    \\    acc ^= a ^ b ^ c ^ d;
+    \\  }
+    \\  for (uint j = i; j < lines.y; j += n) acc ^= M[(size_t)j * 32u];
+    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is stored
+    \\}
+    \\// One word of every 128-byte line a tile-list launch reads of the tiles a GPU list names (its count, then the tiles):
+    \\// each listed tile's code block of every K group, its metadata block of every K group (its first and last word: the
+    \\// lines a block of at most 128 bytes covers) and the metadata's leading table lines. Every read is inside the bytes
+    \\// given; nothing is stored.
+    \\struct tf_warm_tiles { uint groups, batch, block, tiles, slots, code_bytes, meta_base, meta_group, meta_tile, meta_bytes, table_bytes; };
+    \\kernel void tf_q27_warm_tiles(const device uchar* W [[buffer(0)]], const device uchar* M [[buffer(1)]],
+    \\    const device uint* list [[buffer(2)]], constant tf_warm_tiles& a [[buffer(3)]], device uint* sink [[buffer(4)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\  uint acc = 0;
+    \\  const uint items = min(list[0], a.slots) * a.groups;
+    \\  for (uint it = i; it < items; it += n) {
+    \\    const uint tile = list[1 + it / a.groups], g = it % a.groups;
+    \\    if (tile >= a.tiles) continue;
+    \\    const ulong code = (ulong(tile / a.batch) * a.groups * a.batch + tile % a.batch + ulong(g) * a.batch) * a.block;
+    \\    for (uint l = 0; l < a.block; l += 128u) if (code + l + 4u <= a.code_bytes) acc ^= *(const device uint*)(W + code + l);
+    \\    const ulong meta = a.meta_base + ulong(g) * a.meta_group + ulong(tile) * a.meta_tile;
+    \\    if (meta + a.meta_tile <= a.meta_bytes) acc ^= *(const device uint*)(M + meta) ^ *(const device uint*)(M + meta + a.meta_tile - 4u);
+    \\  }
+    \\  for (uint l = i * 128u; l + 4u <= a.table_bytes; l += n * 128u) acc ^= *(const device uint*)(M + l);
+    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is stored
+    \\}
+;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
@@ -121,6 +165,15 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// warm's read-only line touch and the word it could store (it never does), made on first use.
+    warm_pipe: ?mtl.Pipeline = null,
+    warm_sink: ?mtl.Buffer = null,
+    /// Code bytes warm reads ahead of a decoded out projection (TF_Q27_WARM_MB, default warm_mb; 0 turns it off).
+    warm_bytes: ?usize = null,
+    /// warmTiles' line touch (tf_q27_warm_tiles) and the word it could store (it never does), made at load
+    /// (prepareWarmTiles).
+    warm_tiles_pipe: ?mtl.Pipeline = null,
+    warm_tiles_sink: ?mtl.Buffer = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -148,6 +201,10 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.warm_pipe) |p| p.deinit();
+        if (k.warm_sink) |b| b.deinit();
+        if (k.warm_tiles_pipe) |p| p.deinit();
+        if (k.warm_tiles_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -629,6 +686,100 @@ pub const Kernels = struct {
     }
 
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
+    /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
+    /// and padding included) and of all its decoded metadata (the indexed table and indices, else the pairs), with no
+    /// barrier. Encoded inside a latency-bound barrier interval (a star scan, an attention prefix), it moves those lines
+    /// from DRAM into the system cache while the memory bus is idle, just before the decoded launch of `p` reads them.
+    /// It writes nothing anything reads, so it adds no hazard and changes no word.
+    pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
+        return k.warmPrefix(e, p, k.warmBytes());
+    }
+
+    /// warm of all of `p`'s code words (warmBytes() 0 still turns it off): for a window long enough for a whole matrix.
+    pub fn warmAll(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
+        if (k.warmBytes() == 0) return;
+        return k.warmPrefix(e, p, std.math.maxInt(usize));
+    }
+
+    fn warmPrefix(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, want: usize) !void {
+        if (want == 0 or p.bits != 4 or p.group != 64 or p.runs.len != 0) return;
+        const codes = projection.storedColumns(p.n, p.batch) * p.k / 2;
+        const code_room = p.words.buffer.length() -| p.words.offset;
+        const take = @min(want, codes, code_room);
+        const meta: projection.Ref = p.index orelse p.pairs;
+        const meta_bytes: usize = if (p.index == null) @as(usize, p.n) * (p.k / 64) * 4 else if (p.index12) lane.indexed12Bytes(p.n, p.k, 64) else lane.indexedBytes(p.n, p.k, 64);
+        const meta_take = @min(meta_bytes, meta.buffer.length() -| meta.offset);
+        if (take < 128) return;
+        if (k.warm_pipe == null) {
+            const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            const pipe = try mtl.Pipeline.init(k.device, library, "tf_q27_warm", false);
+            errdefer pipe.deinit();
+            k.warm_sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            k.warm_pipe = pipe;
+        }
+        const lines = [2]u32{ @intCast(take / 128), @intCast(meta_take / 128) };
+        // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
+        const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
+        e.setPipeline(k.warm_pipe.?);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
+        e.setBuffer(meta.buffer, meta.offset, 1);
+        e.setValue(lines, 2);
+        e.setBuffer(k.warm_sink.?, 0, 3);
+        e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    /// Compiles at load warmTiles' pipeline (tf_q27_warm_tiles, in warm's source) and makes its sink.
+    pub fn prepareWarmTiles(k: *Kernels) !void {
+        if (k.warm_tiles_pipe != null) return;
+        const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+        defer library.deinit();
+        const pipe = try mtl.Pipeline.init(k.device, library, "tf_q27_warm_tiles", false);
+        errdefer pipe.deinit();
+        k.warm_tiles_sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        k.warm_tiles_pipe = pipe;
+    }
+
+    /// Encoded in the barrier interval of a quantTiles launch of `p` over `list` (its count, then its tiles; at most
+    /// `slots`), behind the barrier that orders the list's writer: one word of every 128-byte line that launch reads of the
+    /// listed tiles (each tile's code block and metadata block of every K group) and of the metadata's index table, all
+    /// requested at once. The tile launch runs one SIMD group a tile, each walking its tile's K groups with one group of
+    /// codes and indices prefetched (a few KB in flight a launch), so each group waits about one memory round trip; with the
+    /// lines on their way into the caches it finds them there. It writes nothing anything reads, so it changes no word.
+    /// A no-op until prepareWarmTiles made its pipeline; it touches the encoder only to encode its one dispatch.
+    pub fn warmTiles(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, list: Ref, slots: u32) !void {
+        const pipe = k.warm_tiles_pipe orelse return;
+        if (!ranged(p) or slots == 0 or p.batch == 0) return;
+        const meta = metadata(p, p.index != null);
+        const n: usize = p.n;
+        // [first block's offset, a K group's stride, a tile's block, table bytes] of the metadata quantTiles binds (the
+        // lean reg loop's TF_SBI12 / TF_SBI / pairs addressing)
+        const form: [4]usize = if (p.index == null) .{ 0, 4 * n, 128, 0 } else if (p.index12) .{ lane.sb_table12 * 4, 3 * n / 2, 48, lane.sb_table12 * 4 } else .{ lane.sb_table * 4, 2 * n, 64, lane.sb_table * 4 };
+        const code_bytes = p.words.buffer.length() -| p.words.offset;
+        const meta_bytes = meta.buf.length() -| meta.off;
+        const most = std.math.maxInt(u32);
+        if (code_bytes > most or meta_bytes > most or form[1] > most) return;
+        const groups = p.k / 64;
+        // a tile's code block of a K group: 32 columns of 64 4-bit codes
+        const args = [11]u32{ groups, p.batch, 32 * 64 / 2, (p.n + 31) / 32, slots, @intCast(code_bytes), @intCast(form[0]), @intCast(form[1]), @intCast(form[2]), @intCast(meta_bytes), @intCast(@min(form[3], meta_bytes)) };
+        const threads = @max(@as(usize, slots) * groups, form[3] / 128);
+        e.setPipeline(pipe);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
+        e.setBuffer(meta.buf, meta.off, 1);
+        e.setBuffer(list.buffer, list.offset, 2);
+        e.setValue(args, 3);
+        e.setBuffer(k.warm_tiles_sink.?, 0, 4);
+        e.dispatchGroups(mtl.Size.of(std.math.clamp((threads + 255) / 256, 1, warm_groups), 1, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    fn warmBytes(k: *Kernels) usize {
+        if (k.warm_bytes) |b| return b;
+        var mb: usize = warm_mb;
+        if (std.c.getenv("TF_Q27_WARM_MB")) |v| mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch warm_mb;
+        k.warm_bytes = mb << 20;
+        return k.warm_bytes.?;
+    }
+
     pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
         return k.countedKey(p, rows, false) != null;
     }
