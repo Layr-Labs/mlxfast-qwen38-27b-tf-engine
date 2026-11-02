@@ -47,6 +47,9 @@ pub const Frame = struct {
     /// A GDN block's gate or a decoded-row attention merge wrote its out projection's group sums into `.sums` (read
     /// and cleared by that projection).
     mixer_sums: bool = false,
+    /// The threadgroups that GDN block's gate reported (gdn.Round.gateCounted): the out projection waits on them in the
+    /// gate's barrier interval (quantCountedAfter). Read and cleared by that projection; 0: the gate closed the interval.
+    mixer_count: u32 = 0,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;
