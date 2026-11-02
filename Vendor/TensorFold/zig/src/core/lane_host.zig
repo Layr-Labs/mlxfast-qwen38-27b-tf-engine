@@ -523,6 +523,12 @@ pub const LaneHost = struct {
     fn run(h: *LaneHost) void {
         defer scoring.close(h);
         if (!@import("lane_thread.zig").start(h)) return;
+        // macOS: this engine thread at the user-interactive QoS (TF_ENGINE_QOS=0: the default QoS). It blocks between a
+        // prompt's chunks, and a default-QoS thread may wake on an efficiency core to encode the next one. Scheduling only.
+        if (comptime @import("builtin").os.tag == .macos) {
+            if (!std.mem.eql(u8, std.mem.span(std.c.getenv("TF_ENGINE_QOS") orelse ""), "0"))
+                _ = std.c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0);
+        }
         // a family planner: prompt pieces and decode rows in one pass; else whole or `prefill_step` chunked prompts
         if (h.rounds) |rd| return rounds.run(h, rd);
         while (true) {
