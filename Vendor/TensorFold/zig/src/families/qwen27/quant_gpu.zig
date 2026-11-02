@@ -576,6 +576,9 @@ pub const Kernels = struct {
         errdefer span.cancel();
         const e = span.encoder;
 
+        // The launch covers padded(rows) so that every entry the lane kernels may address has a value; a
+        // decoded round also builds the rows8 form, which reads mb < 8 only, so its padding rows are the
+        // last eight threadgroups this dispatch spends on rows no kept output reads.
         e.setPipeline(try k.get(.{ .kind = .xsum, .k = width }));
         bind(e, .{ x, dims, xs });
         e.dispatchThreads(mtl.Size.of(width / 64, padded(rows), 1), mtl.Size.of(@min(width / 64, 256), 1, 1));
