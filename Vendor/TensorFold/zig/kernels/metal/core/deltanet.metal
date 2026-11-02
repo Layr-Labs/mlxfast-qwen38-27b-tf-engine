@@ -818,6 +818,7 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          uint3 groups [[threadgroups_per_grid]],
                          uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
+                         uint sgs [[simdgroups_per_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
   // wait_for above 0: this gate shares its barrier interval with the star scan that writes `recurrence`, whose threadgroups
   // count themselves on NC[0] past a device-scope fence; a group reads it once the count reaches wait_for (bounded), past
@@ -834,7 +835,7 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  const uint row = group.z * 4 + sg, head = group.y;
+  const uint row = group.z * sgs + sg, head = group.y; // a row a simdgroup
   if (row >= p.rows || p.dv != 128) return;
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
   const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);

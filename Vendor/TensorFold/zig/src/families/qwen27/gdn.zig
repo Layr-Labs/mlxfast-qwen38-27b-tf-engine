@@ -309,7 +309,8 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
+        // eight rows a group: half the groups waiting on the star's count (one poller a group), as the star's own wait
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 7) / 8 }, .{ .width = 256 });
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
