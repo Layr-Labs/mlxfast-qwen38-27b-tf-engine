@@ -231,7 +231,11 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+/// The floor is read off the verify tile's fixed eight rows: the weight stream is the same for one row or eight, but
+/// each row still adds its tree step, its attention row and its argmax to layers that wait behind that stream, while a
+/// sibling the drafter gives under a fiftieth lands almost never. Trees that dropped the floor to 0.007 lost 0.8-2.5 %
+/// of their record, so the kept rows below this line were cost without tokens.
+pub const dflash_floor = 0.02;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
