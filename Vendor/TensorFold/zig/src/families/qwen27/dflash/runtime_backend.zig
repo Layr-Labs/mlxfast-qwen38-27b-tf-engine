@@ -233,6 +233,8 @@ pub const Backend = struct {
                 low.deinit();
                 head.plain = null;
             };
+            // the line warm beside the head's tile launch (Kernels.warmTiles) compiles here too; without it the warm is off
+            if (head.plain != null) target.kernels.prepareWarmTiles() catch |err| std.log.warn("draft head tile warm off: {s}", .{@errorName(err)});
         }
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
