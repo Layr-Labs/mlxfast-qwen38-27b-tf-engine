@@ -78,8 +78,19 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 // Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
 // k_stride and v_stride, in elements) instead of from copies behind the context.
 struct tf_own_rows { uint rows, k_stride, v_stride; };
-inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
-  return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
+inline void tf_split_step(thread float* q, thread float* out, thread float& maximum, thread float& total,
+    const device bfloat* kr, const device bfloat* vr, float scale, uint lane) {
+  float k[TF_D / 32], v[TF_D / 32];
+  for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[lane + d * 32]); v[d] = float(vr[lane + d * 32]); }
+  float dot = 0.0f;
+  for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
+  const float score = simd_sum(dot) * scale;
+  const float next = max(maximum, score);
+  const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+  const float weight = exp(score - next);
+  total = fma(total, old_weight, weight);
+  for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
+  maximum = next;
 }
 [[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
     const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
@@ -94,22 +105,31 @@ inline const device bfloat* tf_split_row(const device bfloat* C, const device bf
   float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
   const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
   for (uint d = 0; d < TF_D / 32; ++d) { q[d] = float(Q[qi + lane + d * 32]); out[d] = 0.0f; }
+  const uint first = chunk * TF_CHUNK;
   const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
-  for (uint key = chunk * TF_CHUNK; key < last; ++key) {
-    if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
-    const device bfloat* kr = tf_split_row(K, OK, key, context, own.k_stride, kh);
-    const device bfloat* vr = tf_split_row(V, OV, key, context, own.v_stride, kh);
-    float k[TF_D / 32], v[TF_D / 32];
-    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[lane + d * 32]); v[d] = float(vr[lane + d * 32]); }
-    float dot = 0.0f;
-    for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
-    const float score = simd_sum(dot) * scale;
-    const float next = max(maximum, score);
-    const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
-    const float weight = exp(score - next);
-    total = fma(total, old_weight, weight);
-    for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
-    maximum = next;
+  const uint cached_end = min(last, context);
+  {
+    const device bfloat* kr = K + ((size_t)first * TF_KVH + kh) * TF_D;
+    const device bfloat* vr = V + ((size_t)first * TF_KVH + kh) * TF_D;
+    const device uchar* m = mask + (size_t)row * args.mask_stride + first;
+    for (uint key = first; key < cached_end; ++key) {
+      if (m[0] != 0) tf_split_step(q, out, maximum, total, kr, vr, scale, lane);
+      kr += TF_KVH * TF_D;
+      vr += TF_KVH * TF_D;
+      m += 1;
+    }
+  }
+  if (last > context) {
+    const uint own_first = max(first, context);
+    const device bfloat* kr = OK + (size_t)(own_first - context) * own.k_stride + kh * TF_D;
+    const device bfloat* vr = OV + (size_t)(own_first - context) * own.v_stride + kh * TF_D;
+    const device uchar* m = mask + (size_t)row * args.mask_stride + own_first;
+    for (uint key = own_first; key < last; ++key) {
+      if (m[0] != 0) tf_split_step(q, out, maximum, total, kr, vr, scale, lane);
+      kr += own.k_stride;
+      vr += own.v_stride;
+      m += 1;
+    }
   }
   // partials [row][kv head][chunk][query head][D + 2]: outputs, then the chunk's maximum and total
   device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
