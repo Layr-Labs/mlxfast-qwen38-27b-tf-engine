@@ -25,6 +25,10 @@ pub const Bridge = struct {
     flag: mtl.Buffer,
     epoch: u32 = 0,
     open: bool = false,
+    /// Encoded first in the spin's command buffer, behind the proposal's fence: read-only work for the verify that follows
+    /// (the target's first layer's input projections into the system cache while the host plans and encodes that verify).
+    warm: ?Warm = null,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     const bound: u32 = 50_000;
     const source =
         \\#include <metal_stdlib>
@@ -65,6 +69,8 @@ pub const Bridge = struct {
         const cb = queue.commandBuffer();
         const e = cb.compute(.serial);
         mtl.objc.msg(void, e.id, "waitForFence:", .{fence});
+        // a warm that fails to encode only loses its prefetch: it reads and writes nothing the spin or the verify uses
+        if (b.warm) |w| w.encode(w.ptr, e) catch {};
         e.setPipeline(b.spin);
         e.setBuffer(b.flag, 0, 0);
         e.setValue([2]u32{ bound, b.epoch }, 1);
