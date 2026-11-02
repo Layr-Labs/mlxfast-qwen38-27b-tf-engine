@@ -421,6 +421,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
 #endif
   const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
+#if defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
+  // the ring's second slot: the group after the first, clamped to the stream's last group
+  const device uint4* wp2 = wl + (size_t)(TF_G0 + 1 < end ? TF_G0 + 1 : TF_G0) * TF_TB * TF_RW;
+  uint4 nn0 = wp2[0], nn1 = TF_BITS == 2 ? uint4(0) : wp2[32];
+#endif
 #endif
 #if defined(TF_SERIAL_SK2)
   float C0[16];
@@ -435,7 +440,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   for (int i = 0; i < 16; i++) C[i] = 0.0f;
 #if defined(TF_REG_LEAN)
-  // decoded rows prefetch only the next group's codes; a group's metadata quads and row sums load at the top of its own
+  // decoded rows prefetch only the next two groups' codes; a group's metadata quads and row sums load at the top of its own
   // iteration, under the unpack and the tensor op, so ten fewer registers stay live across the loop
 #if defined(TF_PROMPT_SR)
   // prompt rows address the group's codes, scale/bias quads and row sums by pointers that advance a fixed step a group:
@@ -468,6 +473,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
+  // the ring's second slot: the group after the first, clamped to the split's last group (codes only; the metadata
+  // indices keep their one-group prefetch)
+  const device uint4* wp2 = wl + (size_t)(first + 1 < end ? first + 1 : first) * TF_TB * TF_RW;
+  uint4 nn0 = 0, nn1 = 0;
+  if (first < last) { nn0 = wp2[0]; nn1 = TF_BITS == 2 ? uint4(0) : wp2[32]; }
 #endif
 #if defined(TF_WAIT)
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
@@ -524,7 +534,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
 #else
-    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
+    // a two-group ring: the next group's codes were loaded a group ago; the group after it loads now, so each load has
+    // two groups' unpack and tensor ops to land. Clamped at the stream's last group, which reloads its own codes.
+    { nw0 = nn0; nw1 = nn1; const int stay = int(g + 2 >= end); wp2 += (1 - stay) * TF_TB * TF_RW; nn0 = wp2[0]; nn1 = TF_BITS == 2 ? uint4(0) : wp2[32]; }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
