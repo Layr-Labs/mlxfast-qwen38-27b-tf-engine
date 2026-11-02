@@ -385,7 +385,7 @@ pub const Pool = struct {
         e.setValue(p, 5);
         const layer_words = std.math.cast(u32, pool.budget.slots * pool.budget.shape.state) orelse return error.BadGdnPending;
         e.setValue(abi.Unstash{ .rows = pool.pending.rows, .slot = pool.pending.slot, .pending_rows = pending_rows, .layer_words = layer_words }, 6);
-        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 4 });
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 8 });
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
@@ -409,7 +409,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
-            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 4 });
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 8 });
         }
     }
 
