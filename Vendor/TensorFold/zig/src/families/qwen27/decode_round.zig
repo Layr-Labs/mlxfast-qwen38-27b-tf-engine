@@ -5,10 +5,11 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 16;
-/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
-/// encode, and the host encodes the next chunk's layers while the GPU runs that one.
-const first_commit = 1;
+const commit_every = 6;
+/// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
+/// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
+/// MLP and the next chunk's layers while the GPU runs them.
+const first_commit = 0;
 /// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
@@ -707,7 +708,11 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        cb.wait();
+        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -816,6 +821,10 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
+        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
+        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -823,6 +832,16 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    }
+};
+
+/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
+const Warm = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    out: @import("projection.zig").Linear,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out);
     }
 };
 
@@ -915,6 +934,10 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
+    }
+    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
+    pub fn polls(_: *const Stagger) bool {
+        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
