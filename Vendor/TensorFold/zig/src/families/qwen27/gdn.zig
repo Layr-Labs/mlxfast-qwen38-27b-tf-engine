@@ -213,7 +213,7 @@ pub const Round = struct {
         r.b.slot_steps.bind(e, 11);
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         r.gate(e, post_rows);
@@ -259,11 +259,11 @@ pub const Round = struct {
         }
         if (wait_prep != 0) e.setBuffer(counter.?, star_words, 17) else r.b.recurrent.bind(e, 17); // never read: wait_prep 0
         e.setValue(wait_prep, 18);
-        // eight simdgroups a threadgroup: half the threadgroups, so half the pollers on the prepare's count in this
+        // sixteen simdgroups a threadgroup: a quarter of the threadgroups, so a quarter of the pollers on the prepare's count in this
         // shared barrier interval (one a threadgroup at the star wait; four times as many cost 1.2% decode)
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 16, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 16) * r.p.nv * r.segments));
+        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 32) * r.p.nv * r.segments));
         e.barrier();
         r.gate(e, post_rows);
     }
@@ -385,7 +385,7 @@ pub const Round = struct {
     }
 
     fn stateGrid(r: Round, e: metal.ComputeEncoder) void {
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
     }
 };
 
