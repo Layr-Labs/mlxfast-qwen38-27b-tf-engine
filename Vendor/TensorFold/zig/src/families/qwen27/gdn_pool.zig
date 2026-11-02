@@ -43,7 +43,7 @@ pub fn validatePlan(shape: abi.Shape, slots: usize, capacity: usize, plan: Plan)
 
 /// Depth-one star rounds whose keeps defer their GDN replays (gdn_pool_gpu.Pool.stash): every `defer_rounds`-th star scan
 /// writes the state the deferred rows leave back over the committed one.
-pub const defer_rounds = 4;
+pub const defer_rounds = 2;
 /// Rows a depth-one star keeps at most: its root and one child.
 pub const star_kept = 2;
 /// Pending rows a layer holds: `defer_rounds` keeps of a depth-one star.
