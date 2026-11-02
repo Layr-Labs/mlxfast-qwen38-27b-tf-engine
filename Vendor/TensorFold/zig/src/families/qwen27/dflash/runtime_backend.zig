@@ -341,11 +341,9 @@ pub const Backend = struct {
             try @import("../residency.zig").putTiled(b, key, t);
         }
     }
-    /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
-    /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
-    /// other linear q4. In ArthurOstapenko's per-linear acceptance runs (48d75d22) q/k/v and the conv projections cost
-    /// acceptance at 2 bits, and the down's 2-bit copy costs about as many extra rounds as its bytes save, so it stays
-    /// q4; the head's 2-bit copy only picks tiles for its q4 scores (head_bits).
+    /// Prepared gate, up and down MLP, attention output, and fusion input use `mlp_bits`.
+    /// Other linears remain q4; precise frames use the preserved q4 copies.
+    /// The 2-bit draft head only selects tiles for q4 rescoring.
     pub const mlp_bits: u8 = 2;
     /// Code width of the draft head's requantized copy of the spans' rows, which heads of at most Head.rescored_rows rows
     /// read first to pick the tiles the q4 head computes (4: no copy, the q4 head alone).
@@ -356,7 +354,7 @@ pub const Backend = struct {
     /// Elements a (scale, bias) pair covers in the plain kernel's copies below 4 bits (the draft head's included).
     pub const low_group: u32 = 128;
     fn draftBits(name: []const u8) u8 {
-        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
+        const mlp = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight", "self_attn.o_proj.weight", "fc.weight" };
         for (mlp) |m| if (std.mem.endsWith(u8, name, m)) return mlp_bits;
         return 4;
     }
