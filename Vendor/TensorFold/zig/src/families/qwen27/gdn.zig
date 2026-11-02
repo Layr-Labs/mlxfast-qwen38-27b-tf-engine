@@ -385,7 +385,7 @@ pub const Round = struct {
     }
 
     fn stateGrid(r: Round, e: metal.ComputeEncoder) void {
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 8, .depth = 1 });
     }
 };
 
