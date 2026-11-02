@@ -48,6 +48,8 @@ pub const Kernels = struct {
     star_pair: metal.Pipeline,
     /// conv_commit for in-place keeps: a thread a channel, the window written straight over history (no publish_conv).
     conv_keep: metal.Pipeline,
+    /// conv_keep for every linear layer in one launch: the pooled history and projection spans at a fixed stride.
+    conv_keep_layers: metal.Pipeline,
     /// star_pair after a deferred replay's pending rows, which a persist round writes back over the committed state.
     star_pending: metal.Pipeline,
     /// A keep that defers its replay: every layer's kept rows into its pending rows, one launch.
@@ -88,6 +90,7 @@ pub const Kernels = struct {
             "stash",
             "unstash",
             "post_rows16",
+            "conv_keep_layers",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -120,6 +123,7 @@ pub const Kernels = struct {
             .tree_pair = pipelines[20],
             .star_pair = pipelines[21],
             .conv_keep = pipelines[22],
+            .conv_keep_layers = pipelines[27],
             .star_pending = pipelines[23],
             .stash = pipelines[24],
             .unstash = pipelines[25],
@@ -147,6 +151,7 @@ pub const Kernels = struct {
             k.tree_pair,
             k.star_pair,
             k.conv_keep,
+            k.conv_keep_layers,
             k.star_pending,
             k.stash,
             k.unstash,

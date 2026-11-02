@@ -633,6 +633,19 @@ pub const Kernels = struct {
         return k.countedKey(p, rows, false) != null;
     }
 
+    /// Whether a counted gate's threadgroups are what `p`'s decoded launch waits on: the words a counting gate reports
+    /// to (tf_delta_gdn_post_rows' count_out, made on first use and left zero by `p`'s last threadgroup), or null when
+    /// `p` does not take the waiting launch.
+    pub fn gateWords(k: *Kernels, p: projection.Linear, rows: u32) !?mtl.Buffer {
+        if (k.countedKey(p, rows, true) == null) return null;
+        if (k.gu_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.gu_words = b;
+        }
+        return k.gu_words.?;
+    }
+
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {

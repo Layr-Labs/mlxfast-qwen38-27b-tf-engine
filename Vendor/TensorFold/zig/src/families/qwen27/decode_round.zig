@@ -546,9 +546,10 @@ pub const Runner = struct {
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         if (r.deferred != null) {
-            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans
+            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans,
+            // and every layer's conv window lands in the same one launch over the pooled spans
             try r.gdn.stash(plan, e);
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
+            try r.gdn.commitConvKeepLayers(plan, e);
         } else {
             if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
             // Each layer replays its state and copies all conv taps before overwriting that channel's history.
