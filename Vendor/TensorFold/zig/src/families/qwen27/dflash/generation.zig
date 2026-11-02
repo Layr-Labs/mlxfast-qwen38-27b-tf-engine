@@ -14,9 +14,11 @@ pub const Proposer = struct { ptr: *anyopaque, call: *const fn (*anyopaque, u32,
 pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, matched: usize, min_rows: u32 = 0, extended: u32 = 0, extension_landed: u32 = 0 };
 /// What the context says follows `path` (the pending token first), at most `max` tokens; borrowed until the next call.
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
-/// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
-const accept_step: f32 = 0.125;
-const precise_below: f32 = 0.95;
+/// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies. A step under
+/// 1 - precise_below keeps a lone miss after a landing streak on the 2-bit copies (it lowers a full share to 0.917); a
+/// second miss soon after switches to q4 (0.840), and from there six landings in a row switch back.
+const accept_step: f32 = 1.0 / 12.0;
+const precise_below: f32 = 0.9;
 pub const Generation = struct {
     allocator: std.mem.Allocator,
     runner: *Runner,
