@@ -25,7 +25,9 @@ Q27_SPECIALIZE
   // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
   if (int(m) == 0) {
     const int pad = MP - M;
-    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
+    // Only a launch that builds the 16-row form (prompt rows, M > 8) reads a padded row's sums;
+    // a decoded round builds rows8 and reads mb < 8 only, so its pads need no write.
+    if (pad > 0 and M > 8) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
