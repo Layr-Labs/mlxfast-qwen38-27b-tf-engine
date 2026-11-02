@@ -7,6 +7,32 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+/// Code MiB Kernels.warm reads ahead of a decoded out projection: about half of its 15 MiB, as much as a star scan's or an
+/// attention prefix's idle bus time covers at the stream rate.
+const warm_mb = 8;
+/// Code MiB Kernels.warmDrafter reads of the drafter's first projection inside the verify head sieve's first-tile launch:
+/// as much as warm_mb's intervals take (a 16 MiB touch in a star scan measured worse than 8).
+const warm_drafter_mb = 8;
+/// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
+const warm_groups = 64;
+const warm_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\kernel void tf_q27_warm(const device uint* W [[buffer(0)]], const device uint* M [[buffer(1)]],
+    \\    constant uint2& lines [[buffer(2)]], device uint* sink [[buffer(3)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\  uint acc = 0;
+    \\  for (uint j = i; j < lines.x; j += 4u * n) {
+    \\    const uint a = W[(size_t)j * 32u];
+    \\    const uint b = j + n < lines.x ? W[(size_t)(j + n) * 32u] : 0u;
+    \\    const uint c = j + 2u * n < lines.x ? W[(size_t)(j + 2u * n) * 32u] : 0u;
+    \\    const uint d = j + 3u * n < lines.x ? W[(size_t)(j + 3u * n) * 32u] : 0u;
+    \\    acc ^= a ^ b ^ c ^ d;
+    \\  }
+    \\  for (uint j = i; j < lines.y; j += n) acc ^= M[(size_t)j * 32u];
+    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is stored
+    \\}
+;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
@@ -121,6 +147,11 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// warm's read-only line touch and the word it could store (it never does), made on first use.
+    warm_pipe: ?mtl.Pipeline = null,
+    warm_sink: ?mtl.Buffer = null,
+    /// Code bytes warm reads ahead of a decoded out projection (warm_mb MiB), set on first use.
+    warm_bytes: ?usize = null,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -148,6 +179,8 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.warm_pipe) |p| p.deinit();
+        if (k.warm_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
@@ -626,6 +659,70 @@ pub const Kernels = struct {
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
+    }
+
+    /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
+    /// and padding included) and of all its decoded metadata (the indexed table and indices, else the pairs), with no
+    /// barrier. Encoded inside a latency-bound barrier interval (a star scan, an attention prefix), it moves those lines
+    /// from DRAM into the system cache while the memory bus is idle, just before the decoded launch of `p` reads them.
+    /// It writes nothing anything reads, so it adds no hazard and changes no word.
+    pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
+        return k.warmPrefix(e, p, k.warmBytes());
+    }
+
+    /// warm of all of `p`'s code words (warmBytes() 0 still turns it off): for a window long enough for a whole matrix.
+    pub fn warmAll(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
+        if (k.warmBytes() == 0) return;
+        return k.warmPrefix(e, p, std.math.maxInt(usize));
+    }
+
+    /// warm for the drafter's first projection (its fusion fc, in the copy its next frame reads), encoded inside the verify
+    /// head sieve's first-tile launch: one word of every 128-byte line of the leading warm_drafter_mb MiB of `words`, that
+    /// copy's code buffer. The drafter's copies are lane adapters (core.affine4_lane), 4-bit or 2-bit (halveReg's words),
+    /// not Linears warmPrefix can size; the kernel decodes no word, so it touches either buffer's leading lines alike, and
+    /// tile-major those hold its first tiles' whole K range. Its metadata (pairs or an index of several MiB at K 25600,
+    /// laid out group by group over every tile) is not read: the touch is the 8 MiB alone (`words` also fills the metadata
+    /// binding, whose loop then runs no pass). Nothing is written that anything reads.
+    pub fn warmDrafter(k: *Kernels, e: mtl.ComputeEncoder, words: mtl.Buffer) !void {
+        return k.warmLines(e, .{ .buffer = words }, @as(usize, warm_drafter_mb) << 20, .{ .buffer = words }, 0);
+    }
+
+    fn warmPrefix(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, want: usize) !void {
+        if (want == 0 or p.bits != 4 or p.group != 64 or p.runs.len != 0) return;
+        const codes = projection.storedColumns(p.n, p.batch) * p.k / 2;
+        const meta: projection.Ref = p.index orelse p.pairs;
+        const meta_bytes: usize = if (p.index == null) @as(usize, p.n) * (p.k / 64) * 4 else if (p.index12) lane.indexed12Bytes(p.n, p.k, 64) else lane.indexedBytes(p.n, p.k, 64);
+        return k.warmLines(e, p.words, @min(want, codes), meta, meta_bytes);
+    }
+
+    /// tf_q27_warm over the leading `code_bytes` of `words` and `meta_bytes` of `meta`, each cut at its buffer's end.
+    fn warmLines(k: *Kernels, e: mtl.ComputeEncoder, words: Ref, code_bytes: usize, meta: Ref, meta_bytes: usize) !void {
+        const take = @min(code_bytes, words.buffer.length() -| words.offset);
+        const meta_take = @min(meta_bytes, meta.buffer.length() -| meta.offset);
+        if (take < 128) return;
+        if (k.warm_pipe == null) {
+            const library = try mtl.Library.fromSource(k.device, warm_source, mtl.CompileOptions.mlx());
+            defer library.deinit();
+            const pipe = try mtl.Pipeline.init(k.device, library, "tf_q27_warm", false);
+            errdefer pipe.deinit();
+            k.warm_sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            k.warm_pipe = pipe;
+        }
+        const lines = [2]u32{ @intCast(take / 128), @intCast(meta_take / 128) };
+        // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
+        const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
+        e.setPipeline(k.warm_pipe.?);
+        e.setBuffer(words.buffer, words.offset, 0);
+        e.setBuffer(meta.buffer, meta.offset, 1);
+        e.setValue(lines, 2);
+        e.setBuffer(k.warm_sink.?, 0, 3);
+        e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    fn warmBytes(k: *Kernels) usize {
+        if (k.warm_bytes) |b| return b;
+        k.warm_bytes = @as(usize, warm_mb) << 20;
+        return k.warm_bytes.?;
     }
 
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
