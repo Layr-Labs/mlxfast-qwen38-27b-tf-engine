@@ -36,6 +36,17 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     return true;
 }
 
+/// Returns once the GPU reached the end of `cb`, reading its status: a decoded round's small buffers land within
+/// microseconds of the work they gate, and a poll sees that rather than sleeping until the completion handler wakes this
+/// thread. These buffers register no application completion handlers: terminal status is sufficient for their GPU
+/// work, while the caller still checks `failure()`. This helper does not wait for arbitrary completion handlers.
+pub fn spin(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -705,7 +716,8 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        // the replay writes a few rows' states behind work already in the queue: poll its completion, not its wake
+        spin(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -747,10 +759,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        spin(cb);
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;

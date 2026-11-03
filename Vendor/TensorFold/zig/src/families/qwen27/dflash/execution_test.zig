@@ -334,6 +334,23 @@ test "normalized sibling ties preserve candidate order before heap token tie-bre
     try std.testing.expectEqual(lattice.topk, tree.tokens[0]);
 }
 
+test "selector maximum proposal needs only its three returned allocations" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    graph.config.topk = 16;
+    var fake = Fake{};
+    var lattice = try Fake.lattice(&fake, 1, undefined, .{ .handle = 1, .rows = 15, .width = graph.config.rank, .stride = graph.config.rank, .dtype = .bf16 }, graph.config);
+    defer lattice.deinit();
+    var limited = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
+    var tree = try selector.propose(limited.allocator(), &graph, lattice, 3, 2, .{ .nodes = 32, .children = 16 });
+    defer tree.deinit();
+    try std.testing.expectEqual(@as(usize, 32), tree.tokens.len);
+    try std.testing.expectEqual(@as(usize, 3), limited.alloc_index);
+}
+
 test "runtime blocks2 through16 preserve checkpoint block8 and uninterrupted convolution geometry" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);

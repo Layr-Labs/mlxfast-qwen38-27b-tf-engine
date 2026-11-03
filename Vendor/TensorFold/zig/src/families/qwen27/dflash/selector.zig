@@ -121,7 +121,19 @@ fn edgesOf(g: *const weights.Graph, terms: *const [max_rank]f64, tokens: []const
     const exponent: Words = @splat(0x7F80);
     var sums: Sums = @splat(0);
     var bad: Words = @splat(0);
-    for (0..rank) |r| {
+    var r: usize = 0;
+    // Four contiguous BF16 words per load; each candidate still adds ranks in their original order.
+    while (rank - r >= 4) : (r += 4) {
+        var codes: @Vector(lanes, u64) = undefined;
+        inline for (0..lanes) |k| codes[k] = std.mem.readInt(u64, rows[k][r * 2 ..][0..8], .little);
+        inline for (0..4) |j| {
+            const bits: Words = @as(Words, @truncate(codes >> @splat(j * 16))) & @as(Words, @splat(0xFFFF));
+            bad |= @select(u32, bits & exponent == exponent, @as(Words, @splat(1)), @as(Words, @splat(0)));
+            const values: @Vector(lanes, f32) = @bitCast(bits << @splat(16));
+            sums += @as(Sums, @splat(terms[r + j])) * @as(Sums, @floatCast(values));
+        }
+    }
+    while (r < rank) : (r += 1) {
         var bits: Words = undefined;
         inline for (0..lanes) |k| bits[k] = std.mem.readInt(u16, rows[k][r * 2 ..][0..2], .little);
         bad |= @select(u32, bits & exponent == exponent, @as(Words, @splat(1)), @as(Words, @splat(0)));
@@ -218,7 +230,7 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
     for (order[0..lattice.topk]) |i| {
         if (offered == children) break;
         if (offered > 0 and options.floor > 0 and drafter[i] < options.floor) continue;
-        try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
+        frontier.appendAssumeCapacity(.{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
         offered += 1;
     }
 }
@@ -227,14 +239,12 @@ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Latt
     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
     try lattice.check(g.config);
     if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0 or !(options.floor >= 0 and options.floor < 1)) return error.BadDraftSelector;
-    var frontier: std.ArrayList(Node) = .empty;
-    defer frontier.deinit(lattice.gpa);
-    const tokens = try gpa.alloc(u32, options.nodes);
-    defer gpa.free(tokens);
-    const parents = try gpa.alloc(i32, options.nodes);
-    defer gpa.free(parents);
-    const scores = try gpa.alloc(f64, options.nodes);
-    defer gpa.free(scores);
+    // Initially at most 16 children; each of at most 32 pops can add 16 and removes one: at most 496.
+    var frontier_storage: [512]Node = undefined;
+    var frontier = std.ArrayList(Node).initBuffer(&frontier_storage);
+    var tokens: [32]u32 = undefined;
+    var parents: [32]i32 = undefined;
+    var scores: [32]f64 = undefined;
     if (options.nodes > 0) try expand(g, lattice, options, first_position, anchor, -1, 0, 0, &frontier);
     var count: usize = 0;
     while (frontier.items.len > 0 and count < options.nodes) {
@@ -278,4 +288,45 @@ test "proposal width and parent depth have separate bounds" {
     try std.testing.expectError(error.BadDraftDepth, (Policy{ .nodes = 2, .max_depth = 0 }).block(16));
     try std.testing.expectEqual(@as(u32, 2), p.budget(128));
     try std.testing.expectEqual(@as(u32, 1), p.budget(1));
+}
+
+test "packed selector loads preserve ordered FP64 edges at rank tails and unaligned rows" {
+    @setFloatMode(.strict);
+    const fixtures = @import("fixtures.zig");
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var graph = try store.graph(a);
+    defer graph.deinit();
+    var bytes: [64 * max_rank * 2 + 1]u8 = undefined;
+    var terms: [max_rank]f64 = undefined;
+    var rng = std.Random.DefaultPrng.init(93994942);
+    const random = rng.random();
+    var tokens: [lanes]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i);
+    for ([_]u32{ 1, 2, 3, 4, 5, 15, 16, 17, 63, 64, 127, 128, 255, 256 }) |rank| for (0..2) |offset| {
+        graph.config.rank = rank;
+        graph.successor.shape[1] = rank;
+        graph.successor.bytes = bytes[offset..][0 .. 64 * rank * 2];
+        for (0..64 * rank) |i| {
+            var bits = random.int(u16);
+            if (bits & 0x7F80 == 0x7F80) bits ^= 0x80;
+            std.mem.writeInt(u16, bytes[offset + i * 2 ..][0..2], bits, .little);
+        }
+        for (&terms) |*t| t.* = random.float(f64) * 4 - 2;
+        for (1..lanes + 1) |count| {
+            var got: [lanes]f64 = undefined;
+            try edgesOf(&graph, &terms, tokens[0..count], &got);
+            for (got[0..count], tokens[0..count]) |value, token| {
+                var expected: f64 = 0;
+                for (0..rank) |r| expected += terms[r] * try native(graph.successor, token, @intCast(r));
+                try std.testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(value)));
+            }
+        }
+        // The final word exercises both the packed path and scalar tails, without publishing partial results.
+        std.mem.writeInt(u16, bytes[offset + (rank - 1) * 2 ..][0..2], 0x7F80, .little);
+        var out: [lanes]f64 = @splat(123);
+        try std.testing.expectError(error.DraftCodebookFinite, edgesOf(&graph, &terms, &tokens, &out));
+        for (out) |v| try std.testing.expectEqual(@as(f64, 123), v);
+    };
 }
