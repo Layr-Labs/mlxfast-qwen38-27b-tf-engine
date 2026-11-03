@@ -5,7 +5,7 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+const commit_every = 6;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -513,7 +513,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -705,7 +708,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -746,11 +752,7 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        cb.wait();
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -984,10 +986,6 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
-    }
-    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
-    pub fn polls(_: *const Stagger) bool {
-        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
