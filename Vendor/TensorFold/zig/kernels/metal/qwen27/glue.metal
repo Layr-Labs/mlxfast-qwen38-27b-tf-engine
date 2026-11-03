@@ -238,7 +238,7 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
   if (wait_for != 0u) { \
     if (t == 0) { \
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
+      for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; } \
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
       if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
@@ -380,7 +380,7 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
   q27_head_norm_rope_held<false>(QW, KW, positions, a, group, sg, lane, held); \
   if (wait_for != 0u) { \
     if (t == 0) { \
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
+      for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; } \
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
       if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
@@ -413,7 +413,7 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
   q27_head_norm_rope_held<true>(QW, KW, positions, a, group, sg, lane, held, caches, meta, nodes);
   if (wait_for != 0u) {
     if (t == 0) {
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; }
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
       if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
         atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);

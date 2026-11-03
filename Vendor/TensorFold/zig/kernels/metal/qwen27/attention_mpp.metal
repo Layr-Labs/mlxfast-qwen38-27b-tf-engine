@@ -10,7 +10,7 @@ struct Q27AttnReadPtrs { device const bfloat* keys; device const bfloat* values;
 // group arrives on NC[1] and the last of `total` leaves both words zero for the next count. All threads of the group wait.
 inline void q27_wait_count(device atomic_uint* NC, uint wait_for, uint total, ushort tid) {
   if (tid == 0) {
-    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+    for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; }
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
       atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);

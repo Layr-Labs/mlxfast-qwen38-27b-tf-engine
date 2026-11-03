@@ -264,7 +264,7 @@ inline void tf_delta_star_rows(float4 r0, float4 r1, device const bfloat* query,
 inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3 groups, uint t) {
   if (wait_prep == 0u) return;
   if (t == 0) {
-    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&PC[0], memory_order_relaxed) < wait_prep; spin++) {}
+    for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&PC[0], memory_order_relaxed) < wait_prep; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; }
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     const uint total = groups.x * groups.y * groups.z;
     if (atomic_fetch_add_explicit(&PC[1], 1u, memory_order_relaxed) + 1u == total) {

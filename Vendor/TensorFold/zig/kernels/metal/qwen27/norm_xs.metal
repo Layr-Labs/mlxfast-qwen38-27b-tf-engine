@@ -55,7 +55,7 @@ Q27_SPECIALIZE
   if (wait_for != 0u) {
     threadgroup uint arrived;
     if (t == 0) {
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      for (uint spin = 0; spin < (1u << 20) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) { float bo = float(spin); for (int b = 0; b < 64; b++) bo = fma(bo, 0.5f, 1.0f); if (bo < 0.0f) break; }
       atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
       arrived = atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed);
       if (arrived + 1u == uint(M)) {
