@@ -217,6 +217,10 @@ pub const Layout = struct {
     /// Decoded rows over tiles a GPU list names (encodeTiles): threadgroup j computes the list's tile j and stores its 32
     /// columns at j * 32 of rows `y_stride` apart; threadgroups past the list's count store the lowest finite bf16 there.
     tile_list: bool = false,
+    /// Rows8 reg launches on an 8-row tensor op (matmul2d M = 8) instead of the 16-row one, whose second eight rows rows8
+    /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
+    /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
+    m8: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -232,6 +236,7 @@ pub const Layout = struct {
         if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
+        if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
@@ -341,6 +346,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
+    if (l.m8) try text.appendSlice(a, "#define TF_M8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
