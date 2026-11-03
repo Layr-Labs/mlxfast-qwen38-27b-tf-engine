@@ -104,6 +104,16 @@ pub fn checkUnchecked() !void {
     if (failed) return error.GpuFailed;
 }
 
+/// Whether every command buffer a polled pass returned before it reported completion reports it now. It only reads their
+/// status: checkUnchecked still waits for and checks them at the next pass.
+pub fn quiet() bool {
+    for (unchecked[0..n_unchecked]) |cb| switch (cb.status()) {
+        .completed, .@"error" => {},
+        else => return false,
+    };
+    return true;
+}
+
 pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize) !f64 {
     return runCommittingEarly(device, queues, layers, mode, fam, first, every, false);
 }
