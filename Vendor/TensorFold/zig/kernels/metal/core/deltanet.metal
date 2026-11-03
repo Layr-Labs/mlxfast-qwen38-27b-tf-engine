@@ -817,7 +817,12 @@ inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
     device const bfloat* q = query + kq;
     float kf[16], qf[16], remembered[CC], correction[CC], result[CC];
     TF_UNROLL for (uint c = 0; c < CC; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
+    // Each lane owns 16 consecutive BF16 channels at an 8-byte-aligned address.
+    // Widen loads only: keep every FP32 recurrence and reduction in its original order.
+    TF_UNROLL for (uint v = 0; v < 4; ++v) {
+      const float4 values = float4(((device const bfloat4*)k)[v]);
+      TF_UNROLL for (uint j = 0; j < 4; ++j) kf[4 * v + j] = values[j];
+    }
     const float forget = decay[at];
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < CC; ++c) {
@@ -839,7 +844,12 @@ inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
       correction[2 % CC] = b0 ? lo : other_lo;
       correction[3 % CC] = b0 ? hi : other_hi;
     }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
+    // Each lane owns 16 consecutive BF16 channels at an 8-byte-aligned address.
+    // Widen loads only: keep every FP32 recurrence and reduction in its original order.
+    TF_UNROLL for (uint v = 0; v < 4; ++v) {
+      const float4 values = float4(((device const bfloat4*)q)[v]);
+      TF_UNROLL for (uint j = 0; j < 4; ++j) qf[4 * v + j] = values[j];
+    }
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < CC; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
