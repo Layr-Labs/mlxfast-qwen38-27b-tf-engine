@@ -711,6 +711,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
 #define TF_STREAM_RIGHT 0
 #endif
+// Only the large prompt gate/up uses matched BF16 tensor operands. Each unpacked
+// half subnormal is q * 2^-24 (q=0..15), exactly representable as normal BF16.
+// Keep activations, K32 operation order and folded-scale/bias chains unchanged.
+#if defined(TF_SWIGLU) && TF_PROMPT_TN == 2
+using tf_prompt_right_t = bfloat;
+inline vec<bfloat, 2> tf_prompt_code2(uint v) {
+  // Convert integer fields, not FP16 subnormals: avoid half conversion/FTZ.
+  return vec<bfloat, 2>(float2(uint2(v & 0xffffu, v >> 16)) * 0x1p-24f);
+}
+#else
+using tf_prompt_right_t = half;
+inline half2 tf_prompt_code2(uint v) { return as_type<half2>(v); }
+#endif
 #if TF_STREAM_RIGHT
 #define TF_STREAM_PF 0
 #if TF_STREAM_PF
@@ -724,24 +737,24 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       const uint4 q0 = sp[0], q1 = sp[4]; \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
       const uint4 cur0=nw0,cur1=nw1; \
-      thread half2* b2=(thread half2*)&cbl[0]; \
+      thread vec<tf_prompt_right_t, 2>* b2=(thread vec<tf_prompt_right_t, 2>*)&cbl[0]; \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
         const uint word=w<2?cur0[2*w]:cur1[2*(w-2)]; const int e=2*w; \
-        b2[e]=as_type<half2>(word&0x000f000fu); \
-        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
-        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
-        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+        b2[e]=tf_prompt_code2(word&0x000f000fu); \
+        b2[e+1]=tf_prompt_code2((word>>4)&0x000f000fu); \
+        b2[e+8]=tf_prompt_code2((word>>8)&0x000f000fu); \
+        b2[e+9]=tf_prompt_code2((word>>12)&0x000f000fu); \
       } \
       TF_STREAM_EARLY(t) \
       opm.run(xl0,cbl,P); \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
         const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
-        b2[e]=as_type<half2>(word&0x000f000fu); \
-        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
-        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
-        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+        b2[e]=tf_prompt_code2(word&0x000f000fu); \
+        b2[e+1]=tf_prompt_code2((word>>4)&0x000f000fu); \
+        b2[e+8]=tf_prompt_code2((word>>8)&0x000f000fu); \
+        b2[e+9]=tf_prompt_code2((word>>12)&0x000f000fu); \
       } \
       TF_STREAM_LATE(t) \
       opa.run(xl1,cbl,P); \
@@ -833,10 +846,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
   matmul2d<d64, execution_simdgroup> op64;
-  auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
-  auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
-  auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
-#define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
+  auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, tf_prompt_right_t, float>();
+  auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, tf_prompt_right_t, float>();
+  auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, tf_prompt_right_t, float>();
+#define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, tf_prompt_right_t, float>()
 #define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>()
   auto cbl = TF_TN_RIGHT;
 #if !TF_STREAM_RIGHT
