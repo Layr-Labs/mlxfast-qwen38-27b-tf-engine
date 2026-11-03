@@ -17,11 +17,27 @@ fn begin(ptr: *anyopaque) !u64 {
     b.input_sums = null;
     b.held_conv = null;
     b.held_norms = @splat(null);
+    b.stacked = null;
     b.hazards.clear();
-    const lead = b.early orelse return b.frame.begin();
+    const lead = b.early orelse {
+        const epoch = try b.frame.begin();
+        // the frame's count words start at zero: no counted launch runs before this barrier
+        b.resetCounts(b.frame.encoder) catch |err| {
+            b.frame.release();
+            b.failed = true;
+            return err;
+        };
+        b.barrier(b.frame.encoder);
+        return epoch;
+    };
     // an early frame: its words are picked from the verify's result before anything reads them
     const epoch = try b.frame.beginEarly(true);
     lead.encode(lead.ptr, b.frame.encoder, .{ .buf = b.args }) catch |err| {
+        b.frame.release();
+        b.failed = true;
+        return err;
+    };
+    b.resetCounts(b.frame.encoder) catch |err| {
         b.frame.release();
         b.failed = true;
         return err;
@@ -92,15 +108,20 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
             x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
             y.stride == p.y_stride and p.output_bytes == 2;
+        // a stacked block's rows (convStack): the launch on its sums is the one for one row too, its rows the block's and
+        // the taps' the verify admitted (RoundArgs stacked)
+        const stacked: ?@import("core").lane_projection.Ref = if (b.input_sums) |s| (if (std.meta.eql(s.view, x)) s.dims else null) else null;
+        if (stacked != null and (!cacheable or adapter.forRows(1).pipe.id != p.pipe.id)) return error.DraftDeviceRound;
         if (!cacheable or (if (b.input_sums) |s| !std.meta.eql(s.view, x) else false)) b.input_sums = null;
         // an early frame's append: the launch is the one for one row too, its rows the verify's (RoundArgs)
         const early = b.admitting();
         if (early and (!cacheable or adapter.forRows(1).pipe.id != p.pipe.id)) return error.DraftDeviceRound;
-        const dims: ?@import("core").lane_projection.Ref = if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "dims") } else null;
+        const dims: ?@import("core").lane_projection.Ref = if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "dims") } else stacked;
         if (b.input_sums) |s| {
-            if (early and s.sums.stride != 16) return error.DraftDeviceRound;
+            if (dims != null and s.sums.stride != 16) return error.DraftDeviceRound;
             b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            if (!try encodeCountedIf(b, e, adapter, x, s.sums, input, output, ys, early, dims))
+                try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
         } else if (cacheable) {
             // the sums, a barrier, the product: no barrier behind it, so independent work runs beside it
             const sums_span = Span.whole(p.sums_buffer.?);
@@ -108,7 +129,8 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             const sums = try p.encodeSumsOfAt(e, .{ .buf = input.buf, .off = input.off }, x.rows, if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "count") } else null);
             if (early and sums.stride != 16) return error.DraftDeviceRound;
             b.access(e, &.{ xs, sums_span }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            if (!try encodeCountedIf(b, e, adapter, x, sums, input, output, ys, early, dims))
+                try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
@@ -120,6 +142,31 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             }
         }
     }
+}
+/// A block's decoded out, down or q|k|v projection (at most 8 rows, outside an early frame's append) on the adapter's counted build: its
+/// threadgroups each add one to a fresh count word of the frame once their rows are stored, and Backend.counted names the
+/// launch so the sums launch that reads its rows next can share its barrier interval (waitCounted). `dims`: the [rows,
+/// stride] words a stacked block's q|k|v launch reads (RoundArgs stacked), its grid still the one for x.rows. False:
+/// nothing encoded.
+fn encodeCountedIf(b: *Backend, e: @import("metal").ComputeEncoder, adapter: @import("core").affine4_lane.Adapter, x: op.View, sums: @import("core").lane_projection.Sums, input: Ref, output: Ref, ys: Span, early: bool, dims: ?@import("core").lane_projection.Ref) !bool {
+    b.counted = null;
+    if (early or x.rows == 0 or x.rows > 8 or b.count_next >= @import("runtime_backend.zig").count_slots) return false;
+    // only the launches whose readers wait: the hidden-wide out and down projections (the residual conv and norm after
+    // them) and the q|k|v group (its per-head norms and ropes); a wide reader's many waiting groups would cost more
+    const n = adapter.projection.n;
+    if (n != b.config.hidden and n != b.config.qWidth() + 2 * b.config.kvWidth()) return false;
+    const counted = adapter.small_count orelse return false;
+    const word = Ref{ .buf = b.counts, .off = @as(usize, b.count_next) * 8 };
+    b.count_next += 1;
+    try counted.encodeCountedAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, .{ .buf = word.buf, .off = word.off }, dims);
+    b.counted = .{ .span = ys, .ref = word, .groups = @intCast(counted.tile_count) };
+    return true;
+}
+/// `b.access` for a sums launch whose reads may include the last counted projection's rows: those need no barrier, and
+/// the launch takes the projection's count to wait on (draft_ops.Ops.wait, which the caller clears after encoding).
+fn waitCounted(b: *Backend, e: @import("metal").ComputeEncoder, reads: []const Span, writes: []const Span) void {
+    const c = b.counted orelse return b.access(e, reads, writes);
+    if (b.hazards.orderCounted(e, reads, writes, c.span)) b.primitives.wait = .{ .ref = c.ref, .value = c.groups };
 }
 fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
     const b = backend(ptr);
@@ -170,7 +217,8 @@ fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
         if (try sumsFor(b, x.rows, x.width)) |s| {
             const sums = try b.frame.ref(s);
             const r = h.p.residual.?;
-            b.access(e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &.{ try b.span(h.y), try b.span(y), try b.span(s) });
+            waitCounted(b, e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &.{ try b.span(h.y), try b.span(y), try b.span(s) });
+            defer b.primitives.wait = null;
             try b.primitives.convNormSums(e, try b.frame.ref(h.x), try b.frame.ref(h.p.dynamic), try b.weight(h.p.base), try b.frame.ref(r), try b.frame.ref(h.y), .{ .rows = h.x.rows, .width = h.x.width, .group = h.p.group, .block = h.p.block, .branch = h.p.branch, .residual = 1, .x_stride = h.x.stride, .dynamic_stride = h.p.dynamic.stride, .y_stride = h.y.stride }, try b.weight(p.weight), try b.frame.ref(y), .{ .ref = sums, .stride = sums_stride }, .{ .rows = x.rows, .heads = 1, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
             offerSums(b, y, sums);
             return y;
@@ -214,6 +262,7 @@ fn embedEarly(b: *Backend, e: @import("metal").ComputeEncoder, ids: []const u32)
 fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
+    if (p.stack) |s| return convStack(b, e, x, p, s);
     const y = try b.frame.alloc(x.rows, x.width, .bf16);
     // a conv with a residual feeds the next norm: held back for it (tf_dynamic_conv2_rms_xs), or encoded by the next launch
     if (p.residual != null and !b.admitting() and x.rows <= sums_stride and x.width % draft_ops.sums_group == 0 and x.width <= draft_ops.sums_max_width) {
@@ -232,6 +281,20 @@ fn conv(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Conv) !op.View {
     try b.primitives.conv(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), if (p.residual) |r| try b.frame.ref(r) else null, try b.frame.ref(y), .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = @intFromBool(p.residual != null), .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride });
     return y;
 }
+/// An early frame's attention input with its deferred taps' hidden rows behind the block's (Ops.context_defer): one launch
+/// writes the conv's rows, copies the taps' and writes every row's group sums (the taps' in tf_lane_sums' order), which the
+/// qkv launch reads with the rows of the count the verify admitted (RoundArgs stacked).
+fn convStack(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, p: op.Conv, s: op.View) !op.View {
+    const st = b.stacked orelse return error.DraftDeviceRound;
+    if (b.early == null or b.transaction != null or p.residual != null or x.rows != 2 or s.rows != st.rows or x.rows + s.rows > 8 or x.width % draft_ops.sums_group != 0 or x.width > draft_ops.sums_max_width or s.width != x.width) return error.DraftDeviceRound;
+    const y = try b.frame.alloc(x.rows + s.rows, x.width, .bf16);
+    const sums = try b.frame.alloc(sums_stride, x.width / draft_ops.sums_group, .f32);
+    const sr = try b.frame.ref(sums);
+    b.access(e, &.{ try b.span(x), try b.span(p.dynamic), try b.span(s) }, &.{ try b.span(y), try b.span(sums) });
+    try b.primitives.convSumsStack(e, try b.frame.ref(x), try b.frame.ref(p.dynamic), try b.weight(p.base), try b.frame.ref(y), .{ .ref = sr, .stride = sums_stride }, .{ .rows = x.rows, .width = x.width, .group = p.group, .block = p.block, .branch = p.branch, .residual = 0, .x_stride = x.stride, .dynamic_stride = p.dynamic.stride, .y_stride = y.stride }, try b.frame.ref(s), s.rows, s.stride);
+    b.input_sums = .{ .view = y, .sums = .{ .ref = .{ .buf = sr.buf, .off = sr.off }, .stride = sums_stride }, .dims = .{ .buf = b.args, .off = @offsetOf(RoundArgs, "stacked") } };
+    return y;
+}
 fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     const b = backend(ptr);
     // the per-head norm that wrote `x`, held back: it and this rope in one launch
@@ -243,7 +306,8 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     if (b.early != null and b.transaction == null) {
         if (x.rows != 2) return error.DraftDeviceRound;
         if (held) |h| {
-            b.access(e, &.{try b.span(h.x)}, &.{ try b.span(h.y), try b.span(y) });
+            waitCounted(b, e, &.{try b.span(h.x)}, &.{ try b.span(h.y), try b.span(y) });
+            defer b.primitives.wait = null;
             try b.primitives.normRope(e, try b.frame.ref(h.x), try b.weight(h.p.weight), try b.frame.ref(h.y), b.roundArg("positions"), try b.frame.ref(y), normArgs(h), rp);
             return y;
         }
@@ -255,7 +319,8 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
     const r = try b.frame.ref(positions);
     @memcpy(r.buf.slice(u64, p.positions.len), p.positions);
     if (held) |h| {
-        b.access(e, &.{ try b.span(h.x), try b.span(positions) }, &.{ try b.span(h.y), try b.span(y) });
+        waitCounted(b, e, &.{ try b.span(h.x), try b.span(positions) }, &.{ try b.span(h.y), try b.span(y) });
+        defer b.primitives.wait = null;
         try b.primitives.normRope(e, try b.frame.ref(h.x), try b.weight(h.p.weight), try b.frame.ref(h.y), r, try b.frame.ref(y), normArgs(h), rp);
         return y;
     }
@@ -350,6 +415,8 @@ fn lattice(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Confi
 fn latticeBegin(ptr: *anyopaque, epoch: u64, h: op.Head, c: Config) !op.View {
     const b = backend(ptr);
     _ = try b.encoder(epoch);
+    // deferred taps (Ops.context_defer): every layer wrote their keys and values (rope_append)
+    if (b.stacked) |s| if (s.layers != (@as(u32, 1) << @intCast(b.config.layers)) - 1) return error.DraftDeviceRound;
     const output = try b.frame.alloc(h.logits.rows, @sizeOf(@import("core").bf16_topk.Row), .u8);
     const logits = try b.frame.ref(h.logits);
     const out = try b.frame.ref(output);
@@ -405,5 +472,6 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
     }
 }
 pub const offer_sums = offerSums;
+pub const wait_counted = waitCounted;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd, .context_defer = context.deferAppend, .rope_append = context.ropeAppend };
