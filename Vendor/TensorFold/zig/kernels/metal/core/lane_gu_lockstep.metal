@@ -8,12 +8,22 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
  const int gt=2*int(tg.x)+ks,ut=gt+TF_N/64,gn=gt*32,un=ut*32;
  const int nb=4*(lane&1)+8*((lane>>3)&1),mb=((lane>>1)&3)+4*((lane>>4)&1);
- constexpr auto desc=matmul2d_descriptor(16,32,64,false,true,false,matmul2d_descriptor::mode::multiply);
- matmul2d<desc,execution_simdgroup> op;
- tensor<device bfloat,dextents<int32_t,2>,tensor_inline> a((device bfloat*)X,dextents<int32_t,2>(TF_K,M));
- auto a0=a.slice(0,0);auto cb=op.template get_right_input_cooperative_tensor<bfloat,half,float>();
- auto P=op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>,metal::remove_addrspace_t<decltype(cb)>,float>();
- thread half2* b2=(thread half2*)&cb[0];
+ // team-m5-08j: each turn streams both tensor-op operands through K = 32 halves, so a turn's tensor ops hold half the
+ // operand registers the K = 64 op held. The input's K 0-31 half loads into a K = 32 left operand (xl0) and the codes'
+ // even words unpack into one K = 32 right operand (cbl) for a K = 32 multiply into P; then the K 32-63 half (xl1) and
+ // the odd words, unpacked into the same registers, for a K = 32 multiply-accumulate. A K = 64 right operand's registers
+ // are its two K = 32 halves' registers in order (half2 words 0-15, then 16-31), so each code unpacks into the word it
+ // filled before, less 16 for the odd words, as the TF_PROMPT_TN two-tile kernel streams them; the pair's fp32 sums equal
+ // the K = 64 product's (e-man07's bab46765: no differing bit over 2,097,152 outputs).
+ constexpr auto dm=matmul2d_descriptor(16,32,32,false,true,false,matmul2d_descriptor::mode::multiply);
+ constexpr auto da=matmul2d_descriptor(16,32,32,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+ matmul2d<dm,execution_simdgroup> opm;
+ matmul2d<da,execution_simdgroup> opa;
+ auto xl0=opm.template get_left_input_cooperative_tensor<bfloat,half,float>();
+ auto xl1=opa.template get_left_input_cooperative_tensor<bfloat,half,float>();
+ auto cbl=opm.template get_right_input_cooperative_tensor<bfloat,half,float>();
+ auto P=opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>,metal::remove_addrspace_t<decltype(cbl)>,float>();
+ thread half2* b2=(thread half2*)&cbl[0];
  const device uint4* gw=W+((size_t)(gt/TF_TB)*80*TF_TB+gt%TF_TB)*64+lane;
  const device uint4* uw=W+((size_t)(ut/TF_TB)*80*TF_TB+ut%TF_TB)*64+lane;
  const device uint* tab=(const device uint*)SB;
@@ -25,50 +35,69 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const device uint2* ui=(const device uint2*)(tab+TF_SBI)+(un+nb)/4;
 #endif
  float G[16],U[16],G0[16],U0[16];
+ // team-m5-08l: each matrix's codes and indices load a whole K group ahead, in their own registers (gate: gw0, gw1, gni;
+ // up: uw0, uw1, uni), where one set loaded one turn ahead (the gate turn loaded the up turn's words, the up turn the
+ // next gate turn's). A SIMD group then has two groups' words in flight rather than one, under two turns of work rather
+ // than one. The stream also runs through the split cut: the last group of split 0 loads split 1's first, where split 1
+ // loaded it after split 0 ended. Each turn reads the same words as before; only when they load changes.
+ const device uint4* gp=gw;
+ const device uint4* up=uw;
+ uint4 gw0=gp[0],gw1=gp[32],uw0=up[0],uw1=up[32];
+#if defined(TF_SBI12)
+ uint3 gni=gi[0],uni=ui[0];
+#else
+ uint2 gni0=gi[0],gni1=gi[4],uni0=ui[0],uni1=ui[4];
+#endif
  for(int split=0;split<2;split++){
   const int first=split*40,last=first+40;
   for(int i=0;i<16;i++){G[i]=0.0f;U[i]=0.0f;}
-  const device uint4* gp=gw+(size_t)first*TF_TB*64;
-  const device uint4* up=uw+(size_t)first*TF_TB*64;
-  uint4 nw0=gp[0],nw1=gp[32];
-#if defined(TF_SBI12)
-  uint3 ni=gi[(size_t)first*(TF_N/8)];
-#else
-  uint2 ni0=gi[(size_t)first*(TF_N/4)],ni1=gi[(size_t)first*(TF_N/4)+4];
-#endif
   for(int g=first;g<last;g++){
    const float x0=XS[g*stride+mb];
    const array<int32_t,2> xstr={1,TF_K};
-   tensor<device bfloat,dextents<int32_t,2>,tensor_inline> x((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(64,M),xstr);
+   // the stream's next group; the chain's last group reloads its own words, which nothing reads
+   const int advance=g+1<80?TF_TB*64:0,next=min(g+1,79);
    #pragma clang loop unroll(full)
    for(int turn=0;turn<2;turn++){
 #if defined(TF_SBI12)
-    const uint4 q0=tf_look12a(tab,ni),q1=tf_look12b(tab,ni);
+    const uint3 ci=turn==0?gni:uni;
+    const uint4 q0=tf_look12a(tab,ci),q1=tf_look12b(tab,ci);
 #else
-    const uint4 q0=tf_look(tab,ni0),q1=tf_look(tab,ni1);
+    const uint2 ci0=turn==0?gni0:uni0,ci1=turn==0?gni1:uni1;
+    const uint4 q0=tf_look(tab,ci0),q1=tf_look(tab,ci1);
 #endif
-    for(int w=0;w<8;w++){
-     const uint word=w<4?nw0[w]:nw1[w-4];const int e=16*(w&1)+2*(w>>1);
+    // the turn's codes: the prefetch below reloads its matrix's words before the odd words unpack
+    const uint4 cw0=turn==0?gw0:uw0,cw1=turn==0?gw1:uw1;
+    #pragma clang loop unroll(full)
+    for(int w=0;w<8;w+=2){
+     const uint word=w<4?cw0[w]:cw1[w-4];const int e=2*(w>>1);
      b2[e]=as_type<half2>(word&0x000F000Fu);b2[e+1]=as_type<half2>((word>>4)&0x000F000Fu);
      b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
     }
     if(turn==0){
-     nw0=up[0];nw1=up[32];
+     gp+=advance;gw0=gp[0];gw1=gp[32];
 #if defined(TF_SBI12)
-     ni=ui[(size_t)g*(TF_N/8)];
+     gni=gi[(size_t)next*(TF_N/8)];
 #else
-     ni0=ui[(size_t)g*(TF_N/4)];ni1=ui[(size_t)g*(TF_N/4)+4];
+     gni0=gi[(size_t)next*(TF_N/4)];gni1=gi[(size_t)next*(TF_N/4)+4];
 #endif
     }else{
-     const int advance=g+1<last?TF_TB*64:0;gp+=advance;up+=advance;nw0=gp[0];nw1=gp[32];
-     const int next=min(g+1,last-1);
+     up+=advance;uw0=up[0];uw1=up[32];
 #if defined(TF_SBI12)
-     ni=gi[(size_t)next*(TF_N/8)];
+     uni=ui[(size_t)next*(TF_N/8)];
 #else
-     ni0=gi[(size_t)next*(TF_N/4)];ni1=gi[(size_t)next*(TF_N/4)+4];
+     uni0=ui[(size_t)next*(TF_N/4)];uni1=ui[(size_t)next*(TF_N/4)+4];
 #endif
     }
-    op.run(x,cb,P);
+    xl0.load(tensor<device bfloat,dextents<int32_t,2>,tensor_inline>((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(32,M),xstr));
+    opm.run(xl0,cbl,P);
+    #pragma clang loop unroll(full)
+    for(int w=1;w<8;w+=2){
+     const uint word=w<4?cw0[w]:cw1[w-4];const int e=2*(w>>1);
+     b2[e]=as_type<half2>(word&0x000F000Fu);b2[e+1]=as_type<half2>((word>>4)&0x000F000Fu);
+     b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
+    }
+    xl1.load(tensor<device bfloat,dextents<int32_t,2>,tensor_inline>((device bfloat*)X+(size_t)g*64+32,dextents<int32_t,2>(32,M),xstr));
+    opa.run(xl1,cbl,P);
     for(int j=0;j<4;j++){
      const vec<bfloat,2> v0=as_type<vec<bfloat,2>>(q0[j]),v1=as_type<vec<bfloat,2>>(q1[j]);
      const float s0=float(v0.x),b0=float(v0.y),s1=float(v1.x),b1=float(v1.y);
