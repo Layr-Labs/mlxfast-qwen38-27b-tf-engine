@@ -25,47 +25,56 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const device uint2* ui=(const device uint2*)(tab+TF_SBI)+(un+nb)/4;
 #endif
  float G[16],U[16],G0[16],U0[16];
+ // team-m5-08m: each matrix's codes and indices load a whole K group ahead, in their own registers (gate: gw0, gw1, gni;
+ // up: uw0, uw1, uni), where one set loaded one turn ahead (the gate turn loaded the up turn's words, the up turn the
+ // next gate turn's). A SIMD group then has two groups' words in flight rather than one, under two turns of work rather
+ // than one. The stream also runs through the split cut: the last group of split 0 loads split 1's first, where split 1
+ // loaded it after split 0 ended. Each turn reads the same words as before; only when they load changes.
+ const device uint4* gp=gw;
+ const device uint4* up=uw;
+ uint4 gw0=gp[0],gw1=gp[32],uw0=up[0],uw1=up[32];
+#if defined(TF_SBI12)
+ uint3 gni=gi[0],uni=ui[0];
+#else
+ uint2 gni0=gi[0],gni1=gi[4],uni0=ui[0],uni1=ui[4];
+#endif
  for(int split=0;split<2;split++){
   const int first=split*40,last=first+40;
   for(int i=0;i<16;i++){G[i]=0.0f;U[i]=0.0f;}
-  const device uint4* gp=gw+(size_t)first*TF_TB*64;
-  const device uint4* up=uw+(size_t)first*TF_TB*64;
-  uint4 nw0=gp[0],nw1=gp[32];
-#if defined(TF_SBI12)
-  uint3 ni=gi[(size_t)first*(TF_N/8)];
-#else
-  uint2 ni0=gi[(size_t)first*(TF_N/4)],ni1=gi[(size_t)first*(TF_N/4)+4];
-#endif
   for(int g=first;g<last;g++){
    const float x0=XS[g*stride+mb];
    const array<int32_t,2> xstr={1,TF_K};
    tensor<device bfloat,dextents<int32_t,2>,tensor_inline> x((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(64,M),xstr);
+   // the stream's next group; the chain's last group reloads its own words, which nothing reads
+   const int advance=g+1<80?TF_TB*64:0,next=min(g+1,79);
    #pragma clang loop unroll(full)
    for(int turn=0;turn<2;turn++){
 #if defined(TF_SBI12)
-    const uint4 q0=tf_look12a(tab,ni),q1=tf_look12b(tab,ni);
+    const uint3 ci=turn==0?gni:uni;
+    const uint4 q0=tf_look12a(tab,ci),q1=tf_look12b(tab,ci);
 #else
-    const uint4 q0=tf_look(tab,ni0),q1=tf_look(tab,ni1);
+    const uint2 ci0=turn==0?gni0:uni0,ci1=turn==0?gni1:uni1;
+    const uint4 q0=tf_look(tab,ci0),q1=tf_look(tab,ci1);
 #endif
+    const uint4 cw0=turn==0?gw0:uw0,cw1=turn==0?gw1:uw1;
     for(int w=0;w<8;w++){
-     const uint word=w<4?nw0[w]:nw1[w-4];const int e=16*(w&1)+2*(w>>1);
+     const uint word=w<4?cw0[w]:cw1[w-4];const int e=16*(w&1)+2*(w>>1);
      b2[e]=as_type<half2>(word&0x000F000Fu);b2[e+1]=as_type<half2>((word>>4)&0x000F000Fu);
      b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
     }
     if(turn==0){
-     nw0=up[0];nw1=up[32];
+     gp+=advance;gw0=gp[0];gw1=gp[32];
 #if defined(TF_SBI12)
-     ni=ui[(size_t)g*(TF_N/8)];
+     gni=gi[(size_t)next*(TF_N/8)];
 #else
-     ni0=ui[(size_t)g*(TF_N/4)];ni1=ui[(size_t)g*(TF_N/4)+4];
+     gni0=gi[(size_t)next*(TF_N/4)];gni1=gi[(size_t)next*(TF_N/4)+4];
 #endif
     }else{
-     const int advance=g+1<last?TF_TB*64:0;gp+=advance;up+=advance;nw0=gp[0];nw1=gp[32];
-     const int next=min(g+1,last-1);
+     up+=advance;uw0=up[0];uw1=up[32];
 #if defined(TF_SBI12)
-     ni=gi[(size_t)next*(TF_N/8)];
+     uni=ui[(size_t)next*(TF_N/8)];
 #else
-     ni0=gi[(size_t)next*(TF_N/4)];ni1=gi[(size_t)next*(TF_N/4)+4];
+     uni0=ui[(size_t)next*(TF_N/4)];uni1=ui[(size_t)next*(TF_N/4)+4];
 #endif
     }
     op.run(x,cb,P);
