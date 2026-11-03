@@ -8,7 +8,7 @@ pub const Norm = extern struct { rows: u32, heads: u32, dim: u32, x_stride: u32,
 pub const Conv = extern struct { rows: u32, width: u32, group: u32 = 16, block: u32 = 8, branch: u32, residual: u32 = 0, x_stride: u32, dynamic_stride: u32, y_stride: u32, rounding: u32 = 0 };
 pub const Rope = extern struct { rows: u32, heads: u32, dim: u32, x_stride: u32, y_stride: u32, theta: f32 = 10000000 };
 pub const Activation = extern struct { rows: u32, width: u32, gate_stride: u32, up_stride: u32, y_stride: u32, rounding: u32 = 0 };
-const Kind = enum { linear, norm, conv, rope, swiglu, norm_xs, conv_xs, swiglu_xs, conv_norm_xs, norm_rope };
+const Kind = enum { linear, norm, conv, rope, swiglu, norm_xs, conv_xs, swiglu_xs, conv_norm_xs, norm_rope, zero };
 /// Group sums a sums-emitting primitive writes for the q4 projection that reads its output: f32
 /// [width / 64][stride], each group's 64 output values added in order, rows past `rows` zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
@@ -17,15 +17,20 @@ pub const sums_group = 64;
 pub const sums_max_width = 5120;
 /// The widest head a fused norm and rope holds (tf_draft_rms_rope).
 pub const rope_max_dim = 256;
+/// A counted projection's word (lane_projection's TF_COUNT) and its threadgroups: a launch given one reads that
+/// projection's rows in the projection's own barrier interval, its threadgroups waiting until the count is reached.
+pub const Wait = struct { ref: Ref, value: u32 };
 pub const Ops = struct {
-    pipes: [10]mtl.Pipeline,
+    pipes: [11]mtl.Pipeline,
+    /// Taken by the next convSums, convNormSums, swigluSums or normRope (its caller sets and clears it).
+    wait: ?Wait = null,
     pub fn init(device: mtl.Device) !Ops {
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        var pipes: [10]mtl.Pipeline = undefined;
+        var pipes: [11]mtl.Pipeline = undefined;
         var count: usize = 0;
         errdefer for (pipes[0..count]) |pipe| pipe.deinit();
-        for (&pipes, [_][]const u8{ "tf_bf16_linear", "tf_draft_rms", "tf_dynamic_conv2", "tf_full_rope", "tf_draft_swiglu", "tf_draft_rms_xs", "tf_dynamic_conv2_xs", "tf_draft_swiglu_xs", "tf_dynamic_conv2_rms_xs", "tf_draft_rms_rope" }) |*pipe, name| {
+        for (&pipes, [_][]const u8{ "tf_bf16_linear", "tf_draft_rms", "tf_dynamic_conv2", "tf_full_rope", "tf_draft_swiglu", "tf_draft_rms_xs", "tf_dynamic_conv2_xs", "tf_draft_swiglu_xs", "tf_dynamic_conv2_rms_xs", "tf_draft_rms_rope", "tf_draft_zero" }) |*pipe, name| {
             pipe.* = try mtl.Pipeline.init(device, lib, name, false);
             count += 1;
         }
@@ -33,6 +38,19 @@ pub const Ops = struct {
     }
     pub fn deinit(ops: Ops) void {
         for (ops.pipes) |pipe| pipe.deinit();
+    }
+    /// The wait words of the four launches that take one (buffers 14 and 15); none: a zero count, never read.
+    fn bindWait(ops: Ops, e: mtl.ComputeEncoder, unused: Ref) void {
+        const w = ops.wait orelse Wait{ .ref = unused, .value = 0 };
+        e.setBuffer(w.ref.buf, w.ref.off, 14);
+        e.setValue(w.value, 15);
+    }
+    /// `count` u32 words at `words` set to zero.
+    pub fn zero(ops: Ops, e: mtl.ComputeEncoder, words: Ref, count: u32) !void {
+        if (count == 0 or words.off % 4 != 0 or words.off > words.buf.length() or @as(usize, count) * 4 > words.buf.length() - words.off) return error.BadDraftBuffer;
+        e.setPipeline(ops.pipes[@backingInt(Kind.zero)]);
+        e.setBuffer(words.buf, words.off, 0);
+        e.dispatchThreads(mtl.Size.of(count, 1, 1), mtl.Size.of(@min(count, 256), 1, 1));
     }
     pub fn linear(ops: Ops, e: mtl.ComputeEncoder, x: Ref, weight: Ref, out: Ref, p: Linear) !void {
         try checkLinear(p);
@@ -89,6 +107,7 @@ pub const Ops = struct {
         e.setBuffer(positions.buf, positions.off, 4);
         e.setValue(rp, 5);
         e.setBuffer(out.buf, out.off, 6);
+        ops.bindWait(e, out);
         e.dispatchGroups(mtl.Size.of(np.heads, np.rows, 1), mtl.Size.of(threads, 1, 1));
     }
     pub fn rope(ops: Ops, e: mtl.ComputeEncoder, x: Ref, positions: Ref, out: Ref, p: Rope) !void {
@@ -138,6 +157,7 @@ pub const Ops = struct {
         e.setBuffer(out.buf, out.off, 8);
         e.setBuffer(sums.ref.buf, sums.ref.off, 9);
         e.setValue(sums.stride, 10);
+        ops.bindWait(e, out);
         e.dispatchGroups(mtl.Size.of(1, np.rows, 1), mtl.Size.of(threads, 1, 1));
     }
     pub fn convSums(ops: Ops, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: ?Ref, out: Ref, sums: Sums, p: Conv) !void {
@@ -156,6 +176,7 @@ pub const Ops = struct {
         e.setBuffer(out.buf, out.off, 5);
         e.setBuffer(sums.ref.buf, sums.ref.off, 6);
         e.setValue(sums.stride, 7);
+        ops.bindWait(e, out);
         e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(sums_group, 1, 1));
     }
     /// swiglu with its output's group sums.
@@ -169,6 +190,7 @@ pub const Ops = struct {
         e.setBuffer(out.buf, out.off, 3);
         e.setBuffer(sums.ref.buf, sums.ref.off, 4);
         e.setValue(sums.stride, 5);
+        ops.bindWait(e, out);
         e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(sums_group, 1, 1));
     }
     pub fn swiglu(ops: Ops, e: mtl.ComputeEncoder, gate: Ref, up: Ref, out: Ref, p: Activation) !void {

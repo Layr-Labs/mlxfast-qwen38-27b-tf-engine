@@ -136,7 +136,8 @@ pub const Generation = struct {
         try g.runner.taps.accepted(g.runner.model.glue, e, path, .{ .buffer = g.kept }, .{ .buffer = g.taps });
         e.end();
         cb.commit();
-        cb.wait();
+        // fkiene f8eb90b5: a few microseconds of GPU work the host reads straight after: poll it rather than sleep to its wake
+        @import("../decode_round.zig").spin(cb);
         if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
         try g.draft.absorb(.{ .buf = g.taps }, @intCast(path.len));
     }
@@ -197,7 +198,10 @@ pub const Generation = struct {
         const cb = g.keep_done orelse return;
         g.keep_done = null;
         defer cb.release();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
@@ -213,7 +217,6 @@ pub const Generation = struct {
             .completed, .@"error" => break,
             else => std.atomic.spinLoopHint(),
         };
-        cb.wait();
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
