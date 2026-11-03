@@ -117,6 +117,13 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   const int hk = int(tg.x), c = int(tg.y);
   const bool live = tile * 16 < args.rp;
   threadgroup float xs[SG][32][16];
+#ifndef TF_ATTN_TGPAD
+#define TF_ATTN_TGPAD 8192
+#endif
+#if TF_ATTN_TGPAD > 0
+  threadgroup float tgpad[TF_ATTN_TGPAD / 4];
+  if (args.rows < -12345) { tgpad[lane] = float(lane); threadgroup_barrier(mem_flags::mem_threadgroup); xs[0][0][0] = tgpad[lane ^ 1]; }
+#endif
   const int r0 = tile * 16 + fm, r1 = r0 + 8;
   const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
   const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
@@ -179,17 +186,19 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
     m = nm;
   }
+  vec<bfloat, DP> gates = vec<bfloat, DP>(bfloat(0.0f)), values;
+  if (gated) gates = *(device const vec<bfloat, DP>*)(QG + ((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP);
   for (int i = 0; i < DP; i++) {
-    const int64_t index = ((int64_t)node * (PG * 4) + head) * PD + lane * DP + i;
     const bfloat v = static_cast<bfloat>(o[i] / l);
     bfloat value = v;
     if (gated) {
-      const float gate = float(QG[((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP + i]);
+      const float gate = float(gates[i]);
       value = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
     }
-    OUT[index] = value;
+    values[i] = value;
     o[i] = float(value);
   }
+  *(device vec<bfloat, DP>*)(OUT + ((int64_t)node * (PG * 4) + head) * PD + lane * DP) = values;
   if (sums_stride != 0) {
     // Four independent groups per head. Their eight lanes take turns adding eight BF16 values,
     // keeping the existing64-value sequential FP32 sum, including the initial positive zero.

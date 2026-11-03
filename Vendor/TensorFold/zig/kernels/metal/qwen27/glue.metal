@@ -134,7 +134,7 @@ struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
 // DEC (decoded rows of one stream): beside QY and KY, a q head's rounded values also land where q27_attn_pack_a packs
 // them (QA, packed_rows rows a kv head, rows * g on repeating row 0's first head), and a k head's rotated key and its
 // value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
-template <bool PACK, bool DEC>
+template <bool PACK, bool DEC, bool CACHE = false>
 inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
                                     device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
                                     uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
@@ -146,7 +146,16 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
   device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
   device const bfloat* w = query ? QW : KW;
   const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
-  device bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
+  device bfloat* key = nullptr;
+  device bfloat* value = nullptr;
+  if (CACHE && !query) {
+    const uint hk = head - a.heads;
+    const int st = nodes[4 * row + 1], base = 8 + st * 12;
+    const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
+    key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
+    value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
+  }
+  device bfloat* y = !query ? (CACHE ? key : KY + (row * a.kv_heads + head - a.heads) * a.width)
                             : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
   const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
   float sa = 0.0f, sb = 0.0f;
@@ -223,6 +232,11 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
     *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
     *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
   }
+  if (CACHE && !query) {
+    device const bfloat* source = V + row * v_stride + (head - a.heads) * a.width;
+    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
+    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
+  }
 }
 
 // The record's kernels: prompt rows and every launch with no wait (a counted launch takes the _held kernels below).
@@ -252,6 +266,17 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
 Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope, false)
 Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope_packed, true)
 #undef Q27_HEAD_NORM_ROPE_DIRECT
+
+kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]],
+                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
+                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+                 uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+  q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
+                                                    nodes, V, v_stride);
+}
 
 // The words a head's simdgroup reads from outside a decoded launch's barrier interval, gathered before its wait on the
 // counted q and k|v projections (q27_head_norm_rope_held): the head's norm gains, the lane's rope cosine and sine (the

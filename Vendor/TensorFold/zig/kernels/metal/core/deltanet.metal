@@ -187,6 +187,88 @@ inline void tf_delta_gdn_pre_rows4_direct(device const bfloat* projection, devic
   }
 }
 
+inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
+    device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
+    device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
+    device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
+  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  if (sg * per >= in_group) return;
+  const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const uint keep = p.taps - 1;
+  const uint channel0 = head < 2 * p.nk ? head * p.dk : 2 * p.nk * p.dk + (head - 2 * p.nk) * p.dv;
+  const uint channel = channel0 + lane * 4;
+  float weight[4][4];
+  for (uint part = 0; part < 4; ++part)
+    for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
+  const uint slot = row_slot[first];
+  bfloat4 taps[7];
+  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
+    const uint source = first + s;
+    taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
+                                                         : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
+  }
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+    if (i < count) {
+      const uint row = first + i;
+      float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      _Pragma("clang loop unroll(full)") for (uint tap = 0; tap < 4; ++tap) {
+        const bfloat4 input = taps[i + tap];
+        _Pragma("clang loop unroll(full)") for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
+      }
+      float activated[4];
+      for (uint part = 0; part < 4; ++part) {
+        const float rounded = float(bfloat(result[part]));
+        const float sigmoid = float(bfloat(1.0f / (1.0f + metal::exp(-rounded))));
+        activated[part] = float(bfloat(rounded * sigmoid));
+      }
+      if (head < 2 * p.nk) {
+        float square = 0.0f;
+        for (uint part = 0; part < 4; ++part) square += activated[part] * activated[part];
+        square = simd_sum(square);
+        const float inverse = metal::rsqrt(square / float(p.dk) + 1e-6f);
+        const float scale = head < p.nk ? float(bfloat(1.0f / float(p.dk))) : float(bfloat(metal::rsqrt(float(p.dk))));
+        bfloat4 normalized;
+        for (uint part = 0; part < 4; ++part) normalized[part] = bfloat(scale * float(bfloat(activated[part] * inverse)));
+        *(device bfloat4*)((head < p.nk ? query : key) + (row * p.nk + head % p.nk) * p.dk + lane * 4) = normalized;
+      } else {
+        bfloat4 activation;
+        for (uint part = 0; part < 4; ++part) activation[part] = bfloat(activated[part]);
+        *(device bfloat4*)(value + (row * p.nv + head - 2 * p.nk) * p.dv + lane * 4) = activation;
+      }
+    }
+  }
+  if (head >= 2 * p.nk && lane < count) {
+    const uint output_head = head - 2 * p.nk, row = first + lane;
+    const uint at = row * p.nv + output_head, gate_at = p.zba_stride ? row * p.zba_stride + output_head : at;
+    const float shifted = float(bfloat(float(a[gate_at]) + tf_delta_weight(time_bias, output_head, p.weight_flags, 2)));
+    const float softplus = float(bfloat(metal::max(shifted, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(shifted)))));
+    decay[at] = metal::exp(-metal::exp(tf_delta_weight(decay_weight, output_head, p.weight_flags, 1)) * softplus);
+    mixing[at] = bfloat(1.0f / (1.0f + metal::exp(-float(b[gate_at]))));
+  }
+}
+
+kernel void tf_delta_gdn_pre_chain(device const bfloat* projection [[buffer(0)]],
+                        device const bfloat* a [[buffer(1)]],
+                        device const bfloat* b [[buffer(2)]],
+                        device const bfloat* history [[buffer(3)]],
+                        device const void* weights [[buffer(4)]],
+                        device const void* decay_weight [[buffer(5)]],
+                        device const void* time_bias [[buffer(6)]],
+                        device const uint* windows [[buffer(7)]],
+                        device const uint* row_slot [[buffer(8)]],
+                        constant TfDeltaParams& p [[buffer(9)]],
+                        device bfloat* query [[buffer(10)]],
+                        device bfloat* key [[buffer(11)]],
+                        device bfloat* value [[buffer(12)]],
+                        device float* decay [[buffer(13)]],
+                        device bfloat* mixing [[buffer(14)]],
+                        uint3 group [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_chain4(projection, a, b, history, weights, decay_weight, time_bias, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+}
+
 // tf_delta_gdn_pre past 16 rows of 128-wide heads: 4 simdgroups a group, 16 rows. Prompt rows and every launch with no
 // wait take this kernel; a decoded launch behind counted projections takes tf_delta_gdn_pre_rows_held.
 kernel void tf_delta_gdn_pre_rows(device const bfloat* projection [[buffer(0)]],
@@ -758,36 +840,25 @@ inline void tf_delta_gdn_chain_wide_body(device const bfloat* query,
     TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
 }
 
-// A set's xor 1, 2, 4 sum of CC = 2 or 4 columns as a reduce-scatter: every node of the tree adds the same two partial
-// sums as the full reduction's (IEEE addition commutes), but after the first steps a lane carries only some columns'
-// partials. Returns the total of column `held` (CC = 2: b0; CC = 4: 2 b0 + b1; b0 = sub & 1, b1 = sub >> 1 & 1).
-template <uint CC>
-inline float tf_delta_scatter_sum(thread const float (&r)[CC], const bool b0, const bool b1) {
-  static_assert(CC == 2 || CC == 4, "two or four columns");
-  if (CC == 2) {
-    float kept = b0 ? r[1 % CC] : r[0];
-    const float sent = b0 ? r[0] : r[1 % CC];
-    kept += simd_shuffle_xor(sent, 1);
-    kept += simd_shuffle_xor(kept, 2);
-    kept += simd_shuffle_xor(kept, 4);
-    return kept;
-  }
-  float k0 = b0 ? r[2 % CC] : r[0], k1 = b0 ? r[3 % CC] : r[1 % CC]; // b0 keeps columns 2 and 3, sends 0 and 1
-  const float s0 = b0 ? r[0] : r[2 % CC], s1 = b0 ? r[1 % CC] : r[3 % CC];
-  k0 += simd_shuffle_xor(s0, 1);
-  k1 += simd_shuffle_xor(s1, 1);
-  float kept = b1 ? k1 : k0; // b1 keeps the second column of its pair
-  const float sent = b1 ? k0 : k1;
+// The unmarked prompt scan: tf_delta_gdn_chain_wide_body's arithmetic for every column, with running row offsets in
+inline float tf_delta_slot_sum(thread const float (&r)[4]) {
+  float kept = r[0] + simd_shuffle_xor(r[2], 1);
+  const float sent = r[1] + simd_shuffle_xor(r[3], 1);
   kept += simd_shuffle_xor(sent, 2);
   kept += simd_shuffle_xor(kept, 4);
   return kept;
 }
-
-// The unmarked prompt scan: tf_delta_gdn_chain_wide_body's arithmetic for every column, with running row offsets in
-// place of per-row products, and both sums of a row reduced by tf_delta_scatter_sum. A lane forms the correction of
-// column `held` alone and gathers the other columns' corrections by shuffles; lanes sub < CC store column `held`.
-template <uint CC>
-inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
+inline void tf_delta_bf16x16(device const bfloat* x, thread float (&f)[16]) {
+  const uint4 w0 = ((device const uint4*)x)[0], w1 = ((device const uint4*)x)[1];
+  const bfloat4 a0 = as_type<bfloat4>(w0.xy), a1 = as_type<bfloat4>(w0.zw), a2 = as_type<bfloat4>(w1.xy), a3 = as_type<bfloat4>(w1.zw);
+  TF_UNROLL for (uint i = 0; i < 4; ++i) {
+    f[i] = float(a0[i]);
+    f[4 + i] = float(a1[i]);
+    f[8 + i] = float(a2[i]);
+    f[12 + i] = float(a3[i]);
+  }
+}
+inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
     device const bfloat* key,
     device const bfloat* value,
     device const float* decay,
@@ -800,59 +871,47 @@ inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
     uint3 position,
     uint lane) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
-  const uint sub = lane & 7, dimension = position.y * (4 * CC) + (lane >> 3) * CC, key_head = head / (p.nv / p.nk);
+  const uint sub = lane & 7, dimension = position.y * 16 + (lane >> 3) * 4, key_head = head / (p.nv / p.nk);
   const TfDeltaSegment span = segments[segment_index];
   const uint state_stride = p.nv * p.dv * p.dk;
   const uint column = (head * p.dv + dimension) * p.dk + sub * 16;
-  const bool b0 = (sub & 1) != 0, b1 = (sub & 2) != 0;
-  const uint held = CC == 2 ? (sub & 1) : ((sub & 1) << 1 | (sub >> 1 & 1));
-  float state[CC][16]; // state[c]: value column dimension + c, its words at column + c * p.dk
-  TF_UNROLL for (uint c = 0; c < CC; ++c)
-    TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + c * p.dk + i];
+  const uint held = (sub & 1) << 1 | (sub >> 1 & 1);
+  float state[4][16];
+  TF_UNROLL for (uint c = 0; c < 4; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + (held ^ c) * p.dk + i];
   // the row's key and query words, its (row, head) scalars, and its value and output words
   uint kq = (span.first * p.nk + key_head) * p.dk + sub * 16, at = span.first * p.nv + head, vo = at * p.dv + dimension;
   const uint kq_step = p.nk * p.dk, at_step = p.nv, vo_step = p.nv * p.dv;
   for (uint node = 0; node < span.rows; ++node) {
-    device const bfloat* k = key + kq;
-    device const bfloat* q = query + kq;
-    float kf[16], qf[16], remembered[CC], correction[CC], result[CC];
-    TF_UNROLL for (uint c = 0; c < CC; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
+    float kf[16], qf[16], remembered[4], correction[4], result[4];
+    TF_UNROLL for (uint c = 0; c < 4; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
+    tf_delta_bf16x16(key + kq, kf);
     const float forget = decay[at];
     TF_UNROLL for (uint i = 0; i < 16; ++i)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+      TF_UNROLL for (uint c = 0; c < 4; ++c) {
         state[c][i] = state[c][i] * forget;
         remembered[c] += state[c][i] * kf[i];
       }
     const float mix = float(mixing[at]);
-    const float own = (float(value[vo + held]) - tf_delta_scatter_sum<CC>(remembered, b0, b1)) * mix;
-    if (CC == 2) {
-      const float other = simd_shuffle_xor(own, 1);
-      correction[0] = b0 ? other : own;
-      correction[1 % CC] = b0 ? own : other;
-    } else { // xor 2 brings column held ^ 1; xor 1 then brings the other pair
-      const float pair = simd_shuffle_xor(own, 2);
-      const float lo = b1 ? pair : own, hi = b1 ? own : pair; // columns 2 b0 and 2 b0 + 1
-      const float other_lo = simd_shuffle_xor(lo, 1), other_hi = simd_shuffle_xor(hi, 1);
-      correction[0] = b0 ? other_lo : lo;
-      correction[1 % CC] = b0 ? other_hi : hi;
-      correction[2 % CC] = b0 ? lo : other_lo;
-      correction[3 % CC] = b0 ? hi : other_hi;
-    }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
+    const float own = (float(value[vo + held]) - tf_delta_slot_sum(remembered)) * mix;
+    correction[0] = own;
+    correction[1] = simd_shuffle_xor(own, 2);
+    correction[2] = simd_shuffle_xor(own, 1);
+    correction[3] = simd_shuffle_xor(own, 3);
+    tf_delta_bf16x16(query + kq, qf);
     TF_UNROLL for (uint i = 0; i < 16; ++i)
-      TF_UNROLL for (uint c = 0; c < CC; ++c) {
+      TF_UNROLL for (uint c = 0; c < 4; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
         result[c] += state[c][i] * qf[i];
       }
-    const float total = tf_delta_scatter_sum<CC>(result, b0, b1);
-    if (sub < CC) output[vo + held] = bfloat(total);
+    const float total = tf_delta_slot_sum(result);
+    if (sub < 4) output[vo + held] = bfloat(total);
     kq += kq_step;
     at += at_step;
     vo += vo_step;
   }
-  TF_UNROLL for (uint c = 0; c < CC; ++c)
-    TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + c * p.dk + i] = state[c][i];
+  TF_UNROLL for (uint c = 0; c < 4; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + (held ^ c) * p.dk + i] = state[c][i];
 }
 #undef TF_UNROLL
 
@@ -868,7 +927,7 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_scatter<4>(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
+  tf_delta_gdn_chain_wide_slots(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
 }
 
 // marks[segment] (its rows, 0 unused): mark_state[segment * 4 + m] is the state a segment ending there would leave.
@@ -1144,4 +1203,15 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   const ulong row = ulong(at.y) * p.slots + slot; // the whole pool's words pass 32 bits past 113 slots of a 27B
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
+}
+kernel void tf_delta_gdn_clear4(device uint4* state [[buffer(0)]],
+                          device uint4* conv [[buffer(1)]],
+                          constant TfDeltaParams& p [[buffer(2)]],
+                          constant uint& slot [[buffer(3)]],
+                          uint2 at [[thread_position_in_grid]]) {
+  const uint state_width = p.nv * p.dv * p.dk / 4;
+  const uint conv_width = (p.taps - 1) * (2 * p.nk * p.dk + p.nv * p.dv) / 8;
+  const ulong row = ulong(at.y) * p.slots + slot;
+  if (at.x < state_width) state[row * state_width + at.x] = uint4(0u);
+  if (at.x < conv_width) conv[row * conv_width + at.x] = uint4(0u);
 }

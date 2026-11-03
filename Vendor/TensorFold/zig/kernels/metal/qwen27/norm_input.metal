@@ -29,6 +29,25 @@ Q27_SPECIALIZE
   }
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
+#if defined(Q27_NORM_WORDS)
+  bfloat4 h4[E / 4], w4[E / 4];
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 hw = ((const device uint4*)(H + base))[j];
+    h4[2 * j] = as_type<bfloat4>(hw.xy);
+    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
+  }
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 ww = ((const device uint4*)(Wt + int(t) * E))[j];
+    w4[2 * j] = as_type<bfloat4>(ww.xy);
+    w4[2 * j + 1] = as_type<bfloat4>(ww.zw);
+  }
+  float hv[E];
+  float ss = 0.0f;
+  for (int i = 0; i < E; i++) {
+    hv[i] = float(h4[i / 4][i % 4]);
+    ss = fma(hv[i], hv[i], ss);
+  }
+#else
   float hv[E];
   float ss = 0.0f;
   for (int i = 0; i < E; i++) {
@@ -37,6 +56,7 @@ Q27_SPECIALIZE
     hv[i] = float(h);
     ss = fma(hv[i], hv[i], ss);
   }
+#endif
   ss = simd_sum(ss);
   if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -44,11 +64,21 @@ Q27_SPECIALIZE
   for (int i = 0; i < TPG / 32; i++) total += red[i];
   const float inv = metal::rsqrt(total / float(K) + eps[0]);
   float xv[E];
+#if defined(Q27_NORM_WORDS)
+  bfloat4 x4[E / 4];
+  for (int i = 0; i < E; i++) {
+    const bfloat x = bfloat(float(w4[i / 4][i % 4]) * (hv[i] * inv));
+    x4[i / 4][i % 4] = x;
+    xv[i] = float(x);
+  }
+  for (int j = 0; j < E / 8; j++) ((device uint4*)(XO + base))[j] = uint4(as_type<uint2>(x4[2 * j]), as_type<uint2>(x4[2 * j + 1]));
+#else
   for (int i = 0; i < E; i++) {
     const bfloat x = bfloat(float(Wt[int(t) * E + i]) * (hv[i] * inv));
     XO[base + i] = x;
     xv[i] = float(x);
   }
+#endif
   // a group's 64 values summed in order from zero, as the lane projection's sums are: its four threads take turns
   float gs = 0.0f;
   for (uint turn = 0; turn < 4; turn++) {
