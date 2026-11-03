@@ -43,7 +43,10 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
         try fields.append(a, list, adapter);
         try fields.append(a, list, &adapter.projection);
         if (adapter.small) |*s| try fields.append(a, list, s);
+        if (adapter.swiglu) |*s| try fields.append(a, list, s);
+        if (adapter.counted) |*s| try fields.append(a, list, s);
     }
+    if (b.pair_words) |w| try list.append(a, w);
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| try fields.append(a, list, t);
 }
@@ -53,6 +56,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.apply(&b.topk, hook, joining);
     for (b.head.owned.items) |buffer| fields.one(buffer, hook, joining);
     fields.one(b.args, hook, joining);
+    if (b.pair_words) |w| fields.one(w, hook, joining);
     if (b.head.plain) |*p| prepared(p, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
     var adapters = b.prepared.valueIterator();
@@ -66,6 +70,8 @@ pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) 
     fields.apply(&adapter.projection, hook, joining);
     if (adapter.small) |*s| fields.apply(s, hook, joining);
     if (adapter.prompt) |*p| fields.apply(p, hook, joining);
+    if (adapter.swiglu) |*s| fields.apply(s, hook, joining);
+    if (adapter.counted) |*s| fields.apply(s, hook, joining);
 }
 
 pub fn putPrepared(b: anytype, key: usize, adapter: anytype) !void {
