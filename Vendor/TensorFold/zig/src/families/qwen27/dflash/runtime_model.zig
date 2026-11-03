@@ -318,9 +318,13 @@ pub const Model = struct {
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;
         const slot: u32 = @intCast(m.session.context.end % window);
-        if (m.session.ready and behind > 0 and behind <= 128 and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
+        // the taps the session lacks and the block that reads them in one frame: a fresh session's whole prompt too (the
+        // seed's catch-up, up to flush_rows rows), so the GPU runs the block right behind the append instead of idling
+        // while the host waits for a flush frame and encodes the block's own
+        const fresh_start = !m.session.ready and m.session.context.end == m.session.context.begin;
+        if ((m.session.ready or fresh_start) and behind > 0 and behind <= flush_rows and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
             const rows: u32 = @intCast(behind);
-            var positions: [128]u64 = undefined;
+            var positions: [flush_rows]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
