@@ -57,6 +57,12 @@ pub const Attention = struct {
     merge_xs: mtl.Pipeline,
     /// encodeSplit's chunk partials: [16 rows][kv heads][chunks][query heads a kv head][head_dim + 2] fp32.
     part: mtl.Buffer,
+    /// encodeSplitSums' one launch (buildMerged): the split whose last chunk threadgroup of each query head and row merges
+    /// it. Null keeps the split, a barrier and merge_xs.
+    split_merge_xs: ?mtl.Pipeline = null,
+    /// split_merge_xs' arrival counts, u32 [16 rows][query heads]: zero between launches (each launch's last arrivals
+    /// leave their words zero), and launches that share `part` are ordered, so they share these too.
+    arrivals: ?mtl.Buffer = null,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, s: Shape) !Attention {
         const text = try source(a, s);
@@ -93,6 +99,34 @@ pub const Attention = struct {
         p.merge.deinit();
         p.merge_xs.deinit();
         p.part.deinit();
+        if (p.split_merge_xs) |m| m.deinit();
+        if (p.arrivals) |r| r.deinit();
+    }
+
+    /// Rows a split_merge_xs launch takes (`part`'s rows).
+    const arrival_rows = 16;
+    /// Builds split_merge_xs (its own library, so a failure there leaves the others as they are) and keeps it only where
+    /// mergedMatches finds the words of the split, barrier and merge_xs on this GPU; an error or a difference leaves it null.
+    pub fn buildMerged(p: *Attention, a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue) !void {
+        if (p.split_merge_xs) |m| m.deinit();
+        if (p.arrivals) |r| r.deinit();
+        p.split_merge_xs = null;
+        p.arrivals = null;
+        const base = try source(a, p.shape);
+        defer a.free(base);
+        const text = try std.mem.concat(a, u8, &.{ "#define TF_SPLIT_MERGE 1\n", base });
+        defer a.free(text);
+        const lib = try mtl.Library.fromSource(device, text, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+        defer lib.deinit();
+        const pipe = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split_merge_xs", false);
+        errdefer pipe.deinit();
+        if (pipe.simdWidth() != 32 or pipe.maxThreads() < 32) return error.UnsupportedAttentionPipeline;
+        const arrivals = try device.buffer(arrival_rows * p.shape.query_heads * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer arrivals.deinit();
+        @memset(arrivals.slice(u32, arrival_rows * p.shape.query_heads), 0);
+        if (!try p.mergedMatches(pipe, arrivals, device, queue)) return error.MergedAttentionDiffers;
+        p.split_merge_xs = pipe;
+        p.arrivals = arrivals;
     }
 
     /// Encode key chunks and merge their fp32 partials in chunk order.
@@ -137,7 +171,10 @@ pub const Attention = struct {
     }
 
     fn dispatchSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: ?Sums, own: ?Own) void {
-        e.setPipeline(p.split);
+        p.dispatchSplitWith(e, p.split_merge_xs, p.arrivals, rows, keys, args, q, k, v, mask, out, xs, own);
+    }
+    /// The split's buffers 0-8: the views, Args, partials and own rows.
+    fn bindSplit(p: Attention, e: mtl.ComputeEncoder, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, own: ?Own) void {
         for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
         bindArgs(e, args, 4);
         e.setBuffer(p.part, 0, 5);
@@ -146,6 +183,22 @@ pub const Attention = struct {
         e.setBuffer(o.k.buf, o.k.off, 6);
         e.setBuffer(o.v.buf, o.v.off, 7);
         e.setValue([3]u32{ o.rows, o.k_stride, o.v_stride }, 8);
+    }
+    /// dispatchSplit, in one launch (with sums, `merged` and its `arrivals`, and at most 16 rows): each query head and row
+    /// merged by its last chunk threadgroup, with no barrier and no merge launch.
+    fn dispatchSplitWith(p: Attention, e: mtl.ComputeEncoder, merged: ?mtl.Pipeline, arrivals: ?mtl.Buffer, rows: usize, keys: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: ?Sums, own: ?Own) void {
+        if (merged) |pipe| if (arrivals) |counts| if (xs) |s| if (rows <= arrival_rows) {
+            e.setPipeline(pipe);
+            p.bindSplit(e, args, q, k, v, mask, own);
+            e.setBuffer(out.buf, out.off, 9);
+            e.setBuffer(s.ref.buf, s.ref.off, 10);
+            e.setValue(s.stride, 11);
+            e.setBuffer(counts, 0, 12);
+            e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
+            return;
+        };
+        e.setPipeline(p.split);
+        p.bindSplit(e, args, q, k, v, mask, own);
         e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
         e.barrier();
         e.setPipeline(if (xs != null) p.merge_xs else p.merge);
@@ -157,6 +210,96 @@ pub const Attention = struct {
             e.setValue(s.stride, 4);
         }
         e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, 1), mtl.Size.of(32, 1, 1));
+    }
+
+    /// Whether `merged` (split_merge_xs on `arrivals`) writes, on this GPU, the words of the split, barrier and merge_xs it
+    /// replaces: three rows of a fixed bf16 query, keys and values over 17 chunks and 3 keys (or the capacity), a mask with
+    /// holes, and every output word and group-sum word (rows past three included) compared bit for bit, once with every key
+    /// in the K/V views and once with the last 9 keys as own rows in their own buffers (as the drafter's block reads them).
+    /// Each path runs in its own command buffer, waited on, since both use `part`.
+    fn mergedMatches(p: Attention, merged: mtl.Pipeline, arrivals: mtl.Buffer, device: mtl.Device, queue: mtl.Queue) !bool {
+        const s = p.shape;
+        if (s.output != .bf16 or s.head_dim % 64 != 0) return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const rows: usize = 3;
+        const xs_stride: u32 = 16;
+        const keys: usize = @min(s.capacity, 17 * s.split_chunk + 3);
+        const stride = keys;
+        const qw = s.query_heads * s.head_dim;
+        const kvw = s.kv_heads * s.head_dim;
+        const groups = qw / 64;
+        const q = try device.buffer(rows * qw * 2, mtl.ResourceOptions.shared);
+        defer q.deinit();
+        const k = try device.buffer(keys * kvw * 2, mtl.ResourceOptions.shared);
+        defer k.deinit();
+        const v = try device.buffer(keys * kvw * 2, mtl.ResourceOptions.shared);
+        defer v.deinit();
+        const mask = try device.buffer(rows * stride, mtl.ResourceOptions.shared);
+        defer mask.deinit();
+        var outs: [2]mtl.Buffer = undefined;
+        var sums: [2]mtl.Buffer = undefined;
+        var made: usize = 0;
+        defer for (outs[0..made], sums[0..made]) |o, x| {
+            o.deinit();
+            x.deinit();
+        };
+        while (made < 2) : (made += 1) {
+            outs[made] = try device.buffer(rows * qw * 2, mtl.ResourceOptions.shared);
+            sums[made] = device.buffer(groups * xs_stride * 4, mtl.ResourceOptions.shared) catch |err| {
+                outs[made].deinit();
+                return err;
+            };
+        }
+        // the own rows' K and V in buffers of their own, at a row stride wider than the K|V width
+        const own_rows: u32 = 9;
+        const own_stride: u32 = @intCast(kvw + 64);
+        const ok = try device.buffer(own_rows * own_stride * 2, mtl.ResourceOptions.shared);
+        defer ok.deinit();
+        const ov = try device.buffer(own_rows * own_stride * 2, mtl.ResourceOptions.shared);
+        defer ov.deinit();
+        fill(q.slice(u16, rows * qw), 7919, 4001, 2000.0);
+        fill(k.slice(u16, keys * kvw), 104729, 3001, 1500.0);
+        fill(v.slice(u16, keys * kvw), 1299709, 2003, 1000.0);
+        fill(ok.slice(u16, own_rows * own_stride), 15485863, 2999, 1500.0);
+        fill(ov.slice(u16, own_rows * own_stride), 32452843, 1997, 1000.0);
+        for (mask.slice(u8, rows * stride), 0..) |*m, i| m.* = @intFromBool((i * 7 + i / stride) % 11 != 0);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(s.head_dim)));
+        const args = Bound{ .value = .{ .rows = @intCast(rows), .keys = @intCast(keys), .mask_stride = @intCast(stride), .scale_bits = @bitCast(scale) } };
+        const owns = [2]?Own{ null, .{ .k = .{ .buf = ok }, .v = .{ .buf = ov }, .rows = own_rows, .k_stride = own_stride, .v_stride = own_stride } };
+        for (owns) |own| {
+            if (own) |o| if (o.rows >= keys) continue;
+            for (outs, sums) |o, x| {
+                // a NaN pattern neither path writes: a word one path leaves unwritten differs from the other's
+                @memset(o.slice(u16, rows * qw), 0x7fc1);
+                @memset(x.slice(u32, groups * xs_stride), 0x7fc00001);
+            }
+            for (0..2) |path| {
+                // a concurrent encoder, as the frame's: the unmerged path's barrier orders its merge behind the split
+                const cb = queue.commandBuffer();
+                const e = cb.compute(.concurrent);
+                p.dispatchSplitWith(e, if (path == 1) merged else null, arrivals, rows, keys, args, .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = mask }, .{ .buf = outs[path] }, .{ .ref = .{ .buf = sums[path] }, .stride = xs_stride }, own);
+                e.end();
+                cb.commit();
+                cb.wait();
+                if (cb.failure()) |msg| {
+                    std.log.warn("draft attention merge check: {s}", .{msg});
+                    return false;
+                }
+            }
+            // the counts are back to zero for the frame's launches
+            if (!std.mem.allEqual(u32, arrivals.slice(u32, arrival_rows * s.query_heads), 0)) return false;
+            if (!std.mem.eql(u16, outs[0].slice(u16, rows * qw), outs[1].slice(u16, rows * qw)) or
+                !std.mem.eql(u32, sums[0].slice(u32, groups * xs_stride), sums[1].slice(u32, groups * xs_stride))) return false;
+        }
+        return true;
+    }
+    /// bf16 words of moderate values: ((i * step + 13) % period - range) / 1000, truncated to bf16.
+    fn fill(words: []u16, step: usize, period: usize, range: f32) void {
+        for (words, 0..) |*w, i| {
+            const f: f32 = (@as(f32, @floatFromInt((i * step + 13) % period)) - range) / 1000.0;
+            w.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
     }
 
     /// Q is rotated, cached K was rotated at append; no causal mask is inferred: mask[row*stride+key] decides.

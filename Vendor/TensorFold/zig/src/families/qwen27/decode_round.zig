@@ -5,15 +5,16 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 16;
-/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts after one layer's
-/// encode, and the host encodes the next chunk's layers while the GPU runs that one.
-const first_commit = 1;
+const commit_every = 8;
+/// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
+/// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
+/// MLP and the next chunk's layers while the GPU runs them.
+const first_commit = 0;
 /// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
 const stagger_rows = 768;
-/// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+/// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
@@ -148,6 +149,9 @@ pub const Runner = struct {
         defer library.deinit();
         var attention = try attn.Attention.init(m.device, library);
         errdefer attention.deinit();
+        // team-m5-06: a decoded depth-one star's attention in one barrier interval and its merge in the split tail's last
+        // arriver, each kept only where a load-time check finds the barriers' words on this GPU
+        if (units) starFold(a, &attention, m, geometry);
         const limits = attn.Limits{ .rows = m.frame.capacity, .streams = slots, .keys = capacity, .shared_prefix = geometry.shared_prefix, .geometry = geometry };
         var scratch = try attn.Scratch.init(m.device, limits);
         errdefer scratch.deinit();
@@ -342,18 +346,16 @@ pub const Runner = struct {
     }
 
     /// Whether a pass runs as two staggered segments: an accepted prompt window of `stagger_rows` rows or more, text only,
-    /// with none of a verify's hooks around it. TF_Q27_STAGGER=0 keeps one segment.
+    /// with none of a verify's hooks around it.
     fn staggers(r: *const Runner, round: *const Round, head: forward.Head, accepted: bool) bool {
         if (!accepted or !r.model.kernels.prompt or head == .all or round.windows.len != 1 or round.ids.len < stagger_rows) return false;
         if (r.tail != null or r.after != null or r.lead != null or r.model.ane != null or r.gdn.marks != null or r.images != null or r.head_sieve) return false;
         return staggerParts() > 1;
     }
 
-    /// The segments a staggered pass takes: stagger_parts, or TF_Q27_STAGGER's count (2 to core/stagger.MAX; 0 or 1 none).
+    /// The segments a staggered pass takes.
     fn staggerParts() usize {
-        const v = std.c.getenv("TF_Q27_STAGGER") orelse return stagger_parts;
-        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return stagger_parts;
-        return @min(n, @import("core").segments.MAX);
+        return @min(stagger_parts, @import("core").segments.MAX);
     }
 
     /// Later segment k's (1 and on) frame, scratch, bindings and queue, made once (their buffers join the runner's
@@ -707,7 +709,11 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        cb.wait();
+        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -808,7 +814,8 @@ pub const Runner = struct {
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         // a decoded fused chain (one stream, at most 8 rows, counted projections): the preprocess also packs the prefix's
         // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
-        const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
+        // (or a depth-one star, whose preprocess also writes the split tail's query rows: Attention.starAppends)
+        const appended = after != null and !prepacked and (plan.fused or r.attention.starAppends(plan)) and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
         const decoded: ?attn.Decoded = if (appended) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
@@ -816,6 +823,10 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
+        // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
+        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
+        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -823,6 +834,47 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
+    }
+};
+
+/// team-m5-06a: the merge fold (the star's merge in its split tail's last arriver) is not tried. That arriver runs a
+/// (kv head, node)'s six merge rows on its four SIMD groups, two of them back to back, where the merge launch runs every
+/// row at once: one more merge on each attention layer's critical path than the launch and spin it saves.
+const star_merge_fold = false;
+
+/// team-m5-06: builds the star fold's library and keeps what Attention.starMatches finds equal to the barriers: both
+/// halves, else the preprocess alone (the merge launch back), else the merge fold alone (the barriers back), else neither.
+/// Without star_merge_fold, the preprocess alone, else neither.
+fn starFold(a: std.mem.Allocator, attention: *attn.Attention, m: *Model, geometry: attn.planning.Geometry) void {
+    attention.buildStar(m.device) catch |err| {
+        std.log.warn("qwen27: the star verify's attention keeps its barriers and merge launch: {t}", .{err});
+        return;
+    };
+    const tries: []const [2]bool = if (star_merge_fold) &.{ .{ true, true }, .{ true, false }, .{ false, true } } else &.{.{ true, false }};
+    for (tries) |halves| {
+        attention.star_append = halves[0];
+        attention.star_fold = halves[1];
+        const same = attention.starMatches(a, m.device, m.queue, geometry, m.config.eps, m.config.rope_theta) catch |err| {
+            std.log.warn("qwen27: the star verify's attention keeps its barriers and merge launch: {t}", .{err});
+            attention.dropStar();
+            return;
+        };
+        if (!same) continue;
+        if (!halves[0]) std.log.warn("qwen27: the star verify's preprocess keeps its barriers: its words differ on this GPU", .{});
+        if (!halves[1] and star_merge_fold) std.log.warn("qwen27: the star verify's split tail keeps its merge launch: its words differ on this GPU", .{});
+        return;
+    }
+    std.log.warn("qwen27: the star verify's attention keeps its barriers and merge launch: its words differ on this GPU", .{});
+    attention.dropStar();
+}
+
+/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
+const Warm = struct {
+    quant: *@import("quant_gpu.zig").Kernels,
+    out: @import("projection.zig").Linear,
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const w: *Warm = @ptrCast(@alignCast(ptr));
+        try w.quant.warm(e, w.out);
     }
 };
 
@@ -915,6 +967,10 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
+    }
+    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
+    pub fn polls(_: *const Stagger) bool {
+        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
