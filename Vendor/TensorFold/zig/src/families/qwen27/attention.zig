@@ -314,7 +314,10 @@ pub const Attention = struct {
         if (rows4) if (p.decoded) |d| {
             const words = a.chain_words orelse return error.TargetAttentionShape;
             const w = p.after orelse return error.TargetAttentionShape;
-            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or !d.plan.fused or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            // a depth-one star takes the same pass: each row's own key and value land at the window's slot from the plan's
+            // meta and nodes, and the packed query's rows are the stream's rows, as a chain's are
+            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            if (d.plan.prefix_chunks == 0 and !d.plan.fused) return error.TargetAttentionShape;
             if (d.v_stride < g.kv_heads * g.dim) return error.TargetAttentionShape;
             try d.scratch.check(d.plan.*);
             try d.binding.check(d.plan.*, d.caches);
@@ -401,7 +404,9 @@ pub const Attention = struct {
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
         const kv_bytes = @as(usize, plan.rows) * g.kv_heads * g.dim * 2;
         if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt))) return error.TargetAttentionShape;
-        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !plan.fused or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
+        // `appended`: the preprocess already appended the round's keys and values and packed the prefix's query; a tree's
+        // tail still reads its own packed rows, so only a chain skips the barrier that orders them
+        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
         const v_bytes = (@as(usize, plan.rows) - 1) * v_stride * 2 + g.kv_heads * g.dim * 2;
         var timing = profile.begin(a.profiler, input_encoder, .attention);
         errdefer timing.cancel();
@@ -503,8 +508,9 @@ pub const Attention = struct {
             e.setValue(args, 2);
             e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
         }
-        // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
-        if (!appended) e.barrier();
+        // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead; a tree's
+        // pack_b still needs its barrier before the tail reads the rows it wrote
+        if (!appended or !plan.fused) e.barrier();
         const scale: f32 = 0.0625;
         // Small one-chunk trees otherwise expose only four groups per node.
         // Separate head halves double that grid and halve each compute lane's accumulators.
