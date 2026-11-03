@@ -327,7 +327,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -581,6 +583,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // the two-tile prompt launches' threadgroup-memory cap (TF_TGPAD) for the one-tile ones too; the use never runs
+  threadgroup float tgpad1[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
+#endif
+#endif
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -611,6 +623,38 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+  if (mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
@@ -759,6 +803,67 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
 }
 #endif
+// TF_TN_PAIR (TN 2): a group's two tiles as two independent chains, tile 0 into destination P from right operand cbl,
+// tile 1 into Q from cbr, issued interleaved (tile 0's K = 32 multiply, tile 1's, tile 0's multiply-accumulate, tile 1's)
+// so each tensor op has another one in flight beside it. Each tile's operands, its two tensor ops in order and its FMAs
+// are TF_TN_TILE's, so every word is the same; only the destination register a tile's ops write differs.
+#if TF_PROMPT_TN == 2
+#ifndef TF_TN_PAIR
+#define TF_TN_PAIR 1
+#endif
+#else
+#undef TF_TN_PAIR
+#define TF_TN_PAIR 0
+#endif
+#if TF_TN_PAIR
+// one 32-deep half (o = 0: words 0 and 2 of each uint4; o = 1: words 1 and 3) of a tile's codes into a right operand
+#define TF_TN_UNPACK(dst, c0, c1, o) { \
+      thread half2* b2 = (thread half2*)&dst[0]; \
+      TF_UNROLL \
+      for (int w = 0; w < 4; w++) { \
+        const uint word = w < 2 ? c0[2 * w + (o)] : c1[2 * (w - 2) + (o)]; const int e = 2 * w; \
+        b2[e] = as_type<half2>(word & 0x000f000fu); \
+        b2[e + 1] = as_type<half2>((word >> 4) & 0x000f000fu); \
+        b2[e + 8] = as_type<half2>((word >> 8) & 0x000f000fu); \
+        b2[e + 9] = as_type<half2>((word >> 12) & 0x000f000fu); \
+      } \
+}
+#define TF_TN_FMA(t, D, q0, q1) { \
+      TF_UNROLL \
+      for (int j = 0; j < 4; j++) { \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        C[t][j] = fma(s0, D[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, D[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, D[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, D[12 + j], fma(b1, x1, C[t][12 + j])); \
+      } \
+}
+// cp and sp step as TF_TN_TILE(0) then TF_TN_TILE(1) step them: tile 1's codes 64 on, the next group's tile 0
+// (TF_TB - 1) * 64 further (the last group reloads tile 1's, which nothing reads); metadata NT / 4 then (TF_N - NT) / 4
+#define TF_TN_PAIR_GROUP() { \
+      const uint4 a0 = nw0, a1 = nw1; \
+      cp += 64; \
+      const uint4 c0 = cp[0], c1 = cp[32]; \
+      const uint4 qa0 = sp[0], qa1 = sp[4]; \
+      sp += NT / 4; \
+      const uint4 qb0 = sp[0], qb1 = sp[4]; \
+      sp += (TF_N - NT) / 4; \
+      TF_TN_UNPACK(cbl, a0, a1, 0) \
+      opm.run(xl0, cbl, P); \
+      TF_TN_UNPACK(cbr, c0, c1, 0) \
+      opm.run(xl0, cbr, Q); \
+      cp += g + 1 < last ? (TF_TB - 1) * 64 : 0; \
+      nw0 = cp[0]; \
+      nw1 = cp[32]; \
+      TF_TN_UNPACK(cbl, a0, a1, 1) \
+      opa.run(xl1, cbl, P); \
+      TF_TN_UNPACK(cbr, c0, c1, 1) \
+      opa.run(xl1, cbr, Q); \
+      TF_TN_FMA(0, P, qa0, qa1) \
+      TF_TN_FMA(1, Q, qb0, qb1) \
+}
+#endif
 // TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
 // stream's next rows, H + the output, as the norm after it would have formed them.
 // TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
@@ -815,6 +920,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto cbh = TF_TN_RIGHT;
 #endif
   auto P = TF_TN_DEST;
+#if TF_TN_PAIR
+  auto cbr = TF_TN_RIGHT;
+  auto Q = TF_TN_DEST;
+#endif
   const half2 bias = half2(1024.0h);
 #if defined(TF_SWIGLU)
   const int first = TF_G0, last = TF_G0 + TF_GN; // one K split: the threadgroup's SIMD groups are the gate and up pairs
@@ -841,8 +950,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#if TF_TN_PAIR
+    TF_TN_PAIR_GROUP()
+#else
     TF_TN_TILE(0)
     TF_TN_TILE(1)
+#endif
 #if TF_PROMPT_TN == 4
     TF_TN_TILE(2)
     TF_TN_TILE(3)
@@ -880,6 +993,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
+  // (rows are never negative)
+  threadgroup float tgpad[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
+#endif
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
