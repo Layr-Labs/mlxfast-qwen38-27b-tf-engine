@@ -53,7 +53,9 @@ struct Q27PromptRun { q27f8 O[8]; float m0, m1, l0, l1; };
 // One 32-key step at `kt`: S halves summed low first, masked by each row's key count, then softmax and O += PV.
 template <bool EDGE>
 inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const device bfloat* q, const device bfloat* k, const device bfloat* v,
-    threadgroup float (*xs)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
+    threadgroup float (*banks)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
+  // Alternate banks: the next publish barrier also retires all reads of this bank.
+  threadgroup float (*xs)[32][16] = banks + ((kt / PTK) & 1) * 4;
   q27f8 s0 = 0.0f, s1 = 0.0f;
   _Pragma("clang loop unroll_count(4)") // whole unrolling hoists every K load ahead of the products and runs slower
   for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
@@ -66,7 +68,7 @@ inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const devi
     s0[i] = h ? o0 + s0[i] : s0[i] + o0;
     s1[i] = h ? o1 + s1[i] : s1[i] + o1;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // No overwrite of this bank until two steps later, after the intervening publish barrier.
   float x0 = -INFINITY, x1 = -INFINITY;
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 4; i++) {
@@ -116,9 +118,10 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   const int tile = args.tile0 + int(tg.z) * (SG / 2) + (sg >> 1);
   const int hk = int(tg.x), c = int(tg.y);
   const bool live = tile * 16 < args.rp;
-  threadgroup float xs[SG][32][16];
+  static_assert(SG == 4, "the paired exchange banks contain four SIMD groups");
+  threadgroup float xs[2 * SG][32][16];
 #ifndef TF_ATTN_TGPAD
-#define TF_ATTN_TGPAD 8192
+#define TF_ATTN_TGPAD 0 // the extra 8192-byte exchange bank replaces the original occupancy reserve
 #endif
 #if TF_ATTN_TGPAD > 0
   // fewer of these threadgroups a core: reserve TF_ATTN_TGPAD more bytes of threadgroup memory; the use never runs (the
