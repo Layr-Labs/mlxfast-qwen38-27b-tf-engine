@@ -195,6 +195,10 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's two SIMD groups each run a gate tile then its up
     /// tile (64 columns); it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// B2: this swiglu launch waits on the publishing norm's count (TF_GU_WAIT) before it reads its rows.
+    gu_wait: bool = false,
+    /// TF_GU_WAIT: how many norm threadgroups the launch waits for.
+    gu_wait_count: u32 = 0,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
     /// `indexed` as lane_projection.indexed12_layout.
@@ -355,6 +359,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
+    if (l.gu_wait) try text.appendSlice(a, "#define TF_GU_WAIT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
@@ -503,6 +508,10 @@ pub const Projection = struct {
     count: bool = false,
     /// Built with Layout.gu_count: encodeSwigluCounted only.
     gu_count: bool = false,
+    /// Built with Layout.gu_wait: this swiglu launch waits on the publishing norm's count (TF_GU_WAIT).
+    gu_wait: bool = false,
+    /// Layout.gu_wait_count: how many norm threadgroups the launch waits for.
+    gu_wait_count: u32 = 0,
     /// Built with Layout.wait: encodeCountedAfter only.
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
@@ -531,7 +540,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .gu_wait = l.gu_wait, .gu_wait_count = l.gu_wait_count, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -612,19 +621,20 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (p.gu_count) return error.InvalidSchedule;
-        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
+        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null, null);
     }
 
     /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
     /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
-    pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
+    pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref, waited: ?Ref) !u32 {
         if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
         try checkRef(counter, 8, 4);
-        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
+        if (p.gu_wait and waited == null) return error.InvalidSchedule;
+        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter, waited);
         return @intCast(p.n / 128);
     }
 
-    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
+    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref, waited: ?Ref) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
@@ -644,6 +654,11 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
+        if (p.gu_wait) {
+            const w8 = waited orelse return error.InvalidSchedule;
+            e.setBuffer(w8.buf, w8.off, 8); // TF_GU_WAIT: the norm's publish count
+            e.setValue(p.gu_wait_count, 9);
+        }
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
