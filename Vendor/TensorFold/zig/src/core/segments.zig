@@ -209,6 +209,9 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             x.sync(&x.lanes[k], x.evs[k - 1], i + 1, true);
             try x.fam.handoff(&x.lanes[k], i);
         }
+        pub fn beforeWait(x: *const @This(), k: usize, i: usize) !void {
+            if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "beforeWait")) try x.fam.beforeWait(&x.lanes[k], i);
+        }
         pub fn signal(x: *const @This(), k: usize, i: usize) !void {
             x.sync(&x.lanes[k], x.evs[k], i + 1, false);
         }

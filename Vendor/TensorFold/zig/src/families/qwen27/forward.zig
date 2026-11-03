@@ -13,6 +13,12 @@ pub const Mixer = struct {
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+    /// The mixer's last launches, held back to the start of post (a staggered segment's GDN gate or prompt attention):
+    /// encoded behind the next segment's signal, which then waits only on what that segment reads.
+    tail: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize) anyerror!void = null,
+    /// A staggered later segment's attention layer: the launches that read nothing the segment before writes in that
+    /// layer, encoded ahead of the wait on it (Stages.beforeWait); the mixer then encodes the rest.
+    before_wait: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void = null,
 };
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
@@ -104,6 +110,13 @@ pub const Stages = struct {
             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
         }
     }
+    pub fn beforeWait(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        const f = s.hooks.before_wait orelse return;
+        switch (s.model.weights.layers[index].mixer) {
+            .linear => {},
+            .attention => |a| try f(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+        }
+    }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
@@ -117,6 +130,7 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
+        if (s.hooks.tail) |tail| try tail(s.hooks.ptr, e, index); // first: it sets mixer_sums and reads the uncompacted rows
         const out = switch (layer.mixer) {
             .linear => |g| g.out,
             .attention => |a| a.out,

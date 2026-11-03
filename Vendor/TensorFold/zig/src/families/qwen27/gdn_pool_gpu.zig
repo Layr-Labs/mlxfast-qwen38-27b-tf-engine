@@ -242,7 +242,9 @@ pub const Pool = struct {
     }
 
     /// Publish a fully kept chain after its per-position update; prompt chains take the wide scan.
-    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside) !void {
+    /// `gate_out` (prompt chains): the gate is not encoded; its round goes there for gateChain, which the caller encodes
+    /// later in the same lane. Nothing between reads what the gate writes or writes what it reads.
+    pub fn forwardChain(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, input_encoder: metal.ComputeEncoder, prompt: bool, beside: ?gdn.Beside, gate_out: ?*?gdn.Round) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         for (plan.host.segments, plan.host.keeps) |segment, keep| {
             if (keep.rows != segment.rows) return error.NotAcceptedChain;
@@ -278,10 +280,11 @@ pub const Pool = struct {
             try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, if (step) beside else .{ .ptr = &early, .encode = EarlyCommit.encode });
         }
         try scan.end();
-        var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
-        errdefer gate.cancel();
-        if (prompt) prepared.gatePrompt(gate.encoder, pool.kernels.post_rows16, pool.kernels.post_rows) else prepared.gate(gate.encoder, pool.kernels.post_rows);
-        try gate.end();
+        const held = if (prompt and !step) gate_out else null;
+        if (held == null) try pool.gateRound(prepared, input_encoder, prompt);
+        defer if (held) |out| {
+            out.* = prepared;
+        };
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
         errdefer publication.cancel();
@@ -304,6 +307,18 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
         e.barrier();
         try publication.end();
+    }
+
+    /// A prompt chain's gate held back by forwardChain's `gate_out`.
+    pub fn gateChain(pool: *Pool, prepared: gdn.Round, input_encoder: metal.ComputeEncoder) !void {
+        return pool.gateRound(prepared, input_encoder, true);
+    }
+
+    fn gateRound(pool: *Pool, prepared: gdn.Round, input_encoder: metal.ComputeEncoder, prompt: bool) !void {
+        var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
+        errdefer gate.cancel();
+        if (prompt) prepared.gatePrompt(gate.encoder, pool.kernels.post_rows16, pool.kernels.post_rows) else prepared.gate(gate.encoder, pool.kernels.post_rows);
+        try gate.end();
     }
 
     pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {

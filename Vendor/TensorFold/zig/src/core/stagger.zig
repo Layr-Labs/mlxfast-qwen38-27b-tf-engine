@@ -38,7 +38,8 @@ pub fn chunkRows(n: usize, step: usize, k: usize) usize {
     return @min(step, n - k * step);
 }
 
-/// The hook order: begins; per layer, per segment in row order: pre, mixer, post, k waiting on k-1's post-mixer signal.
+/// The hook order: begins; per layer, per segment in row order: pre, mixer, post, k waiting on k-1's post-mixer signal
+/// (behind its optional `beforeWait`).
 pub fn drive(n: usize, layers: usize, x: anytype) !void {
     // k-1's hooks queue before k's (host counters move in row order; a reused event's wait follows its signal)
     for (0..n) |k| try x.begin(k);
@@ -47,7 +48,11 @@ pub fn drive(n: usize, layers: usize, x: anytype) !void {
         for (0..n) |k| {
             if (k > 0 and w == .pre) try x.waitFor(k, i);
             try x.pre(k, i);
-            if (k > 0 and w == .mixer) try x.waitFor(k, i);
+            if (k > 0 and w == .mixer) {
+                // work of the mixer that reads nothing the segment before writes in it (a runner's `beforeWait`) goes ahead of the wait
+                if (comptime @hasDecl(std.meta.Child(@TypeOf(x)), "beforeWait")) try x.beforeWait(k, i);
+                try x.waitFor(k, i);
+            }
             try x.mixer(k, i);
             if (k + 1 < n) try x.signal(k, i);
             try x.post(k, i);

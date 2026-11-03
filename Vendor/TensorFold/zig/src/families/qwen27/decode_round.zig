@@ -478,7 +478,7 @@ pub const Runner = struct {
         for (0..parts) |k| {
             const last = k + 1 == parts;
             const segment_head: forward.Head = if (last) head else .none;
-            segments[k] = .{ .r = r, .gdn = &plans[k], .own = owns[k], .attention = .{ .plan = &attention_plans[k], .round = &rounds[k], .placed = placed[k], .scratch = scratches[k], .bindings = bindings[k], .scratch_due = &due[k], .terminal_head = if (terminal_rows) segment_head else .all }, .tap_row = firsts[k], .total = n };
+            segments[k] = .{ .r = r, .gdn = &plans[k], .own = owns[k], .attention = .{ .plan = &attention_plans[k], .round = &rounds[k], .placed = placed[k], .scratch = scratches[k], .bindings = bindings[k], .scratch_due = &due[k], .terminal_head = if (terminal_rows) segment_head else .all }, .tap_row = firsts[k], .total = n, .holds = !last };
             stages[k] = .{ .terminal_rows = terminal_rows, .model = r.model, .rows = firsts[k + 1] - firsts[k], .hooks = segments[k].mixer(), .head = segment_head, .frame = frames[k], .lane_k = k, .logits = if (k == 0) null else r.model.frame.get(.logits), .clear = if (k == 0) clears.due() else null, .settle = if (k == 0) .{ .ptr = r, .run = settleRound } else null };
             family.stages[k] = &stages[k];
         }
@@ -847,6 +847,27 @@ pub const Runner = struct {
         bindings: []attn.Binding,
         scratch_due: *bool,
         terminal_head: forward.Head,
+        /// A staggered segment's: a prompt plan's attention kernels are held back here (HeldAttention.encode runs them).
+        held: ?*?HeldAttention = null,
+    };
+
+    /// A prompt plan's attention launches (Attention.encode after the packed preprocess) held back by attentionPass.
+    const HeldAttention = struct {
+        scratch: *const attn.Scratch,
+        binding: *const attn.Binding,
+        plan: attn.Plan,
+        query: @import("projection.zig").Ref,
+        key: @import("projection.zig").Ref,
+        value: @import("projection.zig").Ref,
+        v_stride: u32,
+        out: @import("projection.zig").Ref,
+        cache: attn.Cache,
+        raw_gate: @import("projection.zig").Ref,
+        sums: attn.Sums,
+
+        fn encode(h: *const HeldAttention, r: *Runner, e: mtl.ComputeEncoder) !void {
+            try r.attention.encode(e, h.scratch, h.binding, h.plan, h.query, h.key, h.value, h.v_stride, h.out, (&h.cache)[0..1], h.raw_gate, r.model.kernels.prompt, true, h.sums, true);
+        }
     };
 
     fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
@@ -906,8 +927,14 @@ pub const Runner = struct {
         var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
         if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
         defer r.attention.warm = null;
-        try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended or prepacked);
         f.mixer_sums = out_sums;
+        // a staggered segment's prompt plan: the packed preprocess (above, behind its barrier) stored this segment's keys
+        // and values, all the next segment reads of it here; the chunks and merge are held for the caller (Segment)
+        if (pass.held) |held| if (prepacked and caches.len == 1) {
+            held.* = .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = live_plan, .query = f.get(.query), .key = f.get(.rotated_key), .value = value, .v_stride = 2 * kv, .out = f.get(.mixer_out), .cache = caches[0], .raw_gate = f.get(.q_gate), .sums = .{ .ref = xs.ref, .stride = xs.stride } };
+            return;
+        };
+        try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended or prepacked);
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
@@ -1008,18 +1035,54 @@ const Segment = struct {
     attention: Runner.AttentionPass,
     tap_row: u32,
     total: u32,
+    /// Every segment but the last (the one each signal wakes): its mixer's GDN gate or prompt attention kernels wait in
+    /// `gate` or `held` until its post, behind the signal.
+    holds: bool = false,
+    gate: ?@import("gdn.zig").Round = null,
+    /// A prompt attention layer's chunks and merge, held by beforeWaitHook (a later segment, ahead of its wait) or by the
+    /// mixer (`holds`) until the mixer or the post encodes them.
+    held: ?Runner.HeldAttention = null,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null, .tail = if (s.holds) tailHook else null, .before_wait = beforeWaitHook };
+    }
+    fn tailHook(ptr: *anyopaque, e: mtl.ComputeEncoder, _: usize) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        if (s.gate) |round| {
+            s.gate = null;
+            try s.r.gdn.gateChain(round, e);
+        }
+        if (s.held) |*held| {
+            defer s.held = null;
+            try held.encode(s.r, e);
+        }
+    }
+    /// A later segment's prompt attention layer ahead of its wait: the q+gate and k|v projections and the packed
+    /// preprocess read and write only this segment's frame, scratch, bindings and its own rows of the cache (the segment
+    /// before reads keys below this one's first row). The chunk kernel, which reads the rows before, waits.
+    fn beforeWaitHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        if (!s.r.attention.promptPath(s.attention.plan.*, s.r.model.kernels.prompt) or s.attention.round.slots.len != 1) return;
+        var pass = s.attention;
+        pass.held = &s.held;
+        try s.r.attentionPass(pass, e, block, weights, f, rows);
+        if (s.held == null) return error.RoundNotReady; // the pass encoded kernels that read the rows before ahead of the wait
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own, .gate_out = if (s.holds) &s.gate else null };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        return s.r.attentionPass(s.attention, e, block, weights, f, rows);
+        if (s.held) |*held| {
+            if (s.holds) return; // the post encodes them, behind the signal
+            defer s.held = null;
+            return held.encode(s.r, e);
+        }
+        var pass = s.attention;
+        if (s.holds) pass.held = &s.held;
+        return s.r.attentionPass(pass, e, block, weights, f, rows);
     }
     fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
@@ -1039,6 +1102,9 @@ const Stagger = struct {
         return .mixer;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
+    pub fn beforeWait(p: *Stagger, lane: *Lane, index: usize) !void {
+        return p.stages[lane.k].beforeWait(lane, index);
+    }
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].pre(lane, index);
     }

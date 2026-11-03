@@ -26,6 +26,8 @@ pub const Hook = struct {
     uploaded: bool = false,
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
+    /// A staggered segment's prompt chain: its gate is held back here (Pool.forwardChain's `gate_out`).
+    gate_out: ?*?gdn.Round = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -56,7 +58,7 @@ pub const Hook = struct {
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside, hook.gate_out) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
