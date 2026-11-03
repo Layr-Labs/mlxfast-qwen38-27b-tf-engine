@@ -227,6 +227,10 @@ pub const Attention = struct {
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
+    /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
+    warm: ?Warm = null,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -533,6 +537,7 @@ pub const Attention = struct {
             e.setBuffer(words, 16, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
+            if (a.warm) |w| try w.encode(w.ptr, e);
             if (chain == null) e.barrier();
         }
         if (!plan.fused) {

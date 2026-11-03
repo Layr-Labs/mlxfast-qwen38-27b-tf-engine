@@ -84,6 +84,7 @@ pub const Model = struct {
         errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        try m.kernels.prepareWarm();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
