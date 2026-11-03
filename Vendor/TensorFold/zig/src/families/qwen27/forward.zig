@@ -10,8 +10,8 @@ const ane_mlp = @import("ane_mlp.zig");
 
 pub const Mixer = struct {
     ptr: *anyopaque,
-    gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
-    attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
+    gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32, u32) anyerror!void,
+    attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
 
@@ -38,6 +38,8 @@ pub const Stages = struct {
     /// Decoded rows: the MLP down was a quantCounted launch with no barrier after it, so the next norm (the next pre, or
     /// finish) waits on its `wait` counted threadgroups in that barrier interval (Kernels.normAfter).
     norm_wait: u32 = 0,
+    /// B1: the pre-norm published its count (rows) and dropped the barrier; the mixer's first projection waits on it.
+    norm_published: u32 = 0,
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
@@ -93,10 +95,17 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
+        // B1: a GDN layer's pre-norm publishes its count and the mixer's first projection waits on it instead of the
+        // barrier; publish and wait come from this one predicate, so every publish has its consumer. The input_norm path
+        // (s.summed) has no publish counter, so it keeps the barrier.
+        var published: u32 = 0;
         if (s.norm_wait != 0) {
             try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
+        } else if (!s.summed and s.pending != null) {
+            published = try m.kernels.normPublished(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
         } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        e.barrier();
+        if (published == 0) e.barrier();
+        s.norm_published = published;
         s.norm_wait = 0;
         s.summed = false;
         if (s.pending != null) {
@@ -107,8 +116,8 @@ pub const Stages = struct {
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
-            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
-            .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows, s.norm_published),
+            .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows, s.norm_published),
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
@@ -146,7 +155,12 @@ pub const Stages = struct {
             e.barrier();
             try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         }
-        e.barrier();
+        // B2: when the fused gate/up below can wait on a count (gateUpCountable) and this post-norm wrote the residual rows,
+        // the norm publishes and the gate/up waits on that count instead of the barrier. One predicate for both sides.
+        var post_published: u32 = 0;
+        if (!s.summed and !s.compact and m.kernels.gateUpCountable(layer.gu, layer.down, s.rows) and !s.terminal_rows)
+            post_published = try m.kernels.normPublished(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+        if (post_published == 0) e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);
         up.offset += @as(usize, m.config.intermediate) * 2;
@@ -176,7 +190,7 @@ pub const Stages = struct {
             return;
         }
         // decoded rows: a counted gate/up shares its barrier interval with the counted down that waits on it
-        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCounted(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows) else null;
+        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCountedWait(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows, post_published) else null;
         if (gu_wait == null) {
             if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
                 try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
