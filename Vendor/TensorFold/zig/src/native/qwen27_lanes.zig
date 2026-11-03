@@ -619,27 +619,13 @@ pub const Metal = struct {
             return;
         }
         for (0..b.runner.ready) |slot| b.runner.settleSlot(@intCast(slot));
-        // the phase barrier: every command buffer committed on the model's queue has completed before the caches drain.
-        // An empty command buffer goes to the queue and is waited for only while one may still run (quiet).
-        if (!b.quiet()) {
-            const pool = mtl.objc.Pool.push();
-            defer pool.pop();
-            const cb = b.runner.model.queue.commandBuffer();
-            cb.commit();
-            cb.wait();
-            if (q.decode_round.gpuFailed(cb, "the bench phase barrier")) b.runner.failed = true;
-        }
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = b.runner.model.queue.commandBuffer();
+        cb.commit();
+        cb.wait();
+        if (q.decode_round.gpuFailed(cb, "the bench phase barrier")) b.runner.failed = true;
         api.reportPhaseCache(s, api.closeMetalPhaseCaches(b));
-    }
-
-    /// Whether no command buffer committed on the model's queue may still run: the ones the backend still holds unwaited
-    /// (a polled pass's, the drafter frame's, a round's keep) report completion or are gone, no bridge spin is left
-    /// without its stop, and every other one was waited for where it was committed or ran ahead of one that was (a kept
-    /// state's blit is settled above).
-    fn quiet(b: *const Metal) bool {
-        if (!tf.segments.quiet()) return false;
-        const d = b.draft orelse return true;
-        return d.generation.keep == null and d.generation.keep_done == null and d.model.backend.frame.quiet();
     }
 };
 

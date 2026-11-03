@@ -180,8 +180,7 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
-    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or eight on
-    /// one-tile prompt rows.
+    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, or four on decoded rows.
     serial_sk2: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
@@ -212,16 +211,14 @@ pub const Layout = struct {
     /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
     /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
     gu_count: bool = false,
+    /// Count the decoded GU's four contiguous output quarters separately; a waiting down's K splits read one each.
+    gu_parts: usize = 1,
     /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
     /// same barrier interval (encodeCountedAfter).
     wait: bool = false,
     /// Decoded rows over tiles a GPU list names (encodeTiles): threadgroup j computes the list's tile j and stores its 32
     /// columns at j * 32 of rows `y_stride` apart; threadgroups past the list's count store the lowest finite bf16 there.
     tile_list: bool = false,
-    /// Rows8 reg launches on an 8-row tensor op (matmul2d M = 8) instead of the 16-row one, whose second eight rows rows8
-    /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
-    /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
-    m8: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -234,10 +231,9 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
-        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
-        if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
@@ -253,6 +249,8 @@ pub const Layout = struct {
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
+        if (l.gu_parts != 1 and (l.gu_parts != 4 or
+            !(l.gu_count or (l.wait and l.n == 5120 and l.k == 17408 and l.sk == 4)))) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
@@ -327,6 +325,38 @@ fn lockstepGu(l:Layout)bool{
         l.ranges.len==0 and l.y_stride==null and !l.residual;
 }
 
+test "partitioned GU readiness rejects unmatched down splits and shapes" {
+    const good = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4,
+        .precompute_sums = true, .reg = true, .tile_batch = 8, .rows8 = true, .reg_lean = true,
+        .count = true, .wait = true, .gu_parts = 4 };
+    try good.validate();
+    inline for (.{ .{ "gu_parts", @as(usize, 0) }, .{ "gu_parts", @as(usize, 2) },
+        .{ "sk", @as(usize, 2) }, .{ "sk", @as(usize, 8) }, .{ "n", @as(usize, 10240) },
+        .{ "k", @as(usize, 5120) }, .{ "wait", false } }) |change| {
+        var bad = good;
+        @field(bad, change[0]) = change[1];
+        try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    }
+    var producer = good;
+    producer.n = 34816;
+    producer.k = 5120;
+    producer.sk = 2;
+    producer.serial_sk2 = true;
+    producer.swiglu = true;
+    producer.indexed = true;
+    producer.count = false;
+    producer.wait = false;
+    producer.gu_count = true;
+    try producer.validate();
+    producer.n = 17408;
+    try std.testing.expectError(error.InvalidSchedule, producer.validate());
+    // Each admitted down split consumes exactly its GU producers' contiguous 64-column output groups.
+    for (0..4) |split| {
+        try std.testing.expectEqual(split * 68, split * good.k / 64 / good.sk);
+        try std.testing.expectEqual((split + 1) * 68, (split + 1) * good.k / 64 / good.sk);
+    }
+}
+
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
     const g = l.groupCut();
@@ -347,7 +377,6 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
-    if (l.m8) try text.appendSlice(a, "#define TF_M8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
@@ -355,6 +384,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
+    if (l.gu_parts != 1) try text.print(a, "#define TF_GU_PARTS {d}\n", .{l.gu_parts});
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
@@ -503,13 +533,11 @@ pub const Projection = struct {
     count: bool = false,
     /// Built with Layout.gu_count: encodeSwigluCounted only.
     gu_count: bool = false,
+    gu_parts: usize = 1,
     /// Built with Layout.wait: encodeCountedAfter only.
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
-    /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
-    /// adjacent columns at a time, so those rows start four-word aligned.
-    quads: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -531,7 +559,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .gu_parts = l.gu_parts, .wait = l.wait, .tile_list = l.tile_list };
     }
 
     pub fn deinit(p: Projection) void {
@@ -573,36 +601,29 @@ pub const Projection = struct {
             if (s.stride < rows) return error.InvalidRows;
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
         }
-        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, @as(usize, if (p.quads) 8 else 2));
+        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
         return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null, null);
     }
 
     /// A counting projection (Layout.count): encodeSums whose threadgroups each add one to `counter` (a u32 word the
     /// waiting norm leaves zero) once their stores are past a device-scope fence; tile_count of them a launch.
     pub fn encodeCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref) !void {
-        return p.encodeCountedAt(e, x, w, sb, sums, y, rows, counter, null);
-    }
-
-    /// encodeCounted reading its [rows, stride] words at `dims` when given (encodeSumsAt's: an earlier dispatch wrote them,
-    /// at least one and at most `rows` rows): the launch is the one for `rows`, so every one of its tile_count
-    /// threadgroups still counts itself once.
-    pub fn encodeCountedAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, dims: ?Ref) !void {
         if (!p.count or p.wait) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        if (dims) |d| try checkRef(d, 8, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, dims);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
     }
 
-    /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
-    /// this launch leaves zero) reaches `wait_for`: the producer of `x` and `sums` shares this launch's barrier interval.
+    /// encodeCounted waiting on GU in this launch's barrier interval. `waited` holds gu_parts producer counts and an
+    /// arrival word, left zero before the final TC count. `wait_for` is the total producer count over all parts.
     pub fn encodeCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !void {
         if (!p.count or !p.wait or wait_for == 0) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        try checkRef(waited, 8, 4);
+        try checkRef(waited, (p.gu_parts + 1) * 4, 4);
+        if (wait_for % p.gu_parts != 0) return error.InvalidSchedule;
         e.setBuffer(waited.buf, waited.off, 9);
         e.setValue(wait_for, 10);
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
@@ -615,11 +636,11 @@ pub const Projection = struct {
         return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
     }
 
-    /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
-    /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
+    /// encodeSwiglu on a Layout.gu_count build: each threadgroup counts its fenced stores in its output partition.
+    /// `counter` has gu_parts count words and an arrival word, cleared by the waiting down; returns total threadgroups.
     pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
         if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
-        try checkRef(counter, 8, 4);
+        try checkRef(counter, (p.gu_parts + 1) * 4, 4);
         try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
         return @intCast(p.n / 128);
     }
@@ -716,7 +737,7 @@ pub const Projection = struct {
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
         try checkRef(sb, p.metadata_bytes, 16);
-        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes * @as(usize, if (p.quads) 4 else 1));
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
         if (given == null) if (p.sums_pipe) |pipe| {
             e.setPipeline(pipe);
             e.setBuffer(x.buf, x.off, 0);
@@ -782,12 +803,6 @@ test "serial SK2 keeps logical split and is off by default" {
     try std.testing.expect(std.mem.indexOf(u8, serial, "#define TF_SERIAL_SK2 1\n") != null);
     l.sk = 1;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
-    // eight chains: one-tile prompt rows only
-    l.sk = 8;
-    try std.testing.expectError(error.InvalidSchedule, l.validate());
-    l.prompt_sr = true;
-    l.reg_lean = true;
-    try l.validate();
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());

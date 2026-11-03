@@ -163,18 +163,6 @@ pub const Frame = struct {
         f.external = null;
         return f.cacheBytes();
     }
-    /// Whether no command buffer of the frame may still run: no frame open, no bridge spin left without its stop, and every
-    /// command buffer a finished frame returned before it reported completion reports it now (read only: checkUnchecked
-    /// still waits for and checks them).
-    pub fn quiet(f: *const Frame) bool {
-        if (f.active) return false;
-        if (f.bridge) |b| if (b.open) return false;
-        for (f.unchecked[0..f.n_unchecked]) |cb| switch (cb.status()) {
-            .completed, .@"error" => {},
-            else => return false,
-        };
-        return true;
-    }
     /// Waits for and checks the command buffers a finished frame returned before they reported completion.
     pub fn checkUnchecked(f: *Frame) !void {
         var bad = false;

@@ -17,9 +17,6 @@ pub const Plan = struct {
     slot_steps: []tree_slots.Step = &.{},
     compact: bool = false,
     slot_peak: usize = 0, // the most register slots any window's schedule holds live
-    /// One window of more than 16 rows whose row r takes conv sources r .. r + taps - 1 (a prompt chain's rows):
-    /// tf_delta_gdn_pre_chain takes it.
-    chain: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, p: abi.Params, inputs: []const Input) !Plan {
         return initSlots(gpa, p, inputs, tree_slots.max_slots);
@@ -77,12 +74,7 @@ pub const Plan = struct {
             first += n;
             keep_first += @intCast(input.path.len);
         }
-        // past 16 rows only (prompt chunks): decoded rounds' plans keep the record's work
-        var chain = inputs.len == 1 and rows > 16;
-        if (chain) for (0..rows) |row| for (0..p.taps) |tap| {
-            if (windows[row * p.taps + tap] != row + tap) chain = false;
-        };
-        return .{ .gpa = gpa, .parents = parents, .windows = windows, .row_slots = slots, .segments = segments, .keeps = keeps, .kept_rows = kept_rows, .slot_steps = slot_steps, .compact = compact, .slot_peak = slot_peak, .chain = chain };
+        return .{ .gpa = gpa, .parents = parents, .windows = windows, .row_slots = slots, .segments = segments, .keeps = keeps, .kept_rows = kept_rows, .slot_steps = slot_steps, .compact = compact, .slot_peak = slot_peak };
     }
 
     pub fn deinit(plan: *Plan) void {

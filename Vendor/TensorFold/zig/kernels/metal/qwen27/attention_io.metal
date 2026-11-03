@@ -29,18 +29,6 @@ kernel void q27_attn_append(device const bfloat* K [[buffer(0)]], device const b
   caches[st].keys[ulong(at.y) * uint(meta[base + 7]) + row * a.dim + at.x] = K[(at.z * a.kv_heads + at.y) * a.dim + at.x];
   caches[st].values[ulong(at.y) * uint(meta[base + 8]) + row * a.dim + at.x] = V[at.z * a.v_stride + at.y * a.dim + at.x];
 }
-// q27_attn_append in 16-byte words, for prompt rows: a thread moves eight words of a row's key head and eight of its
-// value head, the words eight threads of the one-word kernel move (rows are dim words apart from 16-byte aligned bases;
-// Attention.encode checks them).
-kernel void q27_attn_append8(device const bfloat* K [[buffer(0)]], device const bfloat* V [[buffer(1)]],
-    device const Q27CachePtrs* caches [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* nodes [[buffer(4)]],
-    constant Q27PackArgs& a [[buffer(5)]], uint3 at [[thread_position_in_grid]]) {
-  if (at.x >= a.dim / 8 || at.y >= a.kv_heads || at.z >= a.rows) return;
-  const int st = nodes[4 * at.z + 1], base = 8 + st * 12;
-  const uint local = at.z - uint(meta[base + 6]), row = uint(meta[base + 4]) + local;
-  ((device uint4*)(caches[st].keys + ulong(at.y) * uint(meta[base + 7]) + row * a.dim))[at.x] = ((device const uint4*)(K + (at.z * a.kv_heads + at.y) * a.dim))[at.x];
-  ((device uint4*)(caches[st].values + ulong(at.y) * uint(meta[base + 8]) + row * a.dim))[at.x] = ((device const uint4*)(V + at.z * a.v_stride + at.y * a.dim))[at.x];
-}
 kernel void q27_attn_gather(device const Q27CachePtrs* caches [[buffer(0)]], device const int* meta [[buffer(1)]],
     device const Q27KeepRow* map [[buffer(2)]], device bfloat* K [[buffer(3)]], device bfloat* V [[buffer(4)]],
     constant uint& kept [[buffer(5)]], uint3 at [[thread_position_in_grid]]) {
