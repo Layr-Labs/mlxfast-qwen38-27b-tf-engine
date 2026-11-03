@@ -7,7 +7,7 @@ const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+pub const Linear = struct { native_prompt: ?Ref = null, words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -84,6 +84,11 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
     const dst = w.slice(u32, stored * k / 8);
     @memset(dst, 0);
     const pair = sb.slice(u16, n * (k / 64) * 2);
+    // Input projections: separate prompt-only native-u4 blocks, leaving decode's regBlock storage intact.
+    const native = if (n % 64 == 0 and n > k and n <= 3 * k)
+        try own(device, allocator, owned, n * k / 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked)
+    else null;
+    const native_dst: ?[]u32 = if (native) |b| b.slice(u32, n * k / 8) else null;
     var base: usize = 0;
     for (parts) |p| {
         const rows = p.weight.shape[0];
@@ -95,6 +100,10 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
             const at = (base + r) / tile;
             const to = ((at / batch * (k / 64) + g) * batch + at % batch) * tile * 8 + ((base + r) % tile) * 8;
             @memcpy(dst[to..][0..8], words[src..][0..8]);
+            if (native_dst) |nd| {
+                const nt = (((base + r) / 64 * (k / 64) + g) * 64 + (base + r) % 64) * 8;
+                @memcpy(nd[nt..][0..8], words[src..][0..8]);
+            }
             pair[(g * n + base + r) * 2] = try lane.foldScale(scales[r * (k / 64) + g]); // reg scales carry 2^24
             pair[(g * n + base + r) * 2 + 1] = biases[r * (k / 64) + g];
         };
@@ -106,7 +115,7 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         return err;
     };
     const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+    return .{ .native_prompt = if (native) |b| .{ .buffer = b } else null, .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {

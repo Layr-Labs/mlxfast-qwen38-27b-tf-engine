@@ -14,6 +14,7 @@ pub const kimi_kernels = [_][]const u8{ "dense.metal", "dense_mma.metal", "norms
 
 /// Packed kernels for compilers refusing uint4b_format; keep in step with tools/zig/gen_nemotron_kernels.py.
 pub const nemotron_packed = [_][]const u8{
+    "zig/kernels/metal/core/lane_native_prompt.metal",
     "zig/kernels/metal/nemotron/coop_down_1_0.metal",
     "zig/kernels/metal/nemotron/coop_down_2_0.metal",
     "zig/kernels/metal/nemotron/coop_down_2_1.metal",

@@ -26,13 +26,14 @@ pub fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, metal: *st
         _ = files.addCopyFile(b.path(b.fmt("zig/kernels/metal/qwen27/{s}.metal", .{part})), b.fmt("{s}.metal", .{part}));
         index = b.fmt("{s}pub const {s} = @embedFile(\"{s}.metal\");\n", .{ index, part, part });
     }
+    index = b.fmt("{s}pub const packed_metallib = @import(\"kernel_sources\").packed_metallib;\n", .{index});
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/deltanet.metal"), "gdn.metal");
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/deltanet_slots.metal"), "gdn_slots.metal");
     const bf16_topk = b.createModule(.{ .root_source_file = b.path("zig/src/core/bf16_topk.zig"), .target = target, .optimize = .ReleaseSafe });
     const tree_round = b.createModule(.{ .root_source_file = b.path("zig/src/core/tree_round.zig"), .target = target, .optimize = .ReleaseSafe });
     const s: Shared = .{
         .delta = b.createModule(.{ .root_source_file = b.path("zig/src/core/deltanet_kernels.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } }),
-        .runtime_sources = b.createModule(.{ .root_source_file = files.add("qwen_runtime_sources.zig", index) }),
+        .runtime_sources = b.createModule(.{ .root_source_file = files.add("qwen_runtime_sources.zig", index), .imports = &.{.{ .name = "kernel_sources", .module = sources }} }),
         .gdn_source = b.createModule(.{ .root_source_file = files.add("qwen_gdn_source.zig", "pub const text = @embedFile(\"gdn.metal\") ++ \"\\n\" ++ @embedFile(\"gdn_slots.metal\");\n") }),
         .bf16_topk = bf16_topk,
         .bf16_topk_gpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/bf16_topk_gpu.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "bf16_topk", .module = bf16_topk }, .{ .name = "bf16_topk_sources", .module = b.createModule(.{ .root_source_file = b.path("zig/bf16_topk_sources.zig") }) } } }),

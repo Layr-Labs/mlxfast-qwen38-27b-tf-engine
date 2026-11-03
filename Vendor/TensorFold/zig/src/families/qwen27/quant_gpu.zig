@@ -164,6 +164,7 @@ pub const Kernels = struct {
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
+    native_prompt: [4]?mtl.Pipeline = .{ null, null, null, null },
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
     count_words: ?mtl.Buffer = null,
@@ -205,6 +206,7 @@ pub const Kernels = struct {
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
+        for (k.native_prompt) |slot| if (slot) |pipe| pipe.deinit();
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
@@ -453,6 +455,30 @@ pub const Kernels = struct {
             e.barrier();
             try span.end();
             return;
+        }
+        if (k.prompt and skip == 0 and cut[1] == 0 and range[1] == 0 and p.n % 64 == 0 and sk <= 8) {
+            if (p.native_prompt) |nw| {
+                const sums = xs orelse return error.BadCoreProjectionRows;
+                const ni: usize = switch (sk) { 1 => 0, 2 => 1, 4 => 2, 8 => 3, else => return error.BadCoreProjectionRows };
+                if (k.native_prompt[ni] == null) {
+                    var lib = try mtl.Library.fromBytes(k.device, sources.packed_metallib);
+                    defer lib.deinit();
+                    const names = [_][:0]const u8{ "tf_lane_native_prompt_sk1", "tf_lane_native_prompt_sk2", "tf_lane_native_prompt_sk4", "tf_lane_native_prompt_sk8" };
+                    k.native_prompt[ni] = try mtl.Pipeline.init(k.device, lib, names[ni], false);
+                }
+                e.setPipeline(k.native_prompt[ni].?);
+                e.setBuffer(x.buffer, x.offset, 0);
+                e.setBuffer(nw.buffer, nw.offset, 1);
+                e.setBuffer(p.pairs.buffer, p.pairs.offset, 2);
+                e.setBuffer(sums.ref.buffer, sums.ref.offset, 3);
+                e.setBuffer(y.buffer, y.offset, 4);
+                const Args = extern struct { n: u32, input_width: u32, slices: u32, active: u32, sum_stride: u32 };
+                e.setValue(Args{ .n = p.n, .input_width = p.k, .slices = sk, .active = rows, .sum_stride = sums.stride }, 5);
+                e.dispatchGroups(.{ .width = p.n / 64, .height = (rows + 15) / 16, .depth = 1 }, .{ .width = 32 * sk, .height = 1, .depth = 1 });
+                e.barrier();
+                try span.end();
+                return;
+            }
         }
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
