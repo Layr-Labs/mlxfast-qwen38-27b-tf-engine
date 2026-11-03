@@ -871,10 +871,6 @@ pub const Runner = struct {
         const xs = forward.sums(f, .sums, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
-        // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
-        var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
-        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
-        defer r.attention.warm = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
     }
@@ -882,16 +878,6 @@ pub const Runner = struct {
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
-    }
-};
-
-/// An attention layer's out projection warm (quant_gpu.Kernels.warm), encoded behind its decoded prefix.
-const Warm = struct {
-    quant: *@import("quant_gpu.zig").Kernels,
-    out: @import("projection.zig").Linear,
-    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
-        const w: *Warm = @ptrCast(@alignCast(ptr));
-        try w.quant.warm(e, w.out);
     }
 };
 
