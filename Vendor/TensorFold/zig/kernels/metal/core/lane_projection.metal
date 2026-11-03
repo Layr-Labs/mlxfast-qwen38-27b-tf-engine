@@ -720,6 +720,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_EARLY(t)
 #define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
 #endif
+// TF_PROBE (ceiling probe, gate/up only): one extra 16x32x32 tensor op on tile 0 of every K group, into P, which the real
+// multiply-mode op overwrites next: +25% tensor work in the launch, identical results.
+#if defined(TF_SWIGLU)
+#define TF_PROBE_OP(t) if ((t) == 0) opq.run(xl1, cbl, Q);
+#else
+#define TF_PROBE_OP(t)
+#endif
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
@@ -734,6 +741,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
       } \
       TF_STREAM_EARLY(t) \
+      TF_PROBE_OP(t) \
       opm.run(xl0,cbl,P); \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
@@ -843,6 +851,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto cbh = TF_TN_RIGHT;
 #endif
   auto P = TF_TN_DEST;
+#if defined(TF_SWIGLU)
+  matmul2d<da, execution_simdgroup> opq; // TF_PROBE: its own accumulating destination, read only on a branch that never runs
+  auto Q = TF_TN_DEST;
+  for (int i = 0; i < 16; i++) Q[i] = 0.0f;
+#endif
   const half2 bias = half2(1024.0h);
 #if defined(TF_SWIGLU)
   const int first = TF_G0, last = TF_G0 + TF_GN; // one K split: the threadgroup's SIMD groups are the gate and up pairs
@@ -877,6 +890,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   }
 #if defined(TF_SWIGLU)
+  if (mdims[0] == -12345) { float q = 0.0f; for (int i = 0; i < 16; i++) q += Q[i]; HS[lane] = q; }
   // tf_lane_reg's fused prompt epilogue, with tile t of SIMD group ks as its tile 2 * ks + t: each tile's words round to
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
