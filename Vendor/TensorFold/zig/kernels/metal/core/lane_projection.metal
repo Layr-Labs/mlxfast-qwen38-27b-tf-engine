@@ -660,7 +660,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 #endif
 
-#if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN)
+#if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN) && !defined(TF_PROMPT_RM2)
 #ifndef TF_TB
 #define TF_TB 1
 #endif
@@ -916,5 +916,126 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
 #endif
+}
+#endif
+
+
+#if defined(TF_PROMPT_RM2)
+// A qkv prompt tile: two separate 16x32 outputs reuse one right operand. Each output's two K=32 products,
+// scale/bias FMAs and increasing-K walk are the ordinary TN2 kernel's; only the shared operand changes.
+[[max_total_threads_per_threadgroup(32 * TF_SK)]]
+[[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]],
+    const device bfloat* SB [[buffer(2)]], const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]],
+    const device float* XS [[buffer(5)]], uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const int r0 = int(tg.y) * 32, rows = mdims[0] - r0;
+  if (rows <= 0) return;
+  const int M0 = min(rows, 16), M1 = min(max(rows - 16, 0), 16);
+  const int lane = int(lanei), ks = int(sgi), stride = mdims[1], tile = tf_tile(int(tg.x));
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+  const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+  X += (size_t)r0 * TF_K;
+  Y += (size_t)r0 * TF_YS;
+  XS += r0;
+  constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto d64 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<dm, execution_simdgroup> opm;
+  matmul2d<da, execution_simdgroup> opa;
+  matmul2d<d64, execution_simdgroup> op64;
+  auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto a00 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto a01 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto a10 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto a11 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto right = opm.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto p0 = opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a00)>, metal::remove_addrspace_t<decltype(right)>, float>();
+  auto p1 = opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a10)>, metal::remove_addrspace_t<decltype(right)>, float>();
+  float c0[16], c1[16];
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < 16; i++) { c0[i] = 0.0f; c1[i] = 0.0f; }
+  const device uint4* cp = W + ((size_t)(tile / TF_TB) * KG * TF_TB + tile % TF_TB) * 64 + lane + (size_t)first * TF_TB * 64;
+  const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile * NT + nb) / 4;
+  const device float* xp = XS + first * stride + mb;
+  const device bfloat* xv = X + (size_t)first * GS;
+  const array<int32_t, 2> xstr = {1, TF_K};
+  for (int g = first; g < last; g++) {
+    const float x00 = xp[0], x01 = xp[8];
+    const float x10 = M1 > 0 ? xp[16] : 0.0f, x11 = M1 > 0 ? xp[24] : 0.0f;
+    xp += stride;
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M0), xstr));
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 16; i++) { a00[i] = x64[i]; a01[i] = x64[16 + i]; }
+    if (M1 > 0) {
+      x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)(xv + 16 * TF_K), dextents<int32_t, 2>(GS, M1), xstr));
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 16; i++) { a10[i] = x64[i]; a11[i] = x64[16 + i]; }
+    }
+    xv += GS;
+    const uint4 q0 = sp[0], q1 = sp[4];
+    sp += TF_N / 4;
+    const uint4 cur0 = cp[0], cur1 = cp[32];
+    cp += TF_TB * 64;
+    thread half2* b2 = (thread half2*)&right[0];
+    _Pragma("clang loop unroll(full)")
+    for (int w = 0; w < 4; w++) {
+      const uint word = w < 2 ? cur0[2 * w] : cur1[2 * (w - 2)]; const int e = 2 * w;
+      b2[e] = as_type<half2>(word & 0x000f000fu);
+      b2[e + 1] = as_type<half2>((word >> 4) & 0x000f000fu);
+      b2[e + 8] = as_type<half2>((word >> 8) & 0x000f000fu);
+      b2[e + 9] = as_type<half2>((word >> 12) & 0x000f000fu);
+    }
+    opm.run(a00, right, p0);
+    if (M1 > 0) opm.run(a10, right, p1);
+    _Pragma("clang loop unroll(full)")
+    for (int w = 0; w < 4; w++) {
+      const uint word = w < 2 ? cur0[2 * w + 1] : cur1[2 * (w - 2) + 1]; const int e = 2 * w;
+      b2[e] = as_type<half2>(word & 0x000f000fu);
+      b2[e + 1] = as_type<half2>((word >> 4) & 0x000f000fu);
+      b2[e + 8] = as_type<half2>((word >> 8) & 0x000f000fu);
+      b2[e + 9] = as_type<half2>((word >> 12) & 0x000f000fu);
+    }
+    opa.run(a01, right, p0);
+    if (M1 > 0) opa.run(a11, right, p1);
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < 4; j++) {
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+      c0[j] = fma(s0, p0[j], fma(b0, x00, c0[j]));
+      c0[4 + j] = fma(s0, p0[4 + j], fma(b0, x01, c0[4 + j]));
+      c0[8 + j] = fma(s1, p0[8 + j], fma(b1, x00, c0[8 + j]));
+      c0[12 + j] = fma(s1, p0[12 + j], fma(b1, x01, c0[12 + j]));
+      if (M1 > 0) {
+        c1[j] = fma(s0, p1[j], fma(b0, x10, c1[j]));
+        c1[4 + j] = fma(s0, p1[4 + j], fma(b0, x11, c1[4 + j]));
+        c1[8 + j] = fma(s1, p1[8 + j], fma(b1, x10, c1[8 + j]));
+        c1[12 + j] = fma(s1, p1[12 + j], fma(b1, x11, c1[12 + j]));
+      }
+    }
+  }
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 2 * 16 * 32];
+#if TF_SK > 1
+  if (ks > 0) {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 16; i++) {
+      part[((ks - 1) * 2 * 16 + i) * 32 + lane] = c0[i];
+      part[(((ks - 1) * 2 + 1) * 16 + i) * 32 + lane] = c1[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) for (int split = 1; split < TF_SK; split++) {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 16; i++) {
+      c0[i] += part[((split - 1) * 2 * 16 + i) * 32 + lane];
+      c1[i] += part[(((split - 1) * 2 + 1) * 16 + i) * 32 + lane];
+    }
+  }
+#endif
+  if (ks == 0)
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < 16; i++) {
+    const int m = mb + 8 * ((i >> 2) & 1), n = tile * NT + nb + 16 * (i >> 3) + (i & 3);
+    if (m < M0 && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(c0[i]);
+    if (m < M1 && n < TF_N) Y[(size_t)(16 + m) * TF_YS + n] = static_cast<TF_OUT>(c1[i]);
+  }
 }
 #endif
