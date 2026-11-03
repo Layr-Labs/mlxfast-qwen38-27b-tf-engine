@@ -513,7 +513,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -705,7 +708,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;

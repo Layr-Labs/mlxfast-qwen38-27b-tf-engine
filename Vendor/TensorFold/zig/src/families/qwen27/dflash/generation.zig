@@ -197,7 +197,10 @@ pub const Generation = struct {
         const cb = g.keep_done orelse return;
         g.keep_done = null;
         defer cb.release();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
@@ -213,7 +216,6 @@ pub const Generation = struct {
             .completed, .@"error" => break,
             else => std.atomic.spinLoopHint(),
         };
-        cb.wait();
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
