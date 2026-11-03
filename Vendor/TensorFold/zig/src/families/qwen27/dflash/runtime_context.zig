@@ -66,6 +66,51 @@ fn appendRows(b: *Backend, e: @import("metal").ComputeEncoder, cache: @import("r
         try b.attention.appendKv(e, slots[0..count], .{ .buf = k.buf, .off = k.off + off }, .{ .buf = v.buf, .off = v.off + off }, .{ .buf = cache.keys }, .{ .buf = cache.values });
     }
 }
+/// An early frame's taps left to its 2-row block (Ops.context_defer): when every layer's q, k and v are one fused launch,
+/// each layer's attention input carries the taps' rows behind the block's, and its rope_append writes their keys and
+/// values. The transaction counts them appended now; latticeBegin checks that every layer wrote them.
+pub fn deferAppend(ptr: *anyopaque, transaction: u64, epoch: u64, positions: []const u64, block: u32) !bool {
+    const b = cast(ptr);
+    try b.frame.require(epoch);
+    if (b.failed or b.transaction != transaction or transaction != epoch or b.appended != 0 or b.stacked != null) return error.BadDraftContext;
+    if (!b.admitting() or block != 2 or positions.len != 2 or b.qkv_layers != b.config.layers or b.batch.len != 0) return false;
+    for (positions, 0..) |position, i| if (position != b.context.end + i) return error.BadCommittedTaps;
+    const slot: u32 = @intCast(positions[0] % b.config.window);
+    if (slot + positions.len > b.config.window) return false;
+    // the stacked keys rope at the RoundArgs positions behind the block's: these taps' for either count
+    const blocks: [*]const RoundArgs = @ptrCast(@alignCast(b.args.contents()));
+    for (1..RoundArgs.blocks) |k| if (!std.mem.eql(u64, blocks[k].positions[2..4], positions)) return false;
+    b.appended = (@as(u32, 1) << @intCast(b.config.layers)) - 1;
+    b.appended_rows = @intCast(positions.len);
+    b.stacked = .{ .rows = @intCast(positions.len), .slot = slot };
+    return true;
+}
+/// A stacked block's keys `x` (its rows, then the deferred taps'; Ops.rope_append), whose per-head norm is held: one launch
+/// norms and ropes them all as tf_draft_rms_rope does, the block's rows into its keys and the taps' the verify admitted
+/// (RoundArgs append) into their ring slots, and beside it a row copy puts those taps' `values` in the same slots.
+pub fn ropeAppend(ptr: *anyopaque, epoch: u64, x: op.View, values: op.View, layer: u32, p: op.Rotary) !op.View {
+    const b = cast(ptr);
+    const s = if (b.stacked) |*s| s else return error.DraftDeviceRound;
+    const h = b.takeHeldNorm(x, p.heads, p.dim) orelse return error.DraftDeviceRound;
+    const e = try b.encoderHolding(epoch);
+    if (b.early == null or b.transaction != null or layer >= b.config.layers or s.layers & (@as(u32, 1) << @intCast(layer)) != 0) return error.BadDraftContext;
+    // RoundArgs positions: the 2-row block's, then the taps'
+    if (values.rows != s.rows or x.rows != 2 + s.rows or x.width != b.config.kvWidth() or values.width != x.width or p.positions.len != x.rows) return error.DraftDeviceRound;
+    const rows = x.rows - s.rows;
+    const y = try b.frame.alloc(rows, x.width, .bf16);
+    const cache = b.caches[layer];
+    const at = @as(usize, s.slot) * b.config.kvWidth() * 2;
+    const count = b.roundArg("append"); // its rows word: the taps the verify admitted
+    // `h.x` and `values` are rows of the q|k|v launch: where it is counted (runtime_callbacks.encodeCountedIf) both
+    // launches share its barrier interval and wait on its count, as the q norm-rope beside them does; else a barrier
+    @import("runtime_callbacks.zig").wait_counted(b, e, &.{ try b.span(h.x), try b.span(values) }, &.{ try b.span(h.y), try b.span(y), Span.whole(cache.keys), Span.whole(cache.values) });
+    defer b.primitives.wait = null;
+    const np: @import("core").draft_ops.Norm = .{ .rows = h.x.rows, .heads = h.p.heads, .dim = h.p.head_dim, .x_stride = h.x.stride, .y_stride = h.y.stride, .eps = h.p.eps };
+    try b.primitives.normRopeRing(e, try b.frame.ref(h.x), try b.weight(h.p.weight), try b.frame.ref(h.y), b.roundArg("positions"), try b.frame.ref(y), .{ .buf = cache.keys, .off = at }, count, np, .{ .rows = x.rows, .heads = p.heads, .dim = p.dim, .x_stride = x.stride, .y_stride = y.stride, .theta = @floatCast(p.theta) }, rows);
+    try b.primitives.copyRows(e, try b.frame.ref(values), .{ .buf = cache.values, .off = at }, count, .{ .rows = values.rows, .width = values.width, .x_stride = values.stride, .y_stride = b.config.kvWidth() });
+    s.layers |= @as(u32, 1) << @intCast(layer);
+    return y;
+}
 fn ready(b: *Backend, transaction: u64, epoch: u64, next: op.Context) !void {
     if (b.transaction != transaction or transaction != epoch or b.appended != (@as(u32, 1) << @intCast(b.config.layers)) - 1 or next.cache != b.context.cache or next.end != b.context.end + b.appended_rows or next.begin != @max(b.context.begin, next.end -| (@as(u64, b.config.window) - 1))) return error.BadDraftContext;
 }

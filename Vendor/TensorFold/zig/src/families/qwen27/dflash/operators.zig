@@ -49,7 +49,8 @@ pub const Lattice = struct {
 pub const Context = struct { cache: u64, begin: u64, end: u64 };
 pub const Norm = struct { weight: ck.Tensor, eps: f32, heads: u32 = 1, head_dim: u32 };
 pub const Rotary = struct { positions: []const u64, heads: u32, dim: u32, theta: f64 };
-pub const Conv = struct { dynamic: View, base: ck.Tensor, branch: u32, group: u32, block: u32, residual: ?View = null };
+/// `stack`: rows the output carries behind its own, copied (an early frame's deferred taps behind its block: Ops.context_defer).
+pub const Conv = struct { dynamic: View, base: ck.Tensor, branch: u32, group: u32, block: u32, residual: ?View = null, stack: ?View = null };
 pub const BlockMask = enum { all_slots };
 /// `streams`: a batched pass's contexts, one `block` of rows each, stream k's caches the backend's batch[k].
 pub const Attention = struct { context: Context, config: Config, layer: u32, query: View, keys: View, values: View, positions: []const u64, mask: BlockMask = .all_slots, streams: []const Context = &.{}, block: u32 = 0 };
@@ -89,6 +90,13 @@ pub const Ops = struct {
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
         lattice_end: ?*const fn (*anyopaque, u64, Head, View, View, Config) anyerror!Lattice = null,
+        // an open transaction's taps at `positions`, appended by the frame's next block of the given rows instead: their
+        // hidden rows ride behind the block's in each layer's attention input (Conv.stack), whose keys rope_append writes
+        // with their values; false: nothing deferred, the caller appends them (context_append)
+        context_defer: ?*const fn (*anyopaque, u64, u64, []const u64, u32) anyerror!bool = null,
+        // a stacked block's keys (its rows, then the deferred taps'): its own rows' rope, and the taps' rotated keys with
+        // their `values` written to the layer's context
+        rope_append: ?*const fn (*anyopaque, u64, View, View, u32, Rotary) anyerror!View = null,
     };
 };
 
