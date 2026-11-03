@@ -15,6 +15,8 @@ const Glue = @import("glue_gpu.zig").Kernels;
 pub const Hook = struct {
     pool: *Pool,
     quant: *Quant,
+    /// B1: the norm's published count (rows) when the pre-norm dropped its barrier for this interval, else 0.
+    norm_wait: u32 = 0,
     glue: Glue,
     plan: *const Plan,
     linear_index: []const u32,
@@ -37,7 +39,15 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
+        // B1: when the pre-norm published its count, QKV waits on it and both projections count into count_words for prepare.
+        const norm_wait = hook.norm_wait != 0 and !hook.accepted_chain and z.tiles == 0 and hook.quant.waitable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows);
+        if (hook.norm_wait != 0 and !norm_wait) e.barrier();
+        if (norm_wait) {
+            // Both outputs count into the ordinary completion pair; pool prepare waits for both before reading either.
+            const a = try hook.quant.quantWaitNorm(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows, hook.norm_wait);
+            const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
+            after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
+        } else if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
