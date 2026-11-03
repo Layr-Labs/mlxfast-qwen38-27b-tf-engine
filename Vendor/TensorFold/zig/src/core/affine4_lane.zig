@@ -12,9 +12,20 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    /// 2-bit reg adapters' rows8 build on an 8-row tensor op (Layout.m8), taken in place of `small` only after its words
+    /// equal `small`'s on the GPU at init (agrees8): the 16-row op spends 16 rows of tensor work a code on these
+    /// tensor-bound launches of 1 to 8 rows.
+    small8: ?lane.Projection = null,
     /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
     /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
     prompt: ?lane.Projection = null,
+    /// Reg adapters' rows8 layout (`small`'s), from which draftSwiglu builds `swiglu`.
+    small_layout: ?lane.Layout = null,
+    /// A drafter gate|up group's fused SwiGLU build on the same words and metadata (lane.Layout.draft_act; draftSwiglu).
+    swiglu: ?lane.Projection = null,
+    /// team-m5-08t: `small`'s counted build (lane.Layout.count, countedSmall) on the same words and metadata: each
+    /// threadgroup counts itself once its stores are fenced, for the drafter's waiting conv+norm behind it.
+    counted: ?lane.Projection = null,
     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
         if (prepared.nibbles) {
@@ -61,6 +72,16 @@ pub const Adapter = struct {
             small = try lane.Projection.init(a, device, l8);
         }
         errdefer if (small) |s| s.deinit();
+        var small8: ?lane.Projection = null;
+        if (layout.reg and prepared.nibbles) if (small) |s| {
+            var l8 = layout;
+            l8.rows8 = true;
+            l8.m8 = true;
+            if (lane.Projection.init(a, device, l8)) |p8| {
+                if (agrees8(device, s, p8, words, if (index) |ix| ix else metadata, layout.k) catch false) small8 = p8 else p8.deinit();
+            } else |_| {}
+        };
+        errdefer if (small8) |s| s.deinit();
         var prompt: ?lane.Projection = null;
         if (layout.reg and layout.format.bits == 4) {
             var lp = layout;
@@ -69,7 +90,72 @@ pub const Adapter = struct {
             lp.prompt_sr = true;
             prompt = try lane.Projection.init(a, device, lp);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt };
+        var small_layout: ?lane.Layout = null;
+        if (layout.reg) {
+            small_layout = layout;
+            small_layout.?.rows8 = true;
+        }
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .small8 = small8, .prompt = prompt, .small_layout = small_layout };
+    }
+    /// Whether `p8` writes `small`'s words bit for bit on these weights: both launched on the same rows (deterministic
+    /// pseudo-random bf16 activations in [-2, 2)) at every row count a rows8 launch takes, 1 to 8, their outputs compared
+    /// on the host.
+    fn agrees8(device: mtl.Device, small: lane.Projection, p8: lane.Projection, words: mtl.Buffer, meta_buf: mtl.Buffer, k: usize) !bool {
+        const max_rows: usize = 8;
+        const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+        const x = try device.buffer(max_rows * k * 2, options);
+        defer x.deinit();
+        const y_bytes = max_rows * small.y_stride * small.output_bytes;
+        const y16 = try device.buffer(y_bytes, options);
+        defer y16.deinit();
+        const y8 = try device.buffer(y_bytes, options);
+        defer y8.deinit();
+        var state: u32 = 0x9E3779B9;
+        for (x.slice(u16, max_rows * k)) |*v| {
+            state = state *% 1664525 +% 1013904223;
+            const f = (@as(f32, @floatFromInt(state >> 8)) / 16777216.0) * 4.0 - 2.0;
+            v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
+        }
+        const queue = try device.queue();
+        defer queue.deinit();
+        for ([_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
+            @memset(y16.contents()[0..y_bytes], 0xA5);
+            @memset(y8.contents()[0..y_bytes], 0x5A);
+            const pool = mtl.objc.Pool.push();
+            defer pool.pop();
+            const cb = queue.commandBuffer();
+            const e = cb.compute(.serial);
+            try small.encode(e, .{ .buf = x }, .{ .buf = words }, .{ .buf = meta_buf }, .{ .buf = y16 }, rows);
+            e.barrier();
+            try p8.encode(e, .{ .buf = x }, .{ .buf = words }, .{ .buf = meta_buf }, .{ .buf = y8 }, rows);
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.status() != .completed) return false;
+            const used = ((rows - 1) * small.y_stride + small.n) * small.output_bytes;
+            if (!std.mem.eql(u8, y16.contents()[0..used], y8.contents()[0..used])) return false;
+        }
+        return true;
+    }
+    /// Builds `swiglu`: the rows8 launch of this gate|up group (gate rows then up rows, N / 2 each) that stores the drafter's
+    /// SwiGLU of them and its group sums instead (Projection.encodeSwiglu); its words are the rows8 launch's. Errors leave
+    /// the adapter as it was.
+    pub fn draftSwiglu(adapter: *Adapter, a: std.mem.Allocator, device: mtl.Device) !void {
+        var l = adapter.small_layout orelse return error.InvalidSchedule;
+        l.swiglu = true;
+        l.draft_act = true;
+        const p = try lane.Projection.init(a, device, l);
+        if (adapter.swiglu) |old| old.deinit();
+        adapter.swiglu = p;
+    }
+    /// Builds `counted`: `small`'s layout with Layout.count, its words `small`'s (team-m5-08t). Errors leave the adapter
+    /// as it was.
+    pub fn countedSmall(adapter: *Adapter, a: std.mem.Allocator, device: mtl.Device) !void {
+        var l = adapter.small_layout orelse return error.InvalidSchedule;
+        l.count = true;
+        const p = try lane.Projection.init(a, device, l);
+        if (adapter.counted) |old| old.deinit();
+        adapter.counted = p;
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -87,13 +173,16 @@ pub const Adapter = struct {
     }
     /// The projection a launch of `rows` takes: the rows8 build for at most 8 rows where there is one.
     pub fn forRows(adapter: Adapter, rows: u32) lane.Projection {
-        if (rows <= 8) if (adapter.small) |s| return s;
+        if (rows <= 8) if (adapter.small8 orelse adapter.small) |s| return s;
         return adapter.projection;
     }
     pub fn deinit(adapter: Adapter) void {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
+        if (adapter.small8) |s| s.deinit();
         if (adapter.prompt) |p| p.deinit();
+        if (adapter.swiglu) |p| p.deinit();
+        if (adapter.counted) |p| p.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
         if (adapter.index) |b| b.deinit();
