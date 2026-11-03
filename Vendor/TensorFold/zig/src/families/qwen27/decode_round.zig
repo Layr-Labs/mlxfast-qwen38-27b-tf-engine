@@ -395,9 +395,12 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: its share of the rows doubles toward the last (1, 2, 4 of 7), down to a multiple of 64,
+        // because a later segment's mixer reads every earlier one's K/V rows and GDN state before its own; the last runs
+        // to n
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        const span = (@as(u64, 1) << @intCast(parts)) - 1;
+        for (0..parts) |k| firsts[k] = @intCast(@as(u64, n) * ((@as(u64, 1) << @intCast(k)) - 1) / span / 64 * 64);
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
@@ -562,13 +565,16 @@ pub const Runner = struct {
         e.barrier();
         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
         if (r.deferred != null) {
-            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans
+            // a deferred replay: every layer's kept rows go behind the pending ones in one launch, for the next star scans,
+            // and every layer's conv window follows in one more
             try r.gdn.stash(plan, e);
-            for (0..r.gdn.budget.layers) |gi| try r.gdn.commitConvKeep(gi, plan, e);
+            try r.gdn.commitConvKeep(plan, e);
         } else {
             if (r.gdn.pending.rows != 0) return error.RoundNotReady; // a verify that defers nothing lands them first
-            // Each layer replays its state and copies all conv taps before overwriting that channel's history.
+            // Each layer replays its state; one launch then copies all conv taps before overwriting those channels'
+            // history.
             for (0..r.gdn.budget.layers) |gi| try r.gdn.commitKeep(gi, plan, e);
+            try r.gdn.commitConvKeep(plan, e);
         }
         // The attention moves touch only their caches, maps and lanes: they run beside the GDN commits.
         if (!moves) return e.barrier();

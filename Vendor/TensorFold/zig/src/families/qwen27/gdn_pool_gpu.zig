@@ -335,26 +335,31 @@ pub const Pool = struct {
         e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
     }
 
-    /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
-    /// history by tf_delta_gdn_conv_keep (a thread a channel reads every source tap before it writes), so the keep
-    /// needs no next_history staging, no publish_conv launch and no fence between the two.
+    /// commitScan's replay in a fence-free pass. The conv window follows in commitConvKeep's one launch for every layer
+    /// (a thread a channel reads every source tap before it writes), so the keep needs no next_history staging, no
+    /// publish_conv launch and no fence after it.
     pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         try pool.commitReplay(layer, plan, e);
-        try pool.commitConvKeep(layer, plan, e);
     }
 
-    /// commitKeep's conv window alone (a keep whose replay `stash` defers), unfenced.
-    pub fn commitConvKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+    /// commitKeep's conv window for every layer in one launch: a grid slice a layer, so a keep's conv windows cost one
+    /// dispatch instead of one a layer. A thread a channel reads every source tap before it writes.
+    pub fn commitConvKeep(pool: *Pool, plan: DevicePlan, e: metal.ComputeEncoder) !void {
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
         const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         const m = plan.metadata;
+        const layers: usize = pool.budget.layers;
+        const history = pool.get(.history);
+        const projection = pool.get(.qkv);
         e.setPipeline(pool.kernels.conv_keep);
-        gdn.bind(e, .{ try pool.layerSpan(.history, layer), try pool.layerSpan(.qkv, layer) }, 0);
+        e.setBuffer(history, 0, 0);
+        e.setBuffer(projection, 0, 1);
         e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
         e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
         e.setBuffer(m.windows.buffer, m.windows.offset, 4);
         e.setValue(p, 5);
-        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a channel a thread
+        e.setValue(abi.ConvLayers{ .history_words = @intCast(history.length() / layers / 2), .projection_words = @intCast(projection.length() / layers / 2) }, 6);
+        e.dispatchThreads(.{ .width = pool.budget.shape.qkv, .height = plan.host.keeps.len, .depth = layers }, .{ .width = 256 }); // a channel a thread
     }
 
     /// A lone depth-one star keep that defers its replay, every layer in one launch: the kept rows (keeps[0] and kept_rows,
