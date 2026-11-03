@@ -829,11 +829,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // halves' registers in order (left: elements 0-15 then 16-31; right: 0-31 then 32-63)
   constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
   constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  constexpr auto d64 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
-  matmul2d<d64, execution_simdgroup> op64;
-  auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
@@ -865,10 +862,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+    // each K = 32 half of the group's 16x64 activation slice loads straight into the operand its tensor op reads
+    xl0.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(32, M), xstr));
+    xl1.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv + 32, dextents<int32_t, 2>(32, M), xstr));
     xv += GS;
-    TF_UNROLL
-    for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
