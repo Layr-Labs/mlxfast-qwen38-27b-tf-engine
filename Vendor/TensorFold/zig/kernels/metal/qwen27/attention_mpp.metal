@@ -142,6 +142,8 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   }
   if (count_out != 0u) q27_count(PC, tid);
 }
+// The star fold's own library (Q27_STAR_FOLD, at the end of this file) runs no prefix kernel: it skips their instantiations.
+#if !defined(Q27_STAR_FOLD)
 #define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 Q27_PREFIX(1)
 Q27_PREFIX(2)
@@ -160,6 +162,21 @@ Q27_PREFIX(14)
 Q27_PREFIX(15)
 Q27_PREFIX(16)
 template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+#endif
+
+// One staged K or V block of a tail tile, 128 threads: this thread's slots kv[128 j] (j < 8) take rows q0 + STEP j of the
+// cache at `src` (the thread's column; rows D apart). Rows before P come from the cache through a pointer stepped STEP rows a
+// slot, rows in [P, nmax) are the node's own (row P + path[row - P]), later rows are zero: each slot holds the 16 bytes the
+// per-slot select (row < P, row < nmax) gave it, without a row division, compare chain or 64-bit row product of its own.
+template <int STEP>
+inline void q27_stage(threadgroup vec<bfloat, 8>* kv, const device bfloat* src, int q0, int P, int nmax, const threadgroup int* path) {
+  const int context = min(int(uint(max(P - q0 + STEP - 1, 0)) / STEP), 8), own = min(int(uint(max(nmax - q0 + STEP - 1, 0)) / STEP), 8);
+  const device vec<bfloat, 8>* row = (const device vec<bfloat, 8>*)(src + (int64_t)q0 * D);
+  int j = 0;
+  for (; j < context; ++j, row += STEP * D / 8) kv[128 * j] = *row;
+  for (; j < own; ++j) kv[128 * j] = *(const device vec<bfloat, 8>*)(src + (int64_t)(P + path[q0 + STEP * j - P]) * D);
+  for (; j < 8; ++j) kv[128 * j] = vec<bfloat, 8>(0);
+}
 
 kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
@@ -189,9 +206,11 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   const int n1 = r1 < G ? nmax : 0;
   threadgroup half myP[16 * TK];
   threadgroup bfloat KV[32 * D];
+  threadgroup int path[MAXD];
+  // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
+  if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  const int64_t kstep = D, vstep = D;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -223,14 +242,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
     float sraw[TK / 2];
     for (int h = 0; h < TK / 32; h++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < 32 * D / 8; e += 128) {
-        const int row = int(e) / (D / 8), col = (int(e) % (D / 8)) * 8;
-        const int q = kt + h * 32 + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(kbase + phys * kstep + col) : vec<bfloat, 8>(0);
-      }
+      // slot tid + 128 j: key row kt + 32 h + tid / 32 + 4 j, columns 8 (tid % 32) on
+      q27_stage<4>((threadgroup vec<bfloat, 8>*)KV + tid, kbase + (tid & 31) * 8, kt + h * 32 + (tid >> 5), P, nmax, path);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sg == 0) {
         auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
@@ -271,14 +284,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
     }
     for (int hv = 0; hv < 2; hv++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < TK * 128 / 8; e += 128) {
-        const int row = int(e) / 16, col = hv * 128 + (int(e) % 16) * 8;
-        const int q = kt + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(vbase + phys * vstep + col) : vec<bfloat, 8>(0);
-      }
+      // slot tid + 128 j: value row kt + tid / 16 + 8 j, columns 128 hv + 8 (tid % 16) on
+      q27_stage<8>((threadgroup vec<bfloat, 8>*)KV + tid, vbase + hv * 128 + (tid & 15) * 8, kt + (tid >> 4), P, nmax, path);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sg == 0) {
         if (hv == 0) opO.run(tP, tVh, Olo);
@@ -301,7 +308,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
 
 // A row's chunk partials combined in key order, a block of loads ahead; `gated` applies the query gate (q27_gate).
 // wait_for above 0: the counted split tail shares this launch's barrier interval (it waited on the counted prefix before it
-// counted itself), so a group reads both partials once the tail's count on NC[0] reaches wait_for.
+// counted itself), so a group reads both partials once the tail's count on NC[0] reaches wait_for. The plan words come
+// first: nothing in the barrier interval writes them.
 kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const float* PMA [[buffer(1)]], device const float* PLA [[buffer(2)]],
     device const float* POB [[buffer(3)]], device const float* PMB [[buffer(4)]], device const float* PLB [[buffer(5)]],
     device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
@@ -310,7 +318,6 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
-  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
   const uint lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x;
   const uint r = threadgroup_position_in_grid.y;
@@ -319,6 +326,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
   const int NCBS = meta[MG + st * MS + 5];
   const int ra = meta[MG + st * MS + 3] * 16 + (int(r) / G - meta[MG + st * MS + 6]) * G + int(r) % G;
   const int CT = nodes[NW * (int(r) / G) + 3]; // the row's own prefix chunks
+  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
   constexpr int DP = D / 32, MB = 2;
   const int node = r / G, g = r % G;
   float m = -INFINITY, l = 0.0f, o[DP];
@@ -381,6 +389,8 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
 // Independent output halves preserve the original tail arithmetic; used for small one-chunk trees.
 // wait_for above 0: the counted prefix shares this launch's barrier interval; every group waits on WC[0] before it reads the
 // prefix partials. count_out above 0: every group counts itself on TC[0] once stored, for the merge that waits on it.
+// A group's plan words, its first key tile's K and V staging and its scores read nothing the prefix writes (the round's own
+// rows were appended behind an earlier barrier), so they come before the wait; the partial and the softmax come after it.
 [[max_total_threads_per_threadgroup(128)]]
 kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
@@ -391,17 +401,18 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
-  if (wait_for != 0u) q27_wait_count(WC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
   const ushort lane = thread_index_in_simdgroup;
   const uint hk = threadgroup_position_in_grid.x / 2;
   const bool hi = threadgroup_position_in_grid.x & 1;
   const uint cb = threadgroup_position_in_grid.y;
   const uint node = threadgroup_position_in_grid.z;
+  const uint groups = threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z;
   const int NCB = meta[3], W = meta[4], RPA = meta[5], CA = meta[6];
   const int st = nodes[NW * node + 1];
   const int P = meta[MG + st * MS + 4], PT = meta[MG + st * MS + 0], CK = nodes[NW * node + 2];
   if (int(cb) >= meta[MG + st * MS + 5]) {
+    if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
     if (count_out != 0u) q27_count(TC, tid);
     return;
   }
@@ -418,9 +429,11 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   const int n1 = r1 < G ? nmax : 0;
   threadgroup half myP[16 * TK];
   threadgroup bfloat KV[32 * D];
+  threadgroup int path[MAXD];
+  // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
+  if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  const int64_t kstep = D, vstep = D;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -438,36 +451,43 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   const int c = c0 + int(cb);
   const int kbeg = max(c * CK, PT);
   const int kend = min((c + 1) * CK, nmax);
-  if (sg == 0 && cb == 0 && PT > c0 * CK) {
-    const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + la;
-    for (int q = 0; q < 16; q++) {
-      const int row = fm + (q & 1) * 8;
-      if (row >= G) continue;
-      const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
-      for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
-    }
-    if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
-    if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
-  }
-  for (int kt = kbeg; kt < kend; kt += TK) {
+  // a pass a tile, and a last pass without one; the first pass waits on the prefix between its loads and its softmax
+  for (int kt = kbeg;; kt += TK) {
+    const bool tile = kt < kend;
     float sraw[TK / 2];
-    for (int h = 0; h < TK / 32; h++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < 32 * D / 8; e += 128) {
-        const int row = int(e) / (D / 8), col = (int(e) % (D / 8)) * 8;
-        const int q = kt + h * 32 + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(kbase + phys * kstep + col) : vec<bfloat, 8>(0);
+    if (tile) {
+      for (int h = 0; h < TK / 32; h++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // slot tid + 128 j: key row kt + 32 h + tid / 32 + 4 j, columns 8 (tid % 32) on
+        q27_stage<4>((threadgroup vec<bfloat, 8>*)KV + tid, kbase + (tid & 31) * 8, kt + h * 32 + (tid >> 5), P, nmax, path);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
+          opS.run(tQ, tK32, S);
+          for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+        }
       }
+      // this group's value half, staged before the softmax (KV against myP and registers: nothing shared)
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sg == 0) {
-        auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
-        opS.run(tQ, tK32, S);
-        for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+      // slot tid + 128 j: value row kt + tid / 16 + 8 j, columns 128 hi + 8 (tid % 16) on
+      q27_stage<8>((threadgroup vec<bfloat, 8>*)KV + tid, vbase + int(hi) * 128 + (tid & 15) * 8, kt + (tid >> 4), P, nmax, path);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (kt == kbeg) {
+      if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
+      if (sg == 0 && cb == 0 && PT > c0 * CK) {
+        const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + la;
+        for (int q = 0; q < 16; q++) {
+          const int row = fm + (q & 1) * 8;
+          if (row >= G) continue;
+          const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
+          for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
+        }
+        if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
+        if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
       }
     }
+    if (!tile) break;
     if (sg == 0) {
     float s[TK / 2];
     for (int i = 0; i < TK / 2; i++) {
@@ -499,25 +519,14 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
       }
     for (int i = 0; i < 32; i++) saved[i] *= f0;
     }
-    for (int hv = int(hi); hv < int(hi) + 1; hv++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint e = tid; e < TK * 128 / 8; e += 128) {
-        const int row = int(e) / 16, col = hv * 128 + (int(e) % 16) * 8;
-        const int q = kt + row;
-        int phys = -1;
-        if (q < P) phys = q;
-        else if (q < nmax) phys = P + paths[node * MAXD + (q - P)];
-        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(vbase + phys * vstep + col) : vec<bfloat, 8>(0);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sg == 0) {
-        auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
-        _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
-        opO.run(tP, tVh, Olo);
-        _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
-      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
+      opO.run(tP, tVh, Olo);
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
     }
   }
   if (sg == 0) {
@@ -533,3 +542,340 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   }
   if (count_out != 0u) q27_count(TC, tid);
 }
+
+#if defined(Q27_STAR_FOLD)
+// The depth-one star verify's attention in one barrier interval (team-m5-06). This section compiles only in a library
+// of its own (Attention.buildStar: this define, then glue and this file), so an error here drops the fold, never the
+// attention library the target loads. The two bodies below are q27_attn_tail_split's and q27_attn_merge's, verbatim (the
+// tail's three threadgroup arrays come in from its kernel, since only a kernel declares them); star_fold.py builds and
+// checks this section from the kernels above.
+static_assert(G == 6 && D == 256 && MAXD == 128, "Q27_STAR_FOLD: the merge rows a node takes and the arrays passed in");
+
+// q27_attn_tail_split's body, verbatim.
+inline void q27_star_tail(device const bfloat* QB, device const Q27AttnReadPtrs* caches, constant float* scale,
+    device const int* meta, device const int* paths, device const int* nodes,
+    device const float* POA, device const float* PMA, device const float* PLA, device float* PO, device float* PM,
+    device float* PL, device atomic_uint* WC, uint wait_for, device atomic_uint* TC, uint count_out,
+    uint3 threadgroup_position_in_grid, uint3 threadgroups_per_grid, ushort thread_index_in_simdgroup, ushort sg,
+    ushort tid, threadgroup half* myP, threadgroup bfloat* KV, threadgroup int* path) {
+  // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
+  const ushort lane = thread_index_in_simdgroup;
+  const uint hk = threadgroup_position_in_grid.x / 2;
+  const bool hi = threadgroup_position_in_grid.x & 1;
+  const uint cb = threadgroup_position_in_grid.y;
+  const uint node = threadgroup_position_in_grid.z;
+  const uint groups = threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z;
+  const int NCB = meta[3], W = meta[4], RPA = meta[5], CA = meta[6];
+  const int st = nodes[NW * node + 1];
+  const int P = meta[MG + st * MS + 4], PT = meta[MG + st * MS + 0], CK = nodes[NW * node + 2];
+  if (int(cb) >= meta[MG + st * MS + 5]) {
+    if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
+    if (count_out != 0u) q27_count(TC, tid);
+    return;
+  }
+  const int la = meta[MG + st * MS + 3] * 16 + (int(node) - meta[MG + st * MS + 6]) * G;
+  const int depth = nodes[NW * node];
+  const device bfloat* Kb = caches[st].keys;
+  const device bfloat* Vb = caches[st].values;
+  const int nmax = P + depth + 1;
+  const short qid = lane >> 2;
+  const short fm = (qid & 4) | ((lane >> 1) & 3);
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  const int r0 = fm, r1 = fm + 8;
+  const int n0 = r0 < G ? nmax : 0;
+  const int n1 = r1 < G ? nmax : 0;
+  // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
+  if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
+  const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
+  const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
+  tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
+  tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
+  tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tP(myP, dextents<int32_t, 2>(TK, 16));
+  constexpr auto dS = matmul2d_descriptor(16, 32, D, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto dO = matmul2d_descriptor(16, 128, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<dS, execution_simdgroup> opS;
+  matmul2d<dO, execution_simdgroup> opO;
+  // Each node has six query heads; rows 8..15 are padding. Keep only the first
+  // eight rows between steps, restoring zero padding for the unchanged PV product.
+  float saved[32];
+  for (int i = 0; i < 32; i++) saved[i] = 0.0f;
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+  const int c0 = PT / CK;
+  const int c = c0 + int(cb);
+  const int kbeg = max(c * CK, PT);
+  const int kend = min((c + 1) * CK, nmax);
+  // a pass a tile, and a last pass without one; the first pass waits on the prefix between its loads and its softmax
+  for (int kt = kbeg;; kt += TK) {
+    const bool tile = kt < kend;
+    float sraw[TK / 2];
+    if (tile) {
+      for (int h = 0; h < TK / 32; h++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // slot tid + 128 j: key row kt + 32 h + tid / 32 + 4 j, columns 8 (tid % 32) on
+        q27_stage<4>((threadgroup vec<bfloat, 8>*)KV + tid, kbase + (tid & 31) * 8, kt + h * 32 + (tid >> 5), P, nmax, path);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
+          opS.run(tQ, tK32, S);
+          for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+        }
+      }
+      // this group's value half, staged before the softmax (KV against myP and registers: nothing shared)
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // slot tid + 128 j: value row kt + tid / 16 + 8 j, columns 128 hi + 8 (tid % 16) on
+      q27_stage<8>((threadgroup vec<bfloat, 8>*)KV + tid, vbase + int(hi) * 128 + (tid & 15) * 8, kt + (tid >> 4), P, nmax, path);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (kt == kbeg) {
+      if (wait_for != 0u) q27_wait_count(WC, wait_for, groups, tid);
+      if (sg == 0 && cb == 0 && PT > c0 * CK) {
+        const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + la;
+        for (int q = 0; q < 16; q++) {
+          const int row = fm + (q & 1) * 8;
+          if (row >= G) continue;
+          const auto src = POA + (baseA + row) * D + (q >> 1) * 16 + fn;
+          for (int j = 0; j < 4; j++) saved[4 * (q >> 1) + j] = src[(hi ? 128 : 0) + j];
+        }
+        if (r0 < G) { m0 = PMA[baseA + r0]; l0 = PLA[baseA + r0]; }
+        if (r1 < G) { m1 = PMA[baseA + r1]; l1 = PLA[baseA + r1]; }
+      }
+    }
+    if (!tile) break;
+    if (sg == 0) {
+    float s[TK / 2];
+    for (int i = 0; i < TK / 2; i++) {
+      const int key = kt + (i >> 3) * 16 + fn + (i & 3);
+      s[i] = key < ((i & 4) ? n1 : n0) ? sraw[i] * scale[0] : -INFINITY;
+    }
+    float x0 = -INFINITY, x1 = -INFINITY;
+    for (int i = 0; i < TK / 2; i++) { if (i & 4) x1 = max(x1, s[i]); else x0 = max(x0, s[i]); }
+    x0 = max(x0, simd_shuffle_xor(x0, 1)); x0 = max(x0, simd_shuffle_xor(x0, 8));
+    x1 = max(x1, simd_shuffle_xor(x1, 1)); x1 = max(x1, simd_shuffle_xor(x1, 8));
+    const float nm0 = max(m0, x0), nm1 = max(m1, x1);
+    const float f0 = (x0 == -INFINITY) ? 1.0f : fast::exp(m0 - nm0);
+    const float f1 = (x1 == -INFINITY) ? 1.0f : fast::exp(m1 - nm1);
+    float p[TK / 2];
+    for (int i = 0; i < TK / 2; i++) p[i] = (s[i] == -INFINITY) ? 0.0f : fast::exp(s[i] - ((i & 4) ? nm1 : nm0));
+    float y0 = 0.0f, y1 = 0.0f;
+    for (int b = 0; b < TK / 16; b++) {
+      y0 += (p[b * 8] + p[b * 8 + 1]) + (p[b * 8 + 2] + p[b * 8 + 3]);
+      y1 += (p[b * 8 + 4] + p[b * 8 + 5]) + (p[b * 8 + 6] + p[b * 8 + 7]);
+    }
+    y0 += simd_shuffle_xor(y0, 1); y0 += simd_shuffle_xor(y0, 8);
+    y1 += simd_shuffle_xor(y1, 1); y1 += simd_shuffle_xor(y1, 8);
+    if (x0 != -INFINITY) { l0 = l0 * f0 + y0; m0 = nm0; }
+    if (x1 != -INFINITY) { l1 = l1 * f1 + y1; m1 = nm1; }
+    for (int f = 0; f < TK / 16; f++)
+      for (int i = 0; i < 4; i++) {
+        myP[fm * TK + f * 16 + fn + i] = half(p[f * 8 + i]);
+        myP[(fm + 8) * TK + f * 16 + fn + i] = half(p[f * 8 + 4 + i]);
+      }
+    for (int i = 0; i < 32; i++) saved[i] *= f0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      auto Olo = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(tVh), float>();
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 64; i++) Olo[i] = (i & 4) ? 0.0f : saved[(i >> 3) * 4 + (i & 3)];
+      opO.run(tP, tVh, Olo);
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 32; i++) saved[i] = Olo[(i >> 2) * 8 + (i & 3)];
+    }
+  }
+  if (sg == 0) {
+    const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
+    for (int q = 0; q < 16; q++) {
+      device float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
+      *(device float4*)dst = (q & 1) ? float4(0.0f) : float4(saved[4 * (q >> 1)], saved[4 * (q >> 1) + 1], saved[4 * (q >> 1) + 2], saved[4 * (q >> 1) + 3]);
+    }
+    if (!hi && (lane & 9) == 0) {
+      PM[base + r0] = m0; PL[base + r0] = l0;
+      PM[base + r1] = m1; PL[base + r1] = l1;
+    }
+  }
+  if (count_out != 0u) q27_count(TC, tid);
+}
+
+// q27_attn_merge's body, verbatim: one simdgroup merges row r (threadgroup_position_in_grid.y) of kv head hk (.x).
+inline void q27_star_merge(device const float* POA, device const float* PMA, device const float* PLA,
+    device const float* POB, device const float* PMB, device const float* PLB, device const int* meta,
+    device const int* nodes, device bfloat* OUT, device const bfloat* QG, uint gated, device float* XS, uint sums_stride,
+    device atomic_uint* NC, uint wait_for, uint3 threadgroup_position_in_grid, uint3 threadgroups_per_grid, ushort tid,
+    uint thread_index_in_simdgroup) {
+  const uint lane = thread_index_in_simdgroup;
+  const uint hk = threadgroup_position_in_grid.x;
+  const uint r = threadgroup_position_in_grid.y;
+  const int NCB = meta[3], W = meta[4], RPA = meta[5], CA = meta[6];
+  const int st = nodes[NW * (int(r) / G) + 1];
+  const int NCBS = meta[MG + st * MS + 5];
+  const int ra = meta[MG + st * MS + 3] * 16 + (int(r) / G - meta[MG + st * MS + 6]) * G + int(r) % G;
+  const int CT = nodes[NW * (int(r) / G) + 3]; // the row's own prefix chunks
+  if (wait_for != 0u) q27_wait_count(NC, wait_for, threadgroups_per_grid.x * threadgroups_per_grid.y, tid);
+  constexpr int DP = D / 32, MB = 2;
+  const int node = r / G, g = r % G;
+  float m = -INFINITY, l = 0.0f, o[DP];
+  for (int i = 0; i < DP; i++) o[i] = 0.0f;
+  for (int c0 = 0; c0 < CT; c0 += MB) {
+    float mcs[MB], lcs[MB];
+    float4 lo[MB], hi[MB];
+    for (int j = 0; j < MB; j++) {
+      const int64_t row = ((int64_t)hk * CA + min(c0 + j, CT - 1)) * RPA + ra;
+      mcs[j] = PMA[row];
+      lcs[j] = PLA[row];
+      lo[j] = *(device const float4*)(POA + row * D + lane * DP);
+      hi[j] = *(device const float4*)(POA + row * D + lane * DP + 4);
+    }
+    for (int j = 0; j < MB; j++) {
+      if (c0 + j >= CT) break;
+      const float mc = mcs[j];
+      if (mc == -INFINITY) continue;
+      const float lc = lcs[j];
+      const float nm = max(m, mc);
+      const float f1 = fast::exp(m - nm), f2 = fast::exp(mc - nm);
+      l = l * f1 + lc * f2;
+      for (int i = 0; i < 4; i++) o[i] = o[i] * f1 + lo[j][i] * f2;
+      for (int i = 0; i < 4; i++) o[4 + i] = o[4 + i] * f1 + hi[j][i] * f2;
+      m = nm;
+    }
+  }
+  for (int c = 0; c < NCBS; c++) {
+    const int64_t row = (((int64_t)hk * NCB + c) * W + node) * 16 + g;
+    const float mc = PMB[row];
+    if (mc == -INFINITY) continue;
+    const float lc = PLB[row];
+    const float nm = max(m, mc);
+    const float f1 = fast::exp(m - nm), f2 = fast::exp(mc - nm);
+    l = l * f1 + lc * f2;
+    for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + POB[row * D + lane * DP + i] * f2;
+    m = nm;
+  }
+  const int h = hk * G + g;
+  for (int i = 0; i < DP; i++) {
+    const int64_t index = ((int64_t)node * (G * 4) + h) * D + lane * DP + i;
+    const bfloat v = static_cast<bfloat>(o[i] / l);
+    if (gated) {
+      const float gate = float(QG[((int64_t)node * (G * 4) + h) * 2 * D + D + lane * DP + i]);
+      OUT[index] = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
+    } else OUT[index] = v;
+  }
+  if (sums_stride != 0) {
+    simdgroup_barrier(mem_flags::mem_device);
+    if ((lane & 7) == 0) {
+      const int col = h * D + int(lane) * DP;
+      const int64_t at = (int64_t)node * (G * 4) * D + col;
+      float acc = 0.0f;
+      for (int i = 0; i < 64; i++) acc += float(OUT[at + i]);
+      XS[(int64_t)(col / 64) * sums_stride + node] = acc;
+    }
+  }
+}
+
+// A group's arrival on its word once its stores are past a device-scope fence; true in the last of `of`, which leaves the
+// word zero for the next launch and passes a second fence before it reads the others' stores. Nothing spins.
+inline bool q27_star_last(device atomic_uint* word, uint of, ushort tid, threadgroup uint* last) {
+  threadgroup_barrier(mem_flags::mem_device);
+  if (tid == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const bool is_last = atomic_fetch_add_explicit(word, 1u, memory_order_relaxed) + 1u == of;
+    if (is_last) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_store_explicit(word, 0u, memory_order_relaxed);
+    }
+    last[0] = is_last ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return last[0] != 0u;
+}
+
+// q27_head_norm_rope_decoded for a depth-one star (one stream, at most 8 rows): its rows, packed query and appended keys
+// and values, and also the split tail's query rows where q27_attn_pack_b copies them (QB: a kv head's 16 rows a node,
+// its group's heads from the stored query, then zeros). Each lane reads back the query words it stored, as the bfloat4
+// it stored them as, so QB holds the bits QY holds. count_out above 0: every group counts itself on PC[0] for the prefix, as the decoded kernel does,
+// and on TC[0] for the split tail, which waits on it before it reads QB or the round's cached rows.
+kernel void q27_head_norm_rope_star(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
+                 device atomic_uint* NC [[buffer(8)]], constant uint& wait_for [[buffer(9)]], device bfloat* QA [[buffer(10)]],
+                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
+                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+                 device atomic_uint* PC [[buffer(16)]], constant uint& count_out [[buffer(17)]],
+                 device bfloat* QB [[buffer(18)]], device atomic_uint* TC [[buffer(19)]],
+                 uint2 group [[threadgroup_position_in_grid]], uint2 groups [[threadgroups_per_grid]],
+                 uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+  Q27RopeHeld held;
+  q27_head_norm_rope_held<true>(QW, KW, positions, a, group, sg, lane, held, caches, meta, nodes);
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  q27_head_norm_rope_rows<false, true>(Q, K, a, QY, KY, group, sg, lane, held, QA, V, v_stride);
+  const uint head = group.x * 4 + sg, row = group.y;
+  if (head < a.heads) {
+    // q27_attn_pack_b's copy: QB row (hk * rows + node) * 16 + y is query row node's head hk * g + y, zeros for y >= g
+    const uint g = a.heads / a.kv_heads, hk = head / g, y = head - hk * g;
+    device const bfloat* q = QY + (row * a.heads + head) * a.width;
+    device bfloat* qb = QB + ((hk * a.rows + row) * 16 + y) * a.width;
+    *(device bfloat4*)(qb + 4 * lane) = *(device const bfloat4*)(q + 4 * lane);
+    *(device bfloat4*)(qb + 128 + 4 * lane) = *(device const bfloat4*)(q + 128 + 4 * lane);
+    if (y == 0)
+      for (uint r = g; r < 16; ++r) {
+        device bfloat* pad = QB + ((hk * a.rows + row) * 16 + r) * a.width;
+        *(device bfloat4*)(pad + 4 * lane) = bfloat4(0);  // 0x0000 words, as pack_b's uint4(0u) and q27_stage's zeros
+        *(device bfloat4*)(pad + 128 + 4 * lane) = bfloat4(0);
+      }
+  }
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
+      atomic_fetch_add_explicit(&TC[0], 1u, memory_order_relaxed);
+    }
+  }
+}
+
+// q27_attn_tail_split behind an optional wait and with an optional merge.
+// wait_pre above 0: q27_head_norm_rope_star shares this launch's barrier interval and counts itself on WP[0]; every group
+// waits on that count before it reads its plan's own rows (QB, the round's cached keys and values), and the last leaves
+// WP's two words zero. fold 1: no merge launch follows; each (kv head, node)'s groups (both halves of every tail chunk)
+// arrive on MW[hk * nodes + node] once stored, and the last runs the merge for the node's G rows of that kv head, a row a
+// simdgroup, from the prefix partials every group waited on and both halves' tail partials. The tail's own count for a
+// merge launch (TC, count_out) is then off.
+[[max_total_threads_per_threadgroup(128)]]
+kernel void q27_attn_tail_split_merge(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
+    constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
+    device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
+    device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
+    device atomic_uint* WC [[buffer(12)]], constant uint& wait_for [[buffer(13)]],
+    device atomic_uint* TC [[buffer(14)]], constant uint& count_out [[buffer(15)]],
+    device atomic_uint* WP [[buffer(16)]], constant uint& wait_pre [[buffer(17)]],
+    device atomic_uint* MW [[buffer(18)]], constant uint& fold [[buffer(19)]],
+    device bfloat* OUT [[buffer(20)]], device const bfloat* QG [[buffer(21)]], constant uint& gated [[buffer(22)]],
+    device float* XS [[buffer(23)]], constant uint& sums_stride [[buffer(24)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+  threadgroup half myP[16 * TK];
+  threadgroup bfloat KV[32 * D];
+  threadgroup int path[MAXD];
+  threadgroup uint last[1];
+  if (wait_pre != 0u) q27_wait_count(WP, wait_pre, threadgroups_per_grid.x * threadgroups_per_grid.y * threadgroups_per_grid.z, tid);
+  q27_star_tail(QB, caches, scale, meta, paths, nodes, POA, PMA, PLA, PO, PM, PL, WC, wait_for, TC, fold != 0u ? 0u : count_out,
+                threadgroup_position_in_grid, threadgroups_per_grid, thread_index_in_simdgroup, sg, tid, myP, KV, path);
+  if (fold == 0u) return;
+  const uint hk = threadgroup_position_in_grid.x / 2, node = threadgroup_position_in_grid.z;
+  if (!q27_star_last(MW + hk * threadgroups_per_grid.z + node, 2u * threadgroups_per_grid.y, tid, last)) return;
+  for (uint g = sg; g < uint(G); g += 4)
+    q27_star_merge(POA, PMA, PLA, PO, PM, PL, meta, nodes, OUT, QG, gated, XS, sums_stride, MW, 0u, uint3(hk, node * G + g, 0),
+                   threadgroups_per_grid, tid, thread_index_in_simdgroup);
+}
+#endif  // Q27_STAR_FOLD
