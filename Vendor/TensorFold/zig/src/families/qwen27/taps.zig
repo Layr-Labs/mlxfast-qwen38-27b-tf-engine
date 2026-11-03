@@ -13,6 +13,11 @@ pub const Taps = struct {
     seen: u8 = 0,
     ids: [5]usize = layers,
     rows: u32 = 0,
+    /// A prompt pass's taps go here instead of the planes (Generation.promptChunk): row r of plane j into row r of the
+    /// drafter's ring at column j * width, where the tap gather would copy it.
+    into: ?Into = null,
+
+    pub const Into = struct { buffer: mtl.Buffer, offset: usize, stride: usize };
 
     pub fn init(device: mtl.Device, capacity: u32, width: u32) !Taps {
         if (capacity == 0 or capacity > @import("gpu_frame.zig").max_rows or width == 0) return error.BadTapShape;
@@ -37,7 +42,7 @@ pub const Taps = struct {
         if (t.seen & bit != 0) return error.DuplicateTap;
         // unfenced: the copy runs beside the mixer's projections, whose barrier orders it before any reader of the plane
         // and before the next write of `hidden` (two norms on)
-        try glue.unstack(e, hidden, try t.plane(index), .{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 });
+        try t.copy(glue, e, index, hidden, rows, 0);
         t.seen |= bit;
         t.rows = rows;
     }
@@ -47,12 +52,24 @@ pub const Taps = struct {
     pub fn recordAt(t: *Taps, glue: Glue, e: mtl.ComputeEncoder, layer: usize, hidden: Ref, rows: u32, first: u32, total: u32) !void {
         if (rows == 0 or total > t.capacity or rows > total - @min(first, total) or first >= total) return error.BadTapShape;
         const index = std.mem.indexOfScalar(usize, &t.ids, layer) orelse return;
-        var at = try t.plane(index);
-        at.offset += @as(usize, first) * t.width * 2;
         // unfenced, as record's: the copy runs beside the mixer's projections in the segment's own lane
-        try glue.unstack(e, hidden, at, .{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 });
+        try t.copy(glue, e, index, hidden, rows, first);
         if (first + rows == total) t.seen |= @as(u8, 1) << @intCast(index);
         t.rows = total;
+    }
+
+    /// Rows [first, first + rows) of plane `index`: `hidden`'s rows into the planes, or into the ring rows `into` names.
+    fn copy(t: *const Taps, glue: Glue, e: mtl.ComputeEncoder, index: usize, hidden: Ref, rows: u32, first: u32) !void {
+        const p = @import("glue_gpu.zig").Slice{ .rows = rows, .width = t.width, .stride = t.width, .offset = 0 };
+        if (t.into) |to| {
+            const row_bytes = @as(usize, t.width) * 2;
+            const at = to.offset + @as(usize, first) * to.stride + index * row_bytes;
+            if (to.stride % 2 != 0 or to.stride < row_bytes * layers.len or at + (@as(usize, rows) - 1) * to.stride + row_bytes > to.buffer.length()) return error.BadTapShape;
+            return glue.unstackRows(e, hidden, .{ .buffer = to.buffer, .offset = at }, p, @intCast(to.stride / 2));
+        }
+        var at = try t.plane(index);
+        at.offset += @as(usize, first) * t.width * 2;
+        try glue.unstack(e, hidden, at, p);
     }
 
     pub fn plane(t: Taps, index: usize) !Ref {
