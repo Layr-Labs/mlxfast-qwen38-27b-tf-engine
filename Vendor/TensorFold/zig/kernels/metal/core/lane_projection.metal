@@ -778,8 +778,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_RESID)
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg_in [[threadgroup_position_in_grid]],
+    uint2 tgn [[threadgroups_per_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
+  // bands of RB row blocks, row blocks fastest within a band: a column tile's weights serve the band's rows together
+  constexpr uint RB = 32;
+  const uint tg_linear = tg_in.y * tgn.x + tg_in.x, band = tg_linear / (RB * tgn.x), y0 = band * RB, rb = min(RB, tgn.y - y0);
+  const uint tg_w = tg_linear - band * RB * tgn.x;
+  const uint2 tg = uint2(tg_w / rb, y0 + tg_w % rb);
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
