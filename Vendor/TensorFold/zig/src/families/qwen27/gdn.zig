@@ -104,6 +104,12 @@ pub const Sums = struct { span: Span, stride: u32, written: *bool };
 pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
 /// Byte offset of the prepare-to-star words (count, arrivals) in the pool's scan words, past the scan-to-gate pair.
 pub const star_words: usize = 8;
+/// team-m5-08q: byte offset of the gate-to-out words (the counted gate's count, the out projection's arrivals) in the
+/// pool's scan words, past the prepare-to-star pair.
+pub const out_words: usize = 16;
+/// team-m5-08q: the out projection shares a counted gate's barrier interval (Kernels.quantCountedOn): the gate counts its
+/// threadgroups on `words`' word at `offset` past a device fence, stores how many in `groups`, and no barrier follows it.
+pub const OutCount = struct { words: metal.Buffer, offset: usize, groups: *u32 };
 /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
 /// rows, and how many it applies and whether it writes the state back.
 pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
@@ -124,6 +130,9 @@ pub const Round = struct {
     /// Encoded right behind a star scan's launch, in its barrier interval (forwardStar): work that reads nothing the scan or
     /// its gate writes and writes nothing anything reads, so the counted gate stays counted (Kernels.warm).
     warm: ?Beside = null,
+    /// team-m5-08q: a counted gate (gateAfter) also counts itself for the out projection, which waits on it in the same
+    /// barrier interval.
+    out_count: ?OutCount = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -313,7 +322,15 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
+        // team-m5-08q: with `out_count`, each group also counts itself there once its rows and sums are stored, and the out
+        // projection waits on that count in this barrier interval instead of behind a barrier
+        if (r.out_count) |o| e.setBuffer(o.words, o.offset, 9) else e.setBuffer(counter, 0, 9); // never written: count_out 0
+        e.setValue(@as(u32, @intFromBool(r.out_count != null)), 10);
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
+        if (r.out_count) |o| {
+            o.groups.* = @intCast(r.p.nv * ((r.p.rows + 3) / 4));
+            return;
+        }
         e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
@@ -333,6 +350,8 @@ pub const Round = struct {
         if (wide) {
             r.b.output.bind(e, 7); // never read: wait_for 0
             e.setValue(@as(u32, 0), 8);
+            r.b.output.bind(e, 9); // never written: count_out 0 (team-m5-08q)
+            e.setValue(@as(u32, 0), 10);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();

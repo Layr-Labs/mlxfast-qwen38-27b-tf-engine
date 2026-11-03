@@ -4,7 +4,7 @@ const mtl = @import("metal");
 const Config = @import("config.zig").Config;
 const Ref = @import("projection.zig").Ref;
 
-pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, last_dims };
+pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mixed, mixer_out, output, z, a, b, query, key, value, norm_query, norm_key, q_gate, gate, up, activated, act_sums, logits, drawn, eps, parents, windows, row_slots, segments, keeps, kept_rows, rotated_key, takes, slot_steps, last_dims, out_sums };
 
 /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
 pub const max_rows = 2048;
@@ -25,11 +25,13 @@ pub fn allocationSizes(config: Config, capacity: u32) [std.enums.values(Field).l
         capacity * config.conv_kernel * 4,                                                  capacity * 4,                                                                                                                           capacity * 16,
         capacity * 16,                                                                      capacity * 4,                                                                                                                           capacity * config.kvDim() * 2,
         capacity * 4,                                                                       capacity * @sizeOf(@import("core").tree_slots.Step), 8 * 4,
+        // team-m5-08q: out_sums, a waiting out projection's group sums (Frame.mixer_xs): every out projection's k
+        mp * @max(config.gdnValueDim(), config.heads * config.head_dim) / 64 * 4,
     };
 }
 
 pub const small_rows = 512;
-const scratch_fields = [_]Field{ .hidden, .residual, .input, .sums, .mixed, .mixer_out, .output, .z, .a, .b, .query, .key, .value, .norm_query, .norm_key, .q_gate, .gate, .up, .activated, .act_sums };
+const scratch_fields = [_]Field{ .hidden, .residual, .input, .sums, .mixed, .mixer_out, .output, .z, .a, .b, .query, .key, .value, .norm_query, .norm_key, .q_gate, .gate, .up, .activated, .act_sums, .out_sums };
 
 pub fn decodeSizes(config: Config, capacity: u32) [scratch_fields.len]usize {
     const widths = allocationSizes(config, @min(capacity, small_rows));
@@ -37,6 +39,11 @@ pub fn decodeSizes(config: Config, capacity: u32) [scratch_fields.len]usize {
     for (scratch_fields, &result) |field, *bytes| bytes.* = widths[@backingInt(field)];
     return result;
 }
+
+/// team-m5-08q: a count the out projection waits on: `wait` threadgroups count themselves on the u32 word at `offset` of
+/// `words`, past a device fence; the next word takes the out projection's arrivals, and its last threadgroup leaves both
+/// zero.
+pub const MixerCount = struct { words: mtl.Buffer, offset: usize, wait: u32 };
 
 pub const Frame = struct {
     buffers: [std.enums.values(Field).len]mtl.Buffer,
@@ -47,6 +54,19 @@ pub const Frame = struct {
     /// A GDN block's gate or a decoded-row attention merge wrote its out projection's group sums into `.sums` (read
     /// and cleared by that projection).
     mixer_sums: bool = false,
+    /// team-m5-08q: set by forward.Stages.mixer for its hook: these rows' out projection can take the waiting counted
+    /// launch (quant_gpu.Kernels.outWaits), so the mixer's last kernel may count its threadgroups for it instead of ending
+    /// on a barrier.
+    out_waits: bool = false,
+    /// team-m5-08q: the mixer's last kernel (the GDN gate, or the decoded attention merge) counted its threadgroups and no
+    /// barrier follows it: forward.post's out projection waits on that count (read and cleared there).
+    mixer_count: ?MixerCount = null,
+    /// team-m5-08q: the field the mixer's last kernel wrote its out projection's group sums into: `.out_sums` on rows
+    /// whose out projection waits (out_waits), since that projection then shares a barrier interval with the mixer's
+    /// counted projections, which read the norm's `.sums` in it. A counted consumer reads only what nothing earlier in
+    /// its interval read: a threadgroup on a core whose cache still holds lines of the earlier read would see them
+    /// rather than the counted writes. Read and reset to `.sums` by forward.post.
+    mixer_xs: Field = .sums,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;

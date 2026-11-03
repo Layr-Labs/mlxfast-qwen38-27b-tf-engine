@@ -746,11 +746,7 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        cb.wait();
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -868,15 +864,25 @@ pub const Runner = struct {
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
-        const xs = forward.sums(f, .sums, rows);
+        // team-m5-08q: a waiting out projection's sums go to the fresh `.out_sums` (Frame.mixer_xs): q+gate and k|v read
+        // the norm's `.sums` in the barrier interval that the merge and that projection then share
+        const xs_field: @import("gpu_frame.zig").Field = if (f.out_waits and !promptPlan and dead == 0) .out_sums else .sums;
+        const xs = forward.sums(f, xs_field, rows);
         var live_plan = plan;
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
         // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
         var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
         if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
         defer r.attention.warm = null;
+        // team-m5-08q: decoded rows whose out projection waits (forward.Stages.mixer's f.out_waits): a counted chain's merge
+        // counts its threadgroups for it and ends on no barrier, and forward.post reads that count from f.mixer_count
+        var out_groups: u32 = 0;
+        if (f.out_waits and !promptPlan and dead == 0) r.attention.out_count = .{ .groups = &out_groups };
+        defer r.attention.out_count = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
+        f.mixer_xs = xs_field;
+        if (out_groups != 0) f.mixer_count = .{ .words = r.attention.chain_words.?, .offset = attn.Attention.out_words, .wait = out_groups };
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
@@ -984,10 +990,6 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
-    }
-    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
-    pub fn polls(_: *const Stagger) bool {
-        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {

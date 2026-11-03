@@ -165,6 +165,11 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// team-m5-08q2: a waiting out projection's count and its post-attention norm's arrivals (quantCountedOn's `counter`,
+    /// normAfterOn), left zero by that norm. The chain shares its barrier interval with the mixer's counted projections,
+    /// which count on count_words for the prepare or the preprocess: a norm waiting on count_words there could pass on
+    /// their count before the out projection's, so the chain takes a pair of its own (postWords).
+    post_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -201,6 +206,7 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.post_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
@@ -659,6 +665,11 @@ pub const Kernels = struct {
     /// threadgroup waits until that launch's `wait_for` threadgroups have counted their fenced stores.
     pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
         const words = k.count_words orelse return error.BadCoreProjectionRows;
+        return k.normAfterOn(input_encoder, h, residual, weight, eps, dims, combined, out, xs, width, rows, words, wait_for);
+    }
+
+    /// normAfter waiting on the pair `words` (team-m5-08q2: post_words, behind a waiting out projection).
+    pub fn normAfterOn(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, words: mtl.Buffer, wait_for: u32) !void {
         if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
         try wordAligned(.{ h, residual, weight, combined, out });
         var span = profile.begin(k.profiler, input_encoder, .norm);
@@ -811,8 +822,22 @@ pub const Kernels = struct {
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
+        return k.quantCountedOn(input_encoder, p, x, xs, y, rows, gu, 0, wait_for, null);
+    }
+
+    /// Whether `p` on these rows takes the waiting counted launch (quantCountedOn): a mixer's last kernel may then count
+    /// itself for its out projection instead of ending on a barrier (team-m5-08q).
+    pub fn outWaits(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.countedKey(p, rows, true) != null;
+    }
+
+    /// quantCountedAfter waiting on any producer's count: the u32 word at `offset` of `waited` holds the count, the next
+    /// word this launch's arrivals, and the last threadgroup to arrive leaves both zero (team-m5-08q: the GDN gate's or the
+    /// decoded attention merge's count, for the out projection). `counter` (team-m5-08q2): the pair this launch counts
+    /// itself on for its waiting norm; null takes count_words.
+    pub fn quantCountedOn(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, waited: mtl.Buffer, offset: usize, wait_for: u32, counter: ?mtl.Buffer) !u32 {
+        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -828,9 +853,19 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = counter orelse k.count_words.? }, .{ .buf = waited, .off = offset }, wait_for);
         try span.end();
         return @intCast(entry.value_ptr.tile_count);
+    }
+
+    /// post_words, zeroed when made (team-m5-08q2).
+    pub fn postWords(k: *Kernels) !mtl.Buffer {
+        if (k.post_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.post_words = b;
+        }
+        return k.post_words.?;
     }
 
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated

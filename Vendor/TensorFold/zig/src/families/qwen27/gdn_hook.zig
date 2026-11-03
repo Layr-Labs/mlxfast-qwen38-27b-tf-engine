@@ -53,10 +53,19 @@ pub const Hook = struct {
         // decoded rows: the out projection's leading code lines go to the system cache while the star scan holds the bus idle
         var warm = Warm{ .quant = hook.quant, .out = weight.out };
         if (after != null) gated.warm = .{ .ptr = &warm, .encode = Warm.encode };
-        const xs = frame.get(.sums);
+        // team-m5-08q: a waiting out projection's sums go to the fresh `.out_sums` (Frame.mixer_xs): qkv and zba read
+        // the norm's `.sums` in the barrier interval that the gate and that projection then share
+        const xs_field: @import("gpu_frame.zig").Field = if (frame.out_waits and after != null) .out_sums else .sums;
+        const xs = frame.get(xs_field);
         frame.mixer_sums = false;
+        frame.mixer_xs = xs_field;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
+        // team-m5-08q: decoded rows whose out projection waits (forward.Stages.mixer's frame.out_waits): a counted gate counts
+        // its threadgroups for it and ends on no barrier, and forward.post reads that count from frame.mixer_count
+        var out_groups: u32 = 0;
+        if (frame.out_waits and after != null) gated.out_groups = &out_groups;
         if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        if (out_groups != 0) frame.mixer_count = .{ .words = hook.pool.scan_words.?, .offset = gdn.out_words, .wait = out_groups };
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
