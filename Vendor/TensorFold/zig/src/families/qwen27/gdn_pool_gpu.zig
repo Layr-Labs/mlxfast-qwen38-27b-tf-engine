@@ -389,6 +389,8 @@ pub const Pool = struct {
         e.setValue(p, 5);
         const layer_words = std.math.cast(u32, pool.budget.slots * pool.budget.shape.state) orelse return error.BadGdnPending;
         e.setValue(abi.Unstash{ .rows = pool.pending.rows, .slot = pool.pending.slot, .pending_rows = pending_rows, .layer_words = layer_words }, 6);
+        // eight SIMD groups a threadgroup: the kernel reads only its grid position and its lane, so the grouping is
+        // scheduling alone, and 256 threads a group halves the launch's threadgroup count
         e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 8 });
     }
 
@@ -413,6 +415,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
+            // as unstash: eight SIMD groups a threadgroup, the same grid, the same words a thread
             e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 8 });
         }
     }
