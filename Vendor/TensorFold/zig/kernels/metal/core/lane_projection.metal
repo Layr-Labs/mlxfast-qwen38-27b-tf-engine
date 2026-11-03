@@ -327,7 +327,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -470,6 +472,39 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
 #if defined(TF_WAIT)
+#if defined(TF_WAIT_TOUCH)
+  // team-m5-08r: thread 0 first waits (bounded) until the producer is three quarters counted. If the count is still
+  // short of wait_for then, every thread loads one word of each line of its K split's next TF_WAIT_TOUCH groups' codes
+  // and metadata: weights, which nothing writes (never X or XS), on lines the loop below reads, so they come in over
+  // the producer's tail instead of behind the wait. It counts nothing and stores nothing; the wait below is the
+  // record's, unchanged, and the loads' word is used only after it, so they can stay in flight across it.
+  threadgroup uint tf_touch;
+  uint touched = 0;
+  if (ks == 0 && lane == 0) {
+    const uint at = wait_for - (wait_for >> 2);
+    uint seen = atomic_load_explicit(&WC[0], memory_order_relaxed);
+    for (uint spin = 0; spin < (1u << 24) && seen < at; spin++) seen = atomic_load_explicit(&WC[0], memory_order_relaxed);
+    tf_touch = seen < wait_for ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tf_touch != 0u && first + 1 < last) {
+    for (int t = 1; t <= TF_WAIT_TOUCH; t++) {
+      const int g = min(first + t, last - 1);
+      const device uint4* cw = wl + (size_t)g * TF_TB * TF_RW;
+      touched ^= ((const device uint*)cw)[0];
+#if TF_BITS != 2
+      touched ^= ((const device uint*)(cw + 32))[0];
+#endif
+#if defined(TF_SBI12)
+      { const device uint* iw = (const device uint*)(ixs + (size_t)g * (TF_N / 8)); touched ^= iw[0] ^ iw[2]; }
+#elif defined(TF_SBI)
+      { const size_t gi = (size_t)g * (TF_N / 4); touched ^= ((const device uint*)(ixs + gi))[0] ^ ((const device uint*)(ixs + gi + 4))[0]; }
+#else
+      touched ^= ((const device uint*)(sbv + ((size_t)g * TF_N + n0 + nb) / 4))[0] ^ ((const device uint*)(sbv + ((size_t)g * TF_N + n0 + nb + 16) / 4))[0];
+#endif
+    }
+  }
+#endif
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
@@ -482,6 +517,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+#if defined(TF_WAIT_TOUCH)
+  if (touched == 0x9E3779B9u && tg.x == 0xFFFFFFFFu) ((device uint*)Y)[0] = touched; // never true: the loads stay, nothing is stored
+#endif
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -611,6 +649,38 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+  if (mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];

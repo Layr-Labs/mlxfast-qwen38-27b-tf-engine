@@ -77,6 +77,8 @@ const Key = struct {
     resid: bool = false,
     count: bool = false,
     wait: bool = false,
+    /// team-m5-08r: quantCountedAfter's down with Layout.wait_touch.
+    touch: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
 
@@ -165,6 +167,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// team-m5-08r: set once the down's touch build (Layout.wait_touch) fails on this chip; the down then keeps the
+    /// record's waiting build.
+    no_touch: bool = false,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -821,16 +826,31 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
-            k.joined(entry.value_ptr);
-        }
+        const built = try k.countedAfterLane(p, key);
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try built.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
         try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        return @intCast(built.tile_count);
+    }
+
+    /// quantCountedAfter's lane (team-m5-08r): the waiting build with the down's touch (Layout.wait_touch) while it
+    /// builds on this chip; if it fails to build, the record's waiting build, logged once, as the merges fall back.
+    fn countedAfterLane(k: *Kernels, p: projection.Linear, waiting: Key) !*lane.Projection {
+        var key = waiting;
+        while (true) {
+            key.touch = !k.no_touch;
+            const entry = try k.lanes.getOrPut(k.allocator, key);
+            if (entry.found_existing) return entry.value_ptr;
+            entry.value_ptr.* = lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .wait_touch = key.touch }) catch |err| {
+                _ = k.lanes.remove(key);
+                if (!key.touch) return err;
+                std.log.warn("the counted down keeps the record's wait (team-m5-08r): {s}", .{@errorName(err)});
+                k.no_touch = true;
+                continue;
+            };
+            k.joined(entry.value_ptr);
+            return entry.value_ptr;
+        }
     }
 
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
