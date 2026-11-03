@@ -156,6 +156,9 @@ pub const core_lane_order = @embedFile("core/lane_order.metal");
 pub const core_shared_attention = @embedFile("core/shared_attention.metal");
 /// The core DeltaNet kernels (core/deltanet_kernels.zig).
 pub const core_deltanet = @embedFile("core/deltanet.metal") ++ "\n" ++ @embedFile("core/deltanet_slots.metal");
+/// team-m5-08x1: core_deltanet followed by the star scans whose epilogue runs the gate, as a library of its own
+/// (core/deltanet_kernels.zig Gate).
+pub const core_deltanet_gate = core_deltanet ++ "\n" ++ @embedFile("core/deltanet_gate.metal");
 /// 4-bit projections on simdgroup-matrix tiles before the M5 (core/simd_qmm.zig).
 pub const core_simd_qmm = @embedFile("core/simd_qmm.metal");
 /// 2- to 8-bit projections on the same tiles, rows written at a stride (core/simd_qmm_bits.zig).

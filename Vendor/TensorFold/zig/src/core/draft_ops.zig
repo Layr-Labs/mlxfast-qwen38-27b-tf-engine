@@ -119,26 +119,7 @@ pub const Ops = struct {
     /// conv with its output's group sums.
     /// A conv with `residual` into `conv_out` (conv's values), then normSums of it into `out` and `sums`, one launch.
     pub fn convNormSums(ops: Ops, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: Ref, conv_out: Ref, cp: Conv, gain: Ref, out: Ref, sums: Sums, np: Norm) !void {
-        try checkConv(cp);
-        const threads = try normThreads(np);
-        if (cp.residual != 1 or np.heads != 1 or np.dim != cp.width or np.rows != cp.rows or np.x_stride != cp.y_stride or np.dim > sums_max_width) return error.BadDraftShape;
-        try checkSums(sums, np.rows, np.dim);
-        const xb = try span(cp.rows, cp.x_stride, cp.width);
-        const cb = try span(cp.rows, cp.y_stride, cp.width);
-        const db = try span(cp.rows, cp.dynamic_stride, 4 * (cp.width / cp.group));
-        const bb = @as(usize, cp.width) * 4 * 2;
-        try refs(conv_out, cb, &.{ x, dynamic, base, residual }, &.{ xb, db, bb, xb });
-        try refs(out, try span(np.rows, np.y_stride, np.dim), &.{ conv_out, gain, x }, &.{ cb, @as(usize, np.dim) * 2, xb });
-        e.setPipeline(ops.pipes[@backingInt(Kind.conv_norm_xs)]);
-        bind(e, .{ x, dynamic, base, residual });
-        e.setValue(cp, 4);
-        e.setBuffer(conv_out.buf, conv_out.off, 5);
-        e.setBuffer(gain.buf, gain.off, 6);
-        e.setValue(np, 7);
-        e.setBuffer(out.buf, out.off, 8);
-        e.setBuffer(sums.ref.buf, sums.ref.off, 9);
-        e.setValue(sums.stride, 10);
-        e.dispatchGroups(mtl.Size.of(1, np.rows, 1), mtl.Size.of(threads, 1, 1));
+        return convNorm(ops.pipes[@backingInt(Kind.conv_norm_xs)], e, x, dynamic, base, residual, conv_out, cp, gain, out, sums, np, null);
     }
     pub fn convSums(ops: Ops, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: ?Ref, out: Ref, sums: Sums, p: Conv) !void {
         try checkConv(p);
@@ -179,6 +160,69 @@ pub const Ops = struct {
         e.setValue(p, 2);
         e.setBuffer(out.buf, out.off, 3);
         e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(256, 1, 1));
+    }
+};
+/// A pair's wait (team-m5-08t): two u32 words, the producer's count and the waiting launch's arrivals, and the count.
+const Wait = struct { words: Ref, wait_for: u32 };
+/// Ops.convNormSums on `pipe`, behind `wait` when given (Pairs.convNormSums).
+fn convNorm(pipe: mtl.Pipeline, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: Ref, conv_out: Ref, cp: Conv, gain: Ref, out: Ref, sums: Sums, np: Norm, wait: ?Wait) !void {
+    try checkConv(cp);
+    const threads = try normThreads(np);
+    if (cp.residual != 1 or np.heads != 1 or np.dim != cp.width or np.rows != cp.rows or np.x_stride != cp.y_stride or np.dim > sums_max_width) return error.BadDraftShape;
+    try checkSums(sums, np.rows, np.dim);
+    const xb = try span(cp.rows, cp.x_stride, cp.width);
+    const cb = try span(cp.rows, cp.y_stride, cp.width);
+    const db = try span(cp.rows, cp.dynamic_stride, 4 * (cp.width / cp.group));
+    const bb = @as(usize, cp.width) * 4 * 2;
+    try refs(conv_out, cb, &.{ x, dynamic, base, residual }, &.{ xb, db, bb, xb });
+    try refs(out, try span(np.rows, np.y_stride, np.dim), &.{ conv_out, gain, x }, &.{ cb, @as(usize, np.dim) * 2, xb });
+    if (wait) |w| if (w.wait_for == 0 or w.words.off % 4 != 0 or w.words.off > w.words.buf.length() or 8 > w.words.buf.length() - w.words.off) return error.BadDraftBuffer;
+    e.setPipeline(pipe);
+    bind(e, .{ x, dynamic, base, residual });
+    e.setValue(cp, 4);
+    e.setBuffer(conv_out.buf, conv_out.off, 5);
+    e.setBuffer(gain.buf, gain.off, 6);
+    e.setValue(np, 7);
+    e.setBuffer(out.buf, out.off, 8);
+    e.setBuffer(sums.ref.buf, sums.ref.off, 9);
+    e.setValue(sums.stride, 10);
+    if (wait) |w| {
+        e.setBuffer(w.words.buf, w.words.off, 11);
+        e.setValue(w.wait_for, 12);
+    }
+    e.dispatchGroups(mtl.Size.of(1, np.rows, 1), mtl.Size.of(threads, 1, 1));
+}
+/// team-m5-08t: the drafter's counted pairs. A decoded block's projection counts its threadgroups on a word pair
+/// (lane_projection.Layout.count) and the conv+norm that reads its rows next waits on that count in the same barrier
+/// interval. The waiting conv+norm is Ops' text with TF_DRAFT_WAIT, in a library of its own, so a failure to build it
+/// leaves Ops whole and every pair behind its barrier. `reset` zeroes a pair whose waiting launch was never encoded.
+pub const Pairs = struct {
+    wait: mtl.Pipeline,
+    zero: mtl.Pipeline,
+    pub fn init(device: mtl.Device) !Pairs {
+        const lib = try mtl.Library.fromSource(device, "#define TF_DRAFT_WAIT 1\n" ++ source, mtl.CompileOptions.mlx());
+        defer lib.deinit();
+        const wait = try mtl.Pipeline.init(device, lib, "tf_dynamic_conv2_rms_xs", false);
+        errdefer wait.deinit();
+        // a row's threadgroup takes normThreads' widest: 1024 threads for the drafter's 5120 columns
+        if (wait.simdWidth() != 32 or wait.maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        const zero = try mtl.Pipeline.init(device, lib, "tf_draft_pair_reset", false);
+        return .{ .wait = wait, .zero = zero };
+    }
+    pub fn deinit(p: Pairs) void {
+        p.wait.deinit();
+        p.zero.deinit();
+    }
+    /// Ops.convNormSums once the count at `words` reaches `wait_for`: its producer shares this launch's barrier
+    /// interval, and its last threadgroup leaves both words zero.
+    pub fn convNormSums(p: Pairs, e: mtl.ComputeEncoder, x: Ref, dynamic: Ref, base: Ref, residual: Ref, conv_out: Ref, cp: Conv, gain: Ref, out: Ref, sums: Sums, np: Norm, words: Ref, wait_for: u32) !void {
+        return convNorm(p.wait, e, x, dynamic, base, residual, conv_out, cp, gain, out, sums, np, .{ .words = words, .wait_for = wait_for });
+    }
+    /// Both words of the pair at `words` back to zero (one thread).
+    pub fn reset(p: Pairs, e: mtl.ComputeEncoder, words: Ref) void {
+        e.setPipeline(p.zero);
+        e.setBuffer(words.buf, words.off, 0);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
     }
 };
 fn bind(e: mtl.ComputeEncoder, values: anytype) void {

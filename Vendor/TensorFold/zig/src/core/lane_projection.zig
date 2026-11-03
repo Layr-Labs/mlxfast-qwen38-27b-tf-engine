@@ -180,7 +180,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
-    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, or four on decoded rows.
+    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or eight on
+    /// one-tile prompt rows.
     serial_sk2: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
@@ -194,6 +195,9 @@ pub const Layout = struct {
     /// Fused gate/up rows of decoded rows (rows8, serial SK2): a threadgroup's two SIMD groups each run a gate tile then its up
     /// tile (64 columns); it stores q27_mlp_xs' activation and group sums instead of the gate/up rows.
     swiglu: bool = false,
+    /// A `swiglu` build for the drafter's decoded gate/up (rows8 on one K chain, sk 1): four one-tile SIMD groups a
+    /// threadgroup, two gate tiles then their two up tiles, storing tf_draft_swiglu_xs' activation and group sums.
+    draft_act: bool = false,
     /// Lean decode-row reg launches (not prompt_sr) read lane_projection.indexed_layout metadata.
     indexed: bool = false,
     /// `indexed` as lane_projection.indexed12_layout.
@@ -229,7 +233,7 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
-        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8)))) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
@@ -237,7 +241,8 @@ pub const Layout = struct {
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
-        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
+        const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1) or (l.draft_act and l.rows8 and !l.serial_sk2 and l.sk == 1);
+        if (l.draft_act and (!l.swiglu or !l.rows8 or l.serial_sk2 or l.sk != 1 or l.prompt_tn != 1)) return error.InvalidSchedule;
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
         // a two-tile SwiGLU launch: SIMD group 0 the gate pair, 1 the up pair, each pair inside one code batch
@@ -287,7 +292,7 @@ pub const Layout = struct {
 
     /// Two-bit reg launches (halveReg's words): lean decode-row launches only, one tile a code batch.
     fn regTwo(l: Layout) bool {
-        return l.format.bits == 2 and l.reg_lean and l.tile_batch == 1 and !l.swiglu and !l.prompt_sr and l.prompt_tn == 1;
+        return l.format.bits == 2 and l.reg_lean and l.tile_batch == 1 and (!l.swiglu or l.draft_act) and !l.prompt_sr and l.prompt_tn == 1;
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
@@ -344,6 +349,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
+    if (l.draft_act) try text.appendSlice(a, "#define TF_DRAFT_ACT 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
@@ -500,6 +506,9 @@ pub const Projection = struct {
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
+    /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
+    /// adjacent columns at a time, so those rows start four-word aligned.
+    quads: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -513,7 +522,9 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        // a swiglu launch's threads: two two-tile SIMD groups (prompt_tn 2, or decoded turns), else four one-tile ones
+        const swiglu_threads: usize = if (l.prompt_tn == 2 or (l.rows8 and !l.draft_act)) 64 else 128;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) swiglu_threads else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -521,7 +532,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = swiglu_threads, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -563,7 +574,7 @@ pub const Projection = struct {
             if (s.stride < rows) return error.InvalidRows;
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
         }
-        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
+        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, @as(usize, if (p.quads) 8 else 2));
         return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null, null);
     }
 
@@ -698,7 +709,7 @@ pub const Projection = struct {
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
         try checkRef(sb, p.metadata_bytes, 16);
-        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes * @as(usize, if (p.quads) 4 else 1));
         if (given == null) if (p.sums_pipe) |pipe| {
             e.setPipeline(pipe);
             e.setBuffer(x.buf, x.off, 0);
@@ -764,6 +775,12 @@ test "serial SK2 keeps logical split and is off by default" {
     try std.testing.expect(std.mem.indexOf(u8, serial, "#define TF_SERIAL_SK2 1\n") != null);
     l.sk = 1;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+    // eight chains: one-tile prompt rows only
+    l.sk = 8;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.prompt_sr = true;
+    l.reg_lean = true;
+    try l.validate();
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());

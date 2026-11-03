@@ -327,7 +327,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -569,9 +571,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #endif
 #elif defined(TF_SERIAL_SK2)
-    if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
+    // the K splits' reduction order, in registers: split 0's words, then each later split's added in turn, as the
+    // parallel splits' part reduction adds them: ((c0 + c1) + c2) + ...
+    for (int i = 0; i < 16; i++) C0[i] = split == 0 ? C[i] : C0[i] + C[i];
   }
-  for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+  for (int i = 0; i < 16; i++) C[i] = C0[i];
+#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
+  threadgroup float tgpad1[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
+#endif
+#endif
 #elif defined(TF_ROWS8)
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
   if (TF_SK > 1) {
@@ -581,6 +595,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // the two-tile prompt launches' threadgroup-memory cap (TF_TGPAD) for the one-tile ones too; the use never runs
+  threadgroup float tgpad1[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
+#endif
+#endif
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -611,6 +635,38 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+  if (mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
@@ -880,6 +936,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#ifndef TF_TGPAD
+// the K-split-2 two-tile launches (query+gate, down, the out projections) reserve more: about 16 KiB a threadgroup with
+// their 4 KB reduction array, so a core holds fewer of them; every other launch keeps 8192
+#if TF_SK == 2
+#define TF_TGPAD 12288
+#else
+#define TF_TGPAD 8192
+#endif
+#endif
+#if TF_TGPAD > 0
+  // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
+  // (rows are never negative)
+  threadgroup float tgpad[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
+#endif
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
@@ -899,19 +970,32 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       }
     }
   }
+  // a tile's 16 words of a lane are four quads of adjacent columns: words 4q .. 4q + 3 are row mb + 8 (q & 1), columns
+  // nb + 16 (q >> 1) on. With n, TF_N and TF_YS multiples of 4, a quad is in or out of the row whole and its first word's
+  // address is aligned for the vector, so each quad moves as one vector: the same words at the same addresses.
+  static_assert(TF_N % 4 == 0 && TF_YS % 4 == 0, "a lane's quads are whole and aligned");
   if (ks == 0) {
     TF_UNROLL
     for (int t = 0; t < TN; t++) {
       TF_UNROLL
-      for (int i = 0; i < 16; i++) {
-        const int m = mb + 8 * ((i >> 2) & 1), n = (tile0 + t) * NT + nb + 16 * (i >> 3) + (i & 3);
+      for (int q = 0; q < 4; q++) {
+        const int m = mb + 8 * (q & 1), n = (tile0 + t) * NT + nb + 16 * (q >> 1);
+        if (m < M && n < TF_N) {
 #if defined(TF_RESID)
-        // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as q27_norm_xs
-        // adds them (h + r, rounded to bf16); the norm then reads these rows alone
-        if (m < M && n < TF_N) RO[(size_t)m * TF_YS + n] = bfloat(float(H[(size_t)m * TF_YS + n]) + float(static_cast<bfloat>(C[t][i])));
+          // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as
+          // q27_norm_xs adds them (h + r, rounded to bf16); the norm then reads these rows alone
+          const vec<bfloat, 4> h = *(const device vec<bfloat, 4>*)(H + (size_t)m * TF_YS + n);
+          vec<bfloat, 4> r;
+          TF_UNROLL
+          for (int j = 0; j < 4; j++) r[j] = bfloat(float(h[j]) + float(static_cast<bfloat>(C[t][4 * q + j])));
+          *(device vec<bfloat, 4>*)(RO + (size_t)m * TF_YS + n) = r;
 #else
-        if (m < M && n < TF_N) Y[(size_t)m * TF_YS + n] = static_cast<TF_OUT>(C[t][i]);
+          vec<TF_OUT, 4> y;
+          TF_UNROLL
+          for (int j = 0; j < 4; j++) y[j] = static_cast<TF_OUT>(C[t][4 * q + j]);
+          *(device vec<TF_OUT, 4>*)(Y + (size_t)m * TF_YS + n) = y;
 #endif
+        }
       }
     }
   }
