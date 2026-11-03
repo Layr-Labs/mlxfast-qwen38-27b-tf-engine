@@ -31,6 +31,8 @@ Q27_SPECIALIZE
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  // Padded sum rows stay live in this family: bounding a padding-sum launch failed validation on the
+  // ranked box (architecture-dependent reads of mb + 8), so the guard keeps its zeroing path.
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
   // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
