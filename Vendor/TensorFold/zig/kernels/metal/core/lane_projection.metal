@@ -795,9 +795,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if TF_PROMPT_TN != 2 || TF_SK != 1
 #error "the two-tile SwiGLU launch takes two tiles and one K split"
 #endif
+#if defined(TF_PROMPT_R32)
+[[max_total_threads_per_threadgroup(128)]]
+#else
 [[max_total_threads_per_threadgroup(64)]]
+#endif
+#else
+#if defined(TF_PROMPT_R32)
+[[max_total_threads_per_threadgroup(64 * TF_SK)]]
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
+#endif
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
@@ -808,20 +816,32 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
+#if defined(TF_PROMPT_R32)
+  // 32-row tile: SIMD groups 0,1 take the first 16 rows, 2,3 the next 16 (h = the row half, ks the K slice or gate/up
+  // pair). Per-row arithmetic is unchanged, so results are bit-identical; the weight bytes a block streams are shared by
+  // both halves, halving the prompt pass's weight re-reads.
+  const int h = int(sgi) >> 1, ks = int(sgi) & 1;
+  const int r0 = int(tg.y) * 32 + 16 * h, rows = mdims[0] - int(tg.y) * 32;
+  if (rows <= 0) return;
+  const int M = min(rows - 16 * h, 16);
+#else
+  const int ks = int(sgi);
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
+  const int M = min(rows, 16);
+#endif
   X += (size_t)r0 * TF_K;
 #if defined(TF_SWIGLU)
   Y += (size_t)r0 * (TF_N / 2); // SwiGLU rows are half the fused width
   HS += r0;
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
+  const int lane = int(lanei), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
 #else
   Y += (size_t)r0 * TF_YS;
 #if defined(TF_RESID)
   H += (size_t)r0 * TF_YS;
   RO += (size_t)r0 * TF_YS;
 #endif
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
+  const int lane = int(lanei), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
 #endif
   XS += r0;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
@@ -862,7 +882,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
-  for (int g = first; g < last; g++) {
+  for (int g = first; M > 0 && g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
@@ -879,7 +899,36 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SWIGLU)
   // tf_lane_reg's fused prompt epilogue, with tile t of SIMD group ks as its tile 2 * ks + t: each tile's words round to
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
-  // group's sum adds its values in order from zero.
+  // group's sum adds its values in order from zero. R32: slot 4 * h + 2 * ks + t, two row halves staged and consumed.
+#if defined(TF_PROMPT_R32)
+  threadgroup bfloat gu16[8 * 16 * 32];
+  threadgroup float hb16[32 * 64];
+  TF_UNROLL
+  for (int t = 0; t < TN; t++) {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) {
+      const int m = mb + 8 * ((i >> 2) & 1);
+      gu16[((4 * h + 2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t16 = (sgi & 1) * 32 + lane;
+  for (int at = t16; at < 16 * 64; at += 64) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gf = float(gu16[((4 * h + (c >> 5)) * 16 + m) * 32 + (c & 31)]);
+    const bfloat hv = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((4 * h + 2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = hv;
+    hb16[(h * 16 + m) * 64 + c] = float(hv);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // One K/gate-up group owns the per-row sum for each half; the other only contributed its SwiGLU channels above.
+  if (t16 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb16[(h * 16 + t16) * 64 + i];
+    HS[int(tg.x) * stride + t16] = acc;
+  }
+#else
   threadgroup bfloat gu16[4 * 16 * 32];
   threadgroup float hb16[16 * 64];
   TF_UNROLL
@@ -896,9 +945,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const int m = at / 64, c = at % 64;
     if (m >= M) continue;
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    const bfloat hv = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = hv;
+    hb16[at] = float(hv);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
@@ -906,6 +955,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
+#endif
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
 #ifndef TF_TGPAD

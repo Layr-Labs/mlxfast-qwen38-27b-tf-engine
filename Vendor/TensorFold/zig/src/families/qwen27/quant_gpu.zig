@@ -329,8 +329,10 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
+                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch; R32 doubles the
+                // block's rows so both halves share the block's weight bytes
                 .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
+                .prompt_r32 = key.batch % 2 == 0 and (p.n / 64) % key.batch == 0,
             });
             k.joined(entry.value_ptr);
         }

@@ -203,6 +203,9 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Prompt-row reg launches of 32-row blocks: two row halves a tile, four SIMD groups (half, K slice or gate/up pair),
+    /// the block's weight bytes shared by both halves. Per-row arithmetic is unchanged, so results are bit-identical.
+    prompt_r32: bool = false,
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
@@ -250,6 +253,8 @@ pub const Layout = struct {
         if (l.swiglu and l.prompt_tn != 1 and (l.prompt_tn != 2 or l.sk != 1 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
+        if (l.prompt_r32 and (l.prompt_tn != 2 or l.serial_sk2 or l.rows8 or l.tile_list or l.indexed or
+            l.sk > 2 or l.tile_batch % 2 != 0 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
@@ -297,7 +302,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
-        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
+        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * (if (l.prompt_r32) @as(usize, 32) else 16) * 32 * @sizeOf(f32);
     }
 
     pub fn weightWords(l: Layout) usize {
@@ -345,6 +350,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
+    if (l.prompt_r32) try text.appendSlice(a, "#define TF_PROMPT_R32 1\n");
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.m8) try text.appendSlice(a, "#define TF_M8 1\n");
@@ -495,6 +501,8 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
+    /// Built with Layout.prompt_r32: the launch's blocks hold 32 rows, two halves a tile.
+    prompt_r32: bool = false,
     /// A swiglu launch's threads a group: four one-tile SIMD groups, or two two-tile ones (Layout.prompt_tn 2).
     swiglu_threads: usize = 128,
     /// Built with Layout.residual: encodeResid only.
@@ -523,7 +531,8 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        const r32_threads: usize = if (l.prompt_r32) 2 else 1;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 * r32_threads else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32) * r32_threads)) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -531,7 +540,9 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .prompt_r32 = l.prompt_r32, .swiglu_threads = (if (l.prompt_tn == 2 or l.rows8) @as(usize, 64) else 128) * (if (l.prompt_r32) @as(usize, 2) else 1), .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+
     }
 
     pub fn deinit(p: Projection) void {
@@ -627,13 +638,14 @@ pub const Projection = struct {
     fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
-        const blocks = (rows + 15) / 16;
+        const tile_rows: u32 = if (p.prompt_r32) 32 else 16;
+        const blocks = (rows + tile_rows - 1) / tile_rows;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
         try checkRef(sb, p.metadata_bytes, 16);
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(h, rows * (p.n / 2) * 2, 2);
-        const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
+        const hs_rows: usize = if (p.rows8) sums.stride else tile_rows * blocks;
         try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
         e.setPipeline(p.pipe);
         e.setBuffer(x.buf, x.off, 0);
@@ -662,7 +674,7 @@ pub const Projection = struct {
         const buffer = p.sums_buffer orelse return error.SumsNeedReg;
         try checkRef(x, rows * p.k * 2, 2);
         if (count) |c| try checkRef(c, 4, 4);
-        const stride: u32 = 16 * ((rows + 15) / 16);
+        const stride: u32 = if (p.prompt_r32) 32 * ((rows + 31) / 32) else 16 * ((rows + 15) / 16);
         e.setPipeline(pipe);
         e.setBuffer(x.buf, x.off, 0);
         if (count) |c| e.setBuffer(c.buf, c.off, 1) else e.setValue(@as(i32, @intCast(rows)), 1);
@@ -711,8 +723,9 @@ pub const Projection = struct {
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
         if (p.tile_list) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
-        const blocks = (rows + 15) / 16;
-        const stride: u32 = if (given) |g| g.stride else 16 * blocks;
+        const tile_rows: u32 = if (p.prompt_r32) 32 else 16;
+        const blocks = (rows + tile_rows - 1) / tile_rows;
+        const stride: u32 = if (given) |g| g.stride else tile_rows * blocks;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
         try checkRef(sb, p.metadata_bytes, 16);
@@ -739,7 +752,7 @@ pub const Projection = struct {
             e.setBuffer(y.buf, y.off, 7);
         }
         if (counter) |c| e.setBuffer(c.buf, c.off, 6); // TF_COUNT: the norm's wait word
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk * (if (p.prompt_r32) @as(usize, 2) else 1), 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
