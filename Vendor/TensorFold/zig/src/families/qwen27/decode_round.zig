@@ -813,15 +813,16 @@ pub const Runner = struct {
         return views[0..round.slots.len];
     }
 
-    fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+    fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32, norm_wait: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain };
+        var hook = GdnHook{ .norm_wait = norm_wait, .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
-    fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+    fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32, norm_wait: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        const pass = AttentionPass{ .plan = r.current_attention orelse try r.planAttention(), .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
+        var pass = AttentionPass{ .plan = r.current_attention orelse try r.planAttention(), .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
+        pass.norm_wait = norm_wait;
         return r.attentionPass(pass, e, block, weights, f, rows);
     }
 
@@ -847,6 +848,8 @@ pub const Runner = struct {
         bindings: []attn.Binding,
         scratch_due: *bool,
         terminal_head: forward.Head,
+        /// B1: the pre-norm's published count (rows) when it dropped its barrier for this interval, else 0.
+        norm_wait: u32 = 0,
     };
 
     fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
@@ -867,7 +870,12 @@ pub const Runner = struct {
         var after: ?attn.After = null;
         const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
         if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
-            const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
+            // B1: when the pre-norm published its count, q waits on that instead of the dropped barrier and its own
+            // count goes to a word nothing reads
+            const a: u32 = if (pass.norm_wait != 0) blk: {
+                _ = try r.model.kernels.quantWaitNorm(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows, pass.norm_wait);
+                break :blk 0;
+            } else (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
             const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
             after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
         } else {
@@ -1012,14 +1020,17 @@ const Segment = struct {
     fn mixer(s: *Segment) forward.Mixer {
         return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
     }
-    fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+    fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32, norm_wait: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
+        var hook = GdnHook{ .norm_wait = norm_wait, .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
-    fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+    fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32, norm_wait: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        return s.r.attentionPass(s.attention, e, block, weights, f, rows);
+        // the segment's Stages.pre publishes for its own layers too, so its first attention launch waits on that count
+        var pass = s.attention;
+        pass.norm_wait = norm_wait;
+        return s.r.attentionPass(pass, e, block, weights, f, rows);
     }
     fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
