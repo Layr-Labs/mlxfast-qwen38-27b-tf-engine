@@ -244,7 +244,6 @@ pub fn restoreSlot(a: std.mem.Allocator, r: *Runner, slot: u32, ring: ?Ring, st:
     if (st.bytes != slotBytes(r, ring, st.at) or st.at > r.capacity) return error.SnapshotLayout;
     try st.landed();
     try r.reset(slot);
-    r.writes(); // the copy below writes the slot's words
     try copy(a, r, slot, ring, st, false);
     r.offsets[slot] = st.at;
     if (ring) |g| g.end.* = st.draft_end;
@@ -258,7 +257,6 @@ pub fn moveSlot(a: std.mem.Allocator, r: *Runner, from: u32, from_ring: ?Ring, t
     if (from_ring) |g| if (g.end.* != at) return error.NotAtMark;
     try r.settleGdn(); // the blit copies `from`'s committed states: deferred rows land first
     try r.reset(to);
-    r.writes(); // the blit below writes `to`'s words
     var src: std.ArrayList(Part) = .empty;
     defer src.deinit(a);
     var dst: std.ArrayList(Part) = .empty;
