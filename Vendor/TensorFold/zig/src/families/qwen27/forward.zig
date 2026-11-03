@@ -54,6 +54,8 @@ pub const Stages = struct {
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
     settle: ?Hook = null,
+    /// The last layer count a periodic commit may follow (segments' commitsUntil; 0: every `every` layers to the end).
+    commit_until: usize = 0,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -228,6 +230,9 @@ pub const Stages = struct {
     /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
     pub fn polls(s: *const Stages) bool {
         return s.rows <= 16;
+    }
+    pub fn commitsUntil(s: *const Stages) usize {
+        return s.commit_until;
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);

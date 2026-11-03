@@ -215,17 +215,31 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         pub fn pre(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.pre(&x.lanes[k], i);
         }
+        /// A family's last periodic commit (commitsUntil, 0: none): past it the rest of the pass goes in one buffer. A
+        /// family that declares one also takes its periodic commits after the mixer of layer `every`, 2 `every`, ...
+        /// rather than after the layer before it: a mixer ends with a full barrier, so the fence there drains nothing
+        /// that was not already drained, where after a layer it would split the counted MLP down from the norm waiting
+        /// on it.
+        fn until(x: *const @This()) usize {
+            return if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "commitsUntil")) x.fam.commitsUntil() else 0;
+        }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);
+            if (i + 1 >= x.layers) return;
             // `first` 0: the first commit follows the first layer's mixer (its MLP is encoded while the GPU runs it)
-            if ((x.early or x.first == 0) and i == 0 and i + 1 < x.layers) try x.commitLane(k);
+            if ((x.early or x.first == 0) and i == 0) return x.commitLane(k);
+            const last = x.until();
+            if (last != 0 and x.every != 0 and i != 0 and i % x.every == 0 and i <= last) try x.commitLane(k);
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
+            const last = x.until();
+            if (last != 0 and i + 1 > last) return;
             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
             // host encodes the next chunk's layers
-            if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3) and !(x.first == 0 and i == 0)) return;
+            const periodic = last == 0 and (i + 1) % x.every == 0;
+            if (i + 1 != x.first and !periodic and !(x.early and i < 3) and !(x.first == 0 and i == 0)) return;
             try x.commitLane(k);
         }
         pub fn finish(x: *const @This(), k: usize) !void {
