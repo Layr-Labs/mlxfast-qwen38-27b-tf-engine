@@ -216,3 +216,107 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
       XS[(int64_t(head) * (PD / 64) + (lane >> 3)) * sums_stride + node] = sum;
   }
 }
+
+// The original per-chunk scan and ordered merge in one owner: never carry the softmax state across chunks.
+// A pair of simdgroups still owns a 16-row tile, each taking half the head dimension.
+kernel void q27_attn_prompt_fold(device const bfloat* QA [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]], constant Q27PromptArgs& args [[buffer(2)]],
+    device bfloat* OUT [[buffer(3)]], device const bfloat* QG [[buffer(4)]], device float* XS [[buffer(5)]], constant uint& sums_stride [[buffer(6)]], constant bool& gated [[buffer(7)]],
+    uint3 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+  const short qid = lane >> 2, fm = (qid & 4) | ((lane >> 1) & 3), fn = ((qid & 2) | (lane & 1)) * 4;
+  const short h = sg & 1;
+  const int tile = int(tg.z) * 2 + (sg >> 1), hk = int(tg.x);
+  const bool live = tile * 16 < args.rp;
+  threadgroup float xs[4][32][16];
+#if TF_ATTN_TGPAD > 0
+  threadgroup float tgpad[TF_ATTN_TGPAD / 4];
+  if (args.rows < -12345) { tgpad[lane] = float(lane); threadgroup_barrier(mem_flags::mem_threadgroup); xs[0][0][0] = tgpad[lane ^ 1]; }
+#endif
+  const int r0 = tile * 16 + fm, r1 = r0 + 8;
+  const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
+  const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
+  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * PH;
+  const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride + h * PH;
+  const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride + h * PH;
+  // Both pairs retain their original four-tile group's key-step limit, including dead tiles at the edge.
+  const int first_row = (int(tg.z) * 2 / 4) * 4 * 16, last_row = min(args.rows * PG, first_row + 4 * 16) - 1;
+  Q27PromptRun total;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < 8; j++) total.O[j] = 0.0f;
+  total.m0 = -INFINITY; total.m1 = -INFINITY; total.l0 = 0.0f; total.l1 = 0.0f;
+  for (int c = 0; c < args.chunks; c++) {
+    const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.rows);
+    const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
+    Q27PromptRun part;
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < 8; j++) part.O[j] = 0.0f;
+    part.m0 = -INFINITY; part.m1 = -INFINITY; part.l0 = 0.0f; part.l1 = 0.0f;
+    int kt = kbeg;
+    for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(part, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+    if (kt < kend && kt < kstop) q27_prompt_step<true>(part, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+    // The merge's first valid chunk still executes both exp2 and both products; masked chunks skip first.
+    if (part.m0 != -INFINITY) {
+      const float nm = max(total.m0, part.m0), f1 = fast::exp2(total.m0 - nm), f2 = fast::exp2(part.m0 - nm);
+      total.l0 = total.l0 * f1 + part.l0 * f2;
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < 8; j++) for (int i = 0; i < 4; i++) total.O[j][i] = total.O[j][i] * f1 + part.O[j][i] * f2;
+      total.m0 = nm;
+    }
+    if (part.m1 != -INFINITY) {
+      const float nm = max(total.m1, part.m1), f1 = fast::exp2(total.m1 - nm), f2 = fast::exp2(part.m1 - nm);
+      total.l1 = total.l1 * f1 + part.l1 * f2;
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < 8; j++) for (int i = 4; i < 8; i++) total.O[j][i] = total.O[j][i] * f1 + part.O[j][i] * f2;
+      total.m1 = nm;
+    }
+  }
+  // Do not return dead tiles early: they participated in every scan barrier and cover padded sum rows below.
+  const int node0 = r0 / PG, head0 = hk * PG + r0 % PG;
+  const int node1 = r1 / PG, head1 = hk * PG + r1 % PG;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < 8; j++) {
+    const int col = h * PH + j * 16 + fn;
+    bfloat4 values0 = bfloat4(bfloat(0.0f)), values1 = bfloat4(bfloat(0.0f));
+    if (node0 < args.rows) {
+      bfloat4 gates = bfloat4(bfloat(0.0f));
+      if (gated) gates = *(device const bfloat4*)(QG + ((int64_t)node0 * (PG * 4) + head0) * 2 * PD + PD + col);
+      for (int i = 0; i < 4; i++) {
+        const bfloat value = static_cast<bfloat>(total.O[j][i] / total.l0);
+        values0[i] = gated ? static_cast<bfloat>(float(value) * q27_round(1.0f / (1.0f + exp(-float(gates[i]))), 0)) : value;
+      }
+      *(device bfloat4*)(OUT + ((int64_t)node0 * (PG * 4) + head0) * PD + col) = values0;
+    }
+    if (node1 < args.rows) {
+      bfloat4 gates = bfloat4(bfloat(0.0f));
+      if (gated) gates = *(device const bfloat4*)(QG + ((int64_t)node1 * (PG * 4) + head1) * 2 * PD + PD + col);
+      for (int i = 0; i < 4; i++) {
+        const bfloat value = static_cast<bfloat>(total.O[j][4 + i] / total.l1);
+        values1[i] = gated ? static_cast<bfloat>(float(value) * q27_round(1.0f / (1.0f + exp(-float(gates[i]))), 0)) : value;
+      }
+      *(device bfloat4*)(OUT + ((int64_t)node1 * (PG * 4) + head1) * PD + col) = values1;
+    }
+    for (int i = 0; i < 4; i++) { total.O[j][i] = float(values0[i]); total.O[j][4 + i] = float(values1[i]); }
+  }
+  if (sums_stride != 0) {
+    // Four lanes own each row's four-word fragments. Visit j, fragment, word in increasing column order,
+    // keeping the merge's sequential64-word FP32 sum from positive zero, not a parallel reduction.
+    const ushort row_lane = lane & ~9u;
+    _Pragma("clang loop unroll(full)")
+    for (int group = 0; group < 2; group++) {
+      float sum0 = 0.0f, sum1 = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (int j = group * 4; j < group * 4 + 4; j++) {
+        _Pragma("clang loop unroll(full)")
+        for (ushort turn = 0; turn < 4; turn++) {
+          const ushort owner = (turn & 1) | ((turn & 2) << 2);
+          if ((lane & 9) == owner) for (int i = 0; i < 4; i++) { sum0 += total.O[j][i]; sum1 += total.O[j][4 + i]; }
+          sum0 = simd_shuffle(sum0, ushort(row_lane | owner));
+          sum1 = simd_shuffle(sum1, ushort(row_lane | owner));
+        }
+      }
+      if ((lane & 9) == 0) {
+        if (uint(node0) < sums_stride) XS[(int64_t(head0) * (PD / 64) + h * 2 + group) * sums_stride + node0] = sum0;
+        if (uint(node1) < sums_stride) XS[(int64_t(head1) * (PD / 64) + h * 2 + group) * sums_stride + node1] = sum1;
+      }
+    }
+  }
+}

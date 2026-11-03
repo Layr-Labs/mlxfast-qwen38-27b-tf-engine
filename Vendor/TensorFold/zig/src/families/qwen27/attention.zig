@@ -224,6 +224,7 @@ pub const Attention = struct {
     io: [19]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
+    prompt_fold: ?mtl.Pipeline = null, // ordered chunk producer+merge; ordinary fully-live short prompt plans only
     split_tail: ?mtl.Pipeline = null,
     prefix_quarter: ?mtl.Pipeline = null,
     /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
@@ -258,11 +259,14 @@ pub const Attention = struct {
         const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
         errdefer if (chain_words) |b| b.deinit();
         if (chain_words) |b| @memset(b.contents()[0..32], 0);
-        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .prefix_quarter = prefix_quarter, .chain_words = chain_words };
+        const prompt_fold: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prompt_fold", false) else null;
+        errdefer if (prompt_fold) |pipe| pipe.deinit();
+        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .prompt_fold = prompt_fold, .split_tail = split_tail, .prefix_quarter = prefix_quarter, .chain_words = chain_words };
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
         if (a.prompt) |pipes| for (pipes) |pipe| pipe.deinit();
+        if (a.prompt_fold) |pipe| pipe.deinit();
         if (a.split_tail) |pipe| pipe.deinit();
         if (a.prefix_quarter) |pipe| pipe.deinit();
         if (a.chain_words) |b| b.deinit();
@@ -507,6 +511,26 @@ pub const Attention = struct {
         // Preserve the original four-tile origin used by the ordered key-step limit.
         const tile0: u32 = (live * g.group() / 16) / 4 * 4;
         const args = PromptArgs{ .start = start, .rows = @intCast(plan.rows), .chunks = @intCast(chunks), .rp = @intCast(plan.tiles * 16), .key_stride = @intCast(binding.strides[0][0]), .value_stride = @intCast(binding.strides[0][1]), .scale2 = 0.0625 * std.math.log2e, .tile0 = @intCast(tile0), .row0 = @intCast(live * g.group()) };
+        // Keep terminal live-row pruning, long contexts and pre-M5 arithmetic on their original path.
+        if (a.prompt_fold) |pipe| {
+            if (chunks <= 3 and plan.live_from == 0) {
+                const gate = raw_gate orelse out;
+                if (out.offset % 16 != 0 or gate.offset % 16 != 0) return error.TargetAttentionShape;
+                e.setPipeline(pipe);
+                bind(e, .{ scratch.get(.qa), binding.get(.caches) });
+                e.setValue(args, 2);
+                bindAt(e, out, 3);
+                bindAt(e, gate, 4);
+                bindAt(e, if (sums) |s| s.ref else out, 5);
+                e.setValue(@as(u32, if (sums) |s| s.stride else 0), 6);
+                e.setValue(raw_gate != null, 7);
+                // Include every padded sum row; dead producer tiles still write its four zero sums per head.
+                const packed_rows = @max(plan.tiles * 16, if (sums) |s| s.stride * g.group() else 0);
+                e.dispatchGroups(mtl.Size.of(g.kv_heads, 1, (packed_rows + 31) / 32), mtl.Size.of(128, 1, 1));
+                e.barrier();
+                return;
+            }
+        }
         e.setPipeline(a.prompt.?[0]);
         bind(e, .{ scratch.get(.qa), binding.get(.caches) });
         e.setValue(args, 2);
