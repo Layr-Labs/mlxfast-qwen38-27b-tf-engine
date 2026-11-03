@@ -14,6 +14,8 @@ typedef half float16_t;
   device float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
+  device atomic_uint* CO [[buffer(10)]],
+  constant uint& count_out [[buffer(11)]],
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -31,7 +33,14 @@ Q27_SPECIALIZE
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
-  if (int(m) >= M) return;
+  if (int(m) >= M) {
+    // a row past the real ones stores nothing; with count_out it still counts, so the waiting gate/up's count is the grid's
+    if (count_out != 0u && t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&CO[0], 1u, memory_order_relaxed);
+    }
+    return;
+  }
   const int base = int(m) * K + int(t) * E;
   // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
   // words start 32 bytes apart): HO, XO and XS may alias H, R and Wt as far as the compiler knows, so the scalar loop's
@@ -101,5 +110,14 @@ Q27_SPECIALIZE
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+  // count_out above 0: the decoded gate/up that reads XO and XS shares this norm's barrier interval and waits on CO[0];
+  // each row's threadgroup counts itself once all its stores (row 0's padded group sums included) are past a device fence
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&CO[0], 1u, memory_order_relaxed);
+    }
+  }
 
 }
