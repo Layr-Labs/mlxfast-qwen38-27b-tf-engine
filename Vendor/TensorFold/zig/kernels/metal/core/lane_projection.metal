@@ -327,7 +327,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -351,7 +353,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_SERIAL_SK2)
 [[max_total_threads_per_threadgroup(32)]]
 #else
+#if defined(TF_TILE2)
+[[max_total_threads_per_threadgroup(64 * TF_SK)]]
+#else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
+#endif
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
@@ -388,7 +394,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_SWIGLU)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #else
+#if defined(TF_TILE2)
+  // team-m5-08s: two adjacent tiles a threadgroup. SIMD groups [0, TF_SK) run the first tile's K splits and
+  // [TF_SK, 2 TF_SK) the second's; each SIMD group's loop is the record's, on its own tile and split
+  const int lane = int(lanei), ks = int(sgi) % TF_SK, M = min(rows, 16), stride = mdims[1], tile = TF_TILE_OF(2 * int(tg.x) + int(sgi) / TF_SK), n0 = tile * NT;
+  const int pair_half = int(sgi) / TF_SK;
+#else
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = TF_TILE_OF(tg.x), n0 = tile * NT;
+#endif
 #endif
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
@@ -473,7 +486,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+#if defined(TF_TILE2)
+  if (sgi == 0 && lane == 0) { // team-m5-08s: one waiting thread a threadgroup of two tiles
+#else
   if (ks == 0 && lane == 0) {
+#endif
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
@@ -573,12 +590,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
 #elif defined(TF_ROWS8)
+#if defined(TF_TILE2)
+  // team-m5-08s: each tile of the pair reduces its own K splits, in the record's order, in its own half of `part`
+  threadgroup float part[2 * (TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
+  if (TF_SK > 1) {
+    const int pb = pair_half * (TF_SK - 1);
+    if (ks > 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) part[((pb + ks - 1) * TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] += part[((pb + s2 - 1) * TF_PART + TF_HALF(i)) * 32 + lane];
+  }
+#else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) part[((ks - 1) * TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (ks == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] += part[((s2 - 1) * TF_PART + TF_HALF(i)) * 32 + lane];
   }
+#endif
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
   if (TF_SK > 1) {
@@ -611,6 +639,38 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+  if (mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
@@ -652,7 +712,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // the norm that reads Y shares this launch's barrier interval: each threadgroup counts itself on TC[0] once its
   // stores are past a device-scope fence (q27_norm_xs' wait_for)
   threadgroup_barrier(mem_flags::mem_device);
+#if defined(TF_TILE2)
+  if (sgi == 0 && lane == 0) { // team-m5-08s: one count a threadgroup of two tiles
+#else
   if (ks == 0 && lane == 0) {
+#endif
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
   }

@@ -77,6 +77,8 @@ const Key = struct {
     resid: bool = false,
     count: bool = false,
     wait: bool = false,
+    /// team-m5-08s: quantCountedAfter's down with Layout.tile2.
+    tile2: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
 
@@ -165,6 +167,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// team-m5-08s: set once the down's two-tile build (Layout.tile2) fails on this chip; the down then keeps the
+    /// record's one-tile waiting build.
+    no_tile2: bool = false,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -821,16 +826,33 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
-            k.joined(entry.value_ptr);
-        }
+        const built = try k.countedAfterLane(p, key);
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try built.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
         try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        // the norm behind waits for the threadgroups that counted: half the tiles on a two-tile build (team-m5-08s)
+        return @intCast(built.groupCount());
+    }
+
+    /// quantCountedAfter's lane (team-m5-08s): the waiting build at two tiles a threadgroup (Layout.tile2) while it
+    /// builds on this chip; if it fails to build, the record's one-tile waiting build, logged once, as the merges fall
+    /// back.
+    fn countedAfterLane(k: *Kernels, p: projection.Linear, waiting: Key) !*lane.Projection {
+        var key = waiting;
+        while (true) {
+            key.tile2 = !k.no_tile2 and (p.n / 32) % 2 == 0;
+            const entry = try k.lanes.getOrPut(k.allocator, key);
+            if (entry.found_existing) return entry.value_ptr;
+            entry.value_ptr.* = lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .tile2 = key.tile2 }) catch |err| {
+                _ = k.lanes.remove(key);
+                if (!key.tile2) return err;
+                std.log.warn("the counted down keeps the record's one tile a threadgroup (team-m5-08s): {s}", .{@errorName(err)});
+                k.no_tile2 = true;
+                continue;
+            };
+            k.joined(entry.value_ptr);
+            return entry.value_ptr;
+        }
     }
 
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
