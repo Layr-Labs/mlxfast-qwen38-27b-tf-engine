@@ -195,7 +195,10 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
     device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  const uint head = group.y, base = group.z * 16;
+  if (base >= p.rows) return;
+  // Two row streams per group. Eight rows reuse an eleven-tap window, kept as just four live vectors.
+  const uint in_group = metal::min(16u, p.rows - base), per = (in_group + 1) / 2;
   if (sg * per >= in_group) return;
   const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
@@ -206,19 +209,23 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
   for (uint part = 0; part < 4; ++part)
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
-  // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
-  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
-    const uint source = first + s;
-    taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
-                                                         : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
+  // A rolling BF16 window: after each output, keep the last three inputs and load one new input.
+  // No FP32 convolution, normalization or gate operation moves across rows or changes its channel order.
+  bfloat4 taps[4];
+  _Pragma("clang loop unroll(full)") for (uint k = 0; k < 3; ++k) {
+    const uint source = first + k;
+    taps[k] = source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
+                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
   }
-  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 8; ++i) {
     if (i < count) {
+      const uint source = first + i + 3;
+      taps[3] = source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
+                            : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
       const uint row = first + i;
       float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       _Pragma("clang loop unroll(full)") for (uint tap = 0; tap < 4; ++tap) {
-        const bfloat4 input = taps[i + tap];
+        const bfloat4 input = taps[tap];
         _Pragma("clang loop unroll(full)") for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
       }
       float activated[4];
@@ -241,6 +248,7 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
         for (uint part = 0; part < 4; ++part) activation[part] = bfloat(activated[part]);
         *(device bfloat4*)(value + (row * p.nv + head - 2 * p.nk) * p.dv + lane * 4) = activation;
       }
+      taps[0] = taps[1]; taps[1] = taps[2]; taps[2] = taps[3];
     }
   }
   if (head >= 2 * p.nk && lane < count) {
