@@ -18,15 +18,28 @@ fn begin(ptr: *anyopaque) !u64 {
     b.held_conv = null;
     b.held_norms = @splat(null);
     b.hazards.clear();
-    const lead = b.early orelse return b.frame.begin();
+    // team-m5-08t: a frame's pairs take the word pairs from the first; one an earlier frame left counted (no frame's own
+    // path does) is zeroed in this frame's first encoder, behind which every pair waits on a barrier
+    const stale = b.pending;
+    b.pending = null;
+    b.pair_slot = 0;
+    const lead = b.early orelse {
+        const epoch = try b.frame.begin();
+        if (stale) |p| b.pairs.?.reset(b.frame.encoder, p.words);
+        return epoch;
+    };
     // an early frame: its words are picked from the verify's result before anything reads them
     const epoch = try b.frame.beginEarly(true);
+    if (stale) |p| b.pairs.?.reset(b.frame.encoder, p.words);
     lead.encode(lead.ptr, b.frame.encoder, .{ .buf = b.args }) catch |err| {
         b.frame.release();
         b.failed = true;
         return err;
     };
-    b.barrier(b.frame.encoder);
+    // no barrier behind the select, only its RoundArgs write in the open set: the encoder's dispatches already start
+    // behind the verify's taps (the lead's fence wait), so the append's first launch, its fusion's input sums over every
+    // encoded row (no RoundArgs word), runs beside it; every early launch that reads RoundArgs before a barrier lists it
+    b.access(b.frame.encoder, &.{}, &.{Span.whole(b.args)});
     return epoch;
 }
 fn release(ptr: *anyopaque, epoch: u64) void {
@@ -54,7 +67,8 @@ fn project(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, mode: op.Mode)
         const input = try b.frame.ref(x);
         const output = try b.frame.ref(y);
         const s = @import("core").row_projection.simd;
-        b.access(e, &.{xs}, &.{ys});
+        // an early frame's append reads its launch words from RoundArgs: behind the select (begin)
+        if (b.admitting()) b.access(e, &.{ xs, Span.whole(b.args) }, &.{ys}) else b.access(e, &.{xs}, &.{ys});
         const call = try s.call(&b.simd.?, t.n, t.k, x.rows, false, false);
         s.encodeArgs(e, call, t.matrix(), input.buf, input.off, output.buf, output.off, if (b.admitting()) try simdArgs(b, t, call) else null);
     } else {
@@ -97,18 +111,24 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         const early = b.admitting();
         if (early and (!cacheable or adapter.forRows(1).pipe.id != p.pipe.id)) return error.DraftDeviceRound;
         const dims: ?@import("core").lane_projection.Ref = if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "dims") } else null;
+        // team-m5-08t: a decoded block's o projection or down (Adapter.counted) counts its threadgroups for the conv+norm
+        // that reads `y` next, which waits on the count in this barrier interval (norm)
+        const counted: ?@import("core").lane_projection.Projection = if (!early and cacheable and x.rows <= 8 and adapter.counted != null and b.pairs != null and b.pending == null and b.pair_slot < @import("runtime_backend.zig").pair_slots) adapter.counted.? else null;
         if (b.input_sums) |s| {
             if (early and s.sums.stride != 16) return error.DraftDeviceRound;
-            b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            // an early frame's product reads RoundArgs dims: behind the select (begin)
+            if (early) b.access(e, &.{ xs, Span.whole(s.sums.ref.buf), Span.whole(b.args) }, &.{ys}) else b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
+            if (counted) |c| try encodeCounted(b, e, c, adapter, input, output, s.sums, y) else try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
         } else if (cacheable) {
             // the sums, a barrier, the product: no barrier behind it, so independent work runs beside it
             const sums_span = Span.whole(p.sums_buffer.?);
             b.access(e, &.{xs}, &.{sums_span});
-            const sums = try p.encodeSumsOfAt(e, .{ .buf = input.buf, .off = input.off }, x.rows, if (early) .{ .buf = b.args, .off = @offsetOf(RoundArgs, "count") } else null);
+            // an early frame's sums cover every encoded row: rows past the admitted count feed only accumulators that the
+            // launch's RoundArgs dims drop, so the sums read no RoundArgs word and run beside the select (begin)
+            const sums = try p.encodeSumsOfAt(e, .{ .buf = input.buf, .off = input.off }, x.rows, null);
             if (early and sums.stride != 16) return error.DraftDeviceRound;
-            b.access(e, &.{ xs, sums_span }, &.{ys});
-            try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
+            if (early) b.access(e, &.{ xs, sums_span, Span.whole(b.args) }, &.{ys}) else b.access(e, &.{ xs, sums_span }, &.{ys});
+            if (counted) |c| try encodeCounted(b, e, c, adapter, input, output, sums, y) else try p.encodeSumsAt(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, x.rows, dims);
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
@@ -121,6 +141,14 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
         }
     }
 }
+/// team-m5-08t: an adapter's counted build `c` of `y`'s rows on `sums`, counting on the frame's next word pair; the
+/// conv+norm that reads `y` next waits there (norm). Its words are the rows8 build's: Layout.count adds only the count.
+fn encodeCounted(b: *Backend, e: @import("metal").ComputeEncoder, c: @import("core").lane_projection.Projection, adapter: @import("core").affine4_lane.Adapter, input: Ref, output: Ref, sums: @import("core").lane_projection.Sums, y: op.View) !void {
+    const words: Ref = .{ .buf = b.pair_words.?, .off = @as(usize, b.pair_slot) * 8 };
+    try c.encodeCounted(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = output.buf, .off = output.off }, y.rows, .{ .buf = words.buf, .off = words.off });
+    b.pair_slot += 1;
+    b.pending = .{ .y = y, .span = try b.span(y), .groups = @intCast(c.tile_count), .words = words };
+}
 fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32, mode: op.Mode) !?op.View {
     const b = backend(ptr);
     if (mode == .bf16_reference or b.fused_count == 0) return null;
@@ -130,6 +158,30 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     const e = try b.encoder(epoch);
     const y = try b.frame.alloc(x.rows, @intCast(adapter.projection.n), .bf16);
     try encodePrepared(b, e, x, y, adapter);
+    return y;
+}
+/// The gate|up group of `x` and its swiglu in one launch (affine4_lane.Adapter.swiglu, lane_projection.Layout.draft_act):
+/// the group's rows8 words, each rounded to bf16 as its own launch stores them, then tf_draft_swiglu_xs' activation and
+/// group sums, which the down projection takes. Decoded rows (at most 8) on input sums a producer left, outside an early
+/// frame's append; null otherwise, before anything is encoded (project_group then swiglu).
+fn projectSwiglu(ptr: *anyopaque, epoch: u64, x: op.View, gate: ck.Tensor, mode: op.Mode) !?op.View {
+    const b = backend(ptr);
+    if (mode == .bf16_reference or b.fused_count == 0 or b.admitting() or readsQ4Copy(b, x.rows) or x.rows == 0 or x.rows > 8) return null;
+    const adapter = b.prepared.get(@intFromPtr(gate.bytes.ptr) + @import("runtime_backend.zig").group_gu) orelse return null;
+    const p = adapter.swiglu orelse return null;
+    const s = b.input_sums orelse return null;
+    if (!std.meta.eql(s.view, x) or s.sums.stride != sums_stride or x.dtype != .bf16 or x.stride != x.width or x.width != p.k) return null;
+    const width: u32 = @intCast(p.n / 2);
+    errdefer b.input_sums = null;
+    const e = try b.encoder(epoch);
+    const y = try b.frame.alloc(x.rows, width, .bf16);
+    const hs = (try sumsFor(b, x.rows, width)) orelse return error.DraftOperatorShape;
+    const input = try b.frame.ref(x);
+    const output = try b.frame.ref(y);
+    const sums = try b.frame.ref(hs);
+    b.access(e, &.{ try b.span(x), Span.whole(s.sums.ref.buf) }, &.{ try b.span(y), try b.span(hs) });
+    try p.encodeSwiglu(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), s.sums, .{ .buf = output.buf, .off = output.off }, .{ .buf = sums.buf, .off = sums.off }, x.rows);
+    offerSums(b, y, sums);
     return y;
 }
 fn sliceCols(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, width: u32) !op.View {
@@ -144,8 +196,9 @@ const sums_stride = 16;
 const draft_ops = @import("core").draft_ops;
 /// Where a sums-emitting primitive writes its output's group sums, when the output qualifies.
 fn sumsFor(b: *Backend, rows: u32, width: u32) !?op.View {
-    // an early frame's append: its rows are the count the verify admits, which only the GPU knows
-    if (b.admitting() or rows == 0 or rows > sums_stride or width % draft_ops.sums_group != 0) return null;
+    // an early frame's append writes sums for every encoded row, though only the GPU knows the count the verify admits:
+    // the projections that read them take that count from RoundArgs dims, and a row past it feeds only dropped accumulators
+    if (rows == 0 or rows > sums_stride or width % draft_ops.sums_group != 0) return null;
     return try b.frame.alloc(sums_stride, width / draft_ops.sums_group, .f32);
 }
 /// The projection that reads `y` next takes the sums its producer wrote: no sums pass and no barrier of its own.
@@ -170,6 +223,14 @@ fn norm(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Norm) !op.View {
         if (try sumsFor(b, x.rows, x.width)) |s| {
             const sums = try b.frame.ref(s);
             const r = h.p.residual.?;
+            // team-m5-08t: the conv reads the pending counted projection's rows: it waits on their count, beside it
+            if (b.pending) |pend| if (std.meta.eql(pend.y, h.x)) {
+                b.pending = null;
+                b.accessAfter(e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &.{ try b.span(h.y), try b.span(y), try b.span(s) }, pend.span);
+                try b.pairs.?.convNormSums(e, try b.frame.ref(h.x), try b.frame.ref(h.p.dynamic), try b.weight(h.p.base), try b.frame.ref(r), try b.frame.ref(h.y), .{ .rows = h.x.rows, .width = h.x.width, .group = h.p.group, .block = h.p.block, .branch = h.p.branch, .residual = 1, .x_stride = h.x.stride, .dynamic_stride = h.p.dynamic.stride, .y_stride = h.y.stride }, try b.weight(p.weight), try b.frame.ref(y), .{ .ref = sums, .stride = sums_stride }, .{ .rows = x.rows, .heads = 1, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps }, pend.words, pend.groups);
+                offerSums(b, y, sums);
+                return y;
+            };
             b.access(e, &.{ try b.span(h.x), try b.span(h.p.dynamic), try b.span(r) }, &.{ try b.span(h.y), try b.span(y), try b.span(s) });
             try b.primitives.convNormSums(e, try b.frame.ref(h.x), try b.frame.ref(h.p.dynamic), try b.weight(h.p.base), try b.frame.ref(r), try b.frame.ref(h.y), .{ .rows = h.x.rows, .width = h.x.width, .group = h.p.group, .block = h.p.block, .branch = h.p.branch, .residual = 1, .x_stride = h.x.stride, .dynamic_stride = h.p.dynamic.stride, .y_stride = h.y.stride }, try b.weight(p.weight), try b.frame.ref(y), .{ .ref = sums, .stride = sums_stride }, .{ .rows = x.rows, .heads = 1, .dim = p.head_dim, .x_stride = x.stride, .y_stride = y.stride, .eps = p.eps });
             offerSums(b, y, sums);
@@ -406,4 +467,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
 }
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .project_swiglu = projectSwiglu, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
