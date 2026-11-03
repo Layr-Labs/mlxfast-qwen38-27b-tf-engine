@@ -78,8 +78,21 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 // Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
 // k_stride and v_stride, in elements) instead of from copies behind the context.
 struct tf_own_rows { uint rows, k_stride, v_stride; };
-inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
-  return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
+// One key of a split row: its K and V row (`kr`, `vr` at this lane's first element; the lane's others 32 apart) into
+// the running maximum, total and outputs.
+inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D / 32], thread float& maximum,
+    thread float& total, const device bfloat* kr, const device bfloat* vr, float scale) {
+  float k[TF_D / 32], v[TF_D / 32];
+  for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[d * 32]); v[d] = float(vr[d * 32]); }
+  float dot = 0.0f;
+  for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
+  const float score = simd_sum(dot) * scale;
+  const float next = max(maximum, score);
+  const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+  const float weight = exp(score - next);
+  total = fma(total, old_weight, weight);
+  for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
+  maximum = next;
 }
 [[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
     const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
@@ -94,23 +107,20 @@ inline const device bfloat* tf_split_row(const device bfloat* C, const device bf
   float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
   const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
   for (uint d = 0; d < TF_D / 32; ++d) { q[d] = float(Q[qi + lane + d * 32]); out[d] = 0.0f; }
-  const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
-  for (uint key = chunk * TF_CHUNK; key < last; ++key) {
-    if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
-    const device bfloat* kr = tf_split_row(K, OK, key, context, own.k_stride, kh);
-    const device bfloat* vr = tf_split_row(V, OV, key, context, own.v_stride, kh);
-    float k[TF_D / 32], v[TF_D / 32];
-    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[lane + d * 32]); v[d] = float(vr[lane + d * 32]); }
-    float dot = 0.0f;
-    for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
-    const float score = simd_sum(dot) * scale;
-    const float next = max(maximum, score);
-    const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
-    const float weight = exp(score - next);
-    total = fma(total, old_weight, weight);
-    for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
-    maximum = next;
-  }
+  // the chunk's keys in order: those before `context` from the ring, the rest from the own rows. Each loop steps its
+  // rows' pointers a key at a time and reads the mask through the row's own pointer, so a key costs no address
+  // arithmetic or ring/own select of its own; every key's loads and arithmetic are the per-key loop's.
+  const uint first = chunk * TF_CHUNK, last = min(args.keys, first + TF_CHUNK), split = clamp(context, first, last);
+  const device uchar* m = mask + (size_t)row * args.mask_stride;
+  const device bfloat* kr = K + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  const device bfloat* vr = V + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  for (uint key = first; key < split; ++key, kr += TF_KVH * TF_D, vr += TF_KVH * TF_D)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, kr, vr, scale);
+  const size_t at = split - min(split, context); // the own row of the chunk's first own key (0 when it has none)
+  const device bfloat* ko = OK + at * own.k_stride + kh * TF_D + lane;
+  const device bfloat* vo = OV + at * own.v_stride + kh * TF_D + lane;
+  for (uint key = split; key < last; ++key, ko += own.k_stride, vo += own.v_stride)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, ko, vo, scale);
   // partials [row][kv head][chunk][query head][D + 2]: outputs, then the chunk's maximum and total
   device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
   for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[d];
@@ -195,6 +205,87 @@ inline void tf_attention_merge(const device float* part, constant tf_context_arg
     uint lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   tf_attention_merge<true>(part, args, O, XS, xs_stride, lane, tg);
 }
+
+#if defined(TF_SPLIT_MERGE)
+// tf_shared_lane_attention_split's body for one query head, row and key chunk, the same loads, order and stores: false,
+// with nothing written, past the Args' rows or chunks.
+inline bool tf_split_chunk(const device bfloat* Q, const device bfloat* K, const device bfloat* V,
+    const device uchar* mask, constant tf_context_args& args, device float* part, const device bfloat* OK,
+    const device bfloat* OV, constant tf_own_rows& own, uint lane, uint3 tg) {
+  const uint kh = tg.x / TF_G, g = tg.x % TF_G, row = tg.y, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
+  if (kh >= TF_KVH || row >= args.rows || chunk >= chunks) return false;
+  const float scale = as_type<float>(args.scale_bits);
+  const uint context = args.keys - min(own.rows, args.keys);
+  float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
+  const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
+  for (uint d = 0; d < TF_D / 32; ++d) { q[d] = float(Q[qi + lane + d * 32]); out[d] = 0.0f; }
+  const uint first = chunk * TF_CHUNK, last = min(args.keys, first + TF_CHUNK), split = clamp(context, first, last);
+  const device uchar* m = mask + (size_t)row * args.mask_stride;
+  const device bfloat* kr = K + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  const device bfloat* vr = V + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  for (uint key = first; key + TF_SPLIT_TILE <= split; key += TF_SPLIT_TILE, kr += TF_SPLIT_TILE * TF_KVH * TF_D, vr += TF_SPLIT_TILE * TF_KVH * TF_D) {
+    float k[TF_SPLIT_TILE][TF_D / 32], v[TF_SPLIT_TILE][TF_D / 32];
+    bool live[TF_SPLIT_TILE];
+    for (uint t = 0; t < TF_SPLIT_TILE; ++t) {
+      live[t] = m[key + t] != 0;
+      for (uint d = 0; d < TF_D / 32; ++d) { k[t][d] = float(kr[t * TF_KVH * TF_D + d * 32]); v[t][d] = float(vr[t * TF_KVH * TF_D + d * 32]); }
+    }
+    for (uint t = 0; t < TF_SPLIT_TILE; ++t) {
+      if (!live[t]) continue;
+      float dot = 0.0f;
+      for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[t][d], dot);
+      const float score = simd_sum(dot) * scale;
+      const float next = max(maximum, score);
+      const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+      const float weight = exp(score - next);
+      total = fma(total, old_weight, weight);
+      for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[t][d]);
+      maximum = next;
+    }
+  }
+  for (uint key = split - (split - first) % TF_SPLIT_TILE; key < split; ++key, kr += TF_KVH * TF_D, vr += TF_KVH * TF_D)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, kr, vr, scale);
+  const size_t at = split - min(split, context);
+  const device bfloat* ko = OK + at * own.k_stride + kh * TF_D + lane;
+  const device bfloat* vo = OV + at * own.v_stride + kh * TF_D + lane;
+  for (uint key = split; key < last; ++key, ko += own.k_stride, vo += own.v_stride)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, ko, vo, scale);
+  device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
+  for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[d];
+  if (lane == 0) { p[TF_D] = maximum; p[TF_D + 1] = total; }
+  return true;
+}
+
+// tf_shared_lane_attention_split and tf_shared_lane_attention_merge_xs in one launch, with no barrier between them: each
+// chunk's threadgroup stores its partials as the split does, passes a device-scope fence and counts itself on
+// AC[row * TF_QH + head]; the one that brings the count to the Args' chunks passes its own fence, leaves the word zero
+// for the next launch and merges that head and row with the same tf_attention_merge (the same partials, chunk order and
+// sums). Nothing waits on a count: every other threadgroup ends once counted.
+[[kernel]] void tf_shared_lane_attention_split_merge_xs(const device bfloat* Q [[buffer(0)]],
+    const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
+    const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
+    device float* part [[buffer(5)]], const device bfloat* OK [[buffer(6)]], const device bfloat* OV [[buffer(7)]],
+    constant tf_own_rows& own [[buffer(8)]], device TF_OUT* O [[buffer(9)]], device float* XS [[buffer(10)]],
+    constant uint& xs_stride [[buffer(11)]], device atomic_uint* AC [[buffer(12)]],
+    uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup uint last[1];
+  if (!tf_split_chunk(Q, K, V, mask, args, part, OK, OV, own, lane, tg)) return;
+  threadgroup_barrier(mem_flags::mem_device);
+  if (lane == 0) {
+    const uint chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
+    device atomic_uint* count = AC + (size_t)tg.y * TF_QH + tg.x;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const bool done = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed) + 1u == chunks;
+    if (done) {
+      atomic_store_explicit(count, 0u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    last[0] = done ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (last[0] != 0u) tf_attention_merge<true>(part, args, O, XS, xs_stride, lane, uint2(tg.x, tg.y));
+}
+#endif
 
 // Ordinary one-sequence decode over all keys: the same fp32 order, with no mask or lane indexing.
 [[kernel]] void tf_core_decode_attention(const device bfloat* Q [[buffer(0)]],
