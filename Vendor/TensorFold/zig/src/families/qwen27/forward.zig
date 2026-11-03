@@ -182,6 +182,10 @@ pub const Stages = struct {
             lane.enc.barrier();
         }
         if (gu_wait) |n| {
+            // the down projection's leading code lines are requested inside the gate/up's counted interval, before the
+            // down waits on its count: its first tile launches then find those lines in the caches instead of paying
+            // their misses one after another at its start. Read-only, so the counted interval gains no hazard.
+            try m.kernels.warm(e, layer.down);
             s.norm_wait = try m.kernels.quantCountedAfter(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows, n);
         } else if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
