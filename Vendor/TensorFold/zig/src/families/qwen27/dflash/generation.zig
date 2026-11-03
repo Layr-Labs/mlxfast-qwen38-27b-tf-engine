@@ -171,6 +171,11 @@ pub const Generation = struct {
         g.draft.backend.precise = false;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
+        // the drafter's scratch, freed at the last phase close, is made again on a helper thread while the GPU runs this
+        // pass (Frame.refill): the catch-up frame behind it then waits on no allocation. Nothing here touches the frame.
+        const frame = &g.draft.backend.frame;
+        const refill: ?std.Thread = if (frame.refillDue()) std.Thread.spawn(.{}, @TypeOf(frame.*).refill, .{frame}) catch null else null;
+        defer if (refill) |t| t.join();
         var first: usize = 0;
         while (first < ids.len) {
             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
