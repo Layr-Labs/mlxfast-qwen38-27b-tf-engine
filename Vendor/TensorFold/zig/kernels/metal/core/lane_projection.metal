@@ -365,6 +365,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #if defined(TF_WAIT)
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
+#if defined(TF_WAIT_ALL)
+    constant uint& tgs_all [[buffer(11)]],
+#endif
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
@@ -422,6 +425,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
 #endif
+#if defined(TF_WAIT) && defined(TF_SERIAL_SK2)
+  if (ks == 0 && lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+#if defined(TF_WAIT_ALL)
+    const uint arrivals = tgs_all;
+#else
+    const uint arrivals = tgs.x * tgs.y;
+#endif
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == arrivals) {
+      atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
+      atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
 #if defined(TF_SERIAL_SK2)
   float C0[16];
   for (int split = 0; split < TF_SK; split++) {
@@ -469,14 +488,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
-#if defined(TF_WAIT)
+#if defined(TF_WAIT) && !defined(TF_SERIAL_SK2)
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+#if defined(TF_WAIT_ALL)
+    const uint arrivals = tgs_all;
+#else
+    const uint arrivals = tgs.x * tgs.y;
+#endif
+    if (atomic_fetch_add_explicit(&WC[1], 1u, memory_order_relaxed) + 1u == arrivals) {
       atomic_store_explicit(&WC[0], 0u, memory_order_relaxed);
       atomic_store_explicit(&WC[1], 0u, memory_order_relaxed);
     }

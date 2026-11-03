@@ -53,6 +53,8 @@ const warm_source =
 ;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
+/// The norm's count word and the row count a waiting gate/up polls for (normAfter's `count`, gateUpWaited's `wait`).
+pub const NormWait = struct { words: mtl.Buffer, rows: u32 };
 
 const Key = struct {
     kind: Kind,
@@ -77,6 +79,7 @@ const Key = struct {
     resid: bool = false,
     count: bool = false,
     wait: bool = false,
+    pair: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
 
@@ -165,6 +168,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// The out projection's norm count and the waiting gate/up's arrivals (normAfter's count / encodeSwigluCountedAfter),
+    /// left zero by each gate/up that waits on it.
+    norm_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -201,6 +207,7 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.norm_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
@@ -650,6 +657,8 @@ pub const Kernels = struct {
             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
             bindAt(e, out, 8); // never read: wait_for 0
             e.setValue(@as(u32, 0), 9);
+            bindAt(e, out, 10); // never written: count_out 0
+            e.setValue(@as(u32, 0), 11);
         } else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
@@ -657,7 +666,9 @@ pub const Kernels = struct {
 
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
     /// threadgroup waits until that launch's `wait_for` threadgroups have counted their fenced stores.
-    pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
+    /// `count` (two u32 words, left zero by the launch that waits on them): the same launch counts its own rows instead,
+    /// so the gate/up that reads them follows in this barrier interval with no barrier (gateUpWaited); at most 8 rows.
+    pub fn normAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32, count: ?mtl.Buffer) !void {
         const words = k.count_words orelse return error.BadCoreProjectionRows;
         if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
         try wordAligned(.{ h, residual, weight, combined, out });
@@ -668,8 +679,24 @@ pub const Kernels = struct {
         bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
         e.setBuffer(words, 0, 8);
         e.setValue(wait_for, 9);
+        if (count) |c| {
+            e.setBuffer(c, 0, 10);
+            e.setValue(@as(u32, 1), 11);
+        } else {
+            bindAt(e, out, 10); // never written: count_out 0
+            e.setValue(@as(u32, 0), 11);
+        }
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// The norm's count and the waiting gate/up's arrivals: made on first use, left zero (normAfter's `count`).
+    pub fn normWaitWords(k: *Kernels) !mtl.Buffer {
+        if (k.norm_words) |b| return b;
+        const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        @memset(b.contents()[0..8], 0);
+        k.norm_words = b;
+        return b;
     }
 
     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
@@ -677,10 +704,11 @@ pub const Kernels = struct {
     /// launch's threadgroups); null: nothing encoded, the caller takes quant.
     /// Whether `p` on these rows takes the counted launch (quantCounted, quantCountedAfter); serial split-K launches count
     /// once a threadgroup too, but only parallel split-K launches wait.
-    fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
+    fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool, pair: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
-        if (key.serialSk2() and wait) return null;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait, .pair = pair };
+        // a serial split-K launch waits only as one of a pair: the wait and its arrival count run once, before its K splits
+        if (key.serialSk2() and wait and !pair) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
     }
@@ -783,11 +811,24 @@ pub const Kernels = struct {
 
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
     pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
-        return k.countedKey(p, rows, false) != null;
+        return k.countedKey(p, rows, false, false) != null;
+    }
+
+    /// Whether `p` on `rows` decoded rows takes quantCountedAfter: the launch that waits on the mixer's count before it
+    /// reads its rows (a serial split-K matrix counts but cannot wait).
+    pub fn countableAfter(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.gu_words != null and k.countedKey(p, rows, true, false) != null;
+    }
+
+    /// `p` on `rows` decoded rows waiting on `wait_for` threadgroups counted by the launch before it, for a caller that
+    /// skipped the barrier between them; null where `p` cannot take that launch (the caller keeps its barrier).
+    pub fn quantWaited(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !?u32 {
+        if (wait_for == 0 or !k.countableAfter(p, rows)) return null;
+        return try k.quantCountedAfter(input_encoder, p, x, xs, y, rows, wait_for);
     }
 
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
-        const key = k.countedKey(p, rows, false) orelse return null;
+        const key = k.countedKey(p, rows, false, false) orelse return null;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -811,7 +852,7 @@ pub const Kernels = struct {
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        const key = k.countedKey(p, rows, true, false) orelse return error.BadCoreProjectionRows;
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -833,15 +874,79 @@ pub const Kernels = struct {
         return @intCast(entry.value_ptr.tile_count);
     }
 
+    /// Whether `p` on `rows` decoded rows takes the pair count and wait (Layout.wait_all), a serial split-K launch included:
+    /// checked before the norm that counts requests the count, so a counting norm always has both launches that consume it.
+    pub fn countablePair(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.countedKey(p, rows, true, true) != null;
+    }
+
+    fn pairEntry(k: *Kernels, key: Key) !*lane.Projection {
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = key.n, .k = key.k, .format = .{ .bits = key.bits, .group = key.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .wait_all = true });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr;
+    }
+
+    /// The block-entry norm's rows read by two counted projections in one barrier interval: both wait on the norm's count
+    /// (`words`' first word reaching `wait_for`) and their threadgroups share `words`' second word's arrival total, so
+    /// neither launch needs the barrier the norm would otherwise leave. Returns the two launches' threadgroup counts, the
+    /// pair a prepare waits on; `error.BadCoreProjectionRows` when either projection cannot take the launch.
+    pub fn quantPair(k: *Kernels, input_encoder: mtl.ComputeEncoder, a: projection.Linear, b: projection.Linear, x: Ref, xs: Sums, ya: Ref, yb: Ref, rows: u32, words: mtl.Buffer, wait_for: u32) ![2]u32 {
+        const ka = k.countedKey(a, rows, true, true) orelse return error.BadCoreProjectionRows;
+        const kb = k.countedKey(b, rows, true, true) orelse return error.BadCoreProjectionRows;
+        if (wait_for == 0) return error.BadCoreProjectionRows;
+        if (k.count_words == null) {
+            const c = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(c.contents()[0..8], 0);
+            k.count_words = c;
+        }
+        const ea = try k.pairEntry(ka);
+        const eb = try k.pairEntry(kb);
+        const arrivals: u32 = @intCast(ea.tile_count + eb.tile_count);
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = a.n + b.n, .k = a.k, .sk = a.slices, .bits = a.bits };
+        errdefer span.cancel();
+        const xr = lane.Ref{ .buf = x.buffer, .off = x.offset };
+        try ea.encodeCountedPair(span.encoder, xr, lane.Ref{ .buf = a.words.buffer, .off = a.words.offset }, metadata(a, ka.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = ya.buffer, .off = ya.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = words }, wait_for, arrivals);
+        try eb.encodeCountedPair(span.encoder, xr, lane.Ref{ .buf = b.words.buffer, .off = b.words.offset }, metadata(b, kb.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = yb.buffer, .off = yb.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = words }, wait_for, arrivals);
+        try span.end();
+        return .{ @intCast(ea.tile_count), @intCast(eb.tile_count) };
+    }
+
+    /// Whether `gateUpWaited` encodes this gate/up and down on `rows` decoded rows: checked before the norm it waits on
+    /// requests its count, so a norm that counts always has the launch that consumes the count.
+    pub fn guWaited(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) bool {
+        return guLockstep(k, p, down, rows);
+    }
+
+    fn guLockstep(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) bool {
+        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return false;
+        if (k.countedKey(down, rows, true, false) == null) return false;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
+        return key.serialSk2();
+    }
+
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
     /// rows and their group sums are stored, when `down` takes the counted launch that waits on them in the same barrier
     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
-        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
-        if (k.countedKey(down, rows, true) == null) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
-        if (!key.serialSk2()) return null;
+        return k.gateUpLockstep(input_encoder, p, down, x, xs, out, out_sums, rows, null);
+    }
+
+    /// `gateUpCounted` whose threadgroups first wait on the norm's count (`wait.words`, two u32 words) reaching its
+    /// `rows`: the norm that wrote `x` and `xs` shares this launch's barrier interval (normAfter's `count`), so no
+    /// barrier separates them.
+    pub fn gateUpWaited(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32, wait: NormWait) !?u32 {
+        return k.gateUpLockstep(input_encoder, p, down, x, xs, out, out_sums, rows, wait);
+    }
+
+    fn gateUpLockstep(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32, wait: ?NormWait) !?u32 {
+        if (!guLockstep(k, p, down, rows)) return null;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true, .wait = wait != null };
         if (k.gu_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -853,10 +958,13 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true, .wait = wait != null });
             k.joined(entry.value_ptr);
         }
-        const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
+        const n = if (wait) |w|
+            try entry.value_ptr.encodeSwigluCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? }, .{ .buf = w.words }, w.rows)
+        else
+            try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
         try span.end();
         return n;
     }

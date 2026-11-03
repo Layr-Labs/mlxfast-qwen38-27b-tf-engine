@@ -246,7 +246,7 @@ pub const Round = struct {
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
     /// `wait_prep` above 0 (`counter` given): the prepare shares this scan's barrier interval (prepareRowsAfter's `star`);
     /// each group loads its committed words and replays its pending rows, then waits on that many prepare groups.
-    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32) !void {
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32, count: ?metal.Buffer) !?u32 {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1) or (wait_prep != 0 and counter == null)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
@@ -267,9 +267,10 @@ pub const Round = struct {
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 16, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         if (r.warm) |w| try w.encode(w.ptr, e);
-        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 32) * r.p.nv * r.segments));
+        if (counted) return r.gateAfter(e, post_rows, counter.?, @intCast((r.p.dv / 32) * r.p.nv * r.segments), count);
         e.barrier();
         r.gate(e, post_rows);
+        return null;
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) !void {
@@ -298,7 +299,10 @@ pub const Round = struct {
     }
     /// gate on post_rows in the star scan's barrier interval: each group waits until `counter`'s first word reaches `wait`
     /// (the scan's threadgroups) before it reads the scan's rows; the last group leaves both words zero.
-    pub fn gateAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32) void {
+    /// `count` (the out projection's wait word, two words): every live (row, head) simdgroup counts itself on its first word
+    /// once its row and group sums are stored, no barrier follows, and the returned count is the projection's wait; null
+    /// leaves the parent's barrier.
+    pub fn gateAfter(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline, counter: metal.Buffer, wait: u32, count: ?metal.Buffer) ?u32 {
         e.setPipeline(rows);
         bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
         e.setValue(r.p, 3);
@@ -313,8 +317,17 @@ pub const Round = struct {
         }
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
+        if (count) |c| {
+            e.setBuffer(c, 0, 9);
+            e.setValue(@as(u32, 1), 10);
+        } else {
+            r.b.output.bind(e, 9); // never written: count_out 0
+            e.setValue(@as(u32, 0), 10);
+        }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
+        if (count != null) return r.p.nv * r.p.rows;
         e.barrier();
+        return null;
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
         const wide = r.gateRows();
@@ -333,6 +346,8 @@ pub const Round = struct {
         if (wide) {
             r.b.output.bind(e, 7); // never read: wait_for 0
             e.setValue(@as(u32, 0), 8);
+            r.b.output.bind(e, 9); // never written: count_out 0
+            e.setValue(@as(u32, 0), 10);
         }
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();

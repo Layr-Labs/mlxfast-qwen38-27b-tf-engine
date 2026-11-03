@@ -37,11 +37,19 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
+        // the norm before this block counted its rows for the two projections that read them: both wait on that count
+        // instead of the barrier that would otherwise follow the norm
+        const pre_wait = frame.pre_wait;
+        frame.pre_wait = 0;
+        if (!hook.accepted_chain and z.tiles == 0 and pre_wait != 0 and hook.quant.countablePair(weight.qkv, rows) and hook.quant.countablePair(weight.zba, rows)) {
+            const pair = try hook.quant.quantPair(e, weight.qkv, weight.zba, frame.get(.input), sums, try hook.pool.projected(layer), frame.get(.mixed), rows, try hook.quant.normWaitWords(), pre_wait);
+            after = .{ .counter = hook.quant.count_words.?, .wait = pair[0] + pair[1] };
+        } else if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
         } else {
+            if (pre_wait != 0) e.barrier(); // the norm left none: order its rows here
             try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
@@ -56,7 +64,15 @@ pub const Hook = struct {
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        // the gate counts its live rows on the out projection's wait word instead of leaving a barrier: only a decoded star
+        // block whose projection takes the waiting launch, and not the last block, whose rows post compacts
+        const count: ?metal.Buffer = if (!hook.accepted_chain and after != null and beside == null and !hook.quant.prompt and
+            block + 1 != hook.linear_index.len and hook.quant.countableAfter(weight.out, rows)) hook.quant.gu_words else null;
+        if (hook.accepted_chain) {
+            try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside);
+        } else if (try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded, count)) |waited| {
+            frame.mixer_wait = waited;
+        }
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

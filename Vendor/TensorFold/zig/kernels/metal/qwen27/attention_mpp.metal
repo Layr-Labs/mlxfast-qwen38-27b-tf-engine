@@ -179,6 +179,7 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
     device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
     device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
+    constant uint& HA [[buffer(12)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
@@ -208,7 +209,7 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)node * HA + hk * G) * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
   tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tP(myP, dextents<int32_t, 2>(TK, 16));
@@ -313,6 +314,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
     device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
+    device atomic_uint* TC [[buffer(15)]], constant uint& count_out [[buffer(16)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
   const uint lane = thread_index_in_simdgroup;
@@ -381,6 +383,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
       XS[(int64_t)(col / 64) * sums_stride + node] = acc;
     }
   }
+  if (count_out != 0u) q27_count(TC, tid);
 }
 
 // Independent output halves preserve the original tail arithmetic; used for small one-chunk trees.
@@ -394,7 +397,7 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
     device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
     device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
     device atomic_uint* WC [[buffer(12)]], constant uint& wait_for [[buffer(13)]],
-    device atomic_uint* TC [[buffer(14)]], constant uint& count_out [[buffer(15)]],
+    device atomic_uint* TC [[buffer(14)]], constant uint& count_out [[buffer(15)]], constant uint& HA [[buffer(16)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
@@ -431,7 +434,7 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
   const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
   const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)node * HA + hk * G) * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
   tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tP(myP, dextents<int32_t, 2>(TK, 16));

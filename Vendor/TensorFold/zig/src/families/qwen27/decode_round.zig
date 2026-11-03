@@ -837,11 +837,18 @@ pub const Runner = struct {
         // or neither, so the shared counter always returns to zero
         var after: ?attn.After = null;
         const promptPlan = r.attention.promptPath(plan, r.model.kernels.prompt);
-        if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
+        // the norm before this block counted its rows for q+gate and k|v: both wait on that count instead of a barrier
+        const pre_wait = f.pre_wait;
+        f.pre_wait = 0;
+        if (!promptPlan and dead == 0 and pre_wait != 0 and r.model.kernels.countablePair(weights.q, rows) and r.model.kernels.countablePair(weights.kv, rows)) {
+            const pair = try r.model.kernels.quantPair(e, weights.q, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), f.get(.mixed), rows, try r.model.kernels.normWaitWords(), pre_wait);
+            after = .{ .counter = r.model.kernels.count_words.?, .wait = pair[0] + pair[1] };
+        } else if (!promptPlan and dead == 0 and r.model.kernels.countable(weights.q, rows) and r.model.kernels.countable(weights.kv, rows)) {
             const a = (try r.model.kernels.quantCounted(e, weights.q, f.get(.input), forward.sums(f, .sums, rows), f.get(.q_gate), rows)) orelse return error.RoundNotReady;
             const b = (try r.model.kernels.quantCounted(e, weights.kv, f.get(.input), forward.sums(f, .sums, rows), f.get(.mixed), rows)) orelse return error.RoundNotReady;
             after = .{ .counter = r.model.kernels.count_words.?, .wait = a + b };
         } else {
+            if (pre_wait != 0) e.barrier(); // the norm left none: order its rows here
             if (dead < rows) {
                 var input = f.get(.input);
                 input.offset += @as(usize, dead) * weights.q.k * 2;
@@ -862,8 +869,9 @@ pub const Runner = struct {
         // a prompt plan's query goes straight to the prompt kernel's packed rows
         const prepacked = r.attention.promptPath(plan, r.model.kernels.prompt);
         // a decoded fused chain (one stream, at most 8 rows, counted projections): the preprocess also packs the prefix's
-        // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
-        const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
+        // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval;
+        // a depth-one star's window appends and packs the same way, so its layers fold those two launches in as well
+        const appended = after != null and !prepacked and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
         const decoded: ?attn.Decoded = if (appended) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
@@ -875,8 +883,16 @@ pub const Runner = struct {
         var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
         if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
         defer r.attention.warm = null;
+        // the merge counts its groups once stored and the out projection waits on that count instead of a barrier: on
+        // every decoded block whose projection takes the waiting launch, but not the last, whose rows post compacts
+        const terminal = block + 1 == r.model.config.layers;
+        const gu = r.model.kernels.gu_words;
+        const merge_count = !promptPlan and !terminal and out_sums and gu != null and r.model.kernels.countableAfter(weights.out, rows);
+        if (merge_count) r.attention.merge_count = .{ .words = gu.?, .groups = plan.geometry.kv_heads * plan.rows * plan.geometry.group() };
+        defer r.attention.merge_count = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
         f.mixer_sums = out_sums;
+        f.mixer_wait = if (merge_count) plan.geometry.kv_heads * plan.rows * plan.geometry.group() else 0;
     }
 
     fn tap(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
