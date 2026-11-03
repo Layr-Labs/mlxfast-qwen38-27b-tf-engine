@@ -373,6 +373,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+#if !defined(TF_PROMPT_SR)
+  {
+    threadgroup float decpad[8192 / 4];
+    if (mdims[0] == -12345) { decpad[lanei] = 1.0f; threadgroup_barrier(mem_flags::mem_threadgroup); Y[0] = (TF_OUT)decpad[lanei ^ 1]; }
+  }
+#endif
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
 #if defined(TF_TILE_LIST)
