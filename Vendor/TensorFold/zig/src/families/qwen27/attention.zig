@@ -314,7 +314,10 @@ pub const Attention = struct {
         if (rows4) if (p.decoded) |d| {
             const words = a.chain_words orelse return error.TargetAttentionShape;
             const w = p.after orelse return error.TargetAttentionShape;
-            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or !d.plan.fused or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            // a depth-one star takes the same pass: each row's own key and value land at the window's slot from the plan's
+            // meta and nodes, and the packed query's rows are the stream's rows, as a chain's are
+            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            if (d.plan.prefix_chunks == 0 and !d.plan.fused) return error.TargetAttentionShape;
             if (d.v_stride < g.kv_heads * g.dim) return error.TargetAttentionShape;
             try d.scratch.check(d.plan.*);
             try d.binding.check(d.plan.*, d.caches);
@@ -401,7 +404,9 @@ pub const Attention = struct {
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
         const kv_bytes = @as(usize, plan.rows) * g.kv_heads * g.dim * 2;
         if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt))) return error.TargetAttentionShape;
-        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !plan.fused or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
+        // `appended`: the preprocess already appended the round's keys and values and packed the prefix's query, so the
+        // prefix waits on its count instead of a barrier; a tree and a chain both take that route
+        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
         const v_bytes = (@as(usize, plan.rows) - 1) * v_stride * 2 + g.kv_heads * g.dim * 2;
         var timing = profile.begin(a.profiler, input_encoder, .attention);
         errdefer timing.cancel();
@@ -451,7 +456,7 @@ pub const Attention = struct {
             e.barrier();
             // The merge retains normalized BF16 rounding, then gates and writes ordered group sums.
             try a.promptRows(e, scratch, binding, plan, out, raw_gate, sums);
-        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, args, sums, appended);
+        } else try a.treeRows(e, scratch, binding, plan, q, out, raw_gate, sums, appended);
         try timing.end();
     }
     /// A prompt chunk's rows over absolute 512-key chunks (attention_prompt.metal), merged in key order.
@@ -495,15 +500,12 @@ pub const Attention = struct {
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
-    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums, appended: bool) !void {
+    fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, sums: ?Sums, appended: bool) !void {
         const g = plan.geometry;
-        if (!plan.fused) {
-            e.setPipeline(a.io[1]);
-            bind(e, .{ q, scratch.get(.qb) });
-            e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
-        }
-        // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
+        // The tail reads the round's own query rows where the norm and rope pass left them (`q`, head order per row):
+        // the pack pass that copied them into a group-major tile is gone, so a tree issues no dispatch here and, once
+        // the preprocess counts itself, takes no barrier either — the prefix waits on the preprocess's count and a
+        // split tail waits on the prefix's, which is the order the pack pass's barrier used to give.
         if (!appended) e.barrier();
         const scale: f32 = 0.0625;
         // Small one-chunk trees otherwise expose only four groups per node.
@@ -544,8 +546,10 @@ pub const Attention = struct {
         }
         if (!plan.fused) {
             e.setPipeline(if (split) a.split_tail.? else a.io[3]);
-            bind(e, .{ scratch.get(.qb), binding.get(.caches) });
+            // the preprocess's own query rows, read in place: the tail's group tile starts at head `hk * group` of `row`
+            bind(e, .{ q, binding.get(.caches) });
             e.setValue(scale, 2);
+            e.setValue(g.heads, if (split) 16 else 12);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
             for ([_]Field{ .paths, .nodes, .poa, .pma, .pla, .pob, .pmb, .plb }, 4..) |field, i| {
                 const r = scratch.get(field);
