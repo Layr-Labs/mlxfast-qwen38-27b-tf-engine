@@ -341,3 +341,169 @@ kernel void tf_bf16_topk_wide_merge(const device Row* part [[buffer(0)]],
     if (sl == 0) { output[row].entries[rank] = { w.id, w.bits }; output[row].count = rank + 1; }
   }
 }
+
+#if defined(TF_TOPK_FOLD)
+// TF_TOPK_FOLD (its own library: bf16_topk_gpu.Ops.buildFold): tf_bf16_topk_wide, tf_bf16_topk_wide_merge and
+// tf_bf16_topk_tiles in one launch, for the drafter's rescored head. Each span counts itself on its row's word once its
+// Row is past a device-scope fence; the row's last span, past its own fence, leaves that word zero and merges the row's
+// span lists into `output`, then counts itself on the rows' word; the last row's merger, past its own fence, leaves that
+// word zero and lists every row's tiles. Nothing waits on a count. counts: the rows' word, then a word a row.
+static_assert(TF_TOPK_GROUPS * 8 == TF_TOPK_WIDE_SPANS && TF_TOPK_MAX_K == 16, "the fold's merge: 8 lists a SIMD group, 4 lanes a list");
+// tf_bf16_topk_wide's span, verbatim: tokens [begin, end) of `row` into `out`.
+inline void tf_topk_fold_span(const device ushort* row, device Row& out, ulong begin, ulong end, constant Params& p, uint lane,
+                              uint sg, uint sl, threadgroup uint* masks, threadgroup uint (*list_key)[TF_TOPK_MAX_K],
+                              threadgroup uint (*list_id)[TF_TOPK_MAX_K], threadgroup uint (*list_bits)[TF_TOPK_MAX_K]) {
+  uint key[TF_TOPK_HOLD], bits[TF_TOPK_HOLD], live = 0, mask = 0;
+  for (uint i = 0; i < TF_TOPK_HOLD; i++) {
+    const ulong token = begin + lane + ulong(i) * TF_TOPK_LANES;
+    key[i] = 0; bits[i] = 0;
+    if (token < end) {
+      const ushort raw = row[token];
+      if ((raw & 0x7f80u) == 0x7f80u) mask |= (raw & 0x7fu) != 0 ? 1u : (raw & 0x8000u) == 0 ? 2u : 4u;
+      else { key[i] = tf_bf16_key(raw); bits[i] = uint(raw) << 16; live |= 1u << i; }
+    }
+  }
+  if (lane == 0) {
+    out.nonfinite = 0; out.count = 0;
+    for (uint i = 0; i < TF_TOPK_MAX_K; i++) out.entries[i] = { 0xffffffffu, 0u };
+  }
+  const uint all = tf_tg_or(mask, lane, masks);
+  if (all != 0) { if (lane == 0) out.nonfinite = all; return; }
+  for (uint rank = 0; rank < TF_TOPK_MAX_K; rank++) {
+    TfCand c = { 0u, 0xffffffffu, 0u };
+    uint slot = TF_TOPK_HOLD;
+    if (rank < p.k) for (uint i = 0; i < TF_TOPK_HOLD; i++) {
+      const uint id = uint(begin + lane + ulong(i) * TF_TOPK_LANES);
+      if (((live >> i) & 1u) != 0 && tf_topk_before(key[i], id, c.key, c.id)) { c = { key[i], id, bits[i] }; slot = i; }
+    }
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) live &= ~(1u << slot);
+    if (sl == 0) { list_key[sg][rank] = w.key; list_id[sg][rank] = w.id; list_bits[sg][rank] = w.bits; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  // lane sl: entries 4 * (sl % 4) .. + 3 of SIMD group sl / 4's sorted list
+  const uint g = sl / 4, first = 4 * (sl % 4);
+  uint cursor = 0;
+  for (uint rank = 0; rank < p.k; rank++) {
+    const uint at = first + cursor;
+    const TfCand c = cursor < 4 ? TfCand{ list_key[g][at], list_id[g][at], list_bits[g][at] } : TfCand{ 0u, 0xffffffffu, 0u };
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) cursor++;
+    if (sl == 0) { out.entries[rank] = { w.id, w.bits }; out.count = rank + 1; }
+  }
+}
+// tf_bf16_topk_wide_merge's row from its TF_TOPK_WIDE_SPANS span lists, on the span kernel's own lists and in two stages
+// of the same total order ("before"): SIMD group g picks the top k of span lists 8g .. 8g + 7 (lane sl holding entries
+// 4 (sl % 4) .. + 3 of list 8g + sl / 4, as the span kernel's last stage holds its groups' lists), then SIMD group 0
+// merges the eight group lists with that last stage, verbatim. Each entry of the row's top k is in its group's top k, so
+// the picks are the merge kernel's, rank for rank, with its non-finite mask and empty entries.
+inline void tf_topk_fold_merge(const device Row* spans, device Row& out, constant Params& p, uint lane, uint sg, uint sl,
+                               threadgroup uint* masks, threadgroup uint (*list_key)[TF_TOPK_MAX_K],
+                               threadgroup uint (*list_id)[TF_TOPK_MAX_K], threadgroup uint (*list_bits)[TF_TOPK_MAX_K]) {
+  const device Row& mine = spans[TF_TOPK_GROUPS * sg + sl / 4];
+  uint key[4], id[4], bits[4];
+  for (uint i = 0; i < 4; i++) {
+    const uint at = 4 * (sl % 4) + i;
+    key[i] = 0; id[i] = 0xffffffffu; bits[i] = 0;
+    if (at < p.k && mine.entries[at].token != 0xffffffffu) {
+      bits[i] = mine.entries[at].score_bits;
+      key[i] = tf_bf16_key(ushort(bits[i] >> 16)); id[i] = mine.entries[at].token;
+    }
+  }
+  const uint mask = sl % 4 == 0 ? mine.nonfinite : 0u;
+  if (lane == 0) {
+    out.nonfinite = 0; out.count = 0;
+    for (uint i = 0; i < TF_TOPK_MAX_K; i++) out.entries[i] = { 0xffffffffu, 0u };
+  }
+  const uint all = tf_tg_or(mask, lane, masks);
+  if (all != 0) { if (lane == 0) out.nonfinite = all; return; }
+  for (uint rank = 0; rank < TF_TOPK_MAX_K; rank++) {
+    const TfCand c = rank < p.k ? TfCand{ key[0], id[0], bits[0] } : TfCand{ 0u, 0xffffffffu, 0u };
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) {
+      for (uint i = 0; i < 3; i++) { key[i] = key[i + 1]; id[i] = id[i + 1]; bits[i] = bits[i + 1]; }
+      key[3] = 0; id[3] = 0xffffffffu; bits[3] = 0;
+    }
+    if (sl == 0) { list_key[sg][rank] = w.key; list_id[sg][rank] = w.id; list_bits[sg][rank] = w.bits; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  // lane sl: entries 4 * (sl % 4) .. + 3 of SIMD group sl / 4's sorted list
+  const uint g = sl / 4, first = 4 * (sl % 4);
+  uint cursor = 0;
+  for (uint rank = 0; rank < p.k; rank++) {
+    const uint at = first + cursor;
+    const TfCand c = cursor < 4 ? TfCand{ list_key[g][at], list_id[g][at], list_bits[g][at] } : TfCand{ 0u, 0xffffffffu, 0u };
+    bool taken;
+    const TfCand w = tf_simd_pick(c, taken);
+    if (taken) cursor++;
+    if (sl == 0) { out.entries[rank] = { w.id, w.bits }; out.count = rank + 1; }
+  }
+}
+// tf_bf16_topk_tiles, verbatim: the distinct tiles of `picked`'s rows.
+inline void tf_topk_fold_tiles(const device Row* picked, const device uint* ids, device uint* list, device uint* map,
+                               constant TileParams& p, uint lane, threadgroup atomic_uint* marks, threadgroup uint* order,
+                               threadgroup uint* found) {
+  const uint words = (p.tiles + 31) / 32;
+  for (uint i = lane; i < words; i += TF_TOPK_LANES) atomic_store_explicit(&marks[i], i == 0 ? 1u : 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = lane; i < p.rows * TF_TOPK_MAX_K; i += TF_TOPK_LANES) {
+    const device Row& r = picked[i / TF_TOPK_MAX_K];
+    const uint at = i % TF_TOPK_MAX_K, tile = r.entries[at].token / 32;
+    if (at < r.count && tile < p.tiles) atomic_fetch_or_explicit(&marks[tile / 32], 1u << (tile % 32), memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) {
+    uint n = 0;
+    for (uint i = 0; i < words; i++)
+      for (uint m = atomic_load_explicit(&marks[i], memory_order_relaxed); m != 0 && n < p.slots; m &= m - 1) order[n++] = 32 * i + ctz(m);
+    found[0] = n;
+    list[0] = n;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n = found[0];
+  for (uint j = lane; j < n; j += TF_TOPK_LANES) list[1 + j] = order[j];
+  for (uint at = lane; at < p.slots * 32; at += TF_TOPK_LANES) map[at] = at / 32 < n ? ids[32 * order[at / 32] + at % 32] : 0u;
+}
+// One arrival on `word` past a device-scope fence (every thread here): whether it was the `of`th, which leaves it zero.
+inline bool tf_topk_fold_last(device atomic_uint* word, uint of, uint lane, threadgroup uint* last) {
+  threadgroup_barrier(mem_flags::mem_device);
+  if (lane == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const bool done = atomic_fetch_add_explicit(word, 1u, memory_order_relaxed) == of - 1;
+    if (done) {
+      atomic_store_explicit(word, 0u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    last[0] = done ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return last[0] != 0u;
+}
+kernel void tf_bf16_topk_wide_tiles(const device ushort* logits [[buffer(0)]], device Row* part [[buffer(1)]],
+                                    constant Params& p [[buffer(2)]], device Row* output [[buffer(3)]],
+                                    device atomic_uint* counts [[buffer(4)]], const device uint* ids [[buffer(5)]],
+                                    device uint* list [[buffer(6)]], device uint* map [[buffer(7)]],
+                                    constant TileParams& tp [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint sl [[thread_index_in_simdgroup]]) {
+  threadgroup uint masks[TF_TOPK_LANES];
+  threadgroup uint list_key[TF_TOPK_GROUPS][TF_TOPK_MAX_K], list_id[TF_TOPK_GROUPS][TF_TOPK_MAX_K], list_bits[TF_TOPK_GROUPS][TF_TOPK_MAX_K];
+  const ulong width = (ulong(p.vocab) + TF_TOPK_WIDE_SPANS - 1) / TF_TOPK_WIDE_SPANS;
+  const ulong begin = min(ulong(tg.x) * width, ulong(p.vocab)), end = min(begin + width, ulong(p.vocab));
+  const device ushort* row = logits + ulong(tg.y) * p.stride;
+  device Row& out = part[tg.y * TF_TOPK_WIDE_SPANS + tg.x];
+  threadgroup atomic_uint marks[TF_TOPK_TILE_WORDS];
+  threadgroup uint order[TF_TOPK_TILE_SLOTS];
+  threadgroup uint found[1], last[1];
+  tf_topk_fold_span(row, out, begin, end, p, lane, sg, sl, masks, list_key, list_id, list_bits);
+  if (!tf_topk_fold_last(counts + 1 + tg.y, TF_TOPK_WIDE_SPANS, lane, last)) return;
+  tf_topk_fold_merge(part + tg.y * TF_TOPK_WIDE_SPANS, output[tg.y], p, lane, sg, sl, masks, list_key, list_id, list_bits);
+  if (!tf_topk_fold_last(counts, p.rows, lane, last)) return;
+  tf_topk_fold_tiles(output, ids, list, map, tp, lane, marks, order, found);
+}
+#endif

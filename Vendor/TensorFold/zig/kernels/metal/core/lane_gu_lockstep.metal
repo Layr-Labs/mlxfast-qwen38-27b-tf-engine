@@ -31,15 +31,26 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
   const device uint4* gp=gw+(size_t)first*TF_TB*64;
   const device uint4* up=uw+(size_t)first*TF_TB*64;
   uint4 nw0=gp[0],nw1=gp[32];
+  // team-m5-08a: the index, row-sum and input-row addresses step by a fixed amount a group from the split's first
+  // group (gq, uq, xp, xv), as gp and up already do, instead of being rebuilt from g with 64-bit multiplies each turn:
+  // gq is gi[min(g + 1, last - 1) * (TF_N / 8)] (held at the split's last group, as min held it), uq is
+  // ui[g * (TF_N / 8)], xp is XS + g * stride + mb and xv is X + g * 64 (TF_N / 4 and + 4 on the uint2 path). Every
+  // load reads the word it read before, in the same turn, and no arithmetic on any word changes.
 #if defined(TF_SBI12)
-  uint3 ni=gi[(size_t)first*(TF_N/8)];
+  const device packed_uint3* gq=gi+(size_t)first*(TF_N/8);
+  const device packed_uint3* uq=ui+(size_t)first*(TF_N/8);
+  uint3 ni=gq[0];
 #else
-  uint2 ni0=gi[(size_t)first*(TF_N/4)],ni1=gi[(size_t)first*(TF_N/4)+4];
+  const device uint2* gq=gi+(size_t)first*(TF_N/4);
+  const device uint2* uq=ui+(size_t)first*(TF_N/4);
+  uint2 ni0=gq[0],ni1=gq[4];
 #endif
+  const device float* xp=XS+first*stride+mb;
+  const device bfloat* xv=X+(size_t)first*64;
   for(int g=first;g<last;g++){
-   const float x0=XS[g*stride+mb];
+   const float x0=xp[0];xp+=stride;
    const array<int32_t,2> xstr={1,TF_K};
-   tensor<device bfloat,dextents<int32_t,2>,tensor_inline> x((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(64,M),xstr);
+   tensor<device bfloat,dextents<int32_t,2>,tensor_inline> x((device bfloat*)xv,dextents<int32_t,2>(64,M),xstr);xv+=64;
    #pragma clang loop unroll(full)
    for(int turn=0;turn<2;turn++){
 #if defined(TF_SBI12)
@@ -55,17 +66,16 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
     if(turn==0){
      nw0=up[0];nw1=up[32];
 #if defined(TF_SBI12)
-     ni=ui[(size_t)g*(TF_N/8)];
+     ni=uq[0];uq+=TF_N/8;
 #else
-     ni0=ui[(size_t)g*(TF_N/4)];ni1=ui[(size_t)g*(TF_N/4)+4];
+     ni0=uq[0];ni1=uq[4];uq+=TF_N/4;
 #endif
     }else{
      const int advance=g+1<last?TF_TB*64:0;gp+=advance;up+=advance;nw0=gp[0];nw1=gp[32];
-     const int next=min(g+1,last-1);
 #if defined(TF_SBI12)
-     ni=gi[(size_t)next*(TF_N/8)];
+     gq+=g+1<last?TF_N/8:0;ni=gq[0];
 #else
-     ni0=gi[(size_t)next*(TF_N/4)];ni1=gi[(size_t)next*(TF_N/4)+4];
+     gq+=g+1<last?TF_N/4:0;ni0=gq[0];ni1=gq[4];
 #endif
     }
     op.run(x,cb,P);

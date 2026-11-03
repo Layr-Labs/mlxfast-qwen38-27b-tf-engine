@@ -205,6 +205,47 @@ fn preprocessGroups(g: planning.Geometry) u32 {
 }
 /// Fallback prompt kernel threads per group; the M5 tensor kernel uses four simdgroups.
 const prompt_threads = 256;
+/// The star fold's library text starts with this (attention_mpp.metal's Q27_STAR_FOLD section).
+pub const star_source_define = "#define Q27_STAR_FOLD 1\n";
+/// The merge fold's arrival words: a (kv head, node) of at most 8 rows.
+const star_word_count = 4 * 8;
+/// starMatches' fill for words no side should leave unwritten (a bf16 NaN).
+const star_nan: u16 = 0x7fc1;
+/// One side of starMatches: its own scratch and binding, and its caches and outputs (keys, values, query, rotated key,
+/// both norms, attention output, group sums).
+const StarSide = struct {
+    scratch: Scratch,
+    binding: Binding,
+    buffers: [8]mtl.Buffer,
+    fn init(device: mtl.Device, limits: Limits, words: [8]usize) !StarSide {
+        var scratch = try Scratch.init(device, limits);
+        errdefer scratch.deinit();
+        var binding = try Binding.init(device, limits);
+        errdefer binding.deinit();
+        var buffers: [8]mtl.Buffer = undefined;
+        var made: usize = 0;
+        errdefer for (buffers[0..made]) |b| b.deinit();
+        for (&buffers, words) |*b, n| {
+            b.* = try device.buffer(2 * n, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            made += 1;
+        }
+        return .{ .scratch = scratch, .binding = binding, .buffers = buffers };
+    }
+    fn deinit(s: *StarSide) void {
+        s.scratch.deinit();
+        s.binding.deinit();
+        for (s.buffers) |b| b.deinit();
+    }
+};
+/// starMatches' inputs: bf16 values in [-2, 2), or gains in [0.5, 1.5), from a fixed LCG.
+fn starFill(words: []u16, state: *u32, gain: bool) void {
+    for (words) |*w| {
+        state.* = state.* *% 1664525 +% 1013904223;
+        const unit: f32 = @as(f32, @floatFromInt(state.* >> 8)) / @as(f32, 1 << 24);
+        const f: f32 = if (gain) 0.5 + unit else (unit - 0.5) * 4.0;
+        w.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+    }
+}
 /// h_end and w_end above 0: an M-RoPE round, the h and w position planes `plane` rows past each other in `positions`.
 /// key_stride: values from one key row to the next (0: kv_heads * dim); strided keys take the fused norm and rope alone.
 /// packed_rows above 0: `query` is the scratch's qa, filled for a one-stream prompt plan of that many packed rows as
@@ -224,9 +265,25 @@ pub const Attention = struct {
     split_tail: ?mtl.Pipeline = null,
     prefix_quarter: ?mtl.Pipeline = null,
     /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
-    /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
-    /// left zero by its last waiter.
+    /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals, [6..8) a
+    /// star's preprocess count and its split tail's arrivals (team-m5-06); each pair is left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
+    /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
+    warm: ?Warm = null,
+    /// team-m5-06's fold library (buildStar), for a decoded depth-one star (one stream, at most 8 rows, one tail chunk):
+    /// the one-pass preprocess that also writes the split tail's query rows and counts itself for it
+    /// (q27_head_norm_rope_star), and the split tail behind that count with the merge in each (kv head, node)'s last
+    /// arriving group (q27_attn_tail_split_merge). Null: the barriers and the merge launch.
+    star_pre: ?mtl.Pipeline = null,
+    star_tail: ?mtl.Pipeline = null,
+    /// The merge fold's arrival words, one a (kv head, node), each left zero by its last arriver.
+    star_words: ?mtl.Buffer = null,
+    /// The halves the load-time check kept (starMatches): the star's preprocess in the prefix's barrier interval, and the
+    /// merge in the split tail's last arriver.
+    star_append: bool = false,
+    star_fold: bool = false,
+    pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -259,6 +316,153 @@ pub const Attention = struct {
         if (a.split_tail) |pipe| pipe.deinit();
         if (a.prefix_quarter) |pipe| pipe.deinit();
         if (a.chain_words) |b| b.deinit();
+        a.dropStar();
+    }
+    /// team-m5-06's fold library: the glue and attention_mpp sources behind Q27_STAR_FOLD, compiled on their own, so an
+    /// error there drops only the fold and the library `init` took stays the one the target runs. Both halves start kept;
+    /// the caller's starMatches decides.
+    pub fn buildStar(a: *Attention, device: mtl.Device) !void {
+        if (!a.units or a.split_tail == null or a.chain_words == null) return error.StarFoldUnavailable;
+        const source = @import("qwen_runtime_sources");
+        const library = try mtl.Library.fromSource(device, star_source_define ++ source.glue ++ source.attention_mpp, mtl.CompileOptions.mlx());
+        defer library.deinit();
+        const pre = try mtl.Pipeline.init(device, library, "q27_head_norm_rope_star", false);
+        errdefer pre.deinit();
+        const tail = try mtl.Pipeline.init(device, library, "q27_attn_tail_split_merge", false);
+        errdefer tail.deinit();
+        if (pre.maxThreads() < 128 or tail.maxThreads() < 128) return error.StarFoldThreads;
+        const words = try device.buffer(star_word_count * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        @memset(words.contents()[0 .. star_word_count * 4], 0);
+        a.dropStar();
+        a.star_pre = pre;
+        a.star_tail = tail;
+        a.star_words = words;
+        a.star_append = true;
+        a.star_fold = true;
+    }
+    pub fn dropStar(a: *Attention) void {
+        if (a.star_pre) |pipe| pipe.deinit();
+        if (a.star_tail) |pipe| pipe.deinit();
+        if (a.star_words) |b| b.deinit();
+        a.star_pre = null;
+        a.star_tail = null;
+        a.star_words = null;
+        a.star_append = false;
+        a.star_fold = false;
+    }
+    /// Whether decoded rows of `plan` take the star's preprocess (Preprocess.decoded and `encode`'s `appended` on an
+    /// unfused plan): the fold built and its preprocess kept, one stream of at most 8 rows behind a prefix, and the split
+    /// tail on one tail chunk (a round whose rows cross a tail chunk keeps the barriers).
+    pub fn starAppends(a: *const Attention, plan: Plan) bool {
+        return a.star_append and a.starSplit(plan) and plan.prefix_chunks > 0;
+    }
+    /// Whether `plan`'s split tail takes the fold's kernel: an unfused one-stream plan of at most 8 rows on one tail chunk.
+    fn starSplit(a: *const Attention, plan: Plan) bool {
+        return a.star_pre != null and a.star_tail != null and a.star_words != null and a.chain_words != null and a.split_tail != null and !plan.fused and plan.streams == 1 and plan.rows <= 8 and plan.tail_chunks == 1;
+    }
+    /// team-m5-06's load-time check of the fold as its two flags stand: an 8-row depth-one star (start 300: two 128-key
+    /// prefix chunks, one tail chunk) runs through the barriers and the merge launch, then through the fold, each side on
+    /// its own scratch, binding and caches, on one concurrent encoder over the same inputs. True when both sides' query
+    /// and key rows, attention output, group sums and caches (the round's rows over a NaN fill) match bit for bit, the
+    /// barrier side wrote every output word, and every count word is back at zero.
+    pub fn starMatches(a: *Attention, gpa: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, geometry: planning.Geometry, eps: f32, theta: f64) !bool {
+        if (a.star_pre == null or a.star_tail == null or a.star_words == null or a.chain_words == null) return error.StarFoldUnavailable;
+        // the chain's words and the fold's start and end zero, so a side that left one counted cannot reach a verify
+        @memset(a.chain_words.?.contents()[0..32], 0);
+        @memset(a.star_words.?.contents()[0 .. star_word_count * 4], 0);
+        defer {
+            @memset(a.chain_words.?.contents()[0..32], 0);
+            @memset(a.star_words.?.contents()[0 .. star_word_count * 4], 0);
+        }
+        const rows: u32 = 8;
+        const start: u32 = 300;
+        const capacity: u32 = 320;
+        const parents = [_]i32{ -1, 0, 0, 0, 0, 0, 0, 0 };
+        var plan = try Plan.init(gpa, &.{.{ .parents = &parents, .start = start, .capacity = capacity }}, geometry);
+        defer plan.deinit();
+        if (!a.starSplit(plan) or plan.prefix_chunks == 0) return error.StarCheckPlan;
+        const g = plan.geometry;
+        const limits = Limits{ .rows = rows, .streams = 1, .keys = capacity, .shared_prefix = geometry.shared_prefix, .geometry = geometry };
+        const kv = g.kv_heads * g.dim;
+        const q_words = rows * g.heads * g.dim;
+        // each side's keys, values, query, rotated key, both norms, output and group sums (stride `rows`)
+        const words = [8]usize{ @as(usize, capacity) * kv, @as(usize, capacity) * kv, q_words, rows * kv, q_words, rows * kv, q_words, 2 * (g.heads * g.dim / 64) * rows };
+        const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+        const qg = try device.buffer(2 * q_words * 2, options);
+        defer qg.deinit();
+        const mixed = try device.buffer(rows * 2 * kv * 2, options);
+        defer mixed.deinit();
+        const gains = try device.buffer(2 * g.dim * 2, options);
+        defer gains.deinit();
+        const positions = try device.buffer(rows * 4, options);
+        defer positions.deinit();
+        const counter = try device.buffer(8, options); // the counted projections' words: a wait of 0 never reads them
+        defer counter.deinit();
+        var state: u32 = 0x9e3779b9;
+        starFill(qg.slice(u16, 2 * q_words), &state, false);
+        starFill(mixed.slice(u16, rows * 2 * kv), &state, false);
+        starFill(gains.slice(u16, 2 * g.dim), &state, true);
+        @memcpy(positions.slice(i32, rows), plan.positions[0..rows]);
+        @memset(counter.contents()[0..8], 0);
+        var cache_fill: [2][]u16 = undefined;
+        var sides: [2]StarSide = undefined;
+        var made: usize = 0;
+        defer for (sides[0..made]) |*side| side.deinit();
+        for (&sides) |*side| {
+            side.* = try StarSide.init(device, limits, words);
+            made += 1;
+        }
+        for (&cache_fill, 0..) |*fill, i| fill.* = sides[0].buffers[i].slice(u16, words[i]);
+        for (cache_fill) |fill| starFill(fill, &state, false);
+        // the round's own rows start as NaN: an append that does not land shows
+        for (cache_fill) |fill| for (0..g.kv_heads) |head| @memset(fill[(head * capacity + start) * g.dim ..][0 .. rows * g.dim], star_nan);
+        for (2..7) |i| @memset(sides[0].buffers[i].slice(u16, words[i]), star_nan);
+        @memset(sides[0].buffers[7].slice(u32, words[7] / 2), 0x7fc00001);
+        for (0..8) |i| @memcpy(sides[1].buffers[i].contents()[0 .. 2 * words[i]], sides[0].buffers[i].contents()[0 .. 2 * words[i]]);
+        const kept = [2]bool{ a.star_append, a.star_fold };
+        defer {
+            a.star_append = kept[0];
+            a.star_fold = kept[1];
+        }
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        for (&sides, 0..) |*side, i| {
+            a.star_append = i == 1 and kept[0];
+            a.star_fold = i == 1 and kept[1];
+            const caches = [_]Cache{.{ .keys = .{ .buffer = side.buffers[0] }, .values = .{ .buffer = side.buffers[1] }, .capacity = capacity }};
+            side.scratch.upload(plan) catch |err| {
+                e.end();
+                return err;
+            };
+            side.binding.upload(plan, &caches) catch |err| {
+                e.end();
+                return err;
+            };
+            const appended = a.starAppends(plan);
+            const value = Ref{ .buffer = mixed, .offset = kv * 2 };
+            const query = Ref{ .buffer = side.buffers[2] };
+            const rotated = Ref{ .buffer = side.buffers[3] };
+            const decoded: ?Decoded = if (appended) .{ .scratch = &side.scratch, .binding = &side.binding, .plan = &plan, .caches = &caches, .value = value, .v_stride = 2 * kv } else null;
+            a.preprocess(e, .{ .qg = .{ .buffer = qg }, .key = .{ .buffer = mixed }, .key_stride = 2 * kv, .q_gain = .{ .buffer = gains }, .k_gain = .{ .buffer = gains, .offset = g.dim * 2 }, .norm_q = .{ .buffer = side.buffers[4] }, .norm_k = .{ .buffer = side.buffers[5] }, .query = query, .rotated_key = rotated, .positions = .{ .buffer = positions }, .rows = rows, .eps = eps, .theta = theta, .plane = rows, .geometry = geometry, .after = if (appended) .{ .counter = counter, .wait = 0 } else null, .decoded = decoded }) catch |err| {
+                e.end();
+                return err;
+            };
+            a.encode(e, &side.scratch, &side.binding, plan, query, rotated, value, 2 * kv, .{ .buffer = side.buffers[6] }, &caches, .{ .buffer = qg }, false, false, .{ .ref = .{ .buffer = side.buffers[7] }, .stride = rows }, appended) catch |err| {
+                e.end();
+                return err;
+            };
+        }
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure() != null) return false;
+        // the barrier side's every output word was written: its query and key rows, output and sums hold no NaN fill
+        for ([_]usize{ 2, 3, 6 }) |i| if (std.mem.indexOfScalar(u16, sides[0].buffers[i].slice(u16, words[i]), star_nan) != null) return error.StarCheckUnwritten;
+        if (std.mem.indexOfScalar(u32, sides[0].buffers[7].slice(u32, words[7] / 2), 0x7fc00001) != null) return error.StarCheckUnwritten;
+        for (0..8) |i| if (!std.mem.eql(u8, sides[0].buffers[i].contents()[0 .. 2 * words[i]], sides[1].buffers[i].contents()[0 .. 2 * words[i]])) return false;
+        for (a.chain_words.?.slice(u32, 8)) |w| if (w != 0) return false;
+        for (a.star_words.?.slice(u32, star_word_count)) |w| if (w != 0) return false;
+        return true;
     }
     /// The prompt kernel and its merge; before M5 null without them or without `prompt_threads` a group.
     fn promptPipelines(device: mtl.Device, library: mtl.Library, units: bool) !?[2]mtl.Pipeline {
@@ -310,7 +514,9 @@ pub const Attention = struct {
         if (rows4) if (p.decoded) |d| {
             const words = a.chain_words orelse return error.TargetAttentionShape;
             const w = p.after orelse return error.TargetAttentionShape;
-            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or !d.plan.fused or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            // a depth-one star (team-m5-06's fold) also writes the split tail's query rows and counts itself for that tail
+            const star = !d.plan.fused;
+            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or (star and !a.starAppends(d.plan.*)) or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
             if (d.v_stride < g.kv_heads * g.dim) return error.TargetAttentionShape;
             try d.scratch.check(d.plan.*);
             try d.binding.check(d.plan.*, d.caches);
@@ -320,7 +526,7 @@ pub const Attention = struct {
                 e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
                 e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
             }
-            e.setPipeline(a.io[14]);
+            e.setPipeline(if (star) a.star_pre.? else a.io[14]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
             e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = d.plan.tiles * 16 }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
@@ -335,8 +541,12 @@ pub const Attention = struct {
             e.setValue(d.v_stride, 15);
             e.setBuffer(words, 16, 16);
             e.setValue(@as(u32, 1), 17);
+            if (star) {
+                bindAt(e, d.scratch.get(.qb), 18);
+                e.setBuffer(words, 24, 19); // the split tail's wait (treeRows), words 6 and 7
+            }
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
-            // no barrier: the prefix waits on this launch's count (encode with `appended`)
+            // no barrier: the prefix (and a star's split tail) waits on this launch's count (encode with `appended`)
             return timing.end();
         };
         if (rows4) {
@@ -395,7 +605,7 @@ pub const Attention = struct {
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
         const kv_bytes = @as(usize, plan.rows) * g.kv_heads * g.dim * 2;
         if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt))) return error.TargetAttentionShape;
-        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !plan.fused or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
+        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !(plan.fused or a.starAppends(plan)) or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
         const v_bytes = (@as(usize, plan.rows) - 1) * v_stride * 2 + g.kv_heads * g.dim * 2;
         var timing = profile.begin(a.profiler, input_encoder, .attention);
         errdefer timing.cancel();
@@ -491,7 +701,8 @@ pub const Attention = struct {
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.
     fn treeRows(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, plan: Plan, q: Ref, out: Ref, raw_gate: ?Ref, args: PackArgs, sums: ?Sums, appended: bool) !void {
         const g = plan.geometry;
-        if (!plan.fused) {
+        // a star's appended preprocess (team-m5-06) already wrote the split tail's query rows where pack_b copies them
+        if (!plan.fused and !appended) {
             e.setPipeline(a.io[1]);
             bind(e, .{ q, scratch.get(.qb) });
             e.setValue(args, 2);
@@ -510,6 +721,11 @@ pub const Attention = struct {
         const chain = if (plan.prefix_chunks > 0 and plan.rows <= 8 and (plan.fused or split)) a.chain_words else null;
         const words = chain orelse scratch.get(.nodes).buffer; // never read or written without the chain
         const tail_groups = g.kv_heads * 2 * plan.tail_chunks * plan.rows;
+        // team-m5-06: a one-stream split tail takes the fold's kernel, behind a star preprocess's count when appended (chain
+        // words 6 and 7) and, with star_fold kept, with the merge in each (kv head, node)'s last arriving group, so no
+        // merge launch follows
+        const star_tail = split and a.starSplit(plan) and (appended or a.star_fold);
+        const fold = star_tail and a.star_fold;
         var prefix_groups: u32 = 0;
         if (plan.prefix_chunks > 0) {
             // a pair a tile: a long cache reads each chunk once for six tiles; a short one (under 16 chunks) has too few
@@ -533,10 +749,11 @@ pub const Attention = struct {
             e.setBuffer(words, 16, 11);
             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
             e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
+            if (a.warm) |w| try w.encode(w.ptr, e);
             if (chain == null) e.barrier();
         }
         if (!plan.fused) {
-            e.setPipeline(if (split) a.split_tail.? else a.io[3]);
+            e.setPipeline(if (star_tail) a.star_tail.? else if (split) a.split_tail.? else a.io[3]);
             bind(e, .{ scratch.get(.qb), binding.get(.caches) });
             e.setValue(scale, 2);
             e.setBuffer(binding.get(.meta).buffer, 0, 3);
@@ -550,8 +767,23 @@ pub const Attention = struct {
                 e.setBuffer(words, 8, 14);
                 e.setValue(@as(u32, @intFromBool(chain != null)), 15);
             }
+            if (star_tail) {
+                e.setBuffer(words, 24, 16);
+                e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 17);
+                e.setBuffer(a.star_words.?, 0, 18);
+                e.setValue(@as(u32, @intFromBool(fold)), 19);
+                bindAt(e, out, 20);
+                bindAt(e, raw_gate orelse out, 21);
+                e.setValue(@as(u32, @intFromBool(raw_gate != null)), 22);
+                bindAt(e, if (sums) |s| s.ref else out, 23);
+                e.setValue(@as(u32, if (sums) |s| s.stride else 0), 24);
+            }
             e.dispatchGroups(mtl.Size.of(g.kv_heads * @as(u32, if (split) 2 else 1), plan.tail_chunks, plan.rows), mtl.Size.of(128, 1, 1));
-            if (chain == null) e.barrier();
+            if (chain == null and !fold) e.barrier();
+        }
+        if (fold) {
+            e.barrier();
+            return;
         }
         e.setPipeline(a.io[4]);
         bind(e, .{ scratch.get(.poa), scratch.get(.pma), scratch.get(.pla), scratch.get(.pob), scratch.get(.pmb), scratch.get(.plb), binding.get(.meta), scratch.get(.nodes), out, raw_gate orelse out });
