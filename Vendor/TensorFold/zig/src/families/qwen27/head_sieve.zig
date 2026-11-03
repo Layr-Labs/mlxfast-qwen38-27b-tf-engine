@@ -192,6 +192,9 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_list, 3);
         e.setBuffer(s.scratch, s.o_args, 4);
         e.setBuffer(s.scratch, s.o_bk, 5);
+        // `sums_stride` covers padded(rows) = 16 rows a group, and the scan indexes XQ by mb in [0, 8): rows
+        // 8-15 of every group are written here and read by no kernel. Bounding this grid is a layout change
+        // (both the writer and the scan's 16-word step), worth ~2 of 5 threadgroups a sieved round.
         e.dispatchThreads(mtl.Size.of(@max(@as(usize, s.groups) * sums_stride, @as(usize, s.blocks) * rows_max), 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
         // 2: every tile's best a + k s and best a, a row each, through the 2-bit copy. The 8-row scan is used once it
