@@ -37,20 +37,13 @@ pub const Generation = struct {
     runner: *Runner,
     draft: *Draft,
     kept: mtl.Buffer,
+    /// Row ids 0..n for a whole prompt pass's tap gather into the drafter's ring (absorbChunk), made on first use.
+    kept_all: ?mtl.Buffer = null,
     taps: mtl.Buffer,
     proposer: ?Proposer = null,
     matcher: @import("round_gpu.zig").Matcher,
     commit: @import("core").tree_commit_gpu.Ops,
     keep: ?mtl.CommandBuffer = null, // the last round's cache and state commit, running behind the drafter
-    /// Signalled behind each keep's last command (keep_signal: the pending keep's value, 0 if it signals none): a verify's
-    /// settle sees the keep's work done tens of microseconds before its completion is reported, which comes only behind
-    /// the drafter frame's, committed before it (settleKeep).
-    keep_event: ?mtl.SharedEvent = null,
-    keep_value: u64 = 0,
-    keep_signal: u64 = 0,
-    /// A keep whose work settleKeep saw done before its completion was reported: checked once the verify behind it ran,
-    /// before that verify's result is read (checkKeep).
-    keep_done: ?mtl.CommandBuffer = null,
     picked: ?@import("core").segments.Fence = null, // updated behind a verify's picks; its keep waits on it
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
@@ -79,48 +72,53 @@ pub const Generation = struct {
     pub fn deinit(g: Generation) void {
         // an early frame waits on the picks' fence and reads the matcher's result: it ends before they go
         g.draft.drainNext() catch {};
-        if (g.keep_done) |cb| {
-            cb.wait();
-            cb.release();
-        }
         if (g.keep) |cb| {
             cb.wait();
             cb.release();
         }
-        if (g.keep_event) |ev| ev.deinit();
         g.commit.deinit();
         if (g.picked) |f| f.deinit();
         g.matcher.deinit();
         g.kept.deinit();
+        if (g.kept_all) |b| b.deinit();
         g.taps.deinit();
     }
     fn absorb(g: *Generation, path: []const u32) !void {
         try g.absorbRows(path);
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
     }
-    /// A prompt pass's taps go straight into the drafter's ring at its next slots (Taps.into) when the pass's rows fit
-    /// there without wrapping: the ring then holds the words the tap gather would copy, with no gather after the pass.
-    fn tapsInto(g: *Generation, rows: usize) bool {
-        const r = g.draft.ring();
-        const slot: usize = @intCast(r.end.* % r.window);
-        if (g.keep != null or !g.runner.capture_taps or rows > g.runner.taps.capacity or rows > r.window - slot) return false;
-        g.runner.taps.into = .{ .buffer = r.buf, .offset = slot * r.stride, .stride = r.stride };
-        return true;
-    }
-    /// A prompt pass's rows into the drafter: `direct`, its taps already stand in the ring's next slots (tapsInto); else
-    /// gathered 128 rows a call (its frame's), as the target's pass may be longer.
-    fn absorbChunk(g: *Generation, rows: usize, direct: bool) !void {
-        if (direct) {
-            const t = &g.runner.taps;
-            try t.complete();
-            if (t.rows != rows) return error.BadTapGather;
-            t.begin(); // the planes hold none of this pass's rows: nothing gathers them
-            g.draft.ring().end.* += rows;
-            if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
-            return;
-        }
+    /// A prompt pass's rows into the drafter, 128 a call (its frame's); the target's pass may be longer.
+    fn absorbChunk(g: *Generation, rows: usize) !void {
         var path: [128]u32 = undefined;
         var first: usize = 0;
+        // The whole pass in one gather, written straight into the drafter's ring at its slots when they do not wrap.
+        {
+            const r = g.draft.ring();
+            const slot: usize = @intCast(r.end.* % r.window);
+            if (g.keep == null and rows <= g.runner.taps.rows and rows <= r.window - slot) {
+                if (g.kept_all == null) g.kept_all = try g.runner.model.device.buffer(@as(usize, g.runner.taps.capacity) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+                const ids = g.kept_all.?.slice(u32, rows);
+                for (ids, 0..) |*index, i| index.* = @intCast(i);
+                const cb = g.runner.model.queue.commandBuffer();
+                const e = cb.compute(.serial);
+                g.runner.taps.accepted(g.runner.model.glue, e, ids, .{ .buffer = g.kept_all.? }, .{ .buffer = r.buf, .offset = slot * r.stride }) catch |err| {
+                    e.end();
+                    cb.commit();
+                    cb.wait();
+                    return err;
+                };
+                e.end();
+                cb.commit();
+                while (true) switch (cb.status()) {
+                    .completed, .@"error" => break,
+                    else => std.atomic.spinLoopHint(),
+                };
+                if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
+                r.end.* += rows;
+                if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
+                return;
+            }
+        }
         while (first < rows) : (first += path.len) {
             const n = @min(path.len, rows - first);
             for (path[0..n], 0..) |*index, i| index.* = @intCast(first + i);
@@ -150,20 +148,16 @@ pub const Generation = struct {
         g.pending = null;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
-        const direct = g.tapsInto(ids.len);
-        defer g.runner.taps.into = null;
         try (TargetSession.Session{ .runner = g.runner }).promptChunk(ids, last);
-        try g.absorbChunk(ids.len, direct);
+        try g.absorbChunk(ids.len);
     }
     /// `promptChunk` with decoded rows' arithmetic (an earlier reply's tokens).
     pub fn decodeChunk(g: *Generation, ids: []const u32, last: bool) !void {
         g.pending = null;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
-        const direct = g.tapsInto(ids.len);
-        defer g.runner.taps.into = null;
         try (TargetSession.Session{ .runner = g.runner }).decodeChunk(ids, last);
-        try g.absorbChunk(ids.len, direct);
+        try g.absorbChunk(ids.len);
     }
     pub fn prefill(g: *Generation, ids: []const u32, chunk: usize) !void {
         g.pending = null;
@@ -187,23 +181,6 @@ pub const Generation = struct {
     }
     /// A round's keep runs behind the drafter; it ends before the next verify's GPU work and before a run returns.
     fn finishKeep(g: *Generation) !void {
-        const done = g.checkKeep();
-        try g.finishPending();
-        return done;
-    }
-    /// The keep settleKeep saw done on the GPU: its completion has been reported by now (a verify ran behind it), and it
-    /// is checked as finishKeep checks a keep.
-    fn checkKeep(g: *Generation) !void {
-        const cb = g.keep_done orelse return;
-        g.keep_done = null;
-        defer cb.release();
-        cb.wait();
-        if (gpuFailed(cb, "a draft round's keep")) {
-            g.runner.failed = true;
-            return error.DraftKeepGpuFailure;
-        }
-    }
-    fn finishPending(g: *Generation) !void {
         const cb = g.keep orelse return;
         g.keep = null;
         defer cb.release();
@@ -213,7 +190,6 @@ pub const Generation = struct {
             .completed, .@"error" => break,
             else => std.atomic.spinLoopHint(),
         };
-        cb.wait();
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
@@ -275,14 +251,6 @@ pub const Generation = struct {
             try g.runner.keepDevice(p.round, k, g.commit, result);
             k.end();
             kept = true;
-            // its event behind its last command, for the next verify's settle (settleKeep)
-            if (g.keep_event == null) g.keep_event = g.runner.model.device.sharedEvent() catch null;
-            g.keep_signal = 0;
-            if (g.keep_event) |ev| {
-                g.keep_value += 1;
-                keep_cb.signal(ev, g.keep_value);
-                g.keep_signal = g.keep_value;
-            }
             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
             if (p.early) {
@@ -318,22 +286,10 @@ pub const Generation = struct {
             try g.commit.select(e, .{ .buf = g.matcher.buffers[4] }, .{ .buf = blocks.buf, .off = blocks.off }, .{ .rows = shape.rows, .words = RoundArgs.words, .blocks = RoundArgs.blocks - 1, .token = RoundArgs.token_word, .status = RoundArgs.status_word, .fallback = g.draft.graph.config.mask });
         }
     };
-    /// A keep left pending (runRound), waited for right before the next verify's first GPU work (Runner.settle): once its
-    /// event is seen the GPU ran its last command, and its buffer is checked once the verify ran (checkKeep), as its
-    /// completion is reported only behind the frame's. One already reported, or that signals nothing, is checked now.
+    /// A keep left pending (runRound), waited for right before the next verify's first GPU work (Runner.settle).
     fn settleKeep(ptr: *anyopaque) anyerror!void {
         const g: *Generation = @ptrCast(@alignCast(ptr));
-        const cb = g.keep orelse return;
-        const ev = g.keep_event orelse return g.finishKeep();
-        if (g.keep_signal == 0) return g.finishKeep();
-        while (ev.value() < g.keep_signal and cb.status() != .@"error") std.atomic.spinLoopHint();
-        switch (cb.status()) {
-            .completed, .@"error" => return g.finishKeep(),
-            else => {},
-        }
-        try g.checkKeep();
-        g.keep = null;
-        g.keep_done = cb;
+        try g.finishKeep();
     }
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once. `early`:
     /// the kept taps go to the drafter's ring, and the next round's frame is committed behind the verify, the keep once
@@ -361,8 +317,6 @@ pub const Generation = struct {
         try g.runner.verifyHead(round, .all);
         picks.release();
         errdefer g.runner.failed = true;
-        // the last round's keep, seen done at this verify's settle, is checked before the verify's result is read
-        try g.checkKeep();
         try g.runner.taps.complete();
         const shape = picks.shape orelse return error.DraftKeepGpuFailure;
         if (g.keep == null) return error.DraftKeepGpuFailure;
@@ -423,10 +377,6 @@ pub const Generation = struct {
         offered_policy.nodes = offered;
         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
         if (g.proposer != null) try g.draft.drainNext();
-        // a tree drafted from the early frame waits for it: what waits on nothing it makes goes first (ahead)
-        if (g.proposer == null and g.draft.draftsNext(pending, offered_policy)) try g.ahead();
-        // a first command buffer made ahead that this round's verify did not take goes to the queue with its stop
-        errdefer @import("core").segments.flushFirst();
         var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.proposePolicy(pending, offered_policy);
         defer tree.deinit();
         try offered_policy.checkTree(tree.parents);
@@ -483,21 +433,6 @@ pub const Generation = struct {
             .accepted = @intCast(accepted.matched),
         });
         return .{ .tokens = tokens, .rounds = 1, .verified = ids.len, .matched = accepted.matched, .min_rows = @intCast(ids.len), .extended = @intCast(copied.len), .extension_landed = landed };
-    }
-    /// The host work of a round drafted from the early frame that waits on nothing the frame makes, done while the frame
-    /// runs: the last verify's command buffers checked (segments.checkUnchecked, else this verify's first host work),
-    /// and this verify's first command buffer and encoder made with the bridge's stop encoded first in it, as the
-    /// verify's lead would encode it (Frame.endBridge; the lead then finds the bridge stopped and encodes nothing).
-    fn ahead(g: *Generation) !void {
-        @import("core").segments.checkUnchecked() catch |err| {
-            g.runner.failed = true;
-            g.draft.drainNext() catch {};
-            g.finishKeep() catch {};
-            return err;
-        };
-        const pool = mtl.objc.Pool.push();
-        defer pool.pop();
-        @import("core").segments.prepareFirst(g.runner.model.queue, .concurrent, .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge });
     }
     fn runImpl(g: *Generation, count: usize, force_length: bool, nodes: usize, eos_override: ?[]const u32, already_delivered: bool) !Result {
         g.pending = null;

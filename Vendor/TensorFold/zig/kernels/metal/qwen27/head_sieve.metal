@@ -20,6 +20,7 @@ using namespace mpp::tensor_ops;
 #define TF_SBI12 1
 #define TF_SIEVE_KAPPA 6.0f
 #endif
+// the scan's tensor-op rows: 16, or 8 in head_sieve.zig's second library (its rows past 8 carry nothing)
 #ifndef TF_SIEVE_M
 #define TF_SIEVE_M 16
 #endif
