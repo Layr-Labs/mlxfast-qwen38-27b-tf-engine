@@ -36,6 +36,17 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     return true;
 }
 
+/// Returns once the GPU reached the end of `cb`, reading its status: a decoded round's small buffers land within
+/// microseconds of the work they gate, and a poll sees that rather than sleeping until the completion handler wakes this
+/// thread. A committed buffer reports `completed` only after the completion handler ran, so the status seen here is the
+/// one `waitUntilCompleted` would return on, and its resources are free to go. The caller keeps reading `failure()`.
+pub fn spin(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -342,7 +353,12 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
-        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
+        // a decoded round encodes its whole pass in less time than one of its layers runs (a couple of microseconds a
+        // layer against a third of a millisecond), so feeding its GPU every eight layers buys nothing: each extra commit
+        // costs a command buffer, a fence update and its wait in the next encoder, and leaves the GPU a fence bubble
+        // between the two buffers. It keeps its first layer's commit (the GPU starts on that mixer) and ends in one buffer.
+        const every: usize = if (early) commit_every else 0;
+        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, every, early) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
@@ -705,7 +721,8 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        // the replay writes a few rows' states behind work already in the queue: poll its completion, not its wake
+        spin(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -747,10 +764,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        spin(cb);
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
