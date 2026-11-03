@@ -938,9 +938,84 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 /// the GDN z columns that run beside the scan, MLP gate/up), one elsewhere. A two-tile launch runs its K splits as SIMD
 /// groups of one threadgroup, so the query+gate's prompt rows leave the serial split-K kernel for it.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
+    return promptTilesWithDownTn4(key, n, skip, promptDownTn4On());
+}
+
+/// The MLP down prompt projection can use the existing TN=4 reg-kernel branch when every SIMD group's four tiles stay
+/// inside one code batch. BENCH_WORKER_TF_Q27_PROMPT_TN4=0 restores the record's TN=2 launch for an A/B.
+fn promptTilesWithDownTn4(key: Key, n: u32, skip: u32, down_tn4_on: bool) usize {
     if (!key.prompt_sr or skip != 0 or key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
     // the launch's tiles in whole pairs: a range's first tile and length, or every tile
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
+    // Only the MLP down projection has the non-SwiGLU residual layout for this wider group. Keep every partial/ranged
+    // launch at its existing tile width, and require both the output tile count and the code batch to divide by four.
+    if (down_tn4_on and key.resid and n == 5120 and key.k == 17408 and key.slices == 2 and key.batch % 4 == 0 and
+        key.cut[1] == 0 and key.range[1] == 0 and (n / 32) % 4 == 0) return 4;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
+}
+
+var prompt_down_tn4_env: ?bool = null;
+fn promptDownTn4On() bool {
+    if (prompt_down_tn4_env) |on| return on;
+    const on = promptDownTn4Enabled(if (std.c.getenv("BENCH_WORKER_TF_Q27_PROMPT_TN4")) |v| std.mem.span(v) else null);
+    prompt_down_tn4_env = on;
+    return on;
+}
+
+fn promptDownTn4Enabled(value: ?[]const u8) bool {
+    return if (value) |v| !std.mem.eql(u8, v, "0") else true;
+}
+
+test "prompt MLP down TN4 is shape, prompt, alignment, and kill-switch gated" {
+    try std.testing.expect(promptDownTn4Enabled(null));
+    try std.testing.expect(!promptDownTn4Enabled("0"));
+    try std.testing.expect(promptDownTn4Enabled("1"));
+
+    const eligible = Key{
+        .kind = .projection,
+        .n = 5120,
+        .k = 17408,
+        .slices = 2,
+        .bits = 4,
+        .group = 64,
+        .lean = true,
+        .batch = 8,
+        .prompt_sr = true,
+        .resid = true,
+    };
+    try std.testing.expectEqual(@as(usize, 4), promptTilesWithDownTn4(eligible, 5120, 0, true));
+    try std.testing.expectEqual(@as(usize, 2), promptTilesWithDownTn4(eligible, 5120, 0, false));
+
+    inline for (.{
+        .{ "n", @as(u32, 34816) },
+        .{ "k", @as(u32, 6144) },
+        .{ "slices", @as(u32, 1) },
+        .{ "batch", @as(u32, 6) },
+        .{ "prompt_sr", false },
+        .{ "resid", false },
+        .{ "cut", [2]u32{ 0, 4 } },
+        .{ "range", [2]u32{ 0, 4 } },
+    }) |change| {
+        var excluded = eligible;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(promptTilesWithDownTn4(excluded, excluded.n, 0, true) != 4);
+    }
+    try std.testing.expect(promptTilesWithDownTn4(eligible, 5120, 1, true) != 4);
+
+    const layout = lane.Layout{
+        .n = 5120,
+        .k = 17408,
+        .format = .{ .bits = 4, .group = 64 },
+        .sk = 2,
+        .precompute_sums = true,
+        .reg = true,
+        .prompt_sr = true,
+        .tile_batch = 8,
+        .reg_lean = true,
+        .prompt_tn = 4,
+        .residual = true,
+    };
+    try layout.validate();
+    try std.testing.expectEqual(@as(usize, 12 * 1024), layout.threadgroupBytes());
 }
