@@ -52,7 +52,10 @@ pub const Hook = struct {
         gated.own = hook.own;
         // decoded rows: the out projection's leading code lines go to the system cache while the star scan holds the bus idle
         var warm = Warm{ .quant = hook.quant, .out = weight.out };
-        if (after != null) gated.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        if (after != null) {
+            gated.warm = .{ .ptr = &warm, .encode = Warm.encode };
+            gated.close = frame.close;
+        }
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };

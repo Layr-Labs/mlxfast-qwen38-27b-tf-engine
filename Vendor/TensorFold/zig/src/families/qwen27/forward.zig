@@ -54,6 +54,10 @@ pub const Stages = struct {
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
     settle: ?Hook = null,
+    /// The last layer count a periodic commit may follow (segments' commitsUntil; 0: every `every` layers to the end).
+    commit_until: usize = 0,
+    /// outScope's buffers, held for the mixer that reads them through Frame.close.
+    close_list: [9]mtl.Buffer = undefined,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -106,10 +110,26 @@ pub const Stages = struct {
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
+        const f = s.rowsFrame();
+        f.close = s.outScope(f);
+        defer f.close = null;
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
         }
+    }
+    /// Decoded rows (at most 8, counted launches): every buffer the next interval (post's out projection and its norm,
+    /// any of its paths) reads or writes that a mixer launch may have written or read: the mixer's output and group sums,
+    /// the norm rows the mixer's projections read and the norm rewrites, the counted word, the residual stream and the
+    /// rows' dims and eps. The out weights are read-only on both sides (the out warm reads them, the out launch reads
+    /// them) and every other buffer the mixer touches is read next behind post's full barrier after the norm, so a barrier
+    /// on these orders all that the full one would between those two intervals.
+    fn outScope(s: *Stages, f: *Frame) ?[]const mtl.Buffer {
+        const k = &s.model.kernels;
+        if (k.prompt or s.compact or s.rows > 8 or s.model.ane != null) return null;
+        const words = k.count_words orelse return null;
+        s.close_list = .{ f.get(.mixer_out).buffer, f.get(.sums).buffer, f.get(.input).buffer, f.get(.output).buffer, s.hidden.buffer, s.residual.buffer, f.get(.dims).buffer, f.get(.eps).buffer, words };
+        return &s.close_list;
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
@@ -228,6 +248,9 @@ pub const Stages = struct {
     /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
     pub fn polls(s: *const Stages) bool {
         return s.rows <= 16;
+    }
+    pub fn commitsUntil(s: *const Stages) usize {
+        return s.commit_until;
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);

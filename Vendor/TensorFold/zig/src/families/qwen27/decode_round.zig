@@ -6,6 +6,10 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 24 layers are on the GPU the host encodes the other 40 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 24;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -349,6 +353,7 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
@@ -904,8 +909,12 @@ pub const Runner = struct {
         live_plan.live_from = dead; // the terminal block's dead rows: nothing reads their attention output
         // decoded rows: the out projection's leading code lines go to the system cache while the prefix holds the bus idle
         var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
-        if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+        if (!promptPlan) {
+            r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
+            r.attention.close = f.close;
+        }
         defer r.attention.warm = null;
+        defer r.attention.close = null;
         try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended or prepacked);
         f.mixer_sums = out_sums;
     }

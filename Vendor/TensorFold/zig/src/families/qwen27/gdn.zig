@@ -124,6 +124,9 @@ pub const Round = struct {
     /// Encoded right behind a star scan's launch, in its barrier interval (forwardStar): work that reads nothing the scan or
     /// its gate writes and writes nothing anything reads, so the counted gate stays counted (Kernels.warm).
     warm: ?Beside = null,
+    /// The buffers the counted gate's closing barrier orders (forward.Stages.outScope), set with `warm`: the warm reads only
+    /// out weights, so the out launch behind this barrier need not wait for it. Null: the all-buffers barrier.
+    close: ?[]const metal.Buffer = null,
 
     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
@@ -314,7 +317,7 @@ pub const Round = struct {
         e.setBuffer(counter, 0, 7);
         e.setValue(wait, 8);
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 3) / 4 }, .{ .width = 128 });
-        e.barrier();
+        if (r.close) |c| e.barrierBuffers(c) else e.barrier();
     }
     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
         const wide = r.gateRows();

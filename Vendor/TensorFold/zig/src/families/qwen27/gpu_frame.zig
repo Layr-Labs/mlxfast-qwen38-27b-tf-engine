@@ -47,6 +47,10 @@ pub const Frame = struct {
     /// A GDN block's gate or a decoded-row attention merge wrote its out projection's group sums into `.sums` (read
     /// and cleared by that projection).
     mixer_sums: bool = false,
+    /// Set by forward.Stages.mixer for a decoded block (outScope): the buffers the out projection's barrier interval and
+    /// its norm touch that the mixer's interval also touched. A mixer whose closing interval holds read-only work beside
+    /// its chain (the out warm) closes with a barrier on these alone, so that work need not end before the out launch.
+    close: ?[]const mtl.Buffer = null,
 
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;

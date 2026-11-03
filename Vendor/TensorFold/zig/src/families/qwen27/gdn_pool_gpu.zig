@@ -60,7 +60,8 @@ pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 /// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
+/// `close`: the buffers a decoded star's closing barrier orders (gdn.Round.close).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null, close: ?[]const metal.Buffer = null };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
@@ -205,6 +206,7 @@ pub const Pool = struct {
         if (!uploaded) try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         var prepared = try pool.round(layer, plan, refs, false);
         prepared.warm = refs.warm;
+        prepared.close = refs.close;
         if (!uploaded) try plan.metadata.upload(plan.host);
         // decoded star rows: the star scan joins the counted prepare's barrier interval, loading its states (and replaying
         // any pending rows) while the projections and the prepare run, and reads the prepared rows once they are counted
