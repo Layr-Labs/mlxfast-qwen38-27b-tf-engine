@@ -48,6 +48,8 @@ pub const Tiled = struct {
     }
 };
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+/// Counted projections a frame holds at most: a block's 30 (six a layer) and its head's, with room.
+pub const count_slots = 128;
 const Stashed = struct { prepared: core.affine4.Prepared, key: usize };
 pub const Stash = std.StringHashMapUnmanaged(Stashed);
 /// Fused weight groups: one prepared matrix of several linears' rows that share an input.
@@ -89,6 +91,28 @@ pub const Hazards = struct {
     fn any(list: []const Span, x: Span) bool {
         for (list) |y| if (y.meets(x)) return true;
         return false;
+    }
+    /// `order`, except that reads meeting `counted` (an open write of a counted projection) need no barrier: true when
+    /// one did and no barrier was placed, so the launch must wait on that projection's count instead.
+    pub fn orderCounted(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span, counted: Span) bool {
+        var conflict = h.n_writes + writes.len > h.writes.len or h.n_reads + reads.len > h.reads.len;
+        var waits = false;
+        if (!conflict) for (reads) |x| for (h.writes[0..h.n_writes]) |w| if (w.meets(x)) {
+            if (std.meta.eql(w, counted)) waits = true else conflict = true;
+        };
+        if (!conflict) for (writes) |x| if (any(h.writes[0..h.n_writes], x) or any(h.reads[0..h.n_reads], x)) {
+            conflict = true;
+            break;
+        };
+        if (conflict) {
+            h.barrier(e);
+            waits = false;
+        }
+        @memcpy(h.reads[h.n_reads..][0..reads.len], reads);
+        h.n_reads += reads.len;
+        @memcpy(h.writes[h.n_writes..][0..writes.len], writes);
+        h.n_writes += writes.len;
+        return waits;
     }
     /// Barrier when `reads`/`writes` conflict with the open set, then add them to it.
     pub fn order(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span) void {
@@ -213,6 +237,12 @@ pub const Backend = struct {
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
     /// RoundArgs blocks: the frame's (0), then one per count the verify before it may admit.
     args: mtl.Buffer,
+    /// The frame's count words, two u32 a counted projection (zeroed at each frame's begin), and the next one free.
+    counts: mtl.Buffer,
+    count_next: u32 = 0,
+    /// The last counted projection's output span, count word and threadgroups (encodePrepared): a sums launch reading only
+    /// it shares its barrier interval and waits on the count (runtime_callbacks.waitCounted).
+    counted: ?struct { span: Span, ref: Ref, groups: u32 } = null,
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
@@ -242,7 +272,9 @@ pub const Backend = struct {
         const caches = try newCaches(a, target.device, c, c.layers);
         errdefer freeCaches(a, caches);
         const args = try target.device.buffer(RoundArgs.blocks * @sizeOf(RoundArgs), options);
-        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
+        errdefer args.deinit();
+        const counts = try target.device.buffer(count_slots * 8, options);
+        return .{ .counts = counts, .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -260,6 +292,7 @@ pub const Backend = struct {
         if (b.simd) |*p| p.deinit();
         freeCaches(b.allocator, b.caches);
         b.args.deinit();
+        b.counts.deinit();
         b.head.deinit();
         b.topk.deinit();
         b.attention.deinit();
@@ -477,6 +510,12 @@ pub const Backend = struct {
         }
         try b.flushHeld(false);
         return b.frame.encoder;
+    }
+    /// Zeroes the frame's count words (before the barrier that ends a frame's first interval) and forgets the last count.
+    pub fn resetCounts(b: *Backend, e: mtl.ComputeEncoder) !void {
+        b.count_next = 0;
+        b.counted = null;
+        try b.primitives.zero(e, .{ .buf = b.counts }, count_slots * 2);
     }
     /// Encodes the held conv (and with `norms` the held norms) on their own.
     fn flushHeld(b: *Backend, norms: bool) !void {
