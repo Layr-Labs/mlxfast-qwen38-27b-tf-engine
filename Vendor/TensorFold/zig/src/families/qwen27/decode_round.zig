@@ -16,6 +16,8 @@ const first_commit = 0;
 const stagger_rows = 768;
 /// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
+/// Layers a staggered pass's segments sync over (core/stagger.zig's syncEvery): each later segment waits once per pair.
+const stagger_sync = 2;
 const wts = @import("gpu_weights.zig");
 const attn = @import("attention.zig");
 const abi = @import("gdn_contract.zig");
@@ -1039,6 +1041,9 @@ const Stagger = struct {
         return .mixer;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
+    pub fn syncEvery(_: *Stagger) usize {
+        return stagger_sync;
+    }
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].pre(lane, index);
     }

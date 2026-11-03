@@ -39,17 +39,25 @@ pub fn chunkRows(n: usize, step: usize, k: usize) usize {
 }
 
 /// The hook order: begins; per layer, per segment in row order: pre, mixer, post, k waiting on k-1's post-mixer signal.
+/// A runner that declares `syncEvery` (every layer's wait at the mixer) syncs every that many layers: k-1 signals after
+/// the mixer of each group's last layer, and k waits on that signal before the mixer of the group's first. Each mixer of
+/// k still runs after k-1's mixer of its layer, which that signal follows.
 pub fn drive(n: usize, layers: usize, x: anytype) !void {
+    const every: usize = if (comptime @hasDecl(std.meta.Child(@TypeOf(x)), "syncEvery")) x.syncEvery() else 1;
+    if (every == 0) return error.Segments;
     // k-1's hooks queue before k's (host counters move in row order; a reused event's wait follows its signal)
     for (0..n) |k| try x.begin(k);
     for (0..layers) |i| {
         const w: Wait = x.wait(i);
+        if (every > 1 and w != .mixer) return error.Segments;
+        // the group's last layer, whose signal the group's first layer waits on
+        const last = @min(i - i % every + every, layers) - 1;
         for (0..n) |k| {
             if (k > 0 and w == .pre) try x.waitFor(k, i);
             try x.pre(k, i);
-            if (k > 0 and w == .mixer) try x.waitFor(k, i);
+            if (k > 0 and w == .mixer and i % every == 0) try x.waitFor(k, last);
             try x.mixer(k, i);
-            if (k + 1 < n) try x.signal(k, i);
+            if (k + 1 < n and i == last) try x.signal(k, i);
             try x.post(k, i);
         }
     }
@@ -110,6 +118,11 @@ const Recorder = struct {
     steps: [MAX][64]Step = undefined,
     len: [MAX]usize = @splat(0),
     early: usize, // the layer that waits ahead of pre
+    every: usize = 1, // syncEvery
+
+    pub fn syncEvery(r: *Recorder) usize {
+        return r.every;
+    }
 
     fn add(r: *Recorder, k: usize, s: Step) void {
         r.steps[k][r.len[k]] = s;
@@ -177,4 +190,41 @@ test "the schedule runs to the end on queues and keeps each layer's dependencies
             try std.testing.expectEqual(want, rec.len[k]);
         }
     }
+}
+
+test "a schedule synced every few layers keeps each layer's dependencies" {
+    for ([_]usize{ 2, 3, 4 }) |every| for (1..MAX + 1) |n| {
+        const layers = 7;
+        var rec: Recorder = .{ .early = layers, .every = every };
+        try drive(n, layers, &rec);
+        var pc: [MAX]usize = @splat(0);
+        var signalled: [MAX]?usize = @splat(null);
+        var mixed: [MAX]usize = @splat(0);
+        var moved = true;
+        while (moved) {
+            moved = false;
+            for (0..n) |k| {
+                while (pc[k] < rec.len[k]) {
+                    const s = rec.steps[k][pc[k]];
+                    if (s.kind == .wait and (signalled[k - 1] == null or signalled[k - 1].? < s.i)) break;
+                    switch (s.kind) {
+                        .signal => signalled[k] = s.i,
+                        .mixer => {
+                            if (k > 0) try std.testing.expect(mixed[k - 1] > s.i);
+                            mixed[k] = s.i + 1;
+                        },
+                        else => {},
+                    }
+                    pc[k] += 1;
+                    moved = true;
+                }
+            }
+        }
+        const groups = (layers + every - 1) / every;
+        for (0..n) |k| {
+            try std.testing.expectEqual(rec.len[k], pc[k]);
+            const want: usize = 2 + 3 * layers + @as(usize, if (k > 0) groups else 0) + @as(usize, if (k + 1 < n) groups else 0);
+            try std.testing.expectEqual(want, rec.len[k]);
+        }
+    };
 }

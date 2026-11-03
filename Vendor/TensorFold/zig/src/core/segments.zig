@@ -205,6 +205,9 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         pub fn wait(x: *const @This(), i: usize) Wait {
             return x.fam.wait(i);
         }
+        pub fn syncEvery(x: *const @This()) usize {
+            return if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "syncEvery")) x.fam.syncEvery() else 1;
+        }
         pub fn waitFor(x: *const @This(), k: usize, i: usize) !void {
             x.sync(&x.lanes[k], x.evs[k - 1], i + 1, true);
             try x.fam.handoff(&x.lanes[k], i);
