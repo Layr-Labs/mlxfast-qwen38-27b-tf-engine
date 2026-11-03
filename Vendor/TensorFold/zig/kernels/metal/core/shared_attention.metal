@@ -78,6 +78,9 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 // Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
 // k_stride and v_stride, in elements) instead of from copies behind the context.
 struct tf_own_rows { uint rows, k_stride, v_stride; };
+inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
+  return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
+}
 // One key of a split row: its K and V row (`kr`, `vr` at this lane's first element; the lane's others 32 apart) into
 // the running maximum, total and outputs.
 inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D / 32], thread float& maximum,
@@ -153,6 +156,63 @@ inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D 
   if (lane == 0) { p[TF_D] = maximum; p[TF_D + 1] = total; }
 }
 
+
+// tf_shared_lane_attention_split with the chunk's keys and values read once a threadgroup instead of once a query head
+// and row: a threadgroup takes one KV head's TF_G query heads for TF_SPLIT_ROWS rows and one chunk, one simdgroup each
+// (simdgroup r * TF_G + g: row tg.y * TF_SPLIT_ROWS + r, query head kh * TF_G + g), and stages the chunk TF_STAGE keys
+// at a time in threadgroup memory. Each simdgroup's arithmetic is tf_shared_lane_attention_split's, key by key in the
+// same order on the same bfloat words, into the same partials; rows past args.rows load and barrier but write nothing.
+#define TF_SPLIT_ROWS (TF_G >= 16 ? 1 : 16 / TF_G)
+#define TF_STAGE 16
+[[kernel]] void tf_shared_lane_attention_split_kv(const device bfloat* Q [[buffer(0)]],
+    const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
+    const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
+    device float* part [[buffer(5)]], const device bfloat* OK [[buffer(6)]], const device bfloat* OV [[buffer(7)]],
+    constant tf_own_rows& own [[buffer(8)]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint t [[thread_index_in_threadgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup bfloat sk[TF_STAGE * TF_D];
+  threadgroup bfloat sv[TF_STAGE * TF_D];
+  const uint kh = tg.x, g = sg % TF_G, row = tg.y * TF_SPLIT_ROWS + sg / TF_G, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
+  if (kh >= TF_KVH || chunk >= chunks) return; // the whole threadgroup alike
+  const bool live = row < args.rows;
+  const float scale = as_type<float>(args.scale_bits);
+  const uint context = args.keys - min(own.rows, args.keys);
+  float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
+  const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
+  for (uint d = 0; d < TF_D / 32; ++d) { q[d] = live ? float(Q[qi + lane + d * 32]) : 0.0f; out[d] = 0.0f; }
+  const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
+  for (uint base = chunk * TF_CHUNK; base < last; base += TF_STAGE) {
+    const uint n = min(uint(TF_STAGE), last - base);
+    threadgroup_barrier(mem_flags::mem_threadgroup); // the previous stage's reads are done
+    for (uint i = t; i < n * TF_D; i += TF_G * TF_SPLIT_ROWS * 32) {
+      const uint key = base + i / TF_D, d = i % TF_D;
+      sk[i] = tf_split_row(K, OK, key, context, own.k_stride, kh)[d];
+      sv[i] = tf_split_row(V, OV, key, context, own.v_stride, kh)[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!live) continue;
+    for (uint j = 0; j < n; ++j) {
+      const uint key = base + j;
+      if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
+      float k[TF_D / 32], v[TF_D / 32];
+      for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(sk[j * TF_D + lane + d * 32]); v[d] = float(sv[j * TF_D + lane + d * 32]); }
+      float dot = 0.0f;
+      for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
+      const float score = simd_sum(dot) * scale;
+      const float next = max(maximum, score);
+      const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+      const float weight = exp(score - next);
+      total = fma(total, old_weight, weight);
+      for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
+      maximum = next;
+    }
+  }
+  if (!live) return;
+  device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
+  for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[d];
+  if (lane == 0) { p[TF_D] = maximum; p[TF_D + 1] = total; }
+}
 
 // Chunks a merge lane holds: lane c reads chunk c's maximum and total (at most 32 chunks a row per lane pass).
 #define TF_MERGE_TILE 8
