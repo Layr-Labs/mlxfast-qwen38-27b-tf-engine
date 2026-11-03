@@ -53,6 +53,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     fields.apply(&b.topk, hook, joining);
     for (b.head.owned.items) |buffer| fields.one(buffer, hook, joining);
     fields.one(b.args, hook, joining);
+    fields.one(b.counts, hook, joining);
     if (b.head.plain) |*p| prepared(p, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
     var adapters = b.prepared.valueIterator();
@@ -65,6 +66,8 @@ pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) 
     fields.apply(adapter, hook, joining);
     fields.apply(&adapter.projection, hook, joining);
     if (adapter.small) |*s| fields.apply(s, hook, joining);
+    if (adapter.small_count) |*s| fields.apply(s, hook, joining);
+    if (adapter.small8) |*s| fields.apply(s, hook, joining);
     if (adapter.prompt) |*p| fields.apply(p, hook, joining);
 }
 
