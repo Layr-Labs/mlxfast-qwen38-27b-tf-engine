@@ -367,6 +367,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+#if !defined(TF_PROMPT_SR)
+  {
+    threadgroup float decpad[8192 / 4];
+    if (mdims[0] == -12345) { decpad[lanei] = 1.0f; threadgroup_barrier(mem_flags::mem_threadgroup); Y[0] = (TF_OUT)decpad[lanei ^ 1]; }
+  }
+#endif
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
 #if defined(TF_TILE_LIST)
@@ -880,6 +886,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#ifndef TF_TGPAD
+#define TF_TGPAD (TF_SK > 1 ? 12288 : 8192)
+#endif
+#if TF_TGPAD > 0
+  // fewer of these one-SIMD-group threadgroups a core (the M5 Max ran the SwiGLU launch slower with less threadgroup memory:
+  // 2 KB 0.797, 4 KB 0.789, 8-12 KB 0.785 ms/token): reserve TF_TGPAD bytes; the use below never runs (rows are never negative)
+  threadgroup float tgpad[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
+#endif
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
