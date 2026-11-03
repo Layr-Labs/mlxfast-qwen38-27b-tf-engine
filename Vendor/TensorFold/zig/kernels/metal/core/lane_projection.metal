@@ -712,17 +712,52 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
-#define TF_STREAM_PF 0
-#if TF_STREAM_PF
-#define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
-#define TF_STREAM_LATE(t)
-#else
-#define TF_STREAM_EARLY(t)
-#define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+// Where a streamed tile issues the next tile's code load (TF_STREAM_PF: 0 before its second tensor op, 1 before its
+// first, 2 after its second) and its own (scale, bias) pairs and row sums (TF_META_AT: 0 at the tile's start, 1 after
+// its first tensor op, 2 after its second). Later issue points hold fewer registers across the tensor ops.
+#ifndef TF_STREAM_PF
+#define TF_STREAM_PF 2
 #endif
-#define TF_TN_TILE(t) { \
+#ifndef TF_META_AT
+#define TF_META_AT 2
+#endif
+#define TF_CODE_NEXT(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#define TF_META(t) \
       const uint4 q0 = sp[0], q1 = sp[4]; \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      const float x0 = xp[0], x1 = xp[8];
+#if TF_STREAM_PF == 1
+#define TF_PF_AT1(t) TF_CODE_NEXT(t)
+#else
+#define TF_PF_AT1(t)
+#endif
+#if TF_STREAM_PF == 0
+#define TF_PF_AT2(t) TF_CODE_NEXT(t)
+#else
+#define TF_PF_AT2(t)
+#endif
+#if TF_STREAM_PF == 2
+#define TF_PF_AT3(t) TF_CODE_NEXT(t)
+#else
+#define TF_PF_AT3(t)
+#endif
+#if TF_META_AT == 0
+#define TF_META_AT0(t) TF_META(t)
+#else
+#define TF_META_AT0(t)
+#endif
+#if TF_META_AT == 1
+#define TF_META_AT1(t) TF_META(t)
+#else
+#define TF_META_AT1(t)
+#endif
+#if TF_META_AT == 2
+#define TF_META_AT2(t) TF_META(t)
+#else
+#define TF_META_AT2(t)
+#endif
+#define TF_TN_TILE(t) { \
+      TF_META_AT0(t) \
       const uint4 cur0=nw0,cur1=nw1; \
       thread half2* b2=(thread half2*)&cbl[0]; \
       TF_UNROLL \
@@ -733,8 +768,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
         b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
       } \
-      TF_STREAM_EARLY(t) \
+      TF_PF_AT1(t) \
       opm.run(xl0,cbl,P); \
+      TF_META_AT1(t) \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
         const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
@@ -743,8 +779,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
         b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
       } \
-      TF_STREAM_LATE(t) \
+      TF_PF_AT2(t) \
       opa.run(xl1,cbl,P); \
+      TF_PF_AT3(t) \
+      TF_META_AT2(t) \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
@@ -863,8 +901,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
+#if !TF_STREAM_RIGHT
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
+#endif
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
@@ -874,6 +914,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if TF_PROMPT_TN == 4
     TF_TN_TILE(2)
     TF_TN_TILE(3)
+#endif
+#if TF_STREAM_RIGHT
+    xp += stride;
 #endif
   }
 #if defined(TF_SWIGLU)
