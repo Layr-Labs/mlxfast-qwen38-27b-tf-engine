@@ -60,7 +60,8 @@ pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 /// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
+/// `qkv_row`: the row of the layer's qkv log the rows' projections start at (Pool.projected).
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null, qkv_row: u32 = 0 };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
@@ -184,9 +185,21 @@ pub const Pool = struct {
         return .{ .buffer = pool.buffers[@backingInt(if (recurrent) Field.state else Field.history)], .offset = off, .bytes = bytes };
     }
 
-    pub fn projected(pool: *const Pool, layer: usize) !Ref {
-        const span = try pool.layerSpan(.qkv, layer);
+    /// Where the layer's qkv projections of rows starting at `row` go: a staggered prompt's later segment's rows stand
+    /// past the rows of the segments before it, which may still read theirs while it projects.
+    pub fn projected(pool: *const Pool, layer: usize, row: u32) !Ref {
+        const span = try pool.qkvRows(layer, row);
         return .{ .buffer = span.buffer, .offset = span.offset };
+    }
+
+    /// The layer's qkv log from row `row` on.
+    fn qkvRows(pool: *const Pool, layer: usize, row: u32) !gdn.Span {
+        var span = try pool.layerSpan(.qkv, layer);
+        const skip = @as(usize, row) * pool.budget.shape.qkv * 2;
+        if (skip > span.bytes) return error.BadGdnPoolIndex;
+        span.offset += skip;
+        span.bytes -= skip;
+        return span;
     }
 
     /// `beside`: encoded beside the scan, before the barrier that ends it.
@@ -257,7 +270,8 @@ pub const Pool = struct {
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
@@ -434,12 +448,14 @@ pub const Pool = struct {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
         const p = try pool.budget.shape.params(1, pool.budget.slots, k);
-        e.setPipeline(pool.kernels.clear);
+        // 16-byte stores when every (layer, slot) row is a whole number of them: the same words, a quarter of the threads
+        const wide = pool.budget.shape.state % 4 == 0 and pool.budget.shape.conv % 8 == 0 and pool.budget.shape.conv / 8 <= pool.budget.shape.state / 4;
+        e.setPipeline(if (wide) pool.kernels.clear4 else pool.kernels.clear);
         e.setBuffer(pool.get(.state), 0, 0);
         e.setBuffer(pool.get(.history), 0, 1);
         e.setValue(p, 2);
         e.setValue(slot, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
+        if (wide) e.dispatchThreads(.{ .width = pool.budget.shape.state / 4, .height = pool.budget.layers }, .{ .width = 256 }) else e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
         e.barrier();
     }
 
@@ -453,7 +469,7 @@ pub const Pool = struct {
         const zs: usize = refs.zba_stride;
         const heads = pool.budget.shape.c.v_heads;
         const b = gdn.Buffers{
-            .qkv = try pool.layerSpan(.qkv, layer),
+            .qkv = try pool.qkvRows(layer, refs.qkv_row),
             .a = try refSpan(refs.a, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .b = try refSpan(refs.b, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .z = try refSpan(refs.z, if (zs == 0) bytes.value else ((p.rows - 1) * zs + pool.budget.shape.value) * 2),

@@ -26,6 +26,11 @@ pub const Hook = struct {
     uploaded: bool = false,
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
+    /// A staggered prompt's segment's lane: a later segment runs its wait for the segment before behind its projections
+    /// (Lane.waitDue), which read only its own rows and write only its own (`first`'s qkv rows, its frame's zba rows).
+    lane: ?*@import("core").segments.Lane = null,
+    /// A staggered prompt's segment's first row: its qkv rows go that far into the layer's log (Pool.projected).
+    first: u32 = 0,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -38,25 +43,29 @@ pub const Hook = struct {
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
         if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
-            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
+            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer, hook.first), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
         } else {
-            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
+            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer, hook.first), rows);
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
         }
+        // a staggered prompt's later segment waits for the one before here: the prepare, scan and conv commit read and
+        // write the conv windows and states that one's layer leaves
+        const m = if (hook.lane) |l| l.waitDue() else e;
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         gated.own = hook.own;
+        gated.qkv_row = hook.first;
         // decoded rows: the out projection's leading code lines go to the system cache while the star scan holds the bus idle
         var warm = Warm{ .quant = hook.quant, .out = weight.out };
         if (after != null) gated.warm = .{ .ptr = &warm, .encode = Warm.encode };
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, m, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, m, beside, after, hook.deferred, hook.uploaded);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {

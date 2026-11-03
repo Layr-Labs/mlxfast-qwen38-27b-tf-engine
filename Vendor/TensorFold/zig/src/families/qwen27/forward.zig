@@ -47,6 +47,9 @@ pub const Stages = struct {
     tail: ?Tail = null,
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
+    /// Work encoded in lane 0's first command buffer behind `lead` and ahead of the embedding, ending with a barrier (the
+    /// dirty slots' clears, decode_round.Clears): every later launch of the pass runs behind it.
+    clear: ?Tail = null,
     after: ?Hook = null,
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
@@ -72,6 +75,7 @@ pub const Stages = struct {
         s.hidden = fr.get(.hidden);
         s.residual = fr.get(.residual);
         if (s.lead) |t| try t.encode(t.ptr, lane.enc);
+        if (lane.k == 0) if (s.clear) |t| try t.encode(t.ptr, lane.enc);
         try m.glue.embedding(lane.enc, m.config, m.weights.embed, fr.get(.ids), s.hidden, s.rows);
         lane.enc.barrier();
         if (s.images) |rows| {

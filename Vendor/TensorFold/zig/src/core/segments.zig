@@ -17,6 +17,28 @@ pub const Lane = struct {
     enc: mtl.ComputeEncoder,
     fence: Fence, // orders the segment's encoders: buffers are untracked, so encoders could overlap
     queue: mtl.Queue = undefined, // the segment's queue: its later command buffers come from it
+    /// The wait for the segment before that the lane's mixer runs (Wait.inside), until it runs.
+    due: ?Due = null,
+
+    pub const Due = struct { event: mtl.Event, value: u64, mode: mtl.DispatchType };
+
+    /// Runs the lane's due wait, if any (Wait.inside): its mixer calls this ahead of its first read of what the segment
+    /// before wrote. Returns the encoder the mixer continues on.
+    pub fn waitDue(l: *Lane) mtl.ComputeEncoder {
+        const d = l.due orelse return l.enc;
+        l.due = null;
+        l.sync(d.mode, d.event, d.value, true);
+        return l.enc;
+    }
+
+    /// Ends the encoder, waits for (or signals) `value` between its encoders, and opens the next behind the fence.
+    fn sync(l: *Lane, mode: mtl.DispatchType, ev: mtl.Event, value: u64, wait_: bool) void {
+        l.fence.update(l.enc);
+        l.enc.end();
+        if (wait_) l.cb.waitForEvent(ev, value) else l.cb.signalEvent(ev, value);
+        l.enc = l.cb.compute(mode);
+        l.fence.wait(l.enc);
+    }
 };
 
 pub const rows = stagger.rows;
@@ -104,6 +126,16 @@ pub fn checkUnchecked() !void {
     if (failed) return error.GpuFailed;
 }
 
+/// Whether every command buffer a polled pass returned before it reported completion reports it now. It only reads their
+/// status: checkUnchecked still waits for and checks them at the next pass.
+pub fn quiet() bool {
+    for (unchecked[0..n_unchecked]) |cb| switch (cb.status()) {
+        .completed, .@"error" => {},
+        else => return false,
+    };
+    return true;
+}
+
 pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize) !f64 {
     return runCommittingEarly(device, queues, layers, mode, fam, first, every, false);
 }
@@ -181,14 +213,6 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             l.fence.wait(l.enc);
         }
 
-        /// Ends the lane's encoder, waits for (or signals) `value` between its encoders, and opens the next behind the fence.
-        fn sync(x: *const @This(), l: *Lane, ev: mtl.Event, value: u64, wait_: bool) void {
-            l.fence.update(l.enc);
-            l.enc.end();
-            if (wait_) l.cb.waitForEvent(ev, value) else l.cb.signalEvent(ev, value);
-            l.enc = l.cb.compute(x.mode);
-            l.fence.wait(l.enc);
-        }
         pub fn begin(x: *const @This(), k: usize) !void {
             try x.fam.begin(&x.lanes[k]);
         }
@@ -196,17 +220,24 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             return x.fam.wait(i);
         }
         pub fn waitFor(x: *const @This(), k: usize, i: usize) !void {
-            x.sync(&x.lanes[k], x.evs[k - 1], i + 1, true);
+            // Wait.inside: the lane holds the wait and the family's mixer runs it (Lane.waitDue), with no handoff here
+            if (x.wait(i) == .inside) {
+                x.lanes[k].due = .{ .event = x.evs[k - 1], .value = i + 1, .mode = x.mode };
+                return;
+            }
+            x.lanes[k].sync(x.mode, x.evs[k - 1], i + 1, true);
             try x.fam.handoff(&x.lanes[k], i);
         }
         pub fn signal(x: *const @This(), k: usize, i: usize) !void {
-            x.sync(&x.lanes[k], x.evs[k], i + 1, false);
+            x.lanes[k].sync(x.mode, x.evs[k], i + 1, false);
         }
         pub fn pre(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.pre(&x.lanes[k], i);
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);
+            // a mixer that did not run its due wait (it read nothing of the segment before) runs it before its signal
+            _ = x.lanes[k].waitDue();
             // `first` 0: the first commit follows the first layer's mixer (its MLP is encoded while the GPU runs it)
             if ((x.early or x.first == 0) and i == 0 and i + 1 < x.layers) try x.commitLane(k);
         }

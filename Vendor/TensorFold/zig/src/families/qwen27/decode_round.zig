@@ -11,8 +11,8 @@ const commit_every = 8;
 /// MLP and the next chunk's layers while the GPU runs them.
 const first_commit = 0;
 /// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
-/// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
-/// projections.
+/// segment's mixer of a layer waits for the one before it behind its projections, so one segment's sequential GDN scan
+/// runs beside another's projections.
 const stagger_rows = 768;
 /// Segments a staggered prompt pass takes (up to core/stagger.MAX).
 const stagger_parts = 3;
@@ -35,6 +35,12 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     std.log.err("qwen27: {s} failed on the GPU: {s}", .{ what, msg });
     return true;
 }
+
+/// A slot's GDN states and conv windows: `live` (a reset clears them), `zeroed` (a clear ran and nothing has written them
+/// since) or `dirty` (`clear` left their clear to the slot's next pass, which encodes it ahead of every read of them:
+/// Clears). Anything that writes slot words turns `zeroed` back to `live` (`writes`); only the clear itself, in a pass or
+/// in `landClear`, ends `dirty`.
+pub const Words = enum { live, zeroed, dirty };
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
@@ -107,9 +113,9 @@ pub const Runner = struct {
     second: [@import("core").segments.MAX - 1]?Second = @splat(null),
     /// The residency set the model's queue holds (residency.zig): the later segments' queues hold it as well.
     resident_set: ?mtl.ResidencySet = null,
-    /// Slots whose GDN states and conv windows `clear` zeroed and nothing has written since: their next `reset` finds
-    /// those words zero and skips its own clear. Every operation that writes them forgets every slot's (`writes`).
-    zeroed: [attn.planning.max_streams]bool = @splat(false),
+    /// What each slot's GDN states and conv windows hold (Words): a `reset` clears a live slot's and skips a zeroed or
+    /// dirty one's; the next pass on a dirty slot encodes its clear first (Clears).
+    words: [attn.planning.max_streams]Words = @splat(.live),
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
         return initReady(a, m, slots, capacity, slots);
@@ -331,7 +337,8 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
+        var clears = Clears{ .r = r, .slots = round.slots };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -385,9 +392,9 @@ pub const Runner = struct {
 
     /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 64) in the model's frame on
     /// the model's queue, the rest in the second segment's frame on its own queue. Each layer's mixer of the second waits
-    /// for the first's (its GDN states and conv windows, its K/V rows); everything else of the two runs side by side. Each
-    /// segment's rows take the kernels and the arithmetic a prompt chunk of those rows takes, so every word is the one two
-    /// chunks run in order give.
+    /// for the first's behind its projections (its GDN states and conv windows, its K/V rows); everything else of the two
+    /// runs side by side. Each segment's rows take the kernels and the arithmetic a prompt chunk of those rows takes, so
+    /// every word is the one two chunks run in order give.
     fn staggered(r: *Runner, round: *const Round, head: forward.Head) !void {
         const max = @import("core").segments.MAX;
         const n: u32 = @intCast(round.ids.len);
@@ -465,12 +472,16 @@ pub const Runner = struct {
         var segments: [max]Segment = undefined;
         var stages: [max]forward.Stages = undefined;
         var family = Stagger{};
+        // the slot's clear, if due, runs in the first segment's lane ahead of its embedding: every later segment's first
+        // read of the slot's words (its first GDN prepare) waits for the first's first mixer, behind it
+        var clears = Clears{ .r = r, .slots = round.slots[0..1] };
         for (0..parts) |k| {
             const last = k + 1 == parts;
             const segment_head: forward.Head = if (last) head else .none;
             segments[k] = .{ .r = r, .gdn = &plans[k], .own = owns[k], .attention = .{ .plan = &attention_plans[k], .round = &rounds[k], .placed = placed[k], .scratch = scratches[k], .bindings = bindings[k], .scratch_due = &due[k], .terminal_head = if (terminal_rows) segment_head else .all }, .tap_row = firsts[k], .total = n };
-            stages[k] = .{ .terminal_rows = terminal_rows, .model = r.model, .rows = firsts[k + 1] - firsts[k], .hooks = segments[k].mixer(), .head = segment_head, .frame = frames[k], .lane_k = k, .logits = if (k == 0) null else r.model.frame.get(.logits), .settle = if (k == 0) .{ .ptr = r, .run = settleRound } else null };
+            stages[k] = .{ .terminal_rows = terminal_rows, .model = r.model, .rows = firsts[k + 1] - firsts[k], .hooks = segments[k].mixer(), .head = segment_head, .frame = frames[k], .lane_k = k, .logits = if (k == 0) null else r.model.frame.get(.logits), .clear = if (k == 0) clears.due() else null, .settle = if (k == 0) .{ .ptr = r, .run = settleRound } else null };
             family.stages[k] = &stages[k];
+            family.segments[k] = &segments[k];
         }
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, queues[0..parts], r.model.config.layers, .concurrent, &family, first_commit, commit_every, true) catch |err| {
             r.failed = true;
@@ -513,7 +524,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -705,7 +719,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -718,27 +735,44 @@ pub const Runner = struct {
         return r.resetSlot(slot, false);
     }
 
-    /// `reset` that always runs its clear (the bench reset op's, so each request clears its slot): until something writes
-    /// the slot's words again, its next `reset` finds them zero and skips its own (`zeroed`).
+    /// `reset` whose clear always runs (the bench reset op's, so each request clears its slot), in the slot's next pass:
+    /// the slot turns dirty, and that pass encodes the clear first in its first command buffer (Clears), with no command
+    /// buffer or wait of its own here. A `reset` before that pass finds the slot dirty and skips its own clear.
     pub fn clear(r: *Runner, slot: u32) !void {
         return r.resetSlot(slot, true);
     }
 
-    /// Something writes slot words (GDN states, conv windows) next: no slot stays known zero.
+    /// Something writes slot words (GDN states, conv windows) next: no slot stays known zero. A dirty slot stays dirty: its
+    /// clear still runs before anything reads its words.
     pub fn writes(r: *Runner) void {
-        r.zeroed = @splat(false);
+        for (&r.words) |*w| if (w.* == .zeroed) {
+            w.* = .live;
+        };
+    }
+
+    /// A dirty slot's clear runs now, in its own command buffer, waited for (the slot is then zeroed): before anything
+    /// but a pass, which encodes the clear itself, writes or reads the slot's words.
+    pub fn landClear(r: *Runner, slot: u32) !void {
+        if (slot >= r.ready or r.words[slot] != .dirty) return;
+        return r.clearWaited(slot, .zeroed);
     }
 
     fn resetSlot(r: *Runner, slot: u32, force: bool) !void {
         r.settleSlot(slot);
         if (r.failed or r.active != null or slot >= r.ready) return error.RoundNotReady;
         if (r.gdn.pending.slot == slot) r.gdn.pending = .{}; // rows deferred for the slot's states, which clear below
-        if (!force and r.zeroed[slot]) {
-            // `clear` zeroed the slot's words and nothing wrote them since: this clear would write the same zeros
+        if (force or r.words[slot] != .live) {
+            // `clear` leaves the clear to the slot's next pass; a zeroed or dirty slot's clear would write the same zeros
+            if (force) r.words[slot] = .dirty;
             r.offsets[slot] = 0;
             return;
         }
-        r.zeroed[slot] = false;
+        return r.clearWaited(slot, .live);
+    }
+
+    /// The slot's clear in its own command buffer, waited for; its words are `after` once it ran.
+    fn clearWaited(r: *Runner, slot: u32, after: Words) !void {
+        r.words[slot] = .live;
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
@@ -746,17 +780,13 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        cb.wait();
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
         }
         r.offsets[slot] = 0;
-        r.zeroed[slot] = force;
+        r.words[slot] = after;
     }
 
     fn params(r: *Runner, rows: usize) !abi.Params {
@@ -818,6 +848,10 @@ pub const Runner = struct {
         bindings: []attn.Binding,
         scratch_due: *bool,
         terminal_head: forward.Head,
+        /// A staggered prompt's segment's lane: a later segment runs its wait for the segment before behind its
+        /// projections and preprocess (Lane.waitDue), which read only its own rows and write only its own (its frame's and
+        /// scratch's rows, its rows' cache slots: no earlier segment's prompt kernel reads past its own rows).
+        lane: ?*@import("core").segments.Lane = null,
     };
 
     fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
@@ -865,7 +899,11 @@ pub const Runner = struct {
         // query and appends the round's keys and values, and the prefix waits on its count in the same barrier interval
         const appended = after != null and !prepacked and plan.fused and plan.streams == 1 and plan.prefix_chunks > 0 and rows <= 8 and r.attention.chain_words != null;
         const decoded: ?attn.Decoded = if (appended) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded });
+        // a prompt plan's packed preprocess also stores the round's keys and values in their cache slots: no append follows
+        const cached: ?attn.Decoded = if (prepacked) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded, .cached = cached });
+        // a staggered prompt's later segment waits for the one before here: the attention reads that one's keys and values
+        const m = if (pass.lane) |l| l.waitDue() else e;
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
@@ -875,7 +913,7 @@ pub const Runner = struct {
         var warm = Warm{ .quant = &r.model.kernels, .out = weights.out };
         if (!promptPlan) r.attention.warm = .{ .ptr = &warm, .encode = Warm.encode };
         defer r.attention.warm = null;
-        try r.attention.encode(e, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended);
+        try r.attention.encode(m, pass.scratch, &pass.bindings[layer], live_plan, f.get(.query), f.get(.rotated_key), value, 2 * kv, f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt, prepacked, if (out_sums) .{ .ref = xs.ref, .stride = xs.stride } else null, appended or prepacked);
         f.mixer_sums = out_sums;
     }
 
@@ -892,6 +930,28 @@ const Warm = struct {
     fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
         const w: *Warm = @ptrCast(@alignCast(ptr));
         try w.quant.warm(e, w.out);
+    }
+};
+
+/// A pass's dirty slots' clears (Runner.clear), encoded first in its first lane's first command buffer, ahead of its
+/// embedding (forward.Stages.clear): each is the clear a reset runs, the same launch on the same words, and ends with its
+/// barrier (gdn_pool_gpu.Pool.clearSlot), so every read of the slot's words in the pass (a mixer's) runs behind it. Each
+/// slot is live once its clear is encoded.
+const Clears = struct {
+    r: *Runner,
+    slots: []const u32,
+
+    /// The pass's hook, if one of its slots is dirty.
+    fn due(c: *Clears) ?forward.Tail {
+        for (c.slots) |slot| if (c.r.words[slot] == .dirty) return .{ .ptr = c, .encode = encode };
+        return null;
+    }
+    fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const c: *Clears = @ptrCast(@alignCast(ptr));
+        for (c.slots) |slot| if (c.r.words[slot] == .dirty) {
+            try c.r.gdn.clearSlot(slot, e);
+            c.r.words[slot] = .live;
+        };
     }
 };
 
@@ -955,18 +1015,22 @@ const Segment = struct {
     attention: Runner.AttentionPass,
     tap_row: u32,
     total: u32,
+    /// The segment's lane (Stagger.begin): a later segment's hooks run its wait for the one before (Wait.inside).
+    lane: ?*@import("core").segments.Lane = null,
 
     fn mixer(s: *Segment) forward.Mixer {
         return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own, .lane = s.lane, .first = s.tap_row };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        return s.r.attentionPass(s.attention, e, block, weights, f, rows);
+        var pass = s.attention;
+        pass.lane = s.lane;
+        return s.r.attentionPass(pass, e, block, weights, f, rows);
     }
     fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
@@ -977,17 +1041,18 @@ const Segment = struct {
 /// A staggered prompt pass's segments as one family for core/segments.zig: each hook goes to its lane's stages.
 const Stagger = struct {
     stages: [@import("core").segments.MAX]*forward.Stages = undefined,
+    /// Each lane's segment, whose hooks reach the lane through it.
+    segments: [@import("core").segments.MAX]*Segment = undefined,
     const Lane = @import("core").segments.Lane;
 
     pub fn begin(p: *Stagger, lane: *Lane) !void {
+        p.segments[lane.k].lane = lane;
         return p.stages[lane.k].begin(lane);
     }
+    /// A later segment waits for the one before inside each layer's mixer, behind the projections (and an attention
+    /// layer's preprocess): Segment's hooks.
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
-        return .mixer;
-    }
-    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
-    pub fn polls(_: *const Stagger) bool {
-        return true;
+        return .inside;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {

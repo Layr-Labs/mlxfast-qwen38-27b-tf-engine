@@ -4,8 +4,11 @@ const std = @import("std");
 /// Segments one chunk can take.
 pub const MAX = 4;
 
-/// Where layer i waits for the segment before: ahead of pre (it reads what that one wrote, a conv tail) or of the mixer.
-pub const Wait = enum { pre, mixer };
+/// Where layer i waits for the segment before: ahead of pre (it reads what that one wrote, a conv tail), of the mixer, or
+/// inside the mixer, ahead of its first read of what that one wrote: the lane holds the wait and the family's mixer runs
+/// it there with whatever its handoff would do (core/segments.zig Lane.waitDue); a backend that cannot defer a wait runs
+/// it ahead of the mixer.
+pub const Wait = enum { pre, mixer, inside };
 
 /// Rows of segment k when `n` rows split `parts` ways (near-equal, the first ones longer).
 pub fn rows(n: usize, parts: usize, k: usize) usize {
@@ -47,7 +50,7 @@ pub fn drive(n: usize, layers: usize, x: anytype) !void {
         for (0..n) |k| {
             if (k > 0 and w == .pre) try x.waitFor(k, i);
             try x.pre(k, i);
-            if (k > 0 and w == .mixer) try x.waitFor(k, i);
+            if (k > 0 and w != .pre) try x.waitFor(k, i);
             try x.mixer(k, i);
             if (k + 1 < n) try x.signal(k, i);
             try x.post(k, i);
