@@ -27,6 +27,7 @@ pub const Hook = struct {
     ptr: *anyopaque,
     run: *const fn (*anyopaque) anyerror!void,
 };
+const probe_intervals = 2;
 pub const Stages = struct {
     model: *Model,
     rows: u32,
@@ -97,6 +98,14 @@ pub const Stages = struct {
             try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
         } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
+        // PROBE (gap cost): decoded rows only, the same norm again in probe_intervals extra dependent intervals; it reads
+        // what the first one read and stores the same words again (with no added rows it rewrites its input in place)
+        if (s.rows <= 16) {
+            for (0..probe_intervals) |_| {
+                try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+                e.barrier();
+            }
+        }
         s.norm_wait = 0;
         s.summed = false;
         if (s.pending != null) {
