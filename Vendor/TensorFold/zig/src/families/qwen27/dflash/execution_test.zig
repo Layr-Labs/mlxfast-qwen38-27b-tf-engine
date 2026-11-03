@@ -213,6 +213,31 @@ test "taps absorbed in the block's frame give the separate path's tree, one stag
     try std.testing.expectEqual(@as(u32, 1), merged.stages);
     try std.testing.expectEqual(@as(u32, 5), merged.appends);
 }
+test "a fresh session's first taps absorbed in the block's frame give flush then treeBlock's tree" {
+    const a = std.testing.allocator;
+    var store = try fixtures.Store.init(a);
+    defer store.deinit();
+    var g = try store.graph(a);
+    defer g.deinit();
+    const p = op.Preparation{ .mode = .bf16_reference };
+    var split = Fake{};
+    var first = try session.Session.init(fixtures.toy, 1, 0);
+    try first.absorb(split.ops(), &g, p, batch());
+    var want = try first.treeBlock(a, split.ops(), &g, p, 5, try first.firstDraw(), 8, .{});
+    defer want.deinit();
+    var merged = Fake{};
+    var second = try session.Session.init(fixtures.toy, 1, 0);
+    try std.testing.expect(!second.ready);
+    var got = try second.absorbTreeBlock(a, merged.ops(), &g, p, batch(), 5, 8, .{});
+    defer got.deinit();
+    try std.testing.expectEqualSlices(u32, want.tokens, got.tokens);
+    try std.testing.expectEqualSlices(i32, want.parents, got.parents);
+    try std.testing.expectEqual(first.context, second.context);
+    try std.testing.expect(second.ready);
+    try std.testing.expectEqual(@as(u32, 0), merged.commits); // the append is staged in the block's frame, not committed alone
+    try std.testing.expectEqual(@as(u32, 1), merged.stages);
+    try std.testing.expectEqual(@as(u32, 5), merged.appends);
+}
 test "a block committed before its taps' round is read drafts absorbTreeBlock's tree once completed" {
     const a = std.testing.allocator;
     var store = try fixtures.Store.init(a);
