@@ -234,6 +234,10 @@ pub const Generation = struct {
         held: bool = false,
         /// The rows' picks come from the runner's head sieve (the forward wrote no logits): no head row to keep.
         sieve: bool = false,
+        /// The absorb ahead's events' value (runtime_spec.zig): the verify signals it behind its last layer's block.
+        spec: ?u64 = null,
+        /// That absorb is committed: an error lets it through (letThrough), as nothing else may signal it.
+        spec_committed: bool = false,
         fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;
@@ -286,6 +290,11 @@ pub const Generation = struct {
             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
             if (p.early) {
+                const staged = p.absorbAhead();
+                defer if (staged) {
+                    g.draft.backend.ahead = false;
+                    g.draft.backend.frame.gate = null;
+                };
                 const prepared = g.draft.prepareNext(.{ .ptr = p, .encode = lead }, 2) catch |err| {
                     keep_cb.commit();
                     g.keep = keep_cb.retain();
@@ -300,6 +309,30 @@ pub const Generation = struct {
             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
             keep_cb.commit();
             g.keep = keep_cb.retain();
+        }
+        /// The absorb of this verify's rows, committed behind the verify's split on its own queue, and the next round's
+        /// frame told to wait for it and append the rows the picks keep from it; false (nothing committed, the frame
+        /// computes its own absorb) when it cannot be.
+        fn absorbAhead(p: *Picks) bool {
+            const g = p.g;
+            const value = p.spec orelse return false;
+            const s = if (g.draft.backend.spec) |*x| x else return false;
+            if (!g.draft.canPrepare(2)) return false;
+            const t = &g.runner.taps;
+            s.commit(&g.draft.backend, &g.draft.graph, g.runner.model.glue, .{ .buffer = t.buffer, .capacity = t.capacity, .width = t.width }, @intCast(p.ids.len), g.draft.committed_end, value) catch |err| {
+                std.log.warn("qwen27: draft absorb ahead: {s}", .{@errorName(err)});
+                p.spec_committed = s.committed == value;
+                return false;
+            };
+            p.spec_committed = true;
+            g.draft.backend.frame.gate = .{ .event = s.done, .value = value, .cb = s.last.? };
+            g.draft.backend.ahead = true;
+            return true;
+        }
+        /// After an error: a committed absorb whose verify may not have signalled it runs out now.
+        fn letThrough(p: *Picks) void {
+            if (!p.spec_committed) return;
+            if (p.g.draft.backend.spec) |*s| s.release(p.spec.?);
         }
         /// A held keep to the queue, then the early frame's bridge spin behind it.
         fn release(p: *Picks) void {
@@ -316,6 +349,8 @@ pub const Generation = struct {
             const shape = p.shape orelse return error.DraftKeepGpuFailure;
             g.picked.?.wait(e);
             try g.commit.select(e, .{ .buf = g.matcher.buffers[4] }, .{ .buf = blocks.buf, .off = blocks.off }, .{ .rows = shape.rows, .words = RoundArgs.words, .blocks = RoundArgs.blocks - 1, .token = RoundArgs.token_word, .status = RoundArgs.status_word, .fallback = g.draft.graph.config.mask });
+            // beside it: the kept rows of the absorb ahead, which the frame appends (absorbAhead)
+            if (g.draft.backend.ahead) try g.draft.backend.spec.?.gather(e, g.commit, .{ .buf = g.matcher.buffers[4] }, shape.rows, g.draft.graph.config);
         }
     };
     /// A keep left pending (runRound), waited for right before the next verify's first GPU work (Runner.settle): once its
@@ -346,7 +381,11 @@ pub const Generation = struct {
         defer g.runner.settle = null;
         // a greedy verify of at most the sieve's rows picks through it; wider ones (copies past the tree) take the full head
         const sieve = g.runner.sieve != null and ids.len <= @import("../head_sieve.zig").HeadSieve.rows_max;
-        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .early = early, .sieve = sieve };
+        // a depth-one round's absorb ahead (runtime_spec.zig): the verify signals its event behind its last layer's block
+        const spec: ?u64 = if (early and ids.len <= @import("runtime_spec.zig").rows_max) (if (g.draft.backend.spec) |*s| s.reserve() else null) else null;
+        g.runner.split = if (spec) |value| .{ .event = g.draft.backend.spec.?.taps_in, .value = value } else null;
+        defer g.runner.split = null;
+        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .early = early, .sieve = sieve, .spec = spec };
         g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
         defer g.runner.tail = null;
         g.runner.head_sieve = sieve;
@@ -358,6 +397,8 @@ pub const Generation = struct {
         // a frame the keep hook committed runs on: an error waits for it (and fails the drafter if it admitted nothing)
         errdefer g.draft.drainNext() catch {};
         errdefer picks.release();
+        // before the drain above: the frame waits on the absorb, which waits on the verify's signal
+        errdefer picks.letThrough();
         try g.runner.verifyHead(round, .all);
         picks.release();
         errdefer g.runner.failed = true;

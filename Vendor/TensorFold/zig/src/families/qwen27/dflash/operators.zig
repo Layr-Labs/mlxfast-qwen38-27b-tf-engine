@@ -89,6 +89,9 @@ pub const Ops = struct {
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
         lattice_end: ?*const fn (*anyopaque, u64, Head, View, View, Config) anyerror!Lattice = null,
+        // an append whose keys and values (each layer's, `rows` rows) were computed ahead of the frame: true and the
+        // views of those words, or false (nothing encoded) and the append computes them itself
+        staged_kv: ?*const fn (*anyopaque, u64, u32, []View, []View) anyerror!bool = null,
     };
 };
 

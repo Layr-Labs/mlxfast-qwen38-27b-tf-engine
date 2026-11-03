@@ -404,6 +404,23 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
         made += 1;
     }
 }
+/// An early frame's append of the keys and values its absorb ahead computed (runtime_spec.zig): each layer's kept rows,
+/// which its lead copied out of the absorb's rows in kept order (Spec.gather), in place of the frame's own fusion, norm,
+/// K/V projections and key norm and rope. The appends then write the rows the verify admitted, as before.
+fn stagedKv(ptr: *anyopaque, epoch: u64, rows: u32, keys: []op.View, values: []op.View) !bool {
+    const b = backend(ptr);
+    if (!b.ahead or !b.admitting()) return false;
+    const s = &(b.spec orelse return false);
+    try b.frame.require(epoch);
+    if (rows != 2 or keys.len != b.config.layers or values.len != keys.len) return error.DraftDeviceRound;
+    const kvw = b.config.kvWidth();
+    const n: u32 = @intCast(keys.len);
+    for (keys, values, 0..) |*k, *v, i| {
+        k.* = try b.frame.add(.{ .buf = s.kept_keys, .off = i * kvw * 2 }, rows, kvw, n * kvw, .bf16);
+        v.* = try b.frame.add(.{ .buf = s.kept_values, .off = (i * s.vw + s.voff) * 2 }, rows, kvw, n * s.vw, .bf16);
+    }
+    return true;
+}
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd, .staged_kv = stagedKv };

@@ -22,6 +22,10 @@ pub const Tail = struct {
     ptr: *anyopaque,
     encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void,
 };
+/// The forward's command buffer ends behind its last layer's block, `event` signalled at `value` at its end: work on
+/// another queue that waits for it reads every row the blocks wrote (their taps included) and runs beside the final norm,
+/// the head and the tail in the forward's last buffer (a depth-one round's absorb ahead, dflash/runtime_spec.zig).
+pub const Split = struct { event: mtl.SharedEvent, value: u64 };
 /// Work committed right after the forward's last command buffer, before the host waits on it (a round's keep).
 pub const Hook = struct {
     ptr: *anyopaque,
@@ -47,6 +51,9 @@ pub const Stages = struct {
     tail: ?Tail = null,
     /// Work encoded first in the forward's first command buffer, beside its embedding (a draft's bridge stop).
     lead: ?Tail = null,
+    split: ?Split = null,
+    /// The split is encoded: segments ends the buffer there (commitDue).
+    split_due: bool = false,
     after: ?Hook = null,
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
@@ -100,6 +107,12 @@ pub const Stages = struct {
             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
         }
     }
+    /// Whether the buffer ends here (segments' commitDue): once, behind the split.
+    pub fn commitDue(s: *Stages) bool {
+        const due = s.split_due;
+        s.split_due = false;
+        return due;
+    }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
@@ -108,6 +121,20 @@ pub const Stages = struct {
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        try s.block(lane, index);
+        // behind the last layer's block: the split's event between the encoders, the buffer committed behind it
+        if (index + 1 == s.model.config.layers) if (s.split) |sp| {
+            s.split = null;
+            lane.fence.update(lane.enc);
+            lane.enc.end();
+            lane.cb.signal(sp.event, sp.value);
+            // a forward's encoders are concurrent ones (decode_round)
+            lane.enc = lane.cb.compute(.concurrent);
+            lane.fence.wait(lane.enc);
+            s.split_due = true;
+        };
+    }
+    fn block(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         const f = s.rowsFrame();
         const e = lane.enc;

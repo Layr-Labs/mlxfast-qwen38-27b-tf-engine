@@ -127,6 +127,11 @@ pub const Frame = struct {
     poll_value: u64 = 0,
     unchecked: [9]mtl.CommandBuffer = undefined,
     n_unchecked: usize = 0,
+    /// The next early frame's command buffer first waits for `event` to reach `value` (work on another queue that the
+    /// frame reads, which `cb` runs and signals); `gated` is the running frame's.
+    gate: ?Gate = null,
+    gated: ?Gate = null,
+    pub const Gate = struct { event: mtl.SharedEvent, value: u64, cb: mtl.CommandBuffer };
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -188,6 +193,9 @@ pub const Frame = struct {
         f.early = early;
         f.bridge_due = false;
         f.cb = f.open();
+        f.gated = if (early) f.gate else null;
+        f.gate = null;
+        if (f.gated) |g| f.cb.waitFor(g.event, g.value);
         f.encoder = f.cb.compute(.concurrent);
         f.active = true;
         f.completed = false;
@@ -263,8 +271,19 @@ pub const Frame = struct {
         if (!f.active or f.completed or !f.committed) return error.DraftFrameNotActive;
         // the frame's tokens gate the next verify's encode: return once the GPU reaches the frame's last command
         if (f.poll_event) |ev| {
-            while (ev.value() < f.poll_value and f.cb.status() != .@"error") std.atomic.spinLoopHint();
+            var spins: u32 = 0;
+            while (ev.value() < f.poll_value and f.cb.status() != .@"error") : (spins +%= 1) {
+                // a gate whose work failed on the GPU never signals: let the frame run out, then fail it below
+                if (spins % 4096 == 4095) if (f.gated) |g| if (g.cb.status() == .@"error") g.event.set(g.value);
+                std.atomic.spinLoopHint();
+            }
             if (f.cb.status() != .@"error") {
+                if (f.gated) |g| if (g.cb.status() == .@"error") {
+                    f.cb.wait();
+                    f.completed = true;
+                    f.drop();
+                    return error.DraftGpuFailure;
+                };
                 for (f.parts[0..f.part_count]) |cb| {
                     f.unchecked[f.n_unchecked] = cb.retain();
                     f.n_unchecked += 1;
@@ -291,6 +310,8 @@ pub const Frame = struct {
         if (failed(f.cb)) return error.DraftGpuFailure;
     }
     pub fn release(f: *Frame) void {
+        // an abandoned frame's gate is let through: the frame runs out on whatever its gate's work left
+        if (f.active and !f.completed) if (f.gated) |g| if (g.event.value() < g.value) g.event.set(g.value);
         if (f.active and !f.completed) {
             if (!f.committed) {
                 f.encoder.end();
