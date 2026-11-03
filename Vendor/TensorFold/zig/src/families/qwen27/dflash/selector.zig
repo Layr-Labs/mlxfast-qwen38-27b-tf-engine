@@ -98,72 +98,30 @@ fn codebookRow(g: *const weights.Graph, t: weights.Tensor, row: u32) ![]const u8
     if (t.shape[1] < rank or at + rank * 2 > t.bytes.len) return error.DraftCodebookShape;
     return t.bytes[at..][0 .. rank * 2];
 }
-/// The candidates edgesOf takes at once, one f64 vector lane each: all of a lattice row's (propose bounds topk by it).
-const lanes = 16;
-/// edges for every candidate of a row at once, the parent's terms given: one f64 vector lane a candidate (never a rank
-/// position), each lane's product and sum exactly as edges makes them (its own accumulator from 0, then one product and
-/// one sum a rank position, in rank order: strict, so no fused multiply-add). A non-finite codebook word is the same
-/// error; of a short row and a non-finite word, the one candidates taken four at a time in order would meet first.
+/// edges for every candidate of a row at once, the parent's terms given, four candidates at a time: each candidate's
+/// products and sum exactly as edges makes them (its own accumulator, term by term in rank order), the four sums
+/// interleaved; a non-finite codebook word is the same error.
 fn edgesOf(g: *const weights.Graph, terms: *const [max_rank]f64, tokens: []const u32, out: []f64) !void {
     @setFloatMode(.strict);
     const rank: usize = g.config.rank;
-    if (tokens.len == 0) return;
-    if (tokens.len > lanes or out.len < tokens.len) return error.DraftLatticeShape;
-    const Sums = @Vector(lanes, f64);
-    const Words = @Vector(lanes, u32);
-    // rows a group of four candidates at a time, a lane past the last candidate on the last candidate's row; `groups`
-    // ends before the first group with a short row
-    var rows: [lanes][*]const u8 = undefined;
-    var groups: usize = (tokens.len + 3) / 4;
-    const short = rowsOf(g, tokens, &rows, &groups);
-    if (groups == 0) return error.DraftCodebookShape;
-    for (groups * 4..lanes) |lane| rows[lane] = rows[0]; // read and discarded
-    const exponent: Words = @splat(0x7F80);
-    var sums: Sums = @splat(0);
-    var bad: Words = @splat(0);
-    for (0..rank) |r| {
-        var bits: Words = undefined;
-        inline for (0..lanes) |k| bits[k] = std.mem.readInt(u16, rows[k][r * 2 ..][0..2], .little);
-        bad |= @select(u32, bits & exponent == exponent, @as(Words, @splat(1)), @as(Words, @splat(0)));
-        const values: @Vector(lanes, f32) = @bitCast(bits << @splat(16));
-        sums += @as(Sums, @splat(terms[r])) * @as(Sums, @floatCast(values));
+    var first: usize = 0;
+    while (first < tokens.len) : (first += 4) {
+        const n = @min(4, tokens.len - first);
+        var rows: [4][]const u8 = undefined;
+        for (0..4) |k| rows[k] = try codebookRow(g, g.successor, tokens[first + @min(k, n - 1)]);
+        var sums: [4]f64 = @splat(0);
+        var bad: u16 = 0;
+        for (0..rank) |r| {
+            inline for (0..4) |k| {
+                const bits = std.mem.readInt(u16, rows[k][r * 2 ..][0..2], .little);
+                bad |= @intFromBool(bits & 0x7F80 == 0x7F80);
+                const value: f32 = @bitCast(@as(u32, bits) << 16);
+                sums[k] += terms[r] * @as(f64, value);
+            }
+        }
+        if (bad != 0) return error.DraftCodebookFinite;
+        for (0..n) |k| out[first + k] = sums[k];
     }
-    const flags: [lanes]u32 = bad;
-    for (0..groups) |group| for (flags[group * 4 ..][0..4]) |flag| if (flag != 0) return error.DraftCodebookFinite;
-    if (short) return error.DraftCodebookShape;
-    const edges_of: [lanes]f64 = sums;
-    @memcpy(out[0..tokens.len], edges_of[0..tokens.len]);
-}
-/// edgesOf's successor rows, a group of four candidates at a time in order (the last group's spare lanes on its last
-/// candidate's row), until a short row: whether one was met, `groups` lowered to the groups before it.
-fn rowsOf(g: *const weights.Graph, tokens: []const u32, rows: *[lanes][*]const u8, groups: *usize) bool {
-    for (0..groups.*) |group| for (0..4) |k| {
-        const lane = group * 4 + k;
-        const row = codebookRow(g, g.successor, tokens[@min(lane, tokens.len - 1)]) catch {
-            groups.* = group;
-            return true;
-        };
-        rows[lane] = row.ptr;
-    };
-    return false;
-}
-/// A codebook row's cache lines requested ahead of its reader (a hint: nothing is read here, and a row out of bounds is
-/// left alone).
-fn warmRow(g: *const weights.Graph, t: weights.Tensor, row: u32) void {
-    const bytes = codebookRow(g, t, row) catch return;
-    var at: usize = 0;
-    while (at < bytes.len) : (at += 128) @prefetch(bytes.ptr + at, .{ .locality = 3 });
-    @prefetch(bytes.ptr + bytes.len - 1, .{ .locality = 3 });
-}
-/// The anchor's predecessor row on its way to the caches, before the lattice that parentTerms multiplies it by.
-pub fn warmAnchor(g: *const weights.Graph, anchor: u32) void {
-    if (anchor < g.config.vocab and g.config.rank <= max_rank) warmRow(g, g.predecessor, anchor);
-}
-/// Every candidate's successor row on its way to the caches, once the lattice names them: edgesOf then reads them
-/// from there rather than waiting on each row in turn.
-pub fn warmCandidates(g: *const weights.Graph, lattice: op.Lattice) void {
-    if (g.config.rank > max_rank) return;
-    for (lattice.candidates) |token| if (token < g.config.vocab) warmRow(g, g.successor, token);
 }
 fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first: u64, parent_token: u32, parent: i32, depth: u32, cumulative: f64, frontier: *std.ArrayList(Node)) !void {
     @setFloatMode(.strict);
