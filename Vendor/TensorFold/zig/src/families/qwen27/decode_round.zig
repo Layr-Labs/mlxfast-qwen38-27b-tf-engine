@@ -390,7 +390,7 @@ pub const Runner = struct {
         return &at.*.?;
     }
 
-    /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 64) in the model's frame on
+    /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 32) in the model's frame on
     /// the model's queue, the rest in the second segment's frame on its own queue. Each layer's mixer of the second waits
     /// for the first's (its GDN states and conv windows, its K/V rows); everything else of the two runs side by side. Each
     /// segment's rows take the kernels and the arithmetic a prompt chunk of those rows takes, so every word is the one two
@@ -402,9 +402,9 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: k n / parts, down to a multiple of 32; the last runs to n
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 32 * 32);
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
