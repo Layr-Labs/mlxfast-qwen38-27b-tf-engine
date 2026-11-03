@@ -8,6 +8,8 @@ const profile = @import("core").gpu_profile;
 const Ref = projection.Ref;
 
 pub const Slice = extern struct { rows: u32, width: u32, stride: u32, offset: u32 };
+/// A Slice whose output rows stand `out_stride` elements apart.
+const SliceRows = extern struct { rows: u32, width: u32, stride: u32, offset: u32, out_stride: u32 };
 const Add = extern struct { rows: u32, width: u32 };
 pub const Gather = extern struct { rows: u32, width: u32, capacity: u32, planes: u32 };
 
@@ -15,6 +17,7 @@ pub const Kernels = struct {
     embed: mtl.Pipeline,
     head: mtl.Pipeline,
     slice: mtl.Pipeline,
+    slice_rows: mtl.Pipeline,
     add: mtl.Pipeline,
     gather: mtl.Pipeline,
     take: mtl.Pipeline,
@@ -31,16 +34,18 @@ pub const Kernels = struct {
         errdefer head.deinit();
         const slice = try mtl.Pipeline.init(device, copy, "q27_slice", false);
         errdefer slice.deinit();
+        const slice_rows = try mtl.Pipeline.init(device, copy, "q27_slice_rows", false);
+        errdefer slice_rows.deinit();
         const add = try mtl.Pipeline.init(device, copy, "q27_add", false);
         errdefer add.deinit();
         const gather = try mtl.Pipeline.init(device, copy, "q27_tap_gather", false);
         errdefer gather.deinit();
         const take = try mtl.Pipeline.init(device, copy, "q27_take", false);
-        return .{ .embed = embed, .head = head, .slice = slice, .add = add, .gather = gather, .take = take };
+        return .{ .embed = embed, .head = head, .slice = slice, .slice_rows = slice_rows, .add = add, .gather = gather, .take = take };
     }
 
     pub fn deinit(k: Kernels) void {
-        inline for (.{ k.embed, k.head, k.slice, k.add, k.gather, k.take }) |p| p.deinit();
+        inline for (.{ k.embed, k.head, k.slice, k.slice_rows, k.add, k.gather, k.take }) |p| p.deinit();
     }
 
     /// Each row whose `takes` entry names an image row gets that row's bits from `images` over its embedding.
@@ -90,6 +95,21 @@ pub const Kernels = struct {
         e.setPipeline(k.slice);
         e.setBuffer(x.buffer, x.offset, 0);
         e.setValue(p, 1);
+        e.setBuffer(y.buffer, y.offset, 2);
+        e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(256, 1, 1));
+        try span.end();
+    }
+
+    /// `unstack` with output rows `out_stride` elements apart (a prompt pass's taps into the drafter's ring rows).
+    pub fn unstackRows(k: Kernels, input_encoder: mtl.ComputeEncoder, x: Ref, y: Ref, p: Slice, out_stride: u32) !void {
+        var span = profile.begin(k.profiler, input_encoder, .copy);
+        errdefer span.cancel();
+        const e = span.encoder;
+
+        if (p.rows == 0 or p.width == 0 or p.offset + p.width > p.stride or out_stride < p.width) return error.BadSlice;
+        e.setPipeline(k.slice_rows);
+        e.setBuffer(x.buffer, x.offset, 0);
+        e.setValue(SliceRows{ .rows = p.rows, .width = p.width, .stride = p.stride, .offset = p.offset, .out_stride = out_stride }, 1);
         e.setBuffer(y.buffer, y.offset, 2);
         e.dispatchThreads(mtl.Size.of(p.width, p.rows, 1), mtl.Size.of(256, 1, 1));
         try span.end();
