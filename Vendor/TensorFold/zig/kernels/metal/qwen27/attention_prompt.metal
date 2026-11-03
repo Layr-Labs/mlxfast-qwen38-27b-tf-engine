@@ -179,17 +179,22 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
     m = nm;
   }
+  // the lane's eight gate words in one 16-byte load before any store, its eight output words in one 16-byte store (rows
+  // and head offsets are 16-byte aligned; Attention.promptRows checks the bases): the one-word loop's gate loads each
+  // waited for the store before them. The arithmetic is that loop's, word for word.
+  vec<bfloat, DP> gates = vec<bfloat, DP>(bfloat(0.0f)), values;
+  if (gated) gates = *(device const vec<bfloat, DP>*)(QG + ((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP);
   for (int i = 0; i < DP; i++) {
-    const int64_t index = ((int64_t)node * (PG * 4) + head) * PD + lane * DP + i;
     const bfloat v = static_cast<bfloat>(o[i] / l);
     bfloat value = v;
     if (gated) {
-      const float gate = float(QG[((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP + i]);
+      const float gate = float(gates[i]);
       value = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
     }
-    OUT[index] = value;
+    values[i] = value;
     o[i] = float(value);
   }
+  *(device vec<bfloat, DP>*)(OUT + ((int64_t)node * (PG * 4) + head) * PD + lane * DP) = values;
   if (sums_stride != 0) {
     // Four independent groups per head. Their eight lanes take turns adding eight BF16 values,
     // keeping the existing64-value sequential FP32 sum, including the initial positive zero.
