@@ -52,6 +52,9 @@ pub const Deferred = extern struct { rows: u32, persist: u32 };
 pub const Stash = extern struct { base: u32, room: u32, log_rows: u32, pending_rows: u32 };
 /// tf_delta_gdn_unstash: the pending rows, the slot they extend, the pending rows a layer and a layer's committed words.
 pub const Unstash = extern struct { rows: u32, slot: u32, pending_rows: u32, layer_words: u32 };
+/// tf_delta_gdn_conv_keep: the ushort words a layer's committed history and projected qkv rows take, so one launch
+/// writes every layer's conv window.
+pub const ConvLayers = extern struct { history_words: u32, projection_words: u32 };
 
 pub const Shape = struct {
     c: Config,
