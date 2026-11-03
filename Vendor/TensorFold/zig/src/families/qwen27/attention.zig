@@ -314,7 +314,7 @@ pub const Attention = struct {
         if (rows4) if (p.decoded) |d| {
             const words = a.chain_words orelse return error.TargetAttentionShape;
             const w = p.after orelse return error.TargetAttentionShape;
-            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or !d.plan.fused or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
+            if (p.packed_rows != 0 or key_stride != 2 * g.kv_heads * g.dim or d.plan.streams != 1 or !a.supportsDecodedAppend(d.plan.*) or d.plan.rows != p.rows or p.rows > 8) return error.TargetAttentionShape;
             if (d.v_stride < g.kv_heads * g.dim) return error.TargetAttentionShape;
             try d.scratch.check(d.plan.*);
             try d.binding.check(d.plan.*, d.caches);
@@ -389,6 +389,10 @@ pub const Attention = struct {
     pub fn promptPath(a: *const Attention, plan: Plan, prompt: bool) bool {
         return prompt and a.prompt != null and (plan.geometry.shared_prefix or !a.units) and plan.streams == 1;
     }
+    /// The decoded preprocess count is consumed by the fused prefix or by a one-chunk split tail.
+    pub fn supportsDecodedAppend(a: *const Attention, plan: Plan) bool {
+        return plan.fused or (a.split_tail != null and plan.rows <= 8 and plan.tail_chunks == 1);
+    }
     /// `prompt`: a prompt chunk's rows (one stream, a chain) take the prompt kernel. `v_stride`: values from one row of
     /// `v` to the next (kv_heads * dim when packed). `prepacked`: preprocess already filled qa (`packed_rows`), so
     /// q27_attn_pack_a stays out; the prompt path only. `sums` (decoded rows only): the merge also writes the out
@@ -401,7 +405,7 @@ pub const Attention = struct {
         const q_bytes = @as(usize, plan.rows) * g.heads * g.dim * 2;
         const kv_bytes = @as(usize, plan.rows) * g.kv_heads * g.dim * 2;
         if (v_stride < g.kv_heads * g.dim or (prepacked and !a.promptPath(plan, prompt))) return error.TargetAttentionShape;
-        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !plan.fused or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
+        if (appended and (prepacked or a.promptPath(plan, prompt) or a.chain_words == null or !a.supportsDecodedAppend(plan) or plan.streams != 1 or plan.prefix_chunks == 0 or plan.rows > 8)) return error.TargetAttentionShape;
         const v_bytes = (@as(usize, plan.rows) - 1) * v_stride * 2 + g.kv_heads * g.dim * 2;
         var timing = profile.begin(a.profiler, input_encoder, .attention);
         errdefer timing.cancel();
@@ -503,12 +507,12 @@ pub const Attention = struct {
             e.setValue(args, 2);
             e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
         }
-        // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
-        if (!appended) e.barrier();
+        // The split tail reads QB from pack_b; its dispatch needs the barrier even when preprocess appended the cache rows.
+        if (!appended or !plan.fused) e.barrier();
         const scale: f32 = 0.0625;
         // Small one-chunk trees otherwise expose only four groups per node.
         // Separate head halves double that grid and halve each compute lane's accumulators.
-        const split = !plan.fused and a.split_tail != null and plan.rows <= 8 and plan.tail_chunks == 1;
+        const split = !plan.fused and a.supportsDecodedAppend(plan);
         // decoded rows behind a prefix, with a split tail or none (a fused chain): the kernels share one barrier interval.
         // The prefix's groups count their stored partials; a split tail's groups each wait on that count before they read
         // them, then count their own; every merge group waits on the last count (the tail's groups all waited on the
