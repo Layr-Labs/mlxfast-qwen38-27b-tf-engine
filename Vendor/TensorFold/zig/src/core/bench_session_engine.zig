@@ -231,7 +231,7 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+pub const dflash_floor = 0.020;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
@@ -359,7 +359,11 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // Short sleeps (20 us between checks) instead of yield-spinning a core for the whole request (the CPU and GPU share
+        // one package's power)
+        const sys = @import("sys").c;
+        const req: sys.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+        while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
         if (run.failed) return error.EngineFailed;
     }
 };
