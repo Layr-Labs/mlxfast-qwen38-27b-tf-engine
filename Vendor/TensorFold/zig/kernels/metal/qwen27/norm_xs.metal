@@ -31,7 +31,11 @@ Q27_SPECIALIZE
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
-  if (int(m) >= M) return;
+  if (int(m) >= M) {
+    // team-m5-08o: a counted norm's padded rows store nothing and count at once, so the count reaches the rows dispatched
+    if (Q27_COUNT && t == 0) atomic_fetch_add_explicit(&NC[2], 1u, memory_order_relaxed);
+    return;
+  }
   const int base = int(m) * K + int(t) * E;
   // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
   // words start 32 bytes apart): HO, XO and XS may alias H, R and Wt as far as the compiler knows, so the scalar loop's
@@ -39,7 +43,7 @@ Q27_SPECIALIZE
   // H (the residual stream, stored behind the barrier that opened this interval) and the weights come from nothing in
   // this barrier interval, so their words are requested before the wait below; only R's follow it.
   bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
-  for (int j = 0; j < E / 8; j++) {
+  if (!Q27_LATE_H) for (int j = 0; j < E / 8; j++) {
     const uint4 hw = ((const device uint4*)(H + base))[j];
     h4[2 * j] = as_type<bfloat4>(hw.xy);
     h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
@@ -64,6 +68,13 @@ Q27_SPECIALIZE
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  // team-m5-08o: H stored by a counted norm in this barrier interval (the previous layer's post-attention norm, behind the
+  // gate/up and down this norm's count follows) is read only past the wait, beside R
+  if (Q27_LATE_H) for (int j = 0; j < E / 8; j++) {
+    const uint4 hw = ((const device uint4*)(H + base))[j];
+    h4[2 * j] = as_type<bfloat4>(hw.xy);
+    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
   }
   for (int j = 0; j < E / 8; j++) {
     const uint4 rw = ((const device uint4*)(R + base))[j];
@@ -101,5 +112,14 @@ Q27_SPECIALIZE
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+  if (Q27_COUNT) {
+    // team-m5-08o: the gate/up that reads XO and XS shares this norm's barrier interval: each row's threadgroup counts
+    // itself on NC[2] once its stores (HO, XO, XS, and row 0's padded sums) are past a device-scope fence
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&NC[2], 1u, memory_order_relaxed);
+    }
+  }
 
 }
