@@ -308,6 +308,12 @@ inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
 
 // TF_ROWS8: launches of at most 8 rows (decoded rows). A lane holds rows mb and mb + 8; the second is then always padding,
 // so its accumulators, row sums, hand-over words and stores are left out. Every live row's words are unchanged.
+// TF_M8 (rows8 only): the tensor op is 8 rows (matmul2d M = 8), the rows rows8 reads; lane_projection.Layout.m8.
+#if defined(TF_M8)
+#define TF_DM 8
+#else
+#define TF_DM 16
+#endif
 #if defined(TF_ROWS8)
 #define TF_LIVE(i) ((((i) >> 2) & 1) == 0)
 #define TF_HALF(i) (((i) & 3) | (((i) >> 3) << 2))
@@ -384,14 +390,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   XS += r0;
 #if defined(TF_GU_TURNS)
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1];
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1];
 #elif defined(TF_SWIGLU)
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #else
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = TF_TILE_OF(tg.x), n0 = tile * NT;
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1], tile = TF_TILE_OF(tg.x), n0 = tile * NT;
 #endif
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto desc = matmul2d_descriptor(TF_DM, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto a0 = a.slice(0, 0);
@@ -581,6 +587,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // the two-tile prompt launches' threadgroup-memory cap (TF_TGPAD) for the one-tile ones too; the use never runs
+  threadgroup float tgpad1[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
+#endif
+#endif
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -880,6 +896,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#ifndef TF_TGPAD
+#define TF_TGPAD 8192
+#endif
+#if TF_TGPAD > 0
+  // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
+  // (rows are never negative)
+  threadgroup float tgpad[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
+#endif
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL

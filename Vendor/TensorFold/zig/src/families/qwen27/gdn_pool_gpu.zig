@@ -257,7 +257,8 @@ pub const Pool = struct {
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
@@ -434,12 +435,14 @@ pub const Pool = struct {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
         const p = try pool.budget.shape.params(1, pool.budget.slots, k);
-        e.setPipeline(pool.kernels.clear);
+        // 16-byte stores when every (layer, slot) row is a whole number of them: the same words, a quarter of the threads
+        const wide = pool.budget.shape.state % 4 == 0 and pool.budget.shape.conv % 8 == 0 and pool.budget.shape.conv / 8 <= pool.budget.shape.state / 4;
+        e.setPipeline(if (wide) pool.kernels.clear4 else pool.kernels.clear);
         e.setBuffer(pool.get(.state), 0, 0);
         e.setBuffer(pool.get(.history), 0, 1);
         e.setValue(p, 2);
         e.setValue(slot, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
+        if (wide) e.dispatchThreads(.{ .width = pool.budget.shape.state / 4, .height = pool.budget.layers }, .{ .width = 256 }) else e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
         e.barrier();
     }
 
