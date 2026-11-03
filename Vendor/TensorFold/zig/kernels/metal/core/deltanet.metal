@@ -665,20 +665,34 @@ inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
   // the row's key and query words, its (row, head) scalars, and its value and output words
   uint kq = (span.first * p.nk + key_head) * p.dk + sub * 16, at = span.first * p.nv + head, vo = at * p.dv + dimension;
   const uint kq_step = p.nk * p.dk, at_step = p.nv, vo_step = p.nv * p.dv;
+  // the next row's key, query, value, decay and mixing load while this row computes: the loop's device reads leave the
+  // row-to-row critical path; every conversion, product and sum keeps its order and operands
+  bfloat kb[16], qb[16], vb = bfloat(0.0f), mb = bfloat(0.0f);
+  float fb = 0.0f;
+  if (span.rows > 0) {
+    TF_UNROLL for (uint i = 0; i < 16; ++i) { kb[i] = key[kq + i]; qb[i] = query[kq + i]; }
+    vb = value[vo + held];
+    fb = decay[at];
+    mb = mixing[at];
+  }
   for (uint node = 0; node < span.rows; ++node) {
-    device const bfloat* k = key + kq;
-    device const bfloat* q = query + kq;
     float kf[16], qf[16], remembered[CC], correction[CC], result[CC];
     TF_UNROLL for (uint c = 0; c < CC; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) kf[i] = float(k[i]);
-    const float forget = decay[at];
+    TF_UNROLL for (uint i = 0; i < 16; ++i) { kf[i] = float(kb[i]); qf[i] = float(qb[i]); }
+    const float forget = fb, mix = float(mb), held_value = float(vb);
+    if (node + 1 < span.rows) {
+      const uint nkq = kq + kq_step, nat = at + at_step, nvo = vo + vo_step;
+      TF_UNROLL for (uint i = 0; i < 16; ++i) { kb[i] = key[nkq + i]; qb[i] = query[nkq + i]; }
+      vb = value[nvo + held];
+      fb = decay[nat];
+      mb = mixing[nat];
+    }
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < CC; ++c) {
         state[c][i] = state[c][i] * forget;
         remembered[c] += state[c][i] * kf[i];
       }
-    const float mix = float(mixing[at]);
-    const float own = (float(value[vo + held]) - tf_delta_scatter_sum<CC>(remembered, b0, b1)) * mix;
+    const float own = (held_value - tf_delta_scatter_sum<CC>(remembered, b0, b1)) * mix;
     if (CC == 2) {
       const float other = simd_shuffle_xor(own, 1);
       correction[0] = b0 ? other : own;
@@ -692,7 +706,6 @@ inline void tf_delta_gdn_chain_wide_scatter(device const bfloat* query,
       correction[2 % CC] = b0 ? lo : other_lo;
       correction[3 % CC] = b0 ? hi : other_hi;
     }
-    TF_UNROLL for (uint i = 0; i < 16; ++i) qf[i] = float(q[i]);
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < CC; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
