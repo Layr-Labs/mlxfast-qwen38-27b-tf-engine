@@ -79,6 +79,8 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
+    /// Prompt MLP launches: 16-row blocks a SIMD group (lane Layout.prompt_tm), part of the pipeline's identity.
+    prompt_tm: u32 = 1,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
     /// (12288) with K split 2 (GDN z|b|a keeps its four K slices in parallel).
@@ -293,6 +295,8 @@ pub const Kernels = struct {
         if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
         if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
+        // two tiles a SIMD group where the gate and up pairs each sit inside one code batch; then two row blocks
+        const tn: usize = if (p.batch % 2 == 0 and (p.n / 64) % p.batch == 0) 2 else 1;
         const key = Key{
             .kind = .projection,
             .n = p.n,
@@ -304,6 +308,7 @@ pub const Kernels = struct {
             .prompt_sr = true,
             .batch = p.batch,
             .swiglu = true,
+            .prompt_tm = promptRowBlocks(tn, p.n, p.k),
         };
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
@@ -322,8 +327,8 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
-                .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
+                .prompt_tn = tn,
+                .prompt_tm = key.prompt_tm,
             });
             k.joined(entry.value_ptr);
         }
@@ -351,16 +356,17 @@ pub const Kernels = struct {
         if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
         if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
         const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
         const tn = promptTiles(key, p.n, 0);
         if (tn == 1 or key.serialSk2()) return false;
+        key.prompt_tm = promptRowBlocks(tn, p.n, p.k);
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = sk, .bits = p.bits };
         errdefer span.cancel();
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .prompt_tm = key.prompt_tm, .residual = true });
             k.joined(entry.value_ptr);
         }
         var first: u32 = 0;
@@ -450,16 +456,18 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt) };
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
         const tiles = [_][2]usize{.{ range[0], range[1] }};
+        const tn = promptTiles(key, p.n, skip);
+        // whole-tile prompt launches only (a range or a group cut keeps one row block a SIMD group)
+        if (skip == 0 and cut[1] == 0 and range[1] == 0) key.prompt_tm = promptRowBlocks(tn, p.n, p.k);
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .prompt_tm = key.prompt_tm, .indexed = key.sbi, .indexed12 = key.sbi12 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -937,6 +945,20 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
 /// split-K 5120-wide projections (MLP down, attention output) and for the 5120-deep inputs (attention query+gate, GDN qkv,
 /// the GDN z columns that run beside the scan, MLP gate/up), one elsewhere. A two-tile launch runs its K splits as SIMD
 /// groups of one threadgroup, so the query+gate's prompt rows leave the serial split-K kernel for it.
+/// 16-row blocks a SIMD group for a prompt launch: 2 for the two-tile prompt MLP (fused gate/up 34816 x 5120, down
+/// 5120 x 17408), whose code loads and unpacks two row blocks then share; 1 elsewhere. TF_Q27_PROMPT_TM=1 keeps 1.
+fn promptRowBlocks(tn: usize, n: u32, k: u32) u32 {
+    if (tn != 2 or !promptTmOn()) return 1;
+    return if ((n == 34816 and k == 5120) or (n == 5120 and k == 17408)) 2 else 1;
+}
+var prompt_tm_env: ?bool = null;
+fn promptTmOn() bool {
+    if (prompt_tm_env) |on| return on;
+    const on = if (std.c.getenv("TF_Q27_PROMPT_TM")) |v| !std.mem.eql(u8, std.mem.span(v), "1") else true;
+    prompt_tm_env = on;
+    return on;
+}
+
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
     // the launch's tiles in whole pairs: a range's first tile and length, or every tile
