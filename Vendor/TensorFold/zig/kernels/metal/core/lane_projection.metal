@@ -581,6 +581,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
+#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
+#ifndef TF_TGPAD
+#define TF_TGPAD 16384
+#endif
+#if TF_TGPAD > 0
+  // the two-tile prompt launches' threadgroup-memory cap (TF_TGPAD) for the one-tile ones too; the use never runs
+  threadgroup float tgpad1[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
+#endif
+#endif
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -880,6 +890,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#ifndef TF_TGPAD
+#define TF_TGPAD 16384
+#endif
+#if TF_TGPAD > 0
+  // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
+  // (rows are never negative)
+  threadgroup float tgpad[TF_TGPAD / 4];
+  if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
+#endif
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
