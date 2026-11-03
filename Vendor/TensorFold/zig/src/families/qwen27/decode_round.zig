@@ -746,11 +746,7 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        cb.wait();
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -985,10 +981,6 @@ const Stagger = struct {
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
     }
-    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
-    pub fn polls(_: *const Stagger) bool {
-        return true;
-    }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {
         return p.stages[lane.k].pre(lane, index);
@@ -1040,3 +1032,5 @@ fn fingerprint(round: *const Round) [32]u8 {
     hash.final(&out);
     return out;
 }
+// Commit cadence, in one place: a verify commits after its first layer's mixer, after that layer's MLP and every
+// commit_every layers; a staggered prompt segment after its first mixer, its first three layers and every commit_every. (9)
