@@ -5,7 +5,7 @@ const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+const commit_every = 7;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
