@@ -973,7 +973,7 @@ const Second = struct {
             b.* = try attn.Binding.init(m.device, limits);
             made += 1;
         }
-        const own = try @import("gdn_pool_gpu.zig").Own.init(pool, m.device);
+        const own = try @import("gdn_pool_gpu.zig").Own.init(pool, m.device, frame.capacity);
         errdefer own.deinit();
         const queue = try m.device.queue();
         return .{ .frame = frame, .scratch = scratch, .bindings = bindings, .queue = queue, .gdn = own };
@@ -985,7 +985,7 @@ const Second = struct {
         if (s.frame.standby) |bank| for (bank) |b| fields.one(b, hook, joining);
         fields.apply(&s.scratch, hook, joining);
         for (s.bindings) |*b| fields.apply(b, hook, joining);
-        for ([_]mtl.Buffer{ s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
+        for ([_]mtl.Buffer{ s.gdn.qkv, s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
     }
 
     fn deinit(s: *Second, a: std.mem.Allocator) void {
@@ -1010,12 +1010,17 @@ const Segment = struct {
     total: u32,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .gdn_pre = gdnPre, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own, .preprojected = true };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
+    }
+    fn gdnPre(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .own = s.own };
+        try hook.projectPrompt(e, block, weights, frame, rows);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));

@@ -11,6 +11,8 @@ const ane_mlp = @import("ane_mlp.zig");
 pub const Mixer = struct {
     ptr: *anyopaque,
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
+    /// Staggered prompts only: independent projections run after norm, before the predecessor's mixer wait.
+    gdn_pre: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void = null,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
@@ -103,6 +105,10 @@ pub const Stages = struct {
             std.mem.swap(Ref, &s.hidden, &s.residual);
             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
         }
+        if (s.hooks.gdn_pre) |project| switch (layer.mixer) {
+            .linear => |g| try project(s.hooks.ptr, e, index, g, f, s.rows),
+            .attention => {},
+        };
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
