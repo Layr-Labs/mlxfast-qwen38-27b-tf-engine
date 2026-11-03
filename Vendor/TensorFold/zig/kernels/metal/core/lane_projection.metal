@@ -862,6 +862,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+// TF_GROUP_UNROLL: let the compiler unroll the K-group loop by two, so the next group's activation load, row sums and
+// metadata loads may schedule beside the current group's tensor ops (a remainder iteration covers odd counts)
+#ifndef TF_GROUP_UNROLL
+#define TF_GROUP_UNROLL 1
+#endif
+#if TF_GROUP_UNROLL
+#pragma clang loop unroll_count(2)
+#endif
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
