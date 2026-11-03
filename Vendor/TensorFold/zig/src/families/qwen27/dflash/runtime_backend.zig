@@ -107,6 +107,27 @@ pub const Hazards = struct {
         @memcpy(h.writes[h.n_writes..][0..writes.len], writes);
         h.n_writes += writes.len;
     }
+    /// order for a launch that waits on the count of the launch that wrote `counted` (team-m5-08t): its reads of
+    /// `counted` take no barrier; every other conflict still takes one.
+    pub fn orderAfter(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span, counted: Span) void {
+        var conflict = h.n_writes + writes.len > h.writes.len or h.n_reads + reads.len > h.reads.len;
+        if (!conflict) for (reads) |x| {
+            for (h.writes[0..h.n_writes]) |y| if (y.meets(x) and !std.meta.eql(y, counted)) {
+                conflict = true;
+                break;
+            };
+            if (conflict) break;
+        };
+        if (!conflict) for (writes) |x| if (any(h.writes[0..h.n_writes], x) or any(h.reads[0..h.n_reads], x)) {
+            conflict = true;
+            break;
+        };
+        if (conflict) h.barrier(e);
+        @memcpy(h.reads[h.n_reads..][0..reads.len], reads);
+        h.n_reads += reads.len;
+        @memcpy(h.writes[h.n_writes..][0..writes.len], writes);
+        h.n_writes += writes.len;
+    }
     /// Everything encoded so far completes before anything encoded next.
     pub fn barrier(h: *Hazards, e: mtl.ComputeEncoder) void {
         e.barrier();
@@ -173,6 +194,10 @@ pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.Co
 
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
 
+/// team-m5-08t: a counted projection's output, its count and its word pair.
+pub const Pending = struct { y: op.View, span: Span, groups: u32, words: Ref };
+/// Word pairs a frame's counted pairs take (a five-layer block uses nine).
+pub const pair_slots = 16;
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -209,6 +234,16 @@ pub const Backend = struct {
     precise: bool = false,
     precise_count: usize = 0,
     hazards: Hazards = .{},
+    /// team-m5-08t: the drafter's counted pairs (core.draft_ops.Pairs): a decoded block's o projection and its
+    /// post-attention conv+norm, and each layer's down but the last and the next layer's input conv+norm, share one
+    /// barrier interval. Null (no tensor units, or the waiting library failed to build): every pair keeps its barrier.
+    pairs: ?core.draft_ops.Pairs = null,
+    /// pair_slots word pairs, zero: a frame's pairs take them in turn from pair_slot 0, each left zero by its waiting
+    /// conv+norm, so no two chains share words in a frame.
+    pair_words: ?mtl.Buffer = null,
+    pair_slot: u32 = 0,
+    /// The counted projection whose waiting conv+norm is not encoded yet (encodePrepared, norm).
+    pending: ?Pending = null,
     /// The frame's drafter attention mask: every layer of a frame with the same context and query rows reads it.
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
     /// RoundArgs blocks: the frame's (0), then one per count the verify before it may admit.
@@ -220,8 +255,10 @@ pub const Backend = struct {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
         errdefer primitives.deinit();
-        const attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
+        var attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
         errdefer attention.deinit();
+        // the split's one launch with its merge, kept only where it writes the split and merge's words on this GPU
+        attention.buildMerged(a, target.device, target.queue) catch |err| std.log.warn("draft attention keeps its merge launch: {s}", .{@errorName(err)});
         const topk = try core.bf16_topk_gpu.Ops.init(target.device);
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
@@ -260,6 +297,8 @@ pub const Backend = struct {
         if (b.simd) |*p| p.deinit();
         freeCaches(b.allocator, b.caches);
         b.args.deinit();
+        if (b.pairs) |p| p.deinit();
+        if (b.pair_words) |w| w.deinit();
         b.head.deinit();
         b.topk.deinit();
         b.attention.deinit();
@@ -271,6 +310,7 @@ pub const Backend = struct {
         const order = if (units) try core.lane_projection.RegOrder.init(b.target.device) else null;
         defer if (order) |o| o.deinit();
         if (!units) b.simd = try simd.Pipelines.load(b.target.device);
+        if (units and b.pairs == null) b.preparePairs();
         var stash: Stash = .empty;
         defer {
             var it = stash.iterator();
@@ -319,7 +359,8 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            b.pairCount(&adapter, name);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -334,7 +375,8 @@ pub const Backend = struct {
                     const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
                     try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
                 };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                var exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                b.pairCount(&exact, name);
                 try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
                 b.precise_count += 1;
             }
@@ -342,6 +384,33 @@ pub const Backend = struct {
             const t = try Tiled.init(b.target.device, prepared_words);
             try @import("../residency.zig").putTiled(b, key, t);
         }
+    }
+    /// team-m5-08t: the waiting conv+norm and the pairs' words; without them every pair keeps its barrier (logged once).
+    fn preparePairs(b: *Backend) void {
+        const pairs = core.draft_ops.Pairs.init(b.target.device) catch |err| {
+            std.log.warn("the drafter keeps its norm barriers (team-m5-08t): {s}", .{@errorName(err)});
+            return;
+        };
+        const words = b.target.device.buffer(pair_slots * 8, options) catch |err| {
+            pairs.deinit();
+            std.log.warn("the drafter keeps its norm barriers (team-m5-08t): {s}", .{@errorName(err)});
+            return;
+        };
+        @memset(words.slice(u32, pair_slots * 2), 0);
+        if (b.residency) |f| mtl.resident.fields.one(words, f, true);
+        b.pairs = pairs;
+        b.pair_words = words;
+    }
+    /// team-m5-08t: the counted build of a linear whose output a conv+norm reads next in a decoded block: every layer's
+    /// o projection, and every layer's down but the last (the last one's conv feeds the final norm of other rows). One
+    /// that fails to build keeps its barrier (logged).
+    fn pairCount(b: *Backend, adapter: *core.affine4_lane.Adapter, name: []const u8) void {
+        if (b.pairs == null) return;
+        const down = std.mem.endsWith(u8, name, "mlp.down_proj.weight");
+        if (!down and !std.mem.endsWith(u8, name, "self_attn.o_proj.weight")) return;
+        const layer = layerOf(name) orelse return;
+        if (down and layer + 1 >= b.config.layers) return;
+        adapter.countedSmall(b.allocator, b.target.device) catch |err| std.log.warn("draft {s} keeps its norm barrier (team-m5-08t): {s}", .{ name, @errorName(err) });
     }
     /// Code width of a draft linear's prepared copy: the MLP's gate and up, attention's o and the fusion input projection
     /// fc at `mlp_bits`; q, k and v (one fused launch), the dynamic-conv kernel projections, the MLP's down and every
@@ -407,9 +476,74 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        // the decoded gate|up group (below 4 bits) also gets its fused SwiGLU launch (runtime_callbacks.projectSwiglu),
+        // kept only where it writes the words of the group's launch followed by tf_draft_swiglu_xs on this GPU
+        if (kind == group_gu and key_part == 'g') {
+            adapter.draftSwiglu(b.allocator, b.target.device) catch |err| std.log.warn("draft gate/up keeps its SwiGLU launch: {s}", .{@errorName(err)});
+            if (adapter.swiglu) |fused| if (!(b.swigluMatches(adapter) catch false)) {
+                std.log.warn("draft gate/up keeps its SwiGLU launch: the fused launch's words differ on this GPU", .{});
+                fused.deinit();
+                adapter.swiglu = null;
+            };
+        }
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
+    }
+    /// Whether a gate|up group's fused SwiGLU launch (Adapter.swiglu) writes, on two rows of a fixed input, the words its
+    /// rows8 launch followed by tf_draft_swiglu_xs writes: the activated rows and the live rows' group sums, bit for bit.
+    fn swigluMatches(b: *Backend, adapter: core.affine4_lane.Adapter) !bool {
+        const fused = adapter.swiglu orelse return false;
+        const small = adapter.small orelse return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const device = b.target.device;
+        const rows: u32 = 2;
+        const n = fused.n;
+        const k = fused.k;
+        const half = n / 2;
+        const groups = half / core.draft_ops.sums_group;
+        const x = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer x.deinit();
+        const gu = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer gu.deinit();
+        const h0 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h0.deinit();
+        const h1 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h1.deinit();
+        const s0 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s0.deinit();
+        const s1 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s1.deinit();
+        // a fixed input of moderate values in [-2, 2], every column and both rows different
+        for (x.slice(u16, rows * k), 0..) |*v, i| {
+            const f: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7919 + 13) % 4001)) - 2000)) / 1000.0;
+            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
+        // the frame's way: a concurrent encoder, a barrier between each dispatch and the ones that read its words
+        const cb = b.target.queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        var ended = false;
+        errdefer if (!ended) e.end();
+        const sums = try small.encodeSumsOf(e, .{ .buf = x }, rows);
+        e.barrier();
+        try small.encodeSums(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = gu }, rows);
+        e.barrier();
+        try b.primitives.swigluSums(e, .{ .buf = gu }, .{ .buf = gu, .off = half * 2 }, .{ .buf = h0 }, .{ .ref = .{ .buf = s0 }, .stride = 16 }, .{ .rows = rows, .width = @intCast(half), .gate_stride = @intCast(n), .up_stride = @intCast(n), .y_stride = @intCast(half) });
+        try fused.encodeSwiglu(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = h1 }, .{ .buf = s1 }, rows);
+        e.end();
+        ended = true;
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.warn("draft gate/up SwiGLU check: {s}", .{msg});
+            return false;
+        }
+        if (!std.mem.eql(u16, h0.slice(u16, rows * half), h1.slice(u16, rows * half))) return false;
+        const a0 = s0.slice(u32, groups * 16);
+        const a1 = s1.slice(u32, groups * 16);
+        for (0..groups) |g| for (0..rows) |r| if (a0[g * 16 + r] != a1[g * 16 + r]) return false;
+        return true;
     }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {
@@ -526,10 +660,26 @@ pub const Backend = struct {
         return Span.of(try b.frame.ref(v), (@as(usize, v.rows - 1) * v.stride + v.width) * v.dtype.size());
     }
     pub fn access(b: *Backend, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span) void {
+        b.settle(e);
         b.hazards.order(e, reads, writes);
     }
+    /// access for the pending pair's waiting conv+norm (team-m5-08t): its read of the counted rows `counted` takes no
+    /// barrier, since the launch waits on their count.
+    pub fn accessAfter(b: *Backend, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span, counted: Span) void {
+        b.hazards.orderAfter(e, reads, writes, counted);
+    }
     pub fn barrier(b: *Backend, e: mtl.ComputeEncoder) void {
+        b.settle(e);
         b.hazards.barrier(e);
+    }
+    /// team-m5-08t: a counted projection whose waiting conv+norm is not the next launch: behind a barrier, its pair
+    /// back to zero, so a later pair on those words waits for its own count. The block's own order never takes this (each
+    /// counted projection's next launch is its conv+norm); it guards every other path.
+    fn settle(b: *Backend, e: mtl.ComputeEncoder) void {
+        const p = b.pending orelse return;
+        b.pending = null;
+        b.hazards.barrier(e);
+        b.pairs.?.reset(e, p.words);
     }
     /// Field `name` of the frame's RoundArgs block.
     pub fn roundArg(b: *const Backend, comptime name: []const u8) Ref {
