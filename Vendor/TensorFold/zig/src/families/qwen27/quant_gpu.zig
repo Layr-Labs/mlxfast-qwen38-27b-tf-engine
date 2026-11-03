@@ -7,9 +7,9 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
-/// Code MiB Kernels.warm reads ahead of a decoded out projection: about three fifths of its 15 MiB, as much as a star
+/// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
-const warm_mb = 9;
+const warm_mb = 10;
 /// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
 const warm_groups = 64;
 const warm_source =

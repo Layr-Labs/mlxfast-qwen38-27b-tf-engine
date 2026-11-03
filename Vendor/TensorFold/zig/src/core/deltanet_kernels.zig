@@ -43,6 +43,10 @@ pub const Kernels = struct {
     /// pre_rows for a decoded launch behind counted projections: the reads from outside its barrier interval made before
     /// its wait (tf_delta_gdn_pre_rows_held).
     pre_rows_held: metal.Pipeline,
+    /// clear in 16-byte stores (tf_delta_gdn_clear4): four state words and eight conv words a thread.
+    clear4: metal.Pipeline,
+    /// pre_rows for a prompt chain's rows (row r's taps r .. r + 3): each simdgroup loads its rows' taps once.
+    pre_chain: metal.Pipeline,
     /// tf_delta_gdn_post for 128-wide heads on bfloat4 rows: a simdgroup a row, 4 rows a group.
     post_rows: metal.Pipeline,
     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
@@ -92,6 +96,8 @@ pub const Kernels = struct {
             "unstash",
             "post_rows16",
             "pre_rows_held",
+            "clear4",
+            "pre_chain",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -100,7 +106,7 @@ pub const Kernels = struct {
             pipelines[index] = try metal.Pipeline.init(device, library, "tf_delta_gdn_" ++ name, false);
             done += 1;
         }
-        inline for (.{ 7, 13, 14, 21, 23, 25, 26, 27 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        inline for (.{ 7, 13, 14, 21, 23, 25, 26, 27, 29 }) |index| if (pipelines[index].simdWidth() != 32 or pipelines[index].maxThreads() < 128) return error.UnsupportedGdnPipeline;
         return .{
             .library = library,
             .pipelines = .{
@@ -129,6 +135,8 @@ pub const Kernels = struct {
             .unstash = pipelines[25],
             .post_rows16 = pipelines[26],
             .pre_rows_held = pipelines[27],
+            .clear4 = pipelines[28],
+            .pre_chain = pipelines[29],
         };
     }
 
@@ -157,6 +165,8 @@ pub const Kernels = struct {
             k.unstash,
             k.post_rows16,
             k.pre_rows_held,
+            k.clear4,
+            k.pre_chain,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();
