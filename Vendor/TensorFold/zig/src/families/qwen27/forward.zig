@@ -129,6 +129,8 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
+        // set on the decoded branch below (a counted out projection): the gate|up's warm rides in that barrier interval
+        var decoded_out = false;
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
@@ -137,11 +139,17 @@ pub const Stages = struct {
         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
             try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+            decoded_out = true;
         } else {
             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
             try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         }
+        // the gate|up's leading code lines are requested while the out projection still holds the bus (its counted launch
+        // and the norm waiting on it), so the MLP's first tile batches find them in the caches instead of paying their
+        // misses one after another at the head of sixty-four launches a round. Read-only, and nothing it touches is read
+        // by the norm sharing the interval, so the counted chain stays counted and no barrier moves.
+        if (decoded_out) try m.kernels.warm(e, layer.gu);
         e.barrier();
         std.mem.swap(Ref, &s.hidden, &s.residual);
         var up = f.get(.mixed);
