@@ -5,6 +5,7 @@ const mtl = @import("metal");
 const TargetSession = @import("../session.zig");
 const Runner = @import("../decode_round.zig").Runner;
 const gpuFailed = @import("../decode_round.zig").gpuFailed;
+const spin = @import("../decode_round.zig").spin;
 const Round = @import("../round_plan.zig").Round;
 const Draft = @import("runtime_model.zig").Model;
 const audit_journal = @import("audit.zig");
@@ -136,7 +137,8 @@ pub const Generation = struct {
         try g.runner.taps.accepted(g.runner.model.glue, e, path, .{ .buffer = g.kept }, .{ .buffer = g.taps });
         e.end();
         cb.commit();
-        cb.wait();
+        // the gather reads the round's kept rows: a few microseconds of GPU work the host reads straight after it
+        spin(cb);
         if (gpuFailed(cb, "a draft taps gather")) return error.DraftTapGpuFailure;
         try g.draft.absorb(.{ .buf = g.taps }, @intCast(path.len));
     }
@@ -197,10 +199,8 @@ pub const Generation = struct {
         const cb = g.keep_done orelse return;
         g.keep_done = null;
         defer cb.release();
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        // a whole drafter frame ran behind it: its end is already reported, so this returns at once
+        spin(cb);
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;
@@ -211,11 +211,9 @@ pub const Generation = struct {
         g.keep = null;
         defer cb.release();
         // its completion is reported behind the drafter frame's (committed before it), right before the next verify's
-        // first commit (settle): poll its status rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        // first commit (settle): poll its status rather than sleep until the completion wakes this thread, and skip the
+        // wake itself since the poll already saw the completion the wait would return on
+        spin(cb);
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
             return error.DraftKeepGpuFailure;

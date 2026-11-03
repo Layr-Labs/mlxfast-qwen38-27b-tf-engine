@@ -41,6 +41,16 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
 /// Clears). Anything that writes slot words turns `zeroed` back to `live` (`writes`); only the clear itself, in a pass or
 /// in `landClear`, ends `dirty`.
 pub const Words = enum { live, zeroed, dirty };
+/// Returns once the GPU reached the end of `cb`, reading its status: a decoded round's small buffers land within
+/// microseconds of the work they gate, and a poll sees that rather than sleeping until the completion handler wakes this
+/// thread. A committed buffer reports `completed` only after the completion handler ran, so the status seen here is the
+/// one `waitUntilCompleted` would return on, and its resources are free to go. The caller keeps reading `failure()`.
+pub fn spin(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
@@ -718,10 +728,8 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        // the replay writes a few rows' states behind work already in the queue: poll its completion, not its wake
+        spin(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -779,7 +787,8 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        cb.wait();
+        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
+        spin(cb);
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;

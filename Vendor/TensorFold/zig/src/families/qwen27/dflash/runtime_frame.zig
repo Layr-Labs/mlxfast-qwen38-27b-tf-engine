@@ -179,7 +179,8 @@ pub const Frame = struct {
     pub fn checkUnchecked(f: *Frame) !void {
         var bad = false;
         for (f.unchecked[0..f.n_unchecked]) |cb| {
-            cb.wait();
+            // a whole later frame was encoded, committed and polled behind these: they are reported, so no wake is due
+            @import("../decode_round.zig").spin(cb);
             bad = failed(cb) or bad;
             cb.release();
         }
