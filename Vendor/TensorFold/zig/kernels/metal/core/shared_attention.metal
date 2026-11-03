@@ -78,9 +78,23 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
 // Keys at or past args.keys - own.rows are the block's own rows, read where their producers left them (row strides
 // k_stride and v_stride, in elements) instead of from copies behind the context.
 struct tf_own_rows { uint rows, k_stride, v_stride; };
-inline const device bfloat* tf_split_row(const device bfloat* C, const device bfloat* O, uint key, uint context, uint stride, uint kh) {
-  return key < context ? C + ((size_t)key * TF_KVH + kh) * TF_D : O + (size_t)(key - context) * stride + kh * TF_D;
+// One key of a split row: its K and V row (`kr`, `vr` at this lane's first element; the lane's others 32 apart) into
+// the running maximum, total and outputs.
+inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D / 32], thread float& maximum,
+    thread float& total, const device bfloat* kr, const device bfloat* vr, float scale) {
+  float k[TF_D / 32], v[TF_D / 32];
+  for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[d * 32]); v[d] = float(vr[d * 32]); }
+  float dot = 0.0f;
+  for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
+  const float score = simd_sum(dot) * scale;
+  const float next = max(maximum, score);
+  const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+  const float weight = exp(score - next);
+  total = fma(total, old_weight, weight);
+  for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
+  maximum = next;
 }
+#define TF_SPLIT_TILE 4
 [[kernel]] void tf_shared_lane_attention_split(const device bfloat* Q [[buffer(0)]],
     const device bfloat* K [[buffer(1)]], const device bfloat* V [[buffer(2)]],
     const device uchar* mask [[buffer(3)]], constant tf_context_args& args [[buffer(4)]],
@@ -94,23 +108,38 @@ inline const device bfloat* tf_split_row(const device bfloat* C, const device bf
   float q[TF_D / 32], out[TF_D / 32], maximum = -INFINITY, total = 0.0f;
   const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
   for (uint d = 0; d < TF_D / 32; ++d) { q[d] = float(Q[qi + lane + d * 32]); out[d] = 0.0f; }
-  const uint last = min(args.keys, (chunk + 1) * TF_CHUNK);
-  for (uint key = chunk * TF_CHUNK; key < last; ++key) {
-    if (mask[(size_t)row * args.mask_stride + key] == 0) continue;
-    const device bfloat* kr = tf_split_row(K, OK, key, context, own.k_stride, kh);
-    const device bfloat* vr = tf_split_row(V, OV, key, context, own.v_stride, kh);
-    float k[TF_D / 32], v[TF_D / 32];
-    for (uint d = 0; d < TF_D / 32; ++d) { k[d] = float(kr[lane + d * 32]); v[d] = float(vr[lane + d * 32]); }
-    float dot = 0.0f;
-    for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[d], dot);
-    const float score = simd_sum(dot) * scale;
-    const float next = max(maximum, score);
-    const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
-    const float weight = exp(score - next);
-    total = fma(total, old_weight, weight);
-    for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[d]);
-    maximum = next;
+  // the chunk's keys in order: those before `context` from the ring, the rest from the own rows. Each loop steps its
+  const uint first = chunk * TF_CHUNK, last = min(args.keys, first + TF_CHUNK), split = clamp(context, first, last);
+  const device uchar* m = mask + (size_t)row * args.mask_stride;
+  const device bfloat* kr = K + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  const device bfloat* vr = V + ((size_t)first * TF_KVH + kh) * TF_D + lane;
+  for (uint key = first; key + TF_SPLIT_TILE <= split; key += TF_SPLIT_TILE, kr += TF_SPLIT_TILE * TF_KVH * TF_D, vr += TF_SPLIT_TILE * TF_KVH * TF_D) {
+    float k[TF_SPLIT_TILE][TF_D / 32], v[TF_SPLIT_TILE][TF_D / 32];
+    bool live[TF_SPLIT_TILE];
+    for (uint t = 0; t < TF_SPLIT_TILE; ++t) {
+      live[t] = m[key + t] != 0;
+      for (uint d = 0; d < TF_D / 32; ++d) { k[t][d] = float(kr[t * TF_KVH * TF_D + d * 32]); v[t][d] = float(vr[t * TF_KVH * TF_D + d * 32]); }
+    }
+    for (uint t = 0; t < TF_SPLIT_TILE; ++t) {
+      if (!live[t]) continue;
+      float dot = 0.0f;
+      for (uint d = 0; d < TF_D / 32; ++d) dot = fma(q[d], k[t][d], dot);
+      const float score = simd_sum(dot) * scale;
+      const float next = max(maximum, score);
+      const float old_weight = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+      const float weight = exp(score - next);
+      total = fma(total, old_weight, weight);
+      for (uint d = 0; d < TF_D / 32; ++d) out[d] = fma(out[d], old_weight, weight * v[t][d]);
+      maximum = next;
+    }
   }
+  for (uint key = split - (split - first) % TF_SPLIT_TILE; key < split; ++key, kr += TF_KVH * TF_D, vr += TF_KVH * TF_D)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, kr, vr, scale);
+  const size_t at = split - min(split, context); // the own row of the chunk's first own key (0 when it has none)
+  const device bfloat* ko = OK + at * own.k_stride + kh * TF_D + lane;
+  const device bfloat* vo = OV + at * own.v_stride + kh * TF_D + lane;
+  for (uint key = split; key < last; ++key, ko += own.k_stride, vo += own.v_stride)
+    if (m[key] != 0) tf_split_key(q, out, maximum, total, ko, vo, scale);
   // partials [row][kv head][chunk][query head][D + 2]: outputs, then the chunk's maximum and total
   device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);
   for (uint d = 0; d < TF_D / 32; ++d) p[lane + d * 32] = out[d];

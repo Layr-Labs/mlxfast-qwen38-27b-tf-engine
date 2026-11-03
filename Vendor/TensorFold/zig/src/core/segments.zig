@@ -161,12 +161,15 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.mixer(&x.lanes[k], i);
-            if (x.early and i == 0 and i + 1 < x.layers) try x.commitLane(k);
+            // `first` 0: the first commit follows the first layer's mixer (its MLP is encoded while the GPU runs it)
+            if ((x.early or x.first == 0) and i == 0 and i + 1 < x.layers) try x.commitLane(k);
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
-            if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3)) return;
+            // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
+            // host encodes the next chunk's layers
+            if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3) and !(x.first == 0 and i == 0)) return;
             try x.commitLane(k);
         }
         pub fn finish(x: *const @This(), k: usize) !void {
