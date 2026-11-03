@@ -395,9 +395,15 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: growing row shares toward the last segment, powers of two over their sum, down to a multiple of 64; the last runs to n
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        var total_weight: u64 = 0;
+        for (0..parts) |k| total_weight += @as(u64, 1) << @intCast(k);
+        var cumulative: u64 = 0;
+        for (0..parts) |k| {
+            firsts[k] = @intCast(cumulative * n / total_weight / 64 * 64);
+            cumulative += @as(u64, 1) << @intCast(k);
+        }
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
@@ -513,7 +519,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -705,7 +714,10 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        while (true) switch (cb.status()) {
+            .completed, .@"error" => break,
+            else => std.atomic.spinLoopHint(),
+        };
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
