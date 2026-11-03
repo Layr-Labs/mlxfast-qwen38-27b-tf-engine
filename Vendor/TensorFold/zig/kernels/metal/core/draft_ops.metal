@@ -157,9 +157,28 @@ kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const
 // A conv with a residual (tf_dynamic_conv2's elements), then the RMS norm of its output with that norm's group sums
 // (tf_draft_rms_xs's sum, scale, outputs and sums), one threadgroup a row: each thread takes the norm's columns, so its
 // squares add in the norm's order, and the conv's output reaches the norm through threadgroup memory, not a launch.
+#if defined(TF_DRAFT_WAIT)
+// team-m5-08t: the same launch behind the counted projection that writes X in its barrier interval
+kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& c [[buffer(4)]],device bfloat* C [[buffer(5)]],device const bfloat* W [[buffer(6)]],constant Norm& a [[buffer(7)]],device bfloat* Y [[buffer(8)]],device float* XS [[buffer(9)]],constant uint& xs_stride [[buffer(10)]],device atomic_uint* WC [[buffer(11)]],constant uint& wait_for [[buffer(12)]],uint2 tgs [[threadgroups_per_grid]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+#else
 kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& c [[buffer(4)]],device bfloat* C [[buffer(5)]],device const bfloat* W [[buffer(6)]],constant Norm& a [[buffer(7)]],device bfloat* Y [[buffer(8)]],device float* XS [[buffer(9)]],constant uint& xs_stride [[buffer(10)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+#endif
   threadgroup float sums[32],inverse[1];
   threadgroup bfloat out[TF_XS_MAX_WIDTH];
+#if defined(TF_DRAFT_WAIT)
+  // the projection's threadgroups count themselves on WC[0] past a device-scope fence: thread 0 waits on the count
+  // (bounded) and passes its own fence before any row of X is read; the last row's threadgroup to arrive leaves both
+  // words zero for the next pair. Every word below is the launch's without the wait.
+  if(t==0){
+    for(uint spin=0;spin<(1u<<24)&&atomic_load_explicit(&WC[0],memory_order_relaxed)<wait_for;spin++){}
+    atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+    if(atomic_fetch_add_explicit(&WC[1],1u,memory_order_relaxed)+1u==tgs.x*tgs.y){
+      atomic_store_explicit(&WC[0],0u,memory_order_relaxed);
+      atomic_store_explicit(&WC[1],0u,memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
   const uint row=block.y,groups=c.width/c.group;
   float value=0.0f;
   for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){
@@ -236,3 +255,10 @@ kernel void tf_draft_rms_rope(device const bfloat* X [[buffer(0)]],device const 
     Y[output]=bfloat(left*cs-right*sn);Y[output+pairs]=bfloat(right*cs+left*sn);
   }
 }
+#if defined(TF_DRAFT_WAIT)
+// team-m5-08t: a pair whose waiting conv+norm was never encoded (Backend.settle): both words back to zero, behind a
+// barrier after the projection that counted on them
+kernel void tf_draft_pair_reset(device atomic_uint* WC [[buffer(0)]],uint t [[thread_position_in_grid]]) {
+  if(t==0){atomic_store_explicit(&WC[0],0u,memory_order_relaxed);atomic_store_explicit(&WC[1],0u,memory_order_relaxed);}
+}
+#endif
