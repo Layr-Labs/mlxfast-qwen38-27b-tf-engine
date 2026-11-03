@@ -10,6 +10,9 @@ const Ref = @import("projection.zig").Ref;
 const Tensor = @import("gpu_weights.zig").Tensor;
 const profile = @import("core").gpu_profile;
 const Kernels = @import("gdn_library.zig").Kernels;
+const Gate = @import("gdn_library.zig").Gate;
+/// team-m5-08x1: the gate words' count, one a (segment, head) of a star launch: 85 segments of the 27B's 48 heads.
+const gate_word_count: usize = 4096;
 
 pub const PromptMarks = @import("gdn_marks_gpu.zig").Bank;
 
@@ -95,6 +98,10 @@ pub const Pool = struct {
     residency: ?metal.ResidencySet.Follow = null,
     /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero.
     scan_words: ?metal.Buffer = null,
+    /// team-m5-08x1: the star scans whose epilogue runs the gate (gdn.Fused) and their words, left zero; null where the
+    /// gate library did not build, and the scan counts for the record's waiting gate.
+    gate: ?Gate = null,
+    gate_words: ?metal.Buffer = null,
     /// Read by a deferred star scan, the keep that stashes behind it and unstash only; every other reader of the committed
     /// states runs after the rows land (decode_round.Runner.settleGdn).
     pending: Pending = .{},
@@ -116,7 +123,16 @@ pub const Pool = struct {
         // star scan's arrivals
         const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
         @memset(scan_words.contents()[0..16], 0);
-        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
+        errdefer scan_words.deinit();
+        // team-m5-08x1: logged once a pool; without it every star scan keeps the record's counted gate
+        const gate: ?Gate = Gate.init(device) catch |err| none: {
+            std.log.warn("qwen27: the GDN gate keeps its own launch (team-m5-08x1): {s}", .{@errorName(err)});
+            break :none null;
+        };
+        errdefer if (gate) |g| g.deinit();
+        const gate_words: ?metal.Buffer = if (gate != null) try device.buffer(gate_word_count * 4, metal.ResourceOptions.shared | metal.ResourceOptions.untracked) else null;
+        if (gate_words) |w| @memset(w.contents()[0 .. gate_word_count * 4], 0);
+        return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words, .gate = gate, .gate_words = gate_words };
     }
 
     pub fn allocateBuffers(device: metal.Device, budget: Budget) !@FieldType(Pool, "buffers") {
@@ -138,6 +154,8 @@ pub const Pool = struct {
         pool.kernels.deinit();
         for (pool.buffers) |buffer| buffer.deinit();
         if (pool.scan_words) |b| b.deinit();
+        if (pool.gate) |g| g.deinit();
+        if (pool.gate_words) |b| b.deinit();
     }
 
     /// Called between completed rounds, with no pending keep, before the first encoder can use the bank.
@@ -219,13 +237,17 @@ pub const Pool = struct {
         } else null;
         if (deferred != null and !(prepared.star and prepared.usesSlots())) return error.BadGdnPlan;
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows_held, a.counter, a.wait, if (chained) pool.scan_words else null) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // team-m5-08x2: the gate library's prepare takes its arrival after its barrier, where that library built
+        const held = if (pool.gate) |g| g.pre_late else pool.kernels.pre_rows_held;
+        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, held, a.counter, a.wait, if (chained) pool.scan_words else null) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
+        // team-m5-08x1: the gate in the scan's epilogue, where the gate library built
+        const fused: ?gdn.Fused = if (pool.gate) |g| (if (pool.gate_words) |w| gdn.Fused{ .pair = g.star_pair, .pending = g.star_pending, .words = w, .capacity = gate_word_count } else null) else null;
         if (prepared.star and prepared.usesSlots()) {
             if (pending) |q| {
-                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, q, wait_prep);
-            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, wait_prep);
+                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, q, wait_prep, fused);
+            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, wait_prep, fused);
         } else if (deferred != null) {
             return error.BadGdnPlan;
         } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);

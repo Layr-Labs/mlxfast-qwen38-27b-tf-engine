@@ -107,6 +107,10 @@ pub const star_words: usize = 8;
 /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
 /// rows, and how many it applies and whether it writes the state back.
 pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
+/// team-m5-08x1: a counted star scan whose epilogue runs the gate (tf_delta_gdn_star_pair_gate and
+/// tf_delta_gdn_star_pending_gate) in the head's last threadgroup, in place of the gate launch that waits on the scan's
+/// count. `words`: `capacity` u32 words, zero, one for each (segment, head) of a launch, which leaves them zero.
+pub const Fused = struct { pair: metal.Pipeline, pending: metal.Pipeline, words: metal.Buffer, capacity: usize };
 
 pub const Round = struct {
     p: abi.Params,
@@ -246,9 +250,40 @@ pub const Round = struct {
     /// `pending` (one window): `star` is tf_delta_gdn_star_pending, which applies the pending rows before node 0.
     /// `wait_prep` above 0 (`counter` given): the prepare shares this scan's barrier interval (prepareRowsAfter's `star`);
     /// each group loads its committed words and replays its pending rows, then waits on that many prepare groups.
-    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32) !void {
+    /// `fused` (team-m5-08x1): where the scan would count for the waiting gate, the scan's own launch runs that gate.
+    pub fn forwardStar(r: Round, e: metal.ComputeEncoder, star: metal.Pipeline, post_rows: metal.Pipeline, beside: ?Beside, counter: ?metal.Buffer, pending: ?Pending, wait_prep: u32, fused: ?Fused) !void {
         if (!r.star or !r.usesSlots() or (pending != null and r.segments != 1) or (wait_prep != 0 and counter == null)) return error.BadGdnPlan;
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
+        // team-m5-08x1: the record's scan bindings and grid, the gate's buffers past them (post_rows' 1, 2, 4, 5 and 6 at
+        // 19 to 23) and a zero word a (segment, head) at 10, where the record binds the count its gate waits on
+        if (counted) if (fused) |f| if (r.p.dv == 128 and r.p.nv * r.segments <= f.capacity) {
+            e.setPipeline(if (pending != null) f.pending else f.pair);
+            bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
+            r.b.segments.bind(e, 7);
+            e.setValue(r.p, 8);
+            r.b.recurrent.bind(e, 9);
+            e.setBuffer(f.words, 0, 10);
+            if (pending) |q| {
+                bind(e, .{ q.key, q.value, q.decay, q.mixing }, 12);
+                e.setValue(q.use, 16);
+            }
+            if (wait_prep != 0) e.setBuffer(counter.?, star_words, 17) else r.b.recurrent.bind(e, 17); // never read: wait_prep 0
+            e.setValue(wait_prep, 18);
+            bind(e, .{ r.b.z, r.b.norm }, 19);
+            r.b.output.bind(e, 21);
+            if (r.sums) |w| {
+                w.span.bind(e, 22);
+                e.setValue(w.stride, 23);
+                w.written.* = true;
+            } else {
+                r.b.output.bind(e, 22); // never read: a zero stride writes no sums
+                e.setValue(@as(u32, 0), 23);
+            }
+            e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 16, .depth = 1 });
+            if (r.warm) |w| try w.encode(w.ptr, e);
+            e.barrier();
+            return;
+        };
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
         r.b.segments.bind(e, 7);

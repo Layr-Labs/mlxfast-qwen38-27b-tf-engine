@@ -182,3 +182,42 @@ test "a mark list keeps rows in order and refuses an empty, late, repeated or fi
     try std.testing.expectError(error.BadGdnMark, markList(8, &.{ 3, 3 }));
     try std.testing.expectError(error.TooManyGdnMarks, markList(8, &.{ 1, 2, 3, 4, 5 }));
 }
+
+/// team-m5-08x1: the gate library's text, absent from a host build's stand-in sources.
+const gate_source: ?[]const u8 = if (@hasDecl(source, "core_deltanet_gate")) source.core_deltanet_gate else null;
+
+/// team-m5-08x1: the decoded star scans that run the gate in their epilogue (tf_delta_gdn_star_pair_gate and
+/// tf_delta_gdn_star_pending_gate), from a library of their own (core_deltanet followed by deltanet_gate.metal). The
+/// record's library above keeps the record's text, and an error here leaves the record's scan and waiting gate in place.
+/// team-m5-08x2: the scans take their prep wait's arrival after the barrier, and `pre_late` is the decoded prepare
+/// behind counted projections (tf_delta_gdn_pre_rows_held) with its arrival moved the same way; an error leaves all three
+/// to the record.
+pub const Gate = struct {
+    library: metal.Library,
+    star_pair: metal.Pipeline,
+    star_pending: metal.Pipeline,
+    pre_late: metal.Pipeline,
+
+    pub fn init(device: metal.Device) !Gate {
+        const text = gate_source orelse return error.NoGateSource;
+        const library = try metal.Library.fromSource(device, text, metal.CompileOptions.mlx());
+        errdefer library.deinit();
+        const pair = try metal.Pipeline.init(device, library, "tf_delta_gdn_star_pair_gate", false);
+        errdefer pair.deinit();
+        const pending = try metal.Pipeline.init(device, library, "tf_delta_gdn_star_pending_gate", false);
+        errdefer pending.deinit();
+        const pre = try metal.Pipeline.init(device, library, "tf_delta_gdn_pre_rows_held_late", false);
+        errdefer pre.deinit();
+        // the star scan's threadgroups are 32 x 16 (gdn.Round.forwardStar); the prepare's are 128 (Round.prepareRowsAfter)
+        for ([_]metal.Pipeline{ pair, pending }) |pipe| if (pipe.simdWidth() != 32 or pipe.maxThreads() < 512) return error.UnsupportedGdnPipeline;
+        if (pre.simdWidth() != 32 or pre.maxThreads() < 128) return error.UnsupportedGdnPipeline;
+        return .{ .library = library, .star_pair = pair, .star_pending = pending, .pre_late = pre };
+    }
+
+    pub fn deinit(g: Gate) void {
+        g.star_pair.deinit();
+        g.star_pending.deinit();
+        g.pre_late.deinit();
+        g.library.deinit();
+    }
+};
