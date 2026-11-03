@@ -134,125 +134,6 @@ struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
 // DEC (decoded rows of one stream): beside QY and KY, a q head's rounded values also land where q27_attn_pack_a packs
 // them (QA, packed_rows rows a kv head, rows * g on repeating row 0's first head), and a k head's rotated key and its
 // value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
-template <bool PACK, bool DEC>
-inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
-                                    device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
-                                    uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
-                                    device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
-  const uint head = group.x * 4 + sg, row = group.y;
-  if (head >= a.heads + a.kv_heads) return;
-  const bool query = head < a.heads;
-  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
-  device const bfloat* w = query ? QW : KW;
-  const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
-  device bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
-                            : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
-  const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
-  float sa = 0.0f, sb = 0.0f;
-  for (uint j = 0; j != 4; ++j) {
-    const float value = float(xa[j]);
-    sa += value * value;
-  }
-  for (uint j = 0; j != 4; ++j) {
-    const float value = float(xb[j]);
-    sb += value * value;
-  }
-  const float s0 = simd_sum(sa), s1 = simd_sum(sb);
-  const float total = simd_sum(lane == 0 ? s0 : (lane == 1 ? s1 : 0.0f));
-  const float inverse = precise::rsqrt(total / float(a.width) + a.eps);
-  float na[4], nb[4];
-  for (uint j = 0; j != 4; ++j) {
-    const float normal = float(bfloat(float(xa[j]) * inverse));
-    na[j] = float(bfloat(float(w[4 * lane + j]) * normal));
-  }
-  for (uint j = 0; j != 4; ++j) {
-    const float normal = float(bfloat(float(xb[j]) * inverse));
-    nb[j] = float(bfloat(float(w[128 + 4 * lane + j]) * normal));
-  }
-  const uint pairs = a.rotary / 2;
-  float c = 0.0f, s = 0.0f;
-  if (lane < pairs) {
-    const uint d = lane;
-    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    c = cos(angle);
-    s = sin(angle);
-  }
-  bfloat4 ya, yb;
-  for (uint j = 0; j != 4; ++j) {
-    const uint at = 4 * lane + j;
-    const bool second = at >= pairs;
-    const uint d = second ? at - pairs : at;
-    const float partner = simd_shuffle(na[j], ushort(((second ? d : d + pairs) / 4) % 32));
-    const float cosine = simd_shuffle(c, ushort(d % 32)), sine = simd_shuffle(s, ushort(d % 32));
-    float value = na[j];
-    if (at < a.rotary) value = second ? value * cosine + partner * sine : value * cosine - partner * sine;
-    ya[j] = bfloat(value);
-    yb[j] = bfloat(nb[j]);
-  }
-  *(device bfloat4*)(y + 4 * lane) = ya;
-  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
-  if (PACK && query && row == 0 && head == kv_head * g)
-    for (uint r = a.rows * g; r < a.packed_rows; ++r) {
-      device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
-      *(device bfloat4*)(pad + 4 * lane) = ya;
-      *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
-    }
-  if (DEC && query) {
-    const uint gq = a.heads / a.kv_heads, hq = head / gq;
-    device bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
-    *(device bfloat4*)(packed + 4 * lane) = ya;
-    *(device bfloat4*)(packed + 128 + 4 * lane) = yb;
-    if (row == 0 && head == hq * gq)
-      for (uint r = a.rows * gq; r < a.packed_rows; ++r) {
-        device bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
-        *(device bfloat4*)(pad + 4 * lane) = ya;
-        *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
-      }
-  }
-  if (DEC && !query) {
-    const uint hk = head - a.heads;
-    const int st = nodes[4 * row + 1], base = 8 + st * 12;
-    const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
-    device bfloat* key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
-    *(device bfloat4*)(key + 4 * lane) = ya;
-    *(device bfloat4*)(key + 128 + 4 * lane) = yb;
-    device bfloat* value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
-    device const bfloat* source = V + row * v_stride + hk * a.width;
-    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
-    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
-  }
-}
-
-// The record's kernels: prompt rows and every launch with no wait (a counted launch takes the _held kernels below).
-// wait_for above 0 (decoded verify rows): the counted q+gate and k|v projections share this launch's barrier interval and
-// count their threadgroups on NC[0] past a device fence; each group reads them once the count reaches wait_for (bounded),
-// past its own fence, and the last group leaves both words zero for the next pair (as tf_delta_gdn_pre_rows does)
-#define Q27_HEAD_NORM_ROPE_DIRECT(NAME, PACK) \
-kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
-                 device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
-                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
-                 constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
-                 uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
-                 uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-  if (wait_for != 0u) { \
-    if (t == 0) { \
-      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
-      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); \
-      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == groups.x * groups.y) { \
-        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed); \
-        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed); \
-      } \
-    } \
-    threadgroup_barrier(mem_flags::mem_threadgroup); \
-  } \
-  q27_head_norm_rope_rows_direct<PACK, false>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
-}
-Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope, false)
-Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope_packed, true)
-#undef Q27_HEAD_NORM_ROPE_DIRECT
-
 // The words a head's simdgroup reads from outside a decoded launch's barrier interval, gathered before its wait on the
 // counted q and k|v projections (q27_head_norm_rope_held): the head's norm gains, the lane's rope cosine and sine (the
 // row's position comes from the host), and (DEC, k heads) the row's key and value cache rows from the plan's nodes and
@@ -391,8 +272,8 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
   } \
   q27_head_norm_rope_rows<PACK, false>(Q, K, a, QY, KY, group, sg, lane, held); \
 }
-Q27_HEAD_NORM_ROPE(q27_head_norm_rope_held, false)
-Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed_held, true)
+Q27_HEAD_NORM_ROPE(q27_head_norm_rope, false)
+Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed, true)
 #undef Q27_HEAD_NORM_ROPE
 
 // The decoded rows' one-pass kernel (DEC): q27_head_norm_rope's outputs, the packed query the prefix reads and the round's
