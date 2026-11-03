@@ -233,6 +233,8 @@ pub const Backend = struct {
                 low.deinit();
                 head.plain = null;
             };
+            // the line warm beside the head's tile launch (Kernels.warmTiles) compiles here too; without it the warm is off
+            if (head.plain != null) target.kernels.prepareWarmTiles() catch |err| std.log.warn("draft head tile warm off: {s}", .{@errorName(err)});
         }
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
@@ -405,7 +407,10 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        // the drafter's fused gate/up (34816 x 5120, 1088 tiles) takes split() 1 slice: its 2-bit launch then runs too few
+        // threadgroups to keep the GPU busy, so it splits K in two
+        const slices = if (n == 34816 and k == 5120) 2 else try @import("../projection.zig").split(n, k);
+        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, slices, order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }

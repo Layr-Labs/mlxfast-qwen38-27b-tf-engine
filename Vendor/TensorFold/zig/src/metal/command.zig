@@ -127,6 +127,32 @@ pub const BlitEncoder = struct {
     }
 };
 
+/// The buffer bindings the calling thread last sent to one compute encoder (slots 0-30), so setBuffer skips a slot that
+/// already holds that buffer at that offset. Metal keeps an encoder's bindings across pipeline changes and dispatches, so
+/// a skipped call leaves the encoder exactly as the call would. The record resets when the thread turns to another encoder,
+/// when the encoder ends or executes an indirect command buffer, and whenever any buffer is released (`forgetBindings`):
+/// a buffer made later may reuse a released one's object address.
+const Shadow = struct {
+    encoder: ?Id = null,
+    generation: u64 = 0,
+    ids: [31]?Id = @splat(null),
+    offsets: [31]usize = @splat(0),
+};
+threadlocal var shadow: Shadow = .{};
+var released = std.atomic.Value(u64).init(0);
+
+/// Called on every buffer release: every thread's binding record starts over at its next binding.
+pub fn forgetBindings() void {
+    _ = released.fetchAdd(1, .monotonic);
+}
+
+/// This thread's record for `encoder`, cleared if it held another encoder's or predates a buffer release.
+fn shadowFor(encoder: Id) *Shadow {
+    const generation = released.load(.monotonic);
+    if (shadow.encoder != encoder or shadow.generation != generation) shadow = .{ .encoder = encoder, .generation = generation };
+    return &shadow;
+}
+
 pub const ComputeEncoder = struct {
     id: Id,
 
@@ -135,11 +161,18 @@ pub const ComputeEncoder = struct {
     }
 
     pub fn setBuffer(self: ComputeEncoder, buffer: Buffer, offset: usize, index: usize) void {
+        if (index < 31) {
+            const record = shadowFor(self.id);
+            if (record.ids[index] == buffer.id and record.offsets[index] == offset) return;
+            record.ids[index] = buffer.id;
+            record.offsets[index] = offset;
+        }
         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
     }
 
     /// Small constants copied into the command stream (at most 4 KB).
     pub fn setBytes(self: ComputeEncoder, bytes: []const u8, index: usize) void {
+        if (index < 31) shadowFor(self.id).ids[index] = null; // the slot now holds bytes: its next setBuffer is sent
         objc.msg(void, self.id, "setBytes:length:atIndex:", .{ bytes.ptr, bytes.len, index });
     }
 
@@ -177,10 +210,12 @@ pub const ComputeEncoder = struct {
     }
 
     pub fn execute(self: ComputeEncoder, icb: IndirectCommandBuffer, first: usize, count: usize) void {
+        if (shadow.encoder == self.id) shadow.encoder = null; // an indirect command buffer may leave other bindings
         objc.msg(void, self.id, "executeCommandsInBuffer:withRange:", .{ icb.id, types.Range{ .location = first, .length = count } });
     }
 
     pub fn end(self: ComputeEncoder) void {
+        if (shadow.encoder == self.id) shadow.encoder = null; // a later encoder may reuse this one's address
         objc.msg(void, self.id, "endEncoding", .{});
     }
 };
