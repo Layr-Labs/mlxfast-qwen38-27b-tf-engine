@@ -527,9 +527,9 @@ pub const Attention = struct {
         e.setBuffer(xs.buffer, xs.offset, 6);
         e.setValue(@as(u32, if (sums) |s| s.stride else 0), 7);
         e.setValue(@as(u32, @intFromBool(raw_gate != null)), 8);
-        // Padded sum rows return before reading partials or addressing the output buffer.
+        // Eight packed merge rows share ordered sum scratch; padded rows never read partials or output addresses.
         const merge_rows = if (sums) |s| s.stride else plan.rows;
-        if (merge_rows * g.group() > live * g.group()) e.dispatchGroups(mtl.Size.of(g.kv_heads, (merge_rows - live) * g.group(), 1), mtl.Size.of(32, 1, 1));
+        if (merge_rows > live) e.dispatchGroups(mtl.Size.of(g.kv_heads, std.math.divCeil(u32, (merge_rows - live) * g.group(), 8) catch unreachable, 1), mtl.Size.of(128, 1, 1));
         e.barrier();
     }
     /// Trees and decoded rows: cached keys by chunk (prefix), the round's own by path (tail), merged and gated.

@@ -165,54 +165,62 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     constant Q27PromptArgs& args [[buffer(3)]], device bfloat* OUT [[buffer(4)]],
     device const bfloat* QG [[buffer(5)]], device float* XS [[buffer(6)]],
     constant uint& sums_stride [[buffer(7)]], constant uint& gated [[buffer(8)]],
-    uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-  const int hk = int(tg.x), r = args.row0 + int(tg.y);
-  constexpr int DP = PD / 32;
-  const int node = r / PG, head = hk * PG + r % PG;
-  // Padded sum rows have no attention partial or output address to read.
-  if (node >= args.rows) {
-    if (sums_stride != 0 && uint(node) < sums_stride && (lane & 7) == 0)
-      XS[(int64_t(head) * (PD / 64) + (lane >> 3)) * sums_stride + node] = 0.0f;
-    return;
-  }
-  float m = -INFINITY, l = 0.0f, o[DP];
-  for (int i = 0; i < DP; i++) o[i] = 0.0f;
-  for (int c = 0; c < args.chunks; c++) {
-    const int64_t row = ((int64_t)hk * args.chunks + c) * args.rp + r;
-    const float mc = PM[row];
-    if (mc == -INFINITY) continue;
-    const float lc = PL[row];
-    const float nm = max(m, mc);
-    const float f1 = fast::exp2(m - nm), f2 = fast::exp2(mc - nm);
-    l = l * f1 + lc * f2;
-    for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
-    m = nm;
-  }
-  // the lane's eight gate words in one 16-byte load before any store, its eight output words in one 16-byte store (rows
-  // and head offsets are 16-byte aligned; Attention.promptRows checks the bases): the one-word loop's gate loads each
-  // waited for the store before them. The arithmetic is that loop's, word for word.
-  vec<bfloat, DP> gates = vec<bfloat, DP>(bfloat(0.0f)), values;
-  if (gated) gates = *(device const vec<bfloat, DP>*)(QG + ((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP);
-  for (int i = 0; i < DP; i++) {
-    const bfloat v = static_cast<bfloat>(o[i] / l);
-    bfloat value = v;
-    if (gated) {
-      const float gate = float(gates[i]);
-      value = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
+    uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr int DP = PD / 32, ROWS = 8, QUARTERS = PD / 64;
+  // Four SIMD groups merge two rows apiece. Store already-rounded output words so SIMD group zero can then run all
+  // 32 independent quarter sums in parallel, without changing a quarter's initial +0 or ascending 64-word FP32 order.
+  // The extra word gives each stream a different threadgroup bank. No row returns before the shared barrier.
+  threadgroup float parked[ROWS * QUARTERS * 65];
+  const int hk = int(tg.x), first = args.row0 + int(tg.y) * ROWS;
+  for (int pair = 0; pair < 2; pair++) {
+    const int local_row = int(sg) * 2 + pair, r = first + local_row;
+    const int node = r / PG, head = hk * PG + r % PG;
+    float m = -INFINITY, l = 0.0f, o[DP];
+    for (int i = 0; i < DP; i++) o[i] = 0.0f;
+    // Padded sum rows and the final group's excess rows never read partials, gates or output addresses.
+    if (node < args.rows) {
+      for (int c = 0; c < args.chunks; c++) {
+        const int64_t row = ((int64_t)hk * args.chunks + c) * args.rp + r;
+        const float mc = PM[row];
+        if (mc == -INFINITY) continue;
+        const float lc = PL[row];
+        const float nm = max(m, mc);
+        const float f1 = fast::exp2(m - nm), f2 = fast::exp2(mc - nm);
+        l = l * f1 + lc * f2;
+        for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
+        m = nm;
+      }
+      // the lane's eight gate words in one 16-byte load before any store, its eight output words in one 16-byte store (rows
+      // and head offsets are 16-byte aligned; Attention.promptRows checks the bases): the one-word loop's gate loads each
+      // waited for the store before them. The arithmetic is that loop's, word for word.
+      vec<bfloat, DP> gates = vec<bfloat, DP>(bfloat(0.0f)), values;
+      if (gated) gates = *(device const vec<bfloat, DP>*)(QG + ((int64_t)node * (PG * 4) + head) * 2 * PD + PD + lane * DP);
+      for (int i = 0; i < DP; i++) {
+        const bfloat v = static_cast<bfloat>(o[i] / l);
+        bfloat value = v;
+        if (gated) {
+          const float gate = float(gates[i]);
+          value = static_cast<bfloat>(float(v) * q27_round(1.0f / (1.0f + exp(-gate)), 0));
+        }
+        values[i] = value;
+        o[i] = float(value);
+      }
+      *(device vec<bfloat, DP>*)(OUT + ((int64_t)node * (PG * 4) + head) * PD + lane * DP) = values;
     }
-    values[i] = value;
-    o[i] = float(value);
+    if (sums_stride != 0) {
+      const int at = (local_row * QUARTERS + int(lane / 8)) * 65 + int(lane % 8) * DP;
+      for (int i = 0; i < DP; i++) parked[at + i] = o[i];
+    }
   }
-  *(device vec<bfloat, DP>*)(OUT + ((int64_t)node * (PG * 4) + head) * PD + lane * DP) = values;
   if (sums_stride != 0) {
-    // Four independent groups per head. Their eight lanes take turns adding eight BF16 values,
-    // keeping the existing64-value sequential FP32 sum, including the initial positive zero.
-    float sum = 0.0f;
-    for (uint turn = 0; turn < 8; turn++) {
-      if ((lane & 7) == turn) for (int i = 0; i < DP; i++) sum += o[i];
-      sum = simd_shuffle(sum, ushort((lane & ~7u) | turn));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      const int r = first + int(lane / QUARTERS), node = r / PG, head = hk * PG + r % PG;
+      if (uint(node) < sums_stride) {
+        float sum = 0.0f;
+        for (int i = 0; i < 64; i++) sum += parked[lane * 65 + i];
+        XS[(int64_t(head) * QUARTERS + int(lane % QUARTERS)) * sums_stride + node] = sum;
+      }
     }
-    if ((lane & 7) == 0)
-      XS[(int64_t(head) * (PD / 64) + (lane >> 3)) * sums_stride + node] = sum;
   }
 }
