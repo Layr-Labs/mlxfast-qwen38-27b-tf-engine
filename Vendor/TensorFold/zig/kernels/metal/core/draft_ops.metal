@@ -128,6 +128,35 @@ kernel void tf_dynamic_conv2_xs(device const bfloat* X [[buffer(0)]],device cons
   }
   if(index.y==0&&t>=1&&t<=xs_stride-a.rows)XS[size_t(group)*xs_stride+a.rows+t-1]=0.0f;
 }
+// tf_dynamic_conv2_xs with stack.x more rows behind its a.rows: those rows copy S's (stack.y elements apart), and each
+// row's group sum adds its 64 output values in order from zero (tf_lane_xsum's order); sums rows past all of them are zero.
+kernel void tf_dynamic_conv2_xs_stack(device const bfloat* X [[buffer(0)]],device const bfloat* D [[buffer(1)]],device const bfloat* B [[buffer(2)]],device const bfloat* R [[buffer(3)]],constant Conv& a [[buffer(4)]],device bfloat* Y [[buffer(5)]],device float* XS [[buffer(6)]],constant uint& xs_stride [[buffer(7)]],device const bfloat* S [[buffer(8)]],constant uint2& stack [[buffer(9)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
+  threadgroup bfloat out[TF_XS_GROUP];
+  // the host dispatches whole 64-column groups of real rows only: a threadgroup is one row, so all its threads take one branch
+  bfloat y;
+  if(index.y<a.rows) {
+    const uint groups=a.width/a.group,g=index.x/a.group;
+    float total=0.0f;
+    for(uint lag=0;lag<2;lag++) {
+      const float x=lag&&index.y%a.block==0?0.0f:float(X[size_t(index.y-lag)*a.x_stride+index.x]);
+      const float base=float(B[(a.branch*2+lag)*a.width+index.x]);
+      const float dynamic=float(D[size_t(index.y)*a.dynamic_stride+(a.branch*2+lag)*groups+g]);
+      total=float(bfloat(total+float(bfloat(base*x))));total=float(bfloat(total+float(bfloat(dynamic*x))));
+    }
+    const float conv=float(bfloat(total));
+    y=bfloat(a.residual?float(R[size_t(index.y)*a.x_stride+index.x])+conv:conv);
+  } else y=S[size_t(index.y-a.rows)*stack.y+index.x];
+  Y[size_t(index.y)*a.y_stride+index.x]=y;
+  out[t]=y;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint group=index.x/TF_XS_GROUP,live=a.rows+stack.x;
+  if(t==0){
+    float acc=0.0f;
+    for(uint i=0;i<TF_XS_GROUP;i++)acc+=float(out[i]);
+    XS[size_t(group)*xs_stride+index.y]=acc;
+  }
+  if(index.y==0&&t>=1&&t<=xs_stride-live)XS[size_t(group)*xs_stride+live+t-1]=0.0f;
+}
 // One threadgroup a (row, 64-column group): each thread one output as tf_draft_swiglu, then the group's sum.
 kernel void tf_draft_swiglu_xs(device const bfloat* G [[buffer(0)]],device const bfloat* U [[buffer(1)]],constant Activation& a [[buffer(2)]],device bfloat* Y [[buffer(3)]],device float* XS [[buffer(4)]],constant uint& xs_stride [[buffer(5)]],uint2 index [[thread_position_in_grid]],uint t [[thread_index_in_threadgroup]]) {
   threadgroup bfloat out[TF_XS_GROUP];
@@ -235,4 +264,45 @@ kernel void tf_draft_rms_rope(device const bfloat* X [[buffer(0)]],device const 
     const float left=float(normed[col]),right=float(normed[col+pairs]);
     Y[output]=bfloat(left*cs-right*sn);Y[output+pairs]=bfloat(right*cs+left*sn);
   }
+}
+// tf_draft_rms_rope whose rows from `from` on rotate into K (rows heads * dim apart) instead of Y, and only the first
+// count[0] of them (a word an earlier dispatch wrote); Y holds rows below `from`. Every value is tf_draft_rms_rope's.
+kernel void tf_draft_rms_rope_ring(device const bfloat* X [[buffer(0)]],device const bfloat* W [[buffer(1)]],constant Norm& a [[buffer(2)]],device bfloat* N [[buffer(3)]],device const ulong* positions [[buffer(4)]],constant Rope& r [[buffer(5)]],device bfloat* Y [[buffer(6)]],device bfloat* K [[buffer(7)]],const device uint* count [[buffer(8)]],constant uint& from [[buffer(9)]],uint2 block [[threadgroup_position_in_grid]],uint t [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint2 threads [[threads_per_threadgroup]]) {
+  threadgroup float sums[32],inverse[1];
+  threadgroup bfloat normed[TF_ROPE_MAX_DIM];
+  float value=0.0f;
+  const size_t base=size_t(block.y)*a.x_stride+block.x*a.dim;
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){float x=float(X[base+first+j]);value+=x*x;}
+  value=simd_sum(value);
+  if(sg==0)sums[lane]=0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(lane==0)sums[sg]=value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(sg==0){float total=simd_sum(sums[lane]);if(lane==0)inverse[0]=precise::rsqrt(total/float(a.dim)+a.eps);}
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint first=4*t;first<a.dim;first+=4*threads.x)for(uint j=0;j<4&&first+j<a.dim;j++){
+    const uint col=first+j;
+    float normalized=float(X[base+col])*inverse[0];
+    normalized=float(bfloat(normalized));
+    const bfloat y=bfloat(normalized*float(W[col]));
+    N[size_t(block.y)*a.y_stride+block.x*a.dim+col]=y;
+    normed[col]=y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(block.y>=from&&block.y-from>=count[0])return;
+  device bfloat* out=block.y<from?Y+size_t(block.y)*r.y_stride:K+size_t(block.y-from)*(r.heads*r.dim);
+  const uint pairs=r.dim/2;
+  for(uint col=t;col<pairs;col+=threads.x){
+    const float angle=float(positions[block.y])*pow(r.theta,-float(col)/float(pairs));
+    const float cs=cos(angle),sn=sin(angle);
+    const size_t output=block.x*r.dim+col;
+    const float left=float(normed[col]),right=float(normed[col+pairs]);
+    out[output]=bfloat(left*cs-right*sn);out[output+pairs]=bfloat(right*cs+left*sn);
+  }
+}
+// Rows below min(a.rows, count[0]) (a word an earlier dispatch wrote) of X into Y, 16-bit words as they are.
+struct Rows { uint rows,width,x_stride,y_stride; };
+kernel void tf_draft_copy_rows(device const ushort* X [[buffer(0)]],device ushort* Y [[buffer(1)]],constant Rows& a [[buffer(2)]],const device uint* count [[buffer(3)]],uint2 index [[thread_position_in_grid]]) {
+  if(index.x>=a.width||index.y>=a.rows||index.y>=count[0])return;
+  Y[size_t(index.y)*a.y_stride+index.x]=X[size_t(index.y)*a.x_stride+index.x];
 }
