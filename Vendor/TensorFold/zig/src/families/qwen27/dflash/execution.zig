@@ -15,6 +15,50 @@ fn group(ops: op.Ops, frame: u64, x: op.View, first: w.Tensor, kind: u32, mode: 
     const y = (try f(ops.ptr, frame, x, first, kind, mode)) orelse return null;
     return y;
 }
+/// The gate+up group of `x` and its swiglu in one launch where the backend fuses them (op.Ops.VTable.project_swiglu).
+fn projectSwiglu(ops: op.Ops, frame: u64, x: op.View, gate: w.Tensor, mode: op.Mode) !?op.View {
+    const f = ops.vtable.project_swiglu orelse return null;
+    return f(ops.ptr, frame, x, gate, mode);
+}
+/// A dynamic conv's kernel projection of `x` and branch 0 of that conv of `x`, in one launch where the backend folds them
+/// (op.Ops.VTable.project_conv): the projection's output, then the conv's.
+fn projectConvolve(ops: op.Ops, frame: u64, x: op.View, weights: w.Conv, c: Config, block: u32, mode: op.Mode) ![2]op.View {
+    if (ops.vtable.project_conv) |f| if (try f(ops.ptr, frame, x, weights.projection, weights.base, block, mode)) |both| {
+        try both[0].check(x.rows, c.dynamicWidth(), .bf16);
+        try both[1].check(x.rows, c.hidden, .bf16);
+        return both;
+    };
+    const dynamic = try project(ops, frame, x, weights.projection, mode);
+    return .{ dynamic, try convolve(ops, frame, x, dynamic, weights, 0, null, c, block) };
+}
+/// The q|k|v products of `input` with both per-head norms and both ropes: the rotated queries, the rotated keys and the
+/// values. One launch where the backend folds them (op.Ops.VTable.project_attention); otherwise the group (or the three
+/// products), then both norms, then both ropes, independent neighbours for the concurrent encoder.
+fn projectAttention(ops: op.Ops, frame: u64, input: op.View, a: w.Attention, positions: []const u64, c: Config, mode: op.Mode) ![3]op.View {
+    if (ops.vtable.project_attention) |f| if (try f(ops.ptr, frame, input, a.q, a.q_norm, a.k_norm, c.eps, positions, c.theta, mode)) |all| {
+        try all[0].check(input.rows, c.qWidth(), .bf16);
+        try all[1].check(input.rows, c.kvWidth(), .bf16);
+        try all[2].check(input.rows, c.kvWidth(), .bf16);
+        return all;
+    };
+    var raw_query: op.View = undefined;
+    var raw_keys: op.View = undefined;
+    var values: op.View = undefined;
+    if (try group(ops, frame, input, a.q, 2, mode)) |qkv| {
+        raw_query = try cols(ops, frame, qkv, 0, c.qWidth());
+        raw_keys = try cols(ops, frame, qkv, c.qWidth(), c.kvWidth());
+        values = try cols(ops, frame, qkv, c.qWidth() + c.kvWidth(), c.kvWidth());
+    } else {
+        raw_query = try project(ops, frame, input, a.q, mode);
+        raw_keys = try project(ops, frame, input, a.k, mode);
+        values = try project(ops, frame, input, a.v, mode);
+    }
+    const normed_query = try norm(ops, frame, raw_query, a.q_norm, c.eps, c.heads, c.head_dim);
+    const normed_keys = try norm(ops, frame, raw_keys, a.k_norm, c.eps, c.kv_heads, c.head_dim);
+    const query = try rotate(ops, frame, normed_query, positions, c.heads, c);
+    const keys = try rotate(ops, frame, normed_keys, positions, c.kv_heads, c);
+    return .{ query, keys, values };
+}
 fn cols(ops: op.Ops, frame: u64, x: op.View, first: u32, width: u32) !op.View {
     return (ops.vtable.slice_cols orelse return error.DraftOperatorShape)(ops.ptr, frame, x, first, width);
 }
@@ -184,42 +228,26 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
     for (g.layers, 0..) |layer, i| {
         var residual = hidden;
         const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
-        const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
-        const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
-        // the products, then both norms, then both ropes: independent neighbours for the concurrent encoder
-        var raw_query: op.View = undefined;
-        var raw_keys: op.View = undefined;
-        var values: op.View = undefined;
-        if (try group(ops, frame, input, layer.attention.q, 2, preparation.mode)) |qkv| {
-            raw_query = try cols(ops, frame, qkv, 0, c.qWidth());
-            raw_keys = try cols(ops, frame, qkv, c.qWidth(), c.kvWidth());
-            values = try cols(ops, frame, qkv, c.qWidth() + c.kvWidth(), c.kvWidth());
-        } else {
-            raw_query = try project(ops, frame, input, layer.attention.q, preparation.mode);
-            raw_keys = try project(ops, frame, input, layer.attention.k, preparation.mode);
-            values = try project(ops, frame, input, layer.attention.v, preparation.mode);
-        }
-        const normed_query = try norm(ops, frame, raw_query, layer.attention.q_norm, c.eps, c.heads, c.head_dim);
-        const normed_keys = try norm(ops, frame, raw_keys, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
-        const query = try rotate(ops, frame, normed_query, positions[0..rows], c.heads, c);
-        const keys = try rotate(ops, frame, normed_keys, positions[0..rows], c.kv_heads, c);
+        const dynamic, const input = try projectConvolve(ops, frame, xn, layer.attention_conv, c, block, preparation.mode);
+        const query, const keys, const values = try projectAttention(ops, frame, input, layer.attention, positions[0..rows], c, preparation.mode);
         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
         try attended.check(rows, c.qWidth(), .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
         residual = hidden;
         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
-        const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
-        const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
-        var gate: op.View = undefined;
-        var up: op.View = undefined;
-        if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
-            gate = try cols(ops, frame, gu, 0, c.intermediate);
-            up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
-        } else {
-            gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
-            up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
-        }
-        const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        const dyn_mlp, const mlp_input = try projectConvolve(ops, frame, post, layer.mlp_conv, c, block, preparation.mode);
+        const activated = if (try projectSwiglu(ops, frame, mlp_input, layer.mlp.gate, preparation.mode)) |fused| fused else blk: {
+            var gate: op.View = undefined;
+            var up: op.View = undefined;
+            if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
+                gate = try cols(ops, frame, gu, 0, c.intermediate);
+                up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
+            } else {
+                gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
+                up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
+            }
+            break :blk try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        };
         try activated.check(rows, c.intermediate, .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }

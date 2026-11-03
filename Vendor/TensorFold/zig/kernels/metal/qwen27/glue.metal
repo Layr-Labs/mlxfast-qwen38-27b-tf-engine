@@ -134,17 +134,48 @@ struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
 // DEC (decoded rows of one stream): beside QY and KY, a q head's rounded values also land where q27_attn_pack_a packs
 // them (QA, packed_rows rows a kv head, rows * g on repeating row 0's first head), and a k head's rotated key and its
 // value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
-template <bool PACK, bool DEC>
-inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
-                                    device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
-                                    uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
+// The words a head's simdgroup reads from outside a decoded launch's barrier interval, gathered before its wait on the
+// counted q and k|v projections (q27_head_norm_rope_held): the head's norm gains, the lane's rope cosine and sine (the
+// row's position comes from the host), and (DEC, k heads) the row's key and value cache rows from the plan's nodes and
+// meta and the caches table. The rows' own words (Q, K, V) are read behind the wait.
+struct Q27RopeHeld { float wa[4], wb[4]; float c, s; device bfloat* key; device bfloat* value; };
+template <bool DEC>
+inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat* KW, device const int* positions, constant HeadRope& a,
+                                    uint2 group, uint sg, uint lane, thread Q27RopeHeld& h,
                                     device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
+                                    device const int* nodes = nullptr) {
+  const uint head = group.x * 4 + sg, row = group.y;
+  if (head >= a.heads + a.kv_heads) return;
+  const bool query = head < a.heads;
+  device const bfloat* w = query ? QW : KW;
+  for (uint j = 0; j != 4; ++j) h.wa[j] = float(w[4 * lane + j]);
+  for (uint j = 0; j != 4; ++j) h.wb[j] = float(w[128 + 4 * lane + j]);
+  const uint pairs = a.rotary / 2;
+  h.c = 0.0f;
+  h.s = 0.0f;
+  if (lane < pairs) {
+    const uint d = lane;
+    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
+    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
+    h.c = cos(angle);
+    h.s = sin(angle);
+  }
+  if (DEC && !query) {
+    const uint hk = head - a.heads;
+    const int st = nodes[4 * row + 1], base = 8 + st * 12;
+    const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
+    h.key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
+    h.value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
+  }
+}
+template <bool PACK, bool DEC>
+inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat* K, constant HeadRope& a, device bfloat* QY,
+                                    device bfloat* KY, uint2 group, uint sg, uint lane, thread const Q27RopeHeld& h,
+                                    device bfloat* QA = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
   device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
-  device const bfloat* w = query ? QW : KW;
   const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
   device bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
                             : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
@@ -164,21 +195,14 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
   float na[4], nb[4];
   for (uint j = 0; j != 4; ++j) {
     const float normal = float(bfloat(float(xa[j]) * inverse));
-    na[j] = float(bfloat(float(w[4 * lane + j]) * normal));
+    na[j] = float(bfloat(h.wa[j] * normal));
   }
   for (uint j = 0; j != 4; ++j) {
     const float normal = float(bfloat(float(xb[j]) * inverse));
-    nb[j] = float(bfloat(float(w[128 + 4 * lane + j]) * normal));
+    nb[j] = float(bfloat(h.wb[j] * normal));
   }
   const uint pairs = a.rotary / 2;
-  float c = 0.0f, s = 0.0f;
-  if (lane < pairs) {
-    const uint d = lane;
-    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    c = cos(angle);
-    s = sin(angle);
-  }
+  const float c = h.c, s = h.s;
   bfloat4 ya, yb;
   for (uint j = 0; j != 4; ++j) {
     const uint at = 4 * lane + j;
@@ -213,12 +237,10 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
   }
   if (DEC && !query) {
     const uint hk = head - a.heads;
-    const int st = nodes[4 * row + 1], base = 8 + st * 12;
-    const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
-    device bfloat* key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
+    device bfloat* key = h.key;
     *(device bfloat4*)(key + 4 * lane) = ya;
     *(device bfloat4*)(key + 128 + 4 * lane) = yb;
-    device bfloat* value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
+    device bfloat* value = h.value;
     device const bfloat* source = V + row * v_stride + hk * a.width;
     *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
     *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
@@ -235,6 +257,8 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
                  constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+  Q27RopeHeld held; \
+  q27_head_norm_rope_held<false>(QW, KW, positions, a, group, sg, lane, held); \
   if (wait_for != 0u) { \
     if (t == 0) { \
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
@@ -246,7 +270,7 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
     } \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
   } \
-  q27_head_norm_rope_rows<PACK, false>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
+  q27_head_norm_rope_rows<PACK, false>(Q, K, a, QY, KY, group, sg, lane, held); \
 }
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope, false)
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed, true)
@@ -266,6 +290,8 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
                  uint2 group [[threadgroup_position_in_grid]], uint2 groups [[threadgroups_per_grid]],
                  uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
+  Q27RopeHeld held;
+  q27_head_norm_rope_held<true>(QW, KW, positions, a, group, sg, lane, held, caches, meta, nodes);
   if (wait_for != 0u) {
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
@@ -277,7 +303,7 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  q27_head_norm_rope_rows<false, true>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane, QA, caches, meta, nodes, V, v_stride);
+  q27_head_norm_rope_rows<false, true>(Q, K, a, QY, KY, group, sg, lane, held, QA, V, v_stride);
   if (count_out != 0u) {
     threadgroup_barrier(mem_flags::mem_device);
     if (t == 0) {

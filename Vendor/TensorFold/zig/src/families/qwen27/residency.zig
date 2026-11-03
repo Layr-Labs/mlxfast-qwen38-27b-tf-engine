@@ -43,6 +43,9 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
         try fields.append(a, list, adapter);
         try fields.append(a, list, &adapter.projection);
         if (adapter.small) |*s| try fields.append(a, list, s);
+        if (adapter.swiglu) |*s| try fields.append(a, list, s);
+        if (adapter.conv) |*s| try fields.append(a, list, s);
+        if (adapter.rope) |*s| try fields.append(a, list, s);
     }
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| try fields.append(a, list, t);
@@ -66,6 +69,9 @@ pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) 
     fields.apply(&adapter.projection, hook, joining);
     if (adapter.small) |*s| fields.apply(s, hook, joining);
     if (adapter.prompt) |*p| fields.apply(p, hook, joining);
+    if (adapter.swiglu) |*s| fields.apply(s, hook, joining);
+    if (adapter.conv) |*s| fields.apply(s, hook, joining);
+    if (adapter.rope) |*s| fields.apply(s, hook, joining);
 }
 
 pub fn putPrepared(b: anytype, key: usize, adapter: anytype) !void {
