@@ -342,7 +342,8 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
-        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
+        const every: usize = if (early) commit_every else 0;
+        r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, every, early) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
