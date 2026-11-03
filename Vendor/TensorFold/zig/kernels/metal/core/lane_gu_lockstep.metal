@@ -93,6 +93,13 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  // the MLP down that reads Y and HS shares this launch's barrier interval: each threadgroup counts itself on GC[0] once its
  // stores are past a device-scope fence (tf_lane_reg's TF_WAIT)
  threadgroup_barrier(mem_flags::mem_device);
- if(t==0){atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);atomic_fetch_add_explicit(GC,1u,memory_order_relaxed);}
+ if(t==0){
+  atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+#if TF_GU_PARTS > 1
+  atomic_fetch_add_explicit(GC + int(tg.x) / ((TF_N / 128) / TF_GU_PARTS),1u,memory_order_relaxed);
+#else
+  atomic_fetch_add_explicit(GC,1u,memory_order_relaxed);
+#endif
+ }
 #endif
 }
