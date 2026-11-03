@@ -327,7 +327,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -346,6 +348,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 #if defined(TF_GU_TURNS)
 [[max_total_threads_per_threadgroup(64)]]
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT) && TF_SK > 1
+[[max_total_threads_per_threadgroup(128 * TF_SK)]]
 #elif defined(TF_SWIGLU)
 [[max_total_threads_per_threadgroup(128)]]
 #elif defined(TF_SERIAL_SK2)
@@ -385,6 +389,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   XS += r0;
 #if defined(TF_GU_TURNS)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1];
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT) && TF_SK > 1
+  // the drafter's gate|up on TF_SK K slices: SIMD group sgi runs tile sgi % 4 over slice sgi / 4
+  const int lane = int(lanei), ks = int(sgi) & 3, kspl = int(sgi) >> 2, M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #elif defined(TF_SWIGLU)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #else
@@ -427,7 +434,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int split = 0; split < TF_SK; split++) {
   const int first = TF_G0 + (split * TF_GN) / TF_SK, last = TF_G0 + ((split + 1) * TF_GN) / TF_SK;
 #else
-#if defined(TF_SWIGLU)
+#if defined(TF_SWIGLU) && defined(TF_DRAFT_ACT) && TF_SK > 1
+  const int first = TF_G0 + (kspl * TF_GN) / TF_SK, last = TF_G0 + ((kspl + 1) * TF_GN) / TF_SK; // the unfused launch's slices
+#elif defined(TF_SWIGLU)
   const int first = TF_G0, last = TF_G0 + TF_GN; // one K split: a threadgroup's SIMD groups are its chunk's four tiles
 #else
   const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
@@ -572,6 +581,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (split == 0) for (int i = 0; i < 16; i++) C0[i] = C[i];
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i] + C[i];
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT) && TF_SK > 1
+  // each tile's slices reduce as the unfused rows8 launch's do: slice 0's words plus slice 1's, and so on in order
+  threadgroup float dpart[(TF_SK - 1) * 4 * TF_PART * 32];
+  if (kspl > 0) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) dpart[(((kspl - 1) * 4 + ks) * TF_PART + TF_HALF(i)) * 32 + lane] = C[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (kspl == 0) for (int s2 = 1; s2 < TF_SK; s2++) for (int i = 0; i < 16; i++) if (TF_LIVE(i)) C[i] += dpart[(((s2 - 1) * 4 + ks) * TF_PART + TF_HALF(i)) * 32 + lane];
 #elif defined(TF_ROWS8)
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TF_PART * 32];
   if (TF_SK > 1) {
@@ -611,6 +626,43 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+#if TF_SK > 1
+  const bool tf_lead = kspl == 0; // the reduced words live in slice 0's SIMD groups
+#else
+  const bool tf_lead = true;
+#endif
+  if (tf_lead && mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; tf_lead && at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tf_lead && t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
