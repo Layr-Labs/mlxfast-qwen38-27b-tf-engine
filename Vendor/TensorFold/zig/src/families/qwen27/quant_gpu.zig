@@ -786,6 +786,19 @@ pub const Kernels = struct {
         return k.countedKey(p, rows, false) != null;
     }
 
+    /// Whether `p` on `rows` decoded rows takes quantCountedAfter: the launch that waits on the mixer's count before it
+    /// reads its rows (a serial split-K matrix counts but cannot wait).
+    pub fn countableAfter(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.gu_words != null and k.countedKey(p, rows, true) != null;
+    }
+
+    /// `p` on `rows` decoded rows waiting on `wait_for` threadgroups counted by the launch before it, for a caller that
+    /// skipped the barrier between them; null where `p` cannot take that launch (the caller keeps its barrier).
+    pub fn quantWaited(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !?u32 {
+        if (wait_for == 0 or !k.countableAfter(p, rows)) return null;
+        return try k.quantCountedAfter(input_encoder, p, x, xs, y, rows, wait_for);
+    }
+
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {

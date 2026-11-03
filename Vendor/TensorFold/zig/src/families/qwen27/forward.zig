@@ -120,6 +120,9 @@ pub const Stages = struct {
         // read and cleared before any return, and used only by the block whose GDN gate or attention merge wrote it
         const gated = f.mixer_sums;
         f.mixer_sums = false;
+        // the mixer's merge count for this block's out projection (0: the mixer left a barrier behind it)
+        const waited = f.mixer_wait;
+        f.mixer_wait = 0;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -134,10 +137,12 @@ pub const Stages = struct {
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+        } else if (if (gated and !s.compact) if (waited != 0) try m.kernels.quantWaited(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows, waited) else try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
             try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
         } else {
+            // the mixer skipped its barrier for the wait this block's projection did not take: order its rows here
+            if (waited != 0) e.barrier();
             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
             try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
