@@ -897,6 +897,10 @@ inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
   // the row's key and query words, its (row, head) scalars, and its value and output words
   uint kq = (span.first * p.nk + key_head) * p.dk + sub * 16, at = span.first * p.nv + head, vo = at * p.dv + dimension;
   const uint kq_step = p.nk * p.dk, at_step = p.nv, vo_step = p.nv * p.dv;
+  // row n's output sums are reduced and stored in row n + 1, after its loads: a store ahead of the next row's key load
+  // keeps that load behind it (the buffers may alias), so the reduction's shuffles no longer sit before it
+  float held_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  uint held_vo = vo;
   for (uint node = 0; node < span.rows; ++node) {
     float kf[16], qf[16], remembered[4], correction[4], result[4];
     TF_UNROLL for (uint c = 0; c < 4; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
@@ -914,16 +918,24 @@ inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
     correction[2] = simd_shuffle_xor(own, 1);
     correction[3] = simd_shuffle_xor(own, 3);
     tf_delta_bf16x16(query + kq, qf);
+    if (node > 0) {
+      const float total = tf_delta_slot_sum(held_result);
+      if (sub < 4) output[held_vo + held] = bfloat(total);
+    }
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < 4; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
         result[c] += state[c][i] * qf[i];
       }
-    const float total = tf_delta_slot_sum(result);
-    if (sub < 4) output[vo + held] = bfloat(total);
+    TF_UNROLL for (uint c = 0; c < 4; ++c) held_result[c] = result[c];
+    held_vo = vo;
     kq += kq_step;
     at += at_step;
     vo += vo_step;
+  }
+  if (span.rows > 0) {
+    const float total = tf_delta_slot_sum(held_result);
+    if (sub < 4) output[held_vo + held] = bfloat(total);
   }
   TF_UNROLL for (uint c = 0; c < 4; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + (held ^ c) * p.dk + i] = state[c][i];

@@ -105,7 +105,11 @@ pub const Ops = struct {
             e.setBuffer(ops.part, 0, 1);
             e.setValue(p, 2);
             e.dispatchGroups(mtl.Size.of(wide_spans, p.rows, 1), mtl.Size.of(lanes, 1, 1));
-            e.barrier();
+            if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+                e.barrierBuffers(&.{ logits.buf, ops.part, output.buf });
+            } else {
+                e.barrier();
+            }
             e.setPipeline(ops.wide_merge_pipeline);
             e.setBuffer(ops.part, 0, 0);
             e.setBuffer(output.buf, output.off, 1);
@@ -119,7 +123,11 @@ pub const Ops = struct {
             e.setBuffer(ops.part, 0, 1);
             e.setValue(p, 2);
             e.dispatchGroups(mtl.Size.of(spans, p.rows, 1), mtl.Size.of(lanes, 1, 1));
-            e.barrier();
+            if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+                e.barrierBuffers(&.{ logits.buf, ops.part, output.buf });
+            } else {
+                e.barrier();
+            }
             e.setPipeline(ops.merge_pipeline);
             e.setBuffer(ops.part, 0, 0);
             e.setBuffer(output.buf, output.off, 1);
