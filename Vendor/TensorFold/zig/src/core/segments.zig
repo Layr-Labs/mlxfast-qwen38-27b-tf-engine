@@ -46,37 +46,6 @@ var n_unchecked: usize = 0;
 /// A polled single-lane pass's fence, made once for its queue and kept: a pass's first encoder waits on nothing and
 /// each later one on the update just before it, so a kept fence orders a pass exactly as a new one does.
 var poll_fence: ?struct { fence: Fence, queue: mtl.objc.Id } = null;
-/// The next polled single-lane pass's first command buffer and its open encoder, made ahead (prepareFirst) while the host
-/// waits on work the pass follows, retained past the pool they were made in. Only commit order orders a queue's
-/// command buffers, so one made early runs exactly where one made at the pass would.
-const Ahead = struct { cb: mtl.CommandBuffer, enc: mtl.ComputeEncoder, queue: mtl.objc.Id, mode: mtl.DispatchType };
-var first_ahead: ?Ahead = null;
-
-/// Work encoded first in a command buffer made ahead (a draft bridge's stop).
-pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
-
-/// Makes the next polled single-lane pass's first command buffer and encoder on `queue` now, `lead` encoded first in it,
-/// for runCommittingEarly to take; one made earlier and not taken goes to the queue first (flushFirst).
-pub fn prepareFirst(queue: mtl.Queue, mode: mtl.DispatchType, lead: ?Lead) void {
-    flushFirst();
-    const cb = queue.commandBuffer().retain();
-    const enc = cb.compute(mode);
-    _ = mtl.objc.retain(enc.id);
-    first_ahead = .{ .cb = cb, .enc = enc, .queue = queue.id, .mode = mode };
-    // a lead that fails to encode leaves nothing ahead: the pass makes its own and encodes its lead itself
-    if (lead) |l| l.encode(l.ptr, enc) catch flushFirst();
-}
-
-/// A command buffer made ahead that no pass took, ended and committed with what it holds (at most its lead): it then
-/// neither holds a queue slot nor leaves its lead undone.
-pub fn flushFirst() void {
-    const ahead = first_ahead orelse return;
-    first_ahead = null;
-    ahead.enc.end();
-    ahead.cb.commit();
-    mtl.objc.release(ahead.enc.id);
-    ahead.cb.release();
-}
 
 /// The family's work due right before a pass's first commit, if it declares any (runCommittingFrom).
 fn beforeCommit(fam: anytype) !void {
@@ -124,31 +93,16 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
     // decoded rows poll one lane (as the poll event and the unchecked buffers above): that lane keeps its queue's fence
     const kept_fence = n == 1 and (if (poll_fence) |kept| kept.queue == queues[0].id else true) and (if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "polls")) fam.polls() else false);
     defer if (!kept_fence) for (lanes[0..n_lanes]) |l| l.fence.deinit();
-    // the first command buffer made ahead for such a pass (prepareFirst) is its lane's (released here once the pass is
-    // done with it); a pass that cannot take it sends it to the queue before its own
-    var ahead: ?Ahead = null;
-    defer if (ahead) |a| {
-        mtl.objc.release(a.enc.id);
-        a.cb.release();
-    };
     for (queues) |q| {
         const fence = if (kept_fence) (if (poll_fence) |kept| kept.fence else made: {
             const f = try Fence.init(device);
             poll_fence = .{ .fence = f, .queue = q.id };
             break :made f;
         }) else try Fence.init(device);
-        if (kept_fence) if (first_ahead) |a| if (a.queue == q.id and a.mode == mode) {
-            first_ahead = null;
-            ahead = a;
-            lanes[n_lanes] = .{ .k = n_lanes, .cb = a.cb, .enc = a.enc, .fence = fence, .queue = q };
-            n_lanes += 1;
-            continue;
-        };
         const cb = q.commandBuffer();
         lanes[n_lanes] = .{ .k = n_lanes, .cb = cb, .enc = cb.compute(mode), .fence = fence, .queue = q };
         n_lanes += 1;
     }
-    flushFirst();
     var done: [48]mtl.CommandBuffer = undefined;
     var n_done: usize = 0;
     const X = struct {
