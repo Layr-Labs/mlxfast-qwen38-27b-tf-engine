@@ -6,6 +6,10 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 24 layers are on the GPU the host encodes the other 40 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 24;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -349,6 +353,7 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
@@ -973,7 +978,7 @@ const Second = struct {
             b.* = try attn.Binding.init(m.device, limits);
             made += 1;
         }
-        const own = try @import("gdn_pool_gpu.zig").Own.init(pool, m.device);
+        const own = try @import("gdn_pool_gpu.zig").Own.init(pool, m.device, frame.capacity);
         errdefer own.deinit();
         const queue = try m.device.queue();
         return .{ .frame = frame, .scratch = scratch, .bindings = bindings, .queue = queue, .gdn = own };
@@ -985,7 +990,7 @@ const Second = struct {
         if (s.frame.standby) |bank| for (bank) |b| fields.one(b, hook, joining);
         fields.apply(&s.scratch, hook, joining);
         for (s.bindings) |*b| fields.apply(b, hook, joining);
-        for ([_]mtl.Buffer{ s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
+        for ([_]mtl.Buffer{ s.gdn.qkv, s.gdn.tails, s.gdn.recurrent, s.gdn.snapshots }) |b| fields.one(b, hook, joining);
     }
 
     fn deinit(s: *Second, a: std.mem.Allocator) void {
@@ -1010,12 +1015,17 @@ const Segment = struct {
     total: u32,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .gdn_pre = gdnPre, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own, .preprojected = true };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
+    }
+    fn gdnPre(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .own = s.own };
+        try hook.projectPrompt(e, block, weights, frame, rows);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
