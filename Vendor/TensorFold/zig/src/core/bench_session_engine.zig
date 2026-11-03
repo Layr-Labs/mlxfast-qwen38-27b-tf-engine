@@ -361,10 +361,10 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        // Short sleeps (20 us between checks) instead of yield-spinning a core for the whole request (the CPU and GPU share
+        // Short sleeps (10 us between checks, ercumentyildirim 70fce8fb) instead of yield-spinning a core for the whole request (the CPU and GPU share
         // one package's power)
         const sys = @import("sys").c;
-        const req: sys.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+        const req: sys.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_us };
         while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
         if (run.failed) return error.EngineFailed;
     }
