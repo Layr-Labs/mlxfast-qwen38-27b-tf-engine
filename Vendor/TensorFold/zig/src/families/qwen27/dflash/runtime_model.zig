@@ -175,13 +175,22 @@ pub const Model = struct {
             return error.BadDraftContext;
         }
         m.early = null;
+        // the anchor's codebook row heads for the caches while the frame runs, its candidates' rows once the lattice names
+        // them (while the host checks what the frame admitted): hints only, the selector reads every word as before
+        selector.warmAnchor(&m.graph, pending);
         var lattice = try execution.completeBlock(m.backend.ops(), &m.graph, x.block);
         defer lattice.deinit();
+        selector.warmCandidates(&m.graph, lattice);
         if (!m.admitted(x, pending)) {
             m.backend.failed = true;
             return error.DraftFrameMismatch;
         }
         return selector.propose(m.allocator, &m.graph, lattice, pending, try std.math.add(u64, m.session.context.end, 1), options);
+    }
+    /// Whether proposePolicy drafts `policy`'s tree from the early frame (completeNext), as it decides it.
+    pub fn draftsNext(m: *const Model, pending: u32, policy: selector.Policy) bool {
+        const block = policy.block(m.tree_block) catch return false;
+        return m.early != null and block == 2 and pending < m.graph.config.vocab;
     }
     /// Ends the early frame without drafting from it: the taps it admitted stay admitted. If the host never read the verify
     /// that admits them (an error path), the backend fails: recover resets it.
