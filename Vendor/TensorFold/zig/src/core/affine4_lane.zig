@@ -12,6 +12,8 @@ pub const Adapter = struct {
     /// Reg adapters' rows8 build of `projection` on the same words and metadata: launches of at most 8 rows (the
     /// drafter's decode blocks) skip each lane's padding row.
     small: ?lane.Projection = null,
+    small_layout: ?lane.Layout = null,
+    swiglu: ?lane.Projection = null,
     /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
     /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
     prompt: ?lane.Projection = null,
@@ -69,7 +71,20 @@ pub const Adapter = struct {
             lp.prompt_sr = true;
             prompt = try lane.Projection.init(a, device, lp);
         }
-        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt };
+        var small_layout: ?lane.Layout = null;
+        if (layout.reg) {
+            small_layout = layout;
+            small_layout.?.rows8 = true;
+        }
+        return .{ .projection = projection, .words = words, .metadata = metadata, .index = index, .small = small, .prompt = prompt, .small_layout = small_layout };
+    }
+    pub fn draftSwiglu(adapter: *Adapter, a: std.mem.Allocator, device: mtl.Device) !void {
+        var l = adapter.small_layout orelse return error.InvalidSchedule;
+        l.swiglu = true;
+        l.draft_act = true;
+        const p = try lane.Projection.init(a, device, l);
+        if (adapter.swiglu) |old| old.deinit();
+        adapter.swiglu = p;
     }
     /// A `bits` != 4 copy on the plain lane kernel (MLX bit stream codes, pairs metadata, precomputed row sums).
     fn initPlain(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize) !Adapter {
@@ -94,6 +109,7 @@ pub const Adapter = struct {
         adapter.projection.deinit();
         if (adapter.small) |s| s.deinit();
         if (adapter.prompt) |p| p.deinit();
+        if (adapter.swiglu) |p| p.deinit();
         adapter.words.deinit();
         adapter.metadata.deinit();
         if (adapter.index) |b| b.deinit();

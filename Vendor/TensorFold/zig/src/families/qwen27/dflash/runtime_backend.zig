@@ -407,9 +407,68 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        if (kind == group_gu and key_part == 'g') {
+            adapter.draftSwiglu(b.allocator, b.target.device) catch |err| std.log.warn("draft gate/up keeps its SwiGLU launch: {s}", .{@errorName(err)});
+            if (adapter.swiglu) |fused| if (!(b.swigluMatches(adapter) catch false)) {
+                std.log.warn("draft gate/up keeps its SwiGLU launch: the fused launch's words differ on this GPU", .{});
+                fused.deinit();
+                adapter.swiglu = null;
+            };
+        }
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
+    }
+    fn swigluMatches(b: *Backend, adapter: core.affine4_lane.Adapter) !bool {
+        const fused = adapter.swiglu orelse return false;
+        const small = adapter.small orelse return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const device = b.target.device;
+        const rows: u32 = 2;
+        const n = fused.n;
+        const k = fused.k;
+        const half = n / 2;
+        const groups = half / core.draft_ops.sums_group;
+        const x = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer x.deinit();
+        const gu = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer gu.deinit();
+        const h0 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h0.deinit();
+        const h1 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h1.deinit();
+        const s0 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s0.deinit();
+        const s1 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s1.deinit();
+        for (x.slice(u16, rows * k), 0..) |*v, i| {
+            const f: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7919 + 13) % 4001)) - 2000)) / 1000.0;
+            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
+        const cb = b.target.queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        var ended = false;
+        errdefer if (!ended) e.end();
+        const sums = try small.encodeSumsOf(e, .{ .buf = x }, rows);
+        e.barrier();
+        try small.encodeSums(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = gu }, rows);
+        e.barrier();
+        try b.primitives.swigluSums(e, .{ .buf = gu }, .{ .buf = gu, .off = half * 2 }, .{ .buf = h0 }, .{ .ref = .{ .buf = s0 }, .stride = 16 }, .{ .rows = rows, .width = @intCast(half), .gate_stride = @intCast(n), .up_stride = @intCast(n), .y_stride = @intCast(half) });
+        try fused.encodeSwiglu(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = h1 }, .{ .buf = s1 }, rows);
+        e.end();
+        ended = true;
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.warn("draft gate/up SwiGLU check: {s}", .{msg});
+            return false;
+        }
+        if (!std.mem.eql(u16, h0.slice(u16, rows * half), h1.slice(u16, rows * half))) return false;
+        const a0 = s0.slice(u32, groups * 16);
+        const a1 = s1.slice(u32, groups * 16);
+        for (0..groups) |g| for (0..rows) |r| if (a0[g * 16 + r] != a1[g * 16 + r]) return false;
+        return true;
     }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {

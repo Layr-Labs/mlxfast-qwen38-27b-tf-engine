@@ -15,6 +15,10 @@ fn group(ops: op.Ops, frame: u64, x: op.View, first: w.Tensor, kind: u32, mode: 
     const y = (try f(ops.ptr, frame, x, first, kind, mode)) orelse return null;
     return y;
 }
+fn projectSwiglu(ops: op.Ops, frame: u64, x: op.View, gate: w.Tensor, mode: op.Mode) !?op.View {
+    const f = ops.vtable.project_swiglu orelse return null;
+    return f(ops.ptr, frame, x, gate, mode);
+}
 fn cols(ops: op.Ops, frame: u64, x: op.View, first: u32, width: u32) !op.View {
     return (ops.vtable.slice_cols orelse return error.DraftOperatorShape)(ops.ptr, frame, x, first, width);
 }
@@ -210,16 +214,18 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
         const dyn_mlp = try project(ops, frame, post, layer.mlp_conv.projection, preparation.mode);
         const mlp_input = try convolve(ops, frame, post, dyn_mlp, layer.mlp_conv, 0, null, c, block);
-        var gate: op.View = undefined;
-        var up: op.View = undefined;
-        if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
-            gate = try cols(ops, frame, gu, 0, c.intermediate);
-            up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
-        } else {
-            gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
-            up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
-        }
-        const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        const activated = if (try projectSwiglu(ops, frame, mlp_input, layer.mlp.gate, preparation.mode)) |fused| fused else blk: {
+            var gate: op.View = undefined;
+            var up: op.View = undefined;
+            if (try group(ops, frame, mlp_input, layer.mlp.gate, 3, preparation.mode)) |gu| {
+                gate = try cols(ops, frame, gu, 0, c.intermediate);
+                up = try cols(ops, frame, gu, c.intermediate, c.intermediate);
+            } else {
+                gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
+                up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
+            }
+            break :blk try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+        };
         try activated.check(rows, c.intermediate, .bf16);
         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
     }

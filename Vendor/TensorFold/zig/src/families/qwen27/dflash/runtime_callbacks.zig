@@ -267,6 +267,26 @@ fn rope(ptr: *anyopaque, epoch: u64, x: op.View, p: op.Rotary) !op.View {
 fn normArgs(h: @import("runtime_backend.zig").HeldNorm) draft_ops.Norm {
     return .{ .rows = h.x.rows, .heads = h.p.heads, .dim = h.p.head_dim, .x_stride = h.x.stride, .y_stride = h.y.stride, .eps = h.p.eps };
 }
+fn projectSwiglu(ptr: *anyopaque, epoch: u64, x: op.View, gate: ck.Tensor, mode: op.Mode) !?op.View {
+    const b = backend(ptr);
+    if (mode == .bf16_reference or b.fused_count == 0 or b.admitting() or readsQ4Copy(b, x.rows) or x.rows == 0 or x.rows > 8) return null;
+    const adapter = b.prepared.get(@intFromPtr(gate.bytes.ptr) + @import("runtime_backend.zig").group_gu) orelse return null;
+    const p = adapter.swiglu orelse return null;
+    const sums_in = b.input_sums orelse return null;
+    if (!std.meta.eql(sums_in.view, x) or sums_in.sums.stride != sums_stride or x.dtype != .bf16 or x.stride != x.width or x.width != p.k) return null;
+    const width: u32 = @intCast(p.n / 2);
+    errdefer b.input_sums = null;
+    const e = try b.encoder(epoch);
+    const y = try b.frame.alloc(x.rows, width, .bf16);
+    const hs = (try sumsFor(b, x.rows, width)) orelse return error.DraftOperatorShape;
+    const input = try b.frame.ref(x);
+    const output = try b.frame.ref(y);
+    const sums = try b.frame.ref(hs);
+    b.access(e, &.{ try b.span(x), Span.whole(sums_in.sums.ref.buf) }, &.{ try b.span(y), try b.span(hs) });
+    try p.encodeSwiglu(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), sums_in.sums, .{ .buf = output.buf, .off = output.off }, .{ .buf = sums.buf, .off = sums.off }, x.rows);
+    offerSums(b, y, sums);
+    return y;
+}
 fn swiglu(ptr: *anyopaque, epoch: u64, g: op.View, u: op.View) !op.View {
     const b = backend(ptr);
     const e = try b.encoder(epoch);
@@ -406,4 +426,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
 }
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .project_swiglu = projectSwiglu, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
