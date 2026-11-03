@@ -85,6 +85,9 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        // the gate+up group of `x` (keyed by its gate tensor) and the swiglu of its two halves in one launch: the swiglu's
+        // output, each word as project_group then swiglu would write it; null: not fused (the caller runs those two)
+        project_swiglu: ?*const fn (*anyopaque, u64, View, ck.Tensor, Mode) anyerror!?View = null,
         // lattice in two calls: the head's top-k encoded and the frame committed without a wait (its picks), then, once
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,

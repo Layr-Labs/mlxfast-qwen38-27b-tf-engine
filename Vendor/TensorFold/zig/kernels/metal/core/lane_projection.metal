@@ -317,6 +317,12 @@ inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
 #define TF_HALF(i) (i)
 #define TF_PART 16
 #endif
+// team-m5-08k: decoded rows' lean loop streams both tensor-op operands through K = 32 halves (tf_lane_reg)
+#if defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR) && TF_GROUP == 64
+#define TF_K32_STREAM 1
+#else
+#define TF_K32_STREAM 0
+#endif
 
 inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
 #if defined(TF_ROWS8)
@@ -327,7 +333,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 
 // tf_lane's arithmetic with codes unpacked straight into tensor-op registers: every word equals tf_lane_pair's.
-#if defined(TF_SWIGLU) && defined(TF_ROWS8)
+// TF_DRAFT_ACT (the drafter's decoded gate|up, one K chain a tile): the four-tile threadgroup of the prompt SwiGLU on rows8
+// accumulators, with the drafter's activation (tf_draft_swiglu_xs) in place of q27_mlp_xs'; no turns.
+#if defined(TF_SWIGLU) && defined(TF_ROWS8) && !defined(TF_DRAFT_ACT)
 #define TF_GU_TURNS 1
 #endif
 // TF_TILE_LIST (decoded rows): threadgroup j computes tile TL[1 + j] and stores its columns at j * NT of each row; a
@@ -395,9 +403,28 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   matmul2d<desc, execution_simdgroup> op;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a((device bfloat*)X, dextents<int32_t, 2>(TF_K, M));
   auto a0 = a.slice(0, 0);
+#if TF_K32_STREAM
+  // team-m5-08k: decoded rows stream both tensor-op operands through K = 32 halves, so a group's tensor ops hold half the
+  // operand registers the K = 64 op held. The input's K 0-31 half loads into a K = 32 left operand (xl0) and the codes'
+  // even words unpack into one K = 32 right operand (cbl) for a K = 32 multiply into P; then the K 32-63 half (xl1) and
+  // the odd words, unpacked into the same registers, for a K = 32 multiply-accumulate. A K = 64 right operand's registers
+  // are its two K = 32 halves' registers in order (half2 words 0-15, then 16-31), so each code unpacks into the word it
+  // filled before, less 16 for the odd words, as the TF_PROMPT_TN two-tile kernel streams them; the pair's fp32 sums equal
+  // the K = 64 product's (e-man07's bab46765: no differing bit over 2,097,152 outputs).
+  constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<dm, execution_simdgroup> opm;
+  matmul2d<da, execution_simdgroup> opa;
+  auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto cbl = opm.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto P = opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>();
+  thread half2* b2 = (thread half2*)&cbl[0];
+#else
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
   thread half2* b2 = (thread half2*)&cb[0];
+#endif
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
   float C[16];
@@ -503,7 +530,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = next;
 #endif
+#if TF_K32_STREAM
+    // team-m5-08k: the even words first (the K = 64 operand's half2 words 0-15, K 0-31), into cbl at the same index
+#pragma clang loop unroll(full)
+    for (int w = 0; w < 8; w += 2) {
+#else
     for (int w = 0; w < 8; w++) {
+#endif
       // codes as fp16 subnormals (bits = code, value code * 2^-24): products are the usual ones scaled by 2^-24 exactly, and
       // the scales below carry the 2^24 back
 #if TF_BITS == 2
@@ -511,7 +544,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
       const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
 #endif
+#if TF_K32_STREAM
+      const int e = 2 * (w >> 1);
+#else
       const int e = 16 * (w & 1) + 2 * (w >> 1);
+#endif
       b2[e] = as_type<half2>(word & 0x000F000Fu);
       b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
       b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
@@ -534,6 +571,28 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
 #endif
+#if TF_K32_STREAM
+    // team-m5-08k: K 0-31; then the odd words (the K = 64 operand's half2 words 16-31, K 32-63) into the same registers at
+    // the index less 16, and K 32-63. The next group's codes and indices are already in flight, as before the K = 64 op.
+    const array<int32_t, 2> xstr = {1, TF_K};
+    xl0.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)X + g * GS, dextents<int32_t, 2>(32, M), xstr));
+    opm.run(xl0, cbl, P);
+#pragma clang loop unroll(full)
+    for (int w = 1; w < 8; w += 2) {
+#if TF_BITS == 2
+      const uint word = w < 4 ? (cur.w0[w] & 0x33333333u) : ((cur.w0[w - 4] >> 2) & 0x33333333u);
+#else
+      const uint word = w < 4 ? cur.w0[w] : cur.w1[w - 4];
+#endif
+      const int e = 2 * (w >> 1);
+      b2[e] = as_type<half2>(word & 0x000F000Fu);
+      b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
+      b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
+      b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
+    }
+    xl1.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)X + g * GS + 32, dextents<int32_t, 2>(32, M), xstr));
+    opa.run(xl1, cbl, P);
+#else
 #if defined(TF_REG_LEAN)
     const array<int32_t, 2> xstr = {1, TF_K};
 #if defined(TF_PROMPT_SR)
@@ -546,6 +605,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     auto x = a.slice(g * GS, 0);
 #endif
     op.run(x, cb, P);
+#endif
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
@@ -611,6 +671,38 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
     HS[int(tg.x) * stride + t16] = acc;
+  }
+#elif defined(TF_SWIGLU) && defined(TF_DRAFT_ACT)
+  // the drafter's decoded rows: SIMD groups 0 and 1 ran the 64 columns' gate tiles and 2 and 3 their up tiles, each on the
+  // one K chain the drafter's unfused gate|up launch runs (sk 1). Each word rounds to bf16 as that launch stores it; the
+  // activation is tf_draft_swiglu_xs's, operation for operation, and each live row's 64-column sum adds its stored values
+  // in order from zero. A padded row's sums are read only by rows the down projection drops, so only live rows are written.
+  threadgroup bfloat gu8[4 * 8 * 32];
+  threadgroup float hb8[8 * 64];
+  if (mb < M)
+    for (int i = 0; i < 16; i++)
+      if (TF_LIVE(i)) gu8[(ks * 8 + mb) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int t8 = ks * 32 + lane;
+  for (int at = t8; at < 8 * 64; at += 128) {
+    const int m = at / 64, c = at % 64;
+    if (m >= M) continue;
+    const float gate = float(gu8[((c >> 5) * 8 + m) * 32 + (c & 31)]), up = float(gu8[((2 + (c >> 5)) * 8 + m) * 32 + (c & 31)]);
+    const bfloat gb = bfloat(gate), ub = bfloat(up);
+    const bfloat exponential = bfloat(metal::exp(metal::abs(gate)));
+    const bfloat denominator = bfloat(1.0f + float(exponential));
+    const bfloat inverse = bfloat(1.0f / float(denominator));
+    const bfloat sigmoid = gate < 0.0f ? inverse : bfloat(1.0f - float(inverse));
+    const bfloat activation = bfloat(float(gb) * float(sigmoid));
+    const bfloat h = bfloat(float(activation) * float(ub));
+    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+    hb8[at] = float(h);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t8 < M) {
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += hb8[t8 * 64 + i];
+    HS[int(tg.x) * stride + t8] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
