@@ -180,7 +180,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
-    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, or four on decoded rows.
+    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or eight on
+    /// one-tile prompt rows.
     serial_sk2: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
@@ -229,7 +230,7 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
-        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8)))) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
@@ -500,6 +501,9 @@ pub const Projection = struct {
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
+    /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
+    /// adjacent columns at a time, so those rows start four-word aligned.
+    quads: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
         try l.validate();
@@ -521,7 +525,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -563,7 +567,7 @@ pub const Projection = struct {
             if (s.stride < rows) return error.InvalidRows;
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
         }
-        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, 2);
+        try checkRef(h, ((rows - 1) * p.y_stride + p.n) * 2, @as(usize, if (p.quads) 8 else 2));
         return p.encodeImpl(e, x, w, sb, sums, ro, rows, h, null, null);
     }
 
@@ -698,7 +702,7 @@ pub const Projection = struct {
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
         try checkRef(sb, p.metadata_bytes, 16);
-        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes * @as(usize, if (p.quads) 4 else 1));
         if (given == null) if (p.sums_pipe) |pipe| {
             e.setPipeline(pipe);
             e.setBuffer(x.buf, x.off, 0);
@@ -764,6 +768,12 @@ test "serial SK2 keeps logical split and is off by default" {
     try std.testing.expect(std.mem.indexOf(u8, serial, "#define TF_SERIAL_SK2 1\n") != null);
     l.sk = 1;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+    // eight chains: one-tile prompt rows only
+    l.sk = 8;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.prompt_sr = true;
+    l.reg_lean = true;
+    try l.validate();
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
