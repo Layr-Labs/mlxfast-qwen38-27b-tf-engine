@@ -36,6 +36,17 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     return true;
 }
 
+/// Returns once the GPU reached the end of `cb`, reading its status: a decoded round's small buffers land within
+/// microseconds of the work they gate, and a poll sees that rather than sleeping until the completion handler wakes this
+/// thread. A committed buffer reports `completed` only after the completion handler ran, so the status seen here is the
+/// one `waitUntilCompleted` would return on, and its resources are free to go. The caller keeps reading `failure()`.
+pub fn spin(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -513,7 +524,8 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        // the keep's rows gate the slot's next write, not this thread's sleep: poll the end it reaches
+        spin(cb);
         if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -661,7 +673,8 @@ pub const Runner = struct {
     pub fn settleSlot(r: *Runner, slot: u32) void {
         const cb = r.reading[slot] orelse return;
         r.reading[slot] = null;
-        cb.wait();
+        // the slot's blit reads the committed states, and the caller's next launch waits on them: poll its end
+        spin(cb);
         cb.release();
     }
 
@@ -705,7 +718,8 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        // the replay writes a few rows' states behind work already in the queue: poll its completion, not its wake
+        spin(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -747,10 +761,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        spin(cb);
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;

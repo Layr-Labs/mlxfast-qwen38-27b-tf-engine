@@ -6,6 +6,9 @@ const op = @import("operators.zig");
 pub const Ref = @import("core").draft_ops.Ref;
 const Entry = struct { ref: Ref, view: op.View };
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+/// Polled completion (decode_round.spin): a committed buffer reports `completed` once its work is done, and the poll
+/// returns on the same status `wait` would, without waking this thread through the completion handler.
+const spin = @import("../decode_round.zig").spin;
 /// Whether a frame's command buffer failed on the GPU, its Metal error logged.
 fn failed(cb: mtl.CommandBuffer) bool {
     const msg = cb.failure() orelse return false;
@@ -167,7 +170,8 @@ pub const Frame = struct {
     pub fn checkUnchecked(f: *Frame) !void {
         var bad = false;
         for (f.unchecked[0..f.n_unchecked]) |cb| {
-            cb.wait();
+            // a whole later frame was encoded, committed and polled behind these: they are reported, so no wake is due
+            spin(cb);
             bad = failed(cb) or bad;
             cb.release();
         }
@@ -276,16 +280,13 @@ pub const Frame = struct {
                 return;
             }
         }
-        // poll its status rather than sleep until the completion handler wakes this thread, then wait() returns at once
-        while (true) switch (f.cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
-        f.cb.wait();
+        // poll its status rather than sleep until the completion handler wakes this thread: the poll sees the same end
+        // `wait` would return on, so the frame's buffers are free without the wake
+        spin(f.cb);
         f.completed = true;
         defer f.drop();
         for (f.parts[0..f.part_count]) |cb| {
-            cb.wait();
+            spin(cb); // committed before the last buffer: its end is already reported
             if (failed(cb)) return error.DraftGpuFailure;
         }
         if (failed(f.cb)) return error.DraftGpuFailure;
@@ -298,8 +299,8 @@ pub const Frame = struct {
                 // and enough of them block every later commandBuffer() (a hang, not an error). The caller fails the backend.
                 f.cb.commit();
             }
-            f.cb.wait();
-            for (f.parts[0..f.part_count]) |cb| cb.wait(); // committed parts still use the pool
+            spin(f.cb);
+            for (f.parts[0..f.part_count]) |cb| spin(cb); // committed parts still use the pool
             f.drop();
         }
         f.active = false;
