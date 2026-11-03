@@ -11,6 +11,8 @@ const ane_mlp = @import("ane_mlp.zig");
 pub const Mixer = struct {
     ptr: *anyopaque,
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
+    /// Staggered accepted chains may publish completed state/history before their private gate.
+    gdn_lane: ?*const fn (*anyopaque, *@import("core").segments.Lane, usize, wts.Gdn, *Frame, u32) anyerror!void = null,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
@@ -107,7 +109,10 @@ pub const Stages = struct {
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
-            .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
+            .linear => |g| if (s.hooks.gdn_lane) |hook|
+                try hook(s.hooks.ptr, lane, index, g, s.rowsFrame(), s.rows)
+            else
+                try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
         }
     }

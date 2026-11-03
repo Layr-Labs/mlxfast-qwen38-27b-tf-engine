@@ -60,7 +60,7 @@ pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 /// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null, publish_lane: ?*@import("core").segments.Lane = null };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
@@ -278,12 +278,24 @@ pub const Pool = struct {
             try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, if (step) beside else .{ .ptr = &early, .encode = EarlyCommit.encode });
         }
         try scan.end();
-        var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
+        // EarlyCommit and the scan's barrier have finalized state and directly landed all kept conv windows.
+        // The gate reads only this segment's recurrent slab and private frame z/output/sums, plus immutable norm.
+        // No profiling/marks opt in: those paths keep their original encoder and publication lifetime.
+        var tail_encoder = input_encoder;
+        if (refs.publish_lane) |lane| {
+            if (prompt and wide and !step and pool.profiler == null and pool.marks == null and in_place and
+                plan.host.chain and projectedWindows(plan.host, prepared.p.taps))
+            {
+                lane.publish();
+                tail_encoder = lane.enc;
+            }
+        }
+        var gate = profile.begin(pool.profiler, tail_encoder, .gdn_gate);
         errdefer gate.cancel();
         if (prompt) prepared.gatePrompt(gate.encoder, pool.kernels.post_rows16, pool.kernels.post_rows) else prepared.gate(gate.encoder, pool.kernels.post_rows);
         try gate.end();
         if (step) return;
-        var publication = profile.begin(pool.profiler, input_encoder, .state_publish);
+        var publication = profile.begin(pool.profiler, tail_encoder, .state_publish);
         errdefer publication.cancel();
         const e = publication.encoder;
         if (pool.marks) |m| try m.convolution(layer, prepared, e, pool.kernels.mark_conv);

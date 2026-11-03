@@ -26,6 +26,8 @@ pub const Hook = struct {
     uploaded: bool = false,
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
+    /// Only an accepted staggered prompt may shorten its successor's state dependency.
+    publish_lane: ?*@import("core").segments.Lane = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -50,6 +52,7 @@ pub const Hook = struct {
         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
         var gated = try refs(weight, frame);
         gated.own = hook.own;
+        gated.publish_lane = hook.publish_lane;
         // decoded rows: the out projection's leading code lines go to the system cache while the star scan holds the bus idle
         var warm = Warm{ .quant = hook.quant, .out = weight.out };
         if (after != null) gated.warm = .{ .ptr = &warm, .encode = Warm.encode };

@@ -1010,12 +1010,17 @@ const Segment = struct {
     total: u32,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .gdn_lane = gdnLane, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
         var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
+    }
+    fn gdnLane(ptr: *anyopaque, lane: *@import("core").segments.Lane, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        var hook = GdnHook{ .pool = &s.r.gdn, .quant = &s.r.model.kernels, .glue = s.r.model.glue, .plan = s.gdn, .linear_index = s.r.linear_index, .accepted_chain = true, .deferred = null, .uploaded = false, .own = s.own, .publish_lane = lane };
+        try GdnHook.forward(&hook, lane.enc, block, weights, frame, rows);
     }
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
