@@ -7,9 +7,9 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
-/// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
+/// Code MiB Kernels.warm reads ahead of a decoded out projection: about three fifths of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
-const warm_mb = 10;
+const warm_mb = 9;
 /// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
 const warm_groups = 64;
 const warm_source =
@@ -79,9 +79,6 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
-    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
-    /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
-    serial: bool = false,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
     /// (12288) with K split 2 (GDN z|b|a keeps its four K slices in parallel).
@@ -142,8 +139,7 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
-/// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
-pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
+pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -178,8 +174,6 @@ pub const Kernels = struct {
     /// (prepareWarmTiles).
     warm_tiles_pipe: ?mtl.Pipeline = null,
     warm_tiles_sink: ?mtl.Buffer = null,
-    /// team-m5-08w: the 16-byte input norm failed to build on this chip (logged once): the record's kernel runs instead.
-    input_words_failed: bool = false,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -222,7 +216,7 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => sources.xsum,
             .norm => sources.norm_xs,
-            .input_norm, .input_words => sources.norm_input,
+            .input_norm => sources.norm_input,
             .mlp => sources.mlp_xs,
             .mlp_wide => sources.mlp_xs_wide,
             .ane_input, .mlp_ane, .add_ane => sources.mlp_ane,
@@ -232,7 +226,6 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => try std.fmt.allocPrint(k.allocator, "constexpr int K={d}, GS=64;", .{key.k}),
             .norm, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
-            .input_words => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};\n#define Q27_NORM_WORDS 1", .{key.k}),
             .mlp, .mlp_wide => try std.fmt.allocPrint(k.allocator, "constexpr int N={d};", .{key.n}),
             .ane_input, .mlp_ane, .add_ane => try std.fmt.allocPrint(k.allocator, "constant constexpr int H={d}, N={d}, A={d};", .{ key.k, key.n, key.tile }),
         };
@@ -245,7 +238,7 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => "custom_kernel_q27_xsum_bfloat16_t_int32_t_float",
             .norm => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
-            .input_norm, .input_words => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
+            .input_norm => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
             .mlp => "custom_kernel_q27_mlp_xs_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .mlp_wide => "custom_kernel_q27_mlp_xs_wide_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .ane_input => "q27_ane_input",
@@ -329,8 +322,10 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
+                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch; R32 doubles the
+                // block's rows so both halves share the block's weight bytes
                 .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
+                .prompt_r32 = key.batch % 2 == 0 and (p.n / 64) % key.batch == 0,
             });
             k.joined(entry.value_ptr);
         }
@@ -457,7 +452,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -466,7 +461,7 @@ pub const Kernels = struct {
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
             const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = (key.serialSk2() or key.serial) and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -652,7 +647,7 @@ pub const Kernels = struct {
         errdefer span.cancel();
         const e = span.encoder;
 
-        e.setPipeline(if (residual != null) try k.get(.{ .kind = .norm, .k = width }) else try k.inputNorm(h, weight, out, width));
+        e.setPipeline(try k.get(.{ .kind = if (residual != null) .norm else .input_norm, .k = width }));
         if (residual) |r| {
             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
             bindAt(e, out, 8); // never read: wait_for 0
@@ -660,20 +655,6 @@ pub const Kernels = struct {
         } else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
-    }
-
-    /// team-m5-08w: the input norm's pipeline. q27_norm_input in 16-byte words where its row, its weights and its output
-    /// start 16-byte aligned (every call on this engine's frames and weights), else the record's one-word kernel, which
-    /// also stands in, logged once, if the 16-byte text fails to build on this chip.
-    fn inputNorm(k: *Kernels, h: Ref, weight: Ref, out: Ref, width: u32) !mtl.Pipeline {
-        const aligned = width % 8 == 0 and h.offset % 16 == 0 and weight.offset % 16 == 0 and out.offset % 16 == 0;
-        if (aligned and !k.input_words_failed) {
-            if (k.get(.{ .kind = .input_words, .k = width })) |p| return p else |err| {
-                k.input_words_failed = true;
-                std.log.warn("qwen27: the input norm keeps its one-word kernel (team-m5-08w): {s}", .{@errorName(err)});
-            }
-        }
-        return k.get(.{ .kind = .input_norm, .k = width });
     }
 
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's

@@ -48,8 +48,6 @@ pub const Tiled = struct {
     }
 };
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
-/// Counted projections a frame holds at most: a block's 30 (six a layer) and its head's, with room.
-pub const count_slots = 128;
 const Stashed = struct { prepared: core.affine4.Prepared, key: usize };
 pub const Stash = std.StringHashMapUnmanaged(Stashed);
 /// Fused weight groups: one prepared matrix of several linears' rows that share an input.
@@ -92,28 +90,6 @@ pub const Hazards = struct {
         for (list) |y| if (y.meets(x)) return true;
         return false;
     }
-    /// `order`, except that reads meeting `counted` (an open write of a counted projection) need no barrier: true when
-    /// one did and no barrier was placed, so the launch must wait on that projection's count instead.
-    pub fn orderCounted(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span, counted: Span) bool {
-        var conflict = h.n_writes + writes.len > h.writes.len or h.n_reads + reads.len > h.reads.len;
-        var waits = false;
-        if (!conflict) for (reads) |x| for (h.writes[0..h.n_writes]) |w| if (w.meets(x)) {
-            if (std.meta.eql(w, counted)) waits = true else conflict = true;
-        };
-        if (!conflict) for (writes) |x| if (any(h.writes[0..h.n_writes], x) or any(h.reads[0..h.n_reads], x)) {
-            conflict = true;
-            break;
-        };
-        if (conflict) {
-            h.barrier(e);
-            waits = false;
-        }
-        @memcpy(h.reads[h.n_reads..][0..reads.len], reads);
-        h.n_reads += reads.len;
-        @memcpy(h.writes[h.n_writes..][0..writes.len], writes);
-        h.n_writes += writes.len;
-        return waits;
-    }
     /// Barrier when `reads`/`writes` conflict with the open set, then add them to it.
     pub fn order(h: *Hazards, e: mtl.ComputeEncoder, reads: []const Span, writes: []const Span) void {
         var conflict = h.n_writes + writes.len > h.writes.len or h.n_reads + reads.len > h.reads.len;
@@ -143,9 +119,8 @@ pub const Hazards = struct {
 /// verify's result picks one into block 0 on the GPU (tree_commit_gpu.select), and the frame's dispatches read it there.
 /// Each field starts its own 256 bytes, so every binding's offset is aligned.
 pub const RoundArgs = extern struct {
-    /// the block's rope positions, right behind the admitted taps, then the taps' own (the rows a stacked keys launch ropes
-    /// behind the block's)
-    positions: [4]u64 align(256),
+    /// the block's rope positions: right behind the admitted taps
+    positions: [2]u64 align(256),
     /// the block's tokens: the verify's last token (written on the GPU), then the mask
     ids: [2]u32 align(256),
     /// the K/V slots of the block's own rows, behind the admitted context in the ring
@@ -158,8 +133,6 @@ pub const RoundArgs = extern struct {
     dims: [2]i32 align(256),
     /// their group sums' rows
     count: i32 align(256),
-    /// the block's qkv launch with the admitted taps' rows behind its 2 (Ops.context_defer): [rows, sums stride]
-    stacked: [2]i32 align(256),
     /// the admitted taps' projections on simdgroup tiles (no tensor units): the fusion's and each K or V one's
     fusion: simd.Args align(256),
     kv: simd.Args align(256),
@@ -181,14 +154,13 @@ pub const RoundArgs = extern struct {
         const context_rows: u32 = @intCast(end - context.begin);
         const at: u32 = @intCast(context.begin % c.window);
         return .{
-            .positions = .{ end, end + 1, context.end, context.end + 1 },
+            .positions = .{ end, end + 1 },
             .ids = .{ c.mask, c.mask },
             .slots = .{ at + context_rows, at + context_rows + 1 },
             .attention = .{ .rows = 2, .keys = context_rows + 2, .mask_stride = keys, .scale_bits = @bitCast(@import("runtime_context.zig").scaleOf(c)) },
             .append = .{ .rows = rows },
             .dims = .{ @intCast(rows), 16 },
             .count = @intCast(rows),
-            .stacked = .{ @intCast(2 + rows), 16 },
             .fusion = .{ .k = @intCast(c.tapWidth()), .n = @intCast(c.hidden), .r = @intCast(rows) },
             .kv = .{ .k = @intCast(c.hidden), .n = @intCast(c.kvWidth()), .r = @intCast(rows) },
             .meta = .{ rows, 0, context_rows + 2, 0 },
@@ -200,9 +172,6 @@ pub const RoundArgs = extern struct {
 pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
 
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
-/// An early frame's taps its block's layers append (Ops.context_defer): their rows, the ring slot of the first, and the
-/// layers whose keys and values are encoded so far.
-pub const Stacked = struct { rows: u32, slot: u32, layers: u32 = 0 };
 
 pub const Backend = struct {
     allocator: std.mem.Allocator,
@@ -224,8 +193,7 @@ pub const Backend = struct {
     appended_rows: u32 = 0,
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
-    /// `dims`: the [rows, stride] words a launch on them reads (a stacked block's: RoundArgs stacked), else its own rows.
-    input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums, dims: ?core.lane_projection.Ref = null } = null,
+    input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
     /// A conv with a residual held back for the norm that reads its output (one launch for both); the next launch of
     /// anything else encodes it first, on its own.
     held_conv: ?struct { x: op.View, p: op.Conv, y: op.View } = null,
@@ -236,10 +204,6 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
-    /// Layers whose q, k and v are one fused launch (group_qkv).
-    qkv_layers: u32 = 0,
-    /// The current frame's deferred taps (Ops.context_defer).
-    stacked: ?Stacked = null,
     /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
     /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
     precise: bool = false,
@@ -249,12 +213,6 @@ pub const Backend = struct {
     mask: ?struct { epoch: u64, context_rows: u32, rows: u32, view: op.View } = null,
     /// RoundArgs blocks: the frame's (0), then one per count the verify before it may admit.
     args: mtl.Buffer,
-    /// The frame's count words, two u32 a counted projection (zeroed at each frame's begin), and the next one free.
-    counts: mtl.Buffer,
-    count_next: u32 = 0,
-    /// The last counted projection's output span, count word and threadgroups (encodePrepared): a sums launch reading only
-    /// it shares its barrier interval and waits on the count (runtime_callbacks.waitCounted).
-    counted: ?struct { span: Span, ref: Ref, groups: u32 } = null,
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
@@ -284,9 +242,7 @@ pub const Backend = struct {
         const caches = try newCaches(a, target.device, c, c.layers);
         errdefer freeCaches(a, caches);
         const args = try target.device.buffer(RoundArgs.blocks * @sizeOf(RoundArgs), options);
-        errdefer args.deinit();
-        const counts = try target.device.buffer(count_slots * 8, options);
-        return .{ .counts = counts, .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
+        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -304,7 +260,6 @@ pub const Backend = struct {
         if (b.simd) |*p| p.deinit();
         freeCaches(b.allocator, b.caches);
         b.args.deinit();
-        b.counts.deinit();
         b.head.deinit();
         b.topk.deinit();
         b.attention.deinit();
@@ -459,9 +414,7 @@ pub const Backend = struct {
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {
             try b.fuse(order, st, layer, "kv", 'k', group_kv);
-            const fused = b.fused_count;
             try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
-            if (b.fused_count != fused) b.qkv_layers += 1;
             try b.fuse(order, st, layer, "gu", 'g', group_gu);
             // the q4 copies' gate/up group of a layer drafted below 4 bits (stashed as G and U)
             const before = b.fused_count;
@@ -524,12 +477,6 @@ pub const Backend = struct {
         }
         try b.flushHeld(false);
         return b.frame.encoder;
-    }
-    /// Zeroes the frame's count words (before the barrier that ends a frame's first interval) and forgets the last count.
-    pub fn resetCounts(b: *Backend, e: mtl.ComputeEncoder) !void {
-        b.count_next = 0;
-        b.counted = null;
-        try b.primitives.zero(e, .{ .buf = b.counts }, count_slots * 2);
     }
     /// Encodes the held conv (and with `norms` the held norms) on their own.
     fn flushHeld(b: *Backend, norms: bool) !void {

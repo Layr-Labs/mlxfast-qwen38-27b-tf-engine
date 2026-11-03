@@ -24,15 +24,6 @@ pub const Shape = struct {
     }
 };
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
-/// Rows a tf_shared_lane_attention_split_kv threadgroup takes (its TF_SPLIT_ROWS) and its threads: a simdgroup a query
-/// head of one KV head and row.
-fn kvRows(s: Shape) usize {
-    const g = s.query_heads / s.kv_heads;
-    return if (g >= 16) 1 else 16 / g;
-}
-fn kvThreads(s: Shape) usize {
-    return s.query_heads / s.kv_heads * kvRows(s) * 32;
-}
 /// Chunks covering `keys` (tf_shared_lane_attention_split's TF_CHUNK).
 fn chunksOf(keys: usize, chunk: usize) usize {
     return (keys + chunk - 1) / chunk;
@@ -62,9 +53,6 @@ pub const Attention = struct {
     append: mtl.Pipeline,
     append_strided: mtl.Pipeline,
     split: mtl.Pipeline,
-    /// tf_shared_lane_attention_split_kv: the same partials, a chunk's keys and values read once a threadgroup of
-    /// kvRows() rows of one KV head's query heads; null where that threadgroup is wider than the pipeline takes.
-    split_kv: ?mtl.Pipeline = null,
     merge: mtl.Pipeline,
     merge_xs: mtl.Pipeline,
     /// encodeSplit's chunk partials: [16 rows][kv heads][chunks][query heads a kv head][head_dim + 2] fp32.
@@ -87,19 +75,13 @@ pub const Attention = struct {
         errdefer append_strided.deinit();
         const split = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split", false);
         errdefer split.deinit();
-        const split_kv_any = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_split_kv", false);
-        const split_kv: ?mtl.Pipeline = if (split_kv_any.simdWidth() == 32 and split_kv_any.maxThreads() >= kvThreads(s)) split_kv_any else blk: {
-            split_kv_any.deinit();
-            break :blk null;
-        };
-        errdefer if (split_kv) |p| p.deinit();
         const merge = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge", false);
         errdefer merge.deinit();
         const merge_xs = try mtl.Pipeline.init(device, lib, "tf_shared_lane_attention_merge_xs", false);
         errdefer merge_xs.deinit();
         if (attend.simdWidth() != 32 or attend.maxThreads() < 32 or split.simdWidth() != 32 or merge.simdWidth() != 32) return error.UnsupportedAttentionPipeline;
         const part = try device.buffer(16 * s.query_heads * chunksOf(s.capacity, s.split_chunk) * (s.head_dim + 2) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .append_strided = append_strided, .split = split, .split_kv = split_kv, .merge = merge, .merge_xs = merge_xs, .part = part };
+        return .{ .shape = s, .attend = attend, .decode = decode, .rope = rope, .append = append, .append_strided = append_strided, .split = split, .merge = merge, .merge_xs = merge_xs, .part = part };
     }
     pub fn deinit(p: Attention) void {
         p.attend.deinit();
@@ -108,7 +90,6 @@ pub const Attention = struct {
         p.append.deinit();
         p.append_strided.deinit();
         p.split.deinit();
-        if (p.split_kv) |k| k.deinit();
         p.merge.deinit();
         p.merge_xs.deinit();
         p.part.deinit();
@@ -156,7 +137,7 @@ pub const Attention = struct {
     }
 
     fn dispatchSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: ?Sums, own: ?Own) void {
-        e.setPipeline(p.split_kv orelse p.split);
+        e.setPipeline(p.split);
         for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
         bindArgs(e, args, 4);
         e.setBuffer(p.part, 0, 5);
@@ -165,11 +146,7 @@ pub const Attention = struct {
         e.setBuffer(o.k.buf, o.k.off, 6);
         e.setBuffer(o.v.buf, o.v.off, 7);
         e.setValue([3]u32{ o.rows, o.k_stride, o.v_stride }, 8);
-        const chunks = chunksOf(keys, p.shape.split_chunk);
-        if (p.split_kv != null) {
-            const per = kvRows(p.shape);
-            e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, (rows + per - 1) / per, chunks), mtl.Size.of(kvThreads(p.shape), 1, 1));
-        } else e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunks), mtl.Size.of(32, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunksOf(keys, p.shape.split_chunk)), mtl.Size.of(32, 1, 1));
         e.barrier();
         e.setPipeline(if (xs != null) p.merge_xs else p.merge);
         e.setBuffer(p.part, 0, 0);

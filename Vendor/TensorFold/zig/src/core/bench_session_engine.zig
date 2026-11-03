@@ -297,8 +297,8 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (h.on_thread) |start| try start.run(start.ctx);
         }
 
-        /// `clear`: the reset op's, whose slot clear each request keeps, in its first pass (Runner.clear); the seed's reset
-        /// right behind it, and the prompt reset a lane host pass makes, then find the slot dirty and skip theirs.
+        /// `clear`: the reset op's, whose slot clear each request keeps; the seed's reset right behind it, and the prompt
+        /// reset a lane host pass makes, then find the slot zeroed and skip theirs (Runner.zeroed).
         fn resetNow(binding: *@This(), clear: bool) !void {
             try binding.generation.settle();
             if (clear) try binding.generation.runner.clear(0) else try binding.generation.runner.reset(0);
