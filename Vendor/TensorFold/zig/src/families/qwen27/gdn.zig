@@ -39,6 +39,9 @@ pub const Buffers = struct {
     state: Span,
     query: Span,
     key: Span,
+    /// A prompt chain's query and key rows as fp32 copies (Round.prepareChain writes them, scanChain's `copies` reads them).
+    query32: Span,
+    key32: Span,
     value: Span,
     decay: Span,
     mixing: Span,
@@ -74,6 +77,10 @@ pub const Buffers = struct {
         inline for (.{ "history", "next_history" }) |name| try @field(b, name).check(sizes.history);
         inline for (.{ "state", "next_state" }) |name| try @field(b, name).check(sizes.state);
         inline for (.{ "query", "key" }) |name| try @field(b, name).check(sizes.query);
+        inline for (.{ "query32", "key32" }) |name| {
+            try @field(b, name).check(sizes.query * 2);
+            if (@field(b, name).offset % 16 != 0) return error.BadGdnBuffer; // float4 rows
+        }
         inline for (.{ "value", "recurrent", "output" }) |name| try @field(b, name).check(sizes.value);
         try b.decay.check(sizes.decay);
         try b.tails.check(sizes.tails);
@@ -90,7 +97,7 @@ pub const Buffers = struct {
         const reads = [_]Span{ b.qkv, b.a, b.b, b.z, b.conv_weight, b.a_log, b.dt, b.norm, b.history, b.state, b.parents, b.windows, b.row_slots, b.segments, b.keeps, b.kept_rows, b.slot_steps };
         // an in-place round's next state is its state: each scan thread reads its own words before it writes them
         const in_place = b.next_state.buffer.id == b.state.buffer.id and b.next_state.offset == b.state.offset and b.next_state.bytes == b.state.bytes;
-        const writes = [_]Span{ b.query, b.key, b.value, b.decay, b.mixing, b.tails, b.snapshots, b.recurrent, b.output, if (in_place) .{ .buffer = b.state.buffer, .bytes = 0 } else b.next_state, b.next_history, b.before orelse Span{ .buffer = b.state.buffer, .bytes = 0 } };
+        const writes = [_]Span{ b.query, b.key, b.query32, b.key32, b.value, b.decay, b.mixing, b.tails, b.snapshots, b.recurrent, b.output, if (in_place) .{ .buffer = b.state.buffer, .bytes = 0 } else b.next_state, b.next_history, b.before orelse Span{ .buffer = b.state.buffer, .bytes = 0 } };
         inline for (writes, 0..) |write, index| {
             inline for (reads) |read| if (write.overlaps(read)) return error.AliasedGdnState;
             inline for (writes[0..index]) |other| if (write.overlaps(other)) return error.AliasedGdnState;
@@ -161,6 +168,26 @@ pub const Round = struct {
         e.setValue(@as(u32, 0), 16);
         r.b.qkv.bind(e, 17); // never written: count_out 0
         e.setValue(@as(u32, 0), 18);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
+    /// Whether a prompt chain's rows take prepareChain: prepareRows' shape (128-wide heads, 4 taps) on bfloat4 rows.
+    pub fn chainCopies(r: Round) bool {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return false;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return false; // bfloat4 rows
+        return true;
+    }
+
+    /// prepareRows for a prompt chain's rows (row r's taps r .. r + 3) by `chain` (tf_delta_gdn_pre_chain32), which also
+    /// writes the query and key rows' fp32 copies for scanChain's `copies`. Refused where chainCopies is not, rather than
+    /// run another prepare that writes no copies.
+    pub fn prepareChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) !void {
+        if (!r.chainCopies()) return error.BadGdnPrepare;
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.query32, r.b.key32 }, 10);
         e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128, .height = 1, .depth = 1 });
         e.barrier();
     }
@@ -273,18 +300,19 @@ pub const Round = struct {
     }
 
     pub fn forwardChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, post_rows: metal.Pipeline) !void {
-        try r.scanChain(e, chain, false, null);
+        try r.scanChain(e, chain, false, false, null);
         r.gate(e, post_rows);
         r.commitConv(e);
     }
-    /// `wide`: tf_delta_gdn_chain_wide's grid, 16 value columns a simdgroup (prompt chunks, dk = 128).
-    pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, beside: ?Beside) !void {
+    /// `wide`: tf_delta_gdn_chain_wide's grid, 16 value columns a simdgroup (prompt chunks, dk = 128). `copies` (wide, behind
+    /// prepareChain): the scan reads the query and key rows' fp32 copies (tf_delta_gdn_chain_wide32).
+    pub fn scanChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, wide: bool, copies: bool, beside: ?Beside) !void {
         e.setPipeline(chain);
-        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
+        bind(e, .{ if (copies) r.b.query32 else r.b.query, if (copies) r.b.key32 else r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        // two simdgroups a threadgroup: twice the groups, so the cores' shares of them come out more even
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 2, .depth = 1 }) else r.stateGrid(e);
+        // four simdgroups a threadgroup: half as many groups of twice the size; each thread keeps its grid position and work
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }

@@ -74,6 +74,9 @@ pub const Budget = struct {
     mixing: usize,
     snapshots: usize,
     conv_tails: usize,
+    /// A prompt chain's query (and key) rows as fp32 copies, one layer's: tf_delta_gdn_pre_chain32 writes them and the
+    /// wide scan reads them (gdn_pool_gpu.Pool's query32 and key32).
+    copies: usize,
     scratch: usize,
     /// The pending rows' key, value, decay and mixing words, `pending_rows` a layer (gdn_pool_gpu.Pool.stash).
     pending: [4]usize,
@@ -89,6 +92,7 @@ pub const Budget = struct {
         const snapshot = try abi.countBytes(f32, shape.state, @min(rows, abi.snapshot_rows)); // trees only: a chain keeps no snapshots
         const tails = try abi.countBytes(u16, shape.conv, rows);
         const outputs = try abi.countBytes(u16, shape.value, rows * 2);
+        const copies = try abi.countBytes(f32, shape.c.k_heads * shape.c.dk, rows);
         const pending = try std.math.mul(usize, layers, pending_rows);
         return .{
             .shape = shape,
@@ -105,13 +109,14 @@ pub const Budget = struct {
             .mixing = mixing,
             .snapshots = snapshot,
             .conv_tails = tails,
-            .scratch = try std.math.add(usize, try std.math.add(usize, snapshot, tails), outputs),
+            .copies = copies,
+            .scratch = try std.math.add(usize, try std.math.add(usize, try std.math.add(usize, snapshot, tails), outputs), try std.math.mul(usize, copies, 2)),
             .pending = .{ try abi.countBytes(u16, shape.c.k_heads * shape.c.dk, pending), try abi.countBytes(u16, shape.value, pending), try abi.countBytes(f32, shape.c.v_heads, pending), try abi.countBytes(u16, shape.c.v_heads, pending) },
         };
     }
 
-    pub fn allocationSizes(b: Budget) [16]usize {
-        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2, b.pending[0], b.pending[1], b.pending[2], b.pending[3] };
+    pub fn allocationSizes(b: Budget) [18]usize {
+        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2, b.pending[0], b.pending[1], b.pending[2], b.pending[3], b.copies, b.copies };
     }
 
     pub fn stateOffset(b: Budget, layer: usize, slot: usize) !usize {

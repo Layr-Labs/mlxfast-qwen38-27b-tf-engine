@@ -13,7 +13,7 @@ const Kernels = @import("gdn_library.zig").Kernels;
 
 pub const PromptMarks = @import("gdn_marks_gpu.zig").Bank;
 
-const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing };
+const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing, query32, key32 };
 /// The pending rows' fields, as tf_delta_gdn_stash, tf_delta_gdn_star_pending and tf_delta_gdn_unstash bind them.
 const pending_fields = [_]Field{ .pending_key, .pending_value, .pending_decay, .pending_mixing };
 
@@ -62,11 +62,14 @@ pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
 pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
-/// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
+/// recurrent rows, the snapshots, the prompt chain's fp32 query and key rows): its layer runs beside the first segment's
+/// next layer, which writes the pool's.
 pub const Own = struct {
     tails: metal.Buffer,
     recurrent: metal.Buffer,
     snapshots: metal.Buffer,
+    query32: metal.Buffer,
+    key32: metal.Buffer,
 
     pub fn init(pool: *const Pool, device: metal.Device) !Own {
         const tails = try device.buffer(pool.get(.tails).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
@@ -74,12 +77,18 @@ pub const Own = struct {
         const recurrent = try device.buffer(pool.get(.recurrent).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
         errdefer recurrent.deinit();
         const snapshots = try device.buffer(pool.get(.snapshots).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
+        errdefer snapshots.deinit();
+        const query32 = try device.buffer(pool.get(.query32).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        errdefer query32.deinit();
+        const key32 = try device.buffer(pool.get(.key32).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots, .query32 = query32, .key32 = key32 };
     }
     pub fn deinit(o: Own) void {
         o.tails.deinit();
         o.recurrent.deinit();
         o.snapshots.deinit();
+        o.query32.deinit();
+        o.key32.deinit();
     }
 };
 
@@ -255,13 +264,16 @@ pub const Pool = struct {
         // one row a slot kept in place: its prepare writes the next conv window, so no commit or publication follows
         const step = step_rounds and in_place and !prompt and oneRowSegments(plan.host);
         try plan.metadata.upload(plan.host);
+        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 16 == 0;
+        // an unmarked prompt chain's wide scan reads its query and key rows as the fp32 copies its prepare writes
+        const copies = wide and plan.host.chain and pool.marks == null and prepared.chainCopies();
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else if (copies) try prepared.prepareChain(pre.encoder, pool.kernels.pre_chain32) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
-        const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 16 == 0;
         if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
@@ -274,7 +286,7 @@ pub const Pool = struct {
             // scan or the gate reads or writes, so it runs beside the scan instead of behind the gate's barrier
             var early = EarlyCommit{ .inner = beside, .round = prepared };
             if (!step and inPlace(plan.host) and projectedWindows(plan.host, prepared.p.taps)) early.round.b.next_history = prepared.b.history;
-            try prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, if (step) beside else .{ .ptr = &early, .encode = EarlyCommit.encode });
+            try prepared.scanChain(scan.encoder, if (copies) pool.kernels.chain_wide32 else if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide, copies, if (step) beside else .{ .ptr = &early, .encode = EarlyCommit.encode });
         }
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
@@ -434,12 +446,14 @@ pub const Pool = struct {
         if (slot >= pool.budget.slots) return error.BadGdnPoolIndex;
         const k = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
         const p = try pool.budget.shape.params(1, pool.budget.slots, k);
-        e.setPipeline(pool.kernels.clear);
+        // 16-byte stores when every (layer, slot) row is a whole number of them: the same words, a quarter of the threads
+        const wide = pool.budget.shape.state % 4 == 0 and pool.budget.shape.conv % 8 == 0 and pool.budget.shape.conv / 8 <= pool.budget.shape.state / 4;
+        e.setPipeline(if (wide) pool.kernels.clear4 else pool.kernels.clear);
         e.setBuffer(pool.get(.state), 0, 0);
         e.setBuffer(pool.get(.history), 0, 1);
         e.setValue(p, 2);
         e.setValue(slot, 3);
-        e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
+        if (wide) e.dispatchThreads(.{ .width = pool.budget.shape.state / 4, .height = pool.budget.layers }, .{ .width = 256 }) else e.dispatchThreads(.{ .width = pool.budget.shape.state, .height = pool.budget.layers }, .{ .width = 32 });
         e.barrier();
     }
 
@@ -470,6 +484,8 @@ pub const Pool = struct {
             .decay = try pool.layerSpan(.decay, layer),
             .mixing = try pool.layerSpan(.mixing, layer),
             .tails = try refSpan(.{ .buffer = if (refs.own) |o| o.tails else pool.get(.tails) }, bytes.tails),
+            .query32 = try refSpan(.{ .buffer = if (refs.own) |o| o.query32 else pool.get(.query32) }, bytes.query * 2),
+            .key32 = try refSpan(.{ .buffer = if (refs.own) |o| o.key32 else pool.get(.key32) }, bytes.query * 2),
             .snapshots = try refSpan(.{ .buffer = if (refs.own) |o| o.snapshots else pool.get(.snapshots) }, bytes.snapshots),
             .recurrent = try refSpan(.{ .buffer = if (refs.own) |o| o.recurrent else pool.get(.recurrent) }, bytes.value),
             .output = try refSpan(refs.output, bytes.value),
