@@ -963,5 +963,8 @@ fn promptTiles(key: Key, n: u32, skip: u32) usize {
     // the launch's tiles in whole pairs: a range's first tile and length, or every tile
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
+    // The prompt MLP down reuses each activation slice across four adjacent output tiles, within one code batch.
+    if (n == 5120 and key.k == 17408 and key.slices == 2 and key.batch % 4 == 0 and
+        (if (key.range[1] != 0) key.range[0] % 4 == 0 and key.range[1] % 4 == 0 else (n + 31) / 32 % 4 == 0)) return 4;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
 }
