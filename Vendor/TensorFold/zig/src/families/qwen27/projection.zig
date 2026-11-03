@@ -30,6 +30,11 @@ fn m5Split(n: usize, k: usize) ?u32 {
 pub fn tileBatch(n: usize, k: usize) u32 {
     // with the four mixer input projections (GDN qkv, GDN z|b|a, attention query+gate, attention k|v), as in fkiene's 8e8e27e2
     const table = [_][2]usize{ .{ 34816, 5120 }, .{ 5120, 17408 }, .{ 5120, 6144 }, .{ 10240, 5120 }, .{ 6240, 5120 }, .{ 12288, 5120 }, .{ 2048, 5120 } };
+    // team-swarm-tb16 (od): the MLP down and the GDN/attention out (the slow decoded streams) interleave 16 adjacent tiles
+    // by group; every other listed shape (gate|up's lockstep among them) keeps 8. Only addresses change: each reader takes
+    // the batch from Linear.batch (TF_TB, warm's storedColumns), and each output word's K order is the kernel's.
+    const wide = [_][2]usize{ .{ 5120, 17408 }, .{ 5120, 6144 } };
+    for (wide) |t| if (t[0] == n and t[1] == k) return 16;
     for (table) |t| if (t[0] == n and t[1] == k) return 8;
     return 1;
 }
@@ -107,6 +112,14 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
     };
     const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
     return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+}
+
+test "the slow decoded streams interleave 16 tiles, gate/up and the other listed shapes 8" {
+    try std.testing.expectEqual(@as(u32, 16), tileBatch(5120, 17408));
+    try std.testing.expectEqual(@as(u32, 16), tileBatch(5120, 6144));
+    for ([_][2]usize{ .{ 34816, 5120 }, .{ 10240, 5120 }, .{ 6240, 5120 }, .{ 12288, 5120 }, .{ 2048, 5120 } }) |s| try std.testing.expectEqual(@as(u32, 8), tileBatch(s[0], s[1]));
+    try std.testing.expectEqual(@as(u32, 1), tileBatch(248320, 5120));
+    try std.testing.expectEqual(@as(usize, 5120), storedColumns(5120, 16));
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {
