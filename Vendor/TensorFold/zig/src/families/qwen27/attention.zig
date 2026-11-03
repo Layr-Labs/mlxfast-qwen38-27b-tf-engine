@@ -218,7 +218,7 @@ pub const After = struct { counter: mtl.Buffer, wait: u32 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [17]mtl.Pipeline,
+    io: [18]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
@@ -240,10 +240,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [17]mtl.Pipeline = undefined;
+        var io: [18]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded", "q27_head_norm_rope_held", "q27_head_norm_rope_packed_held" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded", "q27_head_norm_rope_held", "q27_head_norm_rope_packed_held", "q27_attn_append8" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -436,10 +436,15 @@ pub const Attention = struct {
         }
         const args = PackArgs{ .rows = plan.rows, .packed_rows = plan.tiles * 16, .heads = g.heads, .kv_heads = g.kv_heads, .dim = g.dim, .group = g.group(), .v_stride = v_stride };
         if (!appended) {
-            e.setPipeline(a.io[2]);
+            // prompt rows: eight words a thread (q27_attn_append8) where every row starts 16-byte aligned in K, V and the caches
+            const wide = a.promptPath(plan, prompt) and g.dim % 8 == 0 and k.offset % 16 == 0 and v.offset % 16 == 0 and v_stride % 8 == 0 and
+                for (caches, 0..) |cache, i| {
+                    if (cache.keys.offset % 16 != 0 or cache.values.offset % 16 != 0 or binding.strides[i][0] % 8 != 0 or binding.strides[i][1] % 8 != 0) break false;
+                } else true;
+            e.setPipeline(a.io[if (wide) 17 else 2]);
             bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
             e.setValue(args, 5);
-            e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 1, 1));
+            e.dispatchThreads(mtl.Size.of(if (wide) g.dim / 8 else g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 1, 1));
         }
         if (!prepacked and !appended) {
             e.setPipeline(a.io[0]);
@@ -484,6 +489,8 @@ pub const Attention = struct {
         e.setValue(args, 3);
         e.setBuffer(out.buffer, out.offset, 4);
         const gate = raw_gate orelse out;
+        // the merge moves a lane's eight output words and eight gate words in 16-byte words
+        if (out.offset % 16 != 0 or gate.offset % 16 != 0) return error.TargetAttentionShape;
         e.setBuffer(gate.buffer, gate.offset, 5);
         const xs = if (sums) |s| s.ref else scratch.get(.pma);
         e.setBuffer(xs.buffer, xs.offset, 6);
