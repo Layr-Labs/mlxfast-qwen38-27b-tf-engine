@@ -46,6 +46,7 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
     }
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| try fields.append(a, list, t);
+    if (b.spec) |*s| try fields.append(a, list, s);
 }
 
 fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
@@ -59,6 +60,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     while (adapters.next()) |adapter| prepared(adapter, hook, joining);
     var tiled = b.tiled.valueIterator();
     while (tiled.next()) |t| fields.apply(t, hook, joining);
+    if (b.spec) |*s| fields.apply(s, hook, joining);
 }
 
 pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
@@ -163,6 +165,7 @@ pub fn hold(h: anytype, io: std.Io) !void {
         h.model.kernels.setResident(r.follow());
         h.runner.setResident(r.follow());
         h.runner.resident_set = r.held.set;
+        if (h.draft) |d| if (d.model.backend.spec) |s| s.queue.addResidencySet(r.held.set);
         setBack(h.back, r.follow());
         if (h.draft) |d| d.model.backend.setResident(r.follow());
     }
@@ -173,6 +176,7 @@ pub fn drop(h: anytype) void {
     h.model.kernels.setResident(null);
     h.runner.setResident(null);
     if (h.runner.resident_set) |set| for (h.runner.second) |second| if (second) |s| s.queue.removeResidencySet(set);
+    if (h.runner.resident_set) |set| if (h.draft) |d| if (d.model.backend.spec) |s| s.queue.removeResidencySet(set);
     h.runner.resident_set = null;
     setBack(h.back, null);
     if (h.draft) |d| d.model.backend.setResident(null);

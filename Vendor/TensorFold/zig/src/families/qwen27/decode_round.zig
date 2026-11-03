@@ -68,6 +68,8 @@ pub const Runner = struct {
     after: ?forward.Hook = null,
     /// Encoded first in the next verify's first command buffer, then cleared by its caller.
     lead: ?forward.Tail = null,
+    /// The next verify's buffer split behind its last layer's block (forward.Split), then cleared by its caller.
+    split: ?forward.Split = null,
     /// Run once before the next verify's first GPU work (its first commit, or a deferred GDN replay it lands first),
     /// then cleared: work its caller left pending (Generation: the last round's keep), so planning and encoding overlap
     /// it.
@@ -331,7 +333,7 @@ pub const Runner = struct {
             (!r.capture_taps or std.mem.indexOfScalar(usize, &r.taps.ids, r.model.config.layers - 1) == null);
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .split = r.split, .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -746,11 +748,7 @@ pub const Runner = struct {
         try r.gdn.clearSlot(slot, e);
         e.end();
         cb.commit();
-        // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        cb.wait();
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -984,10 +982,6 @@ const Stagger = struct {
     }
     pub fn wait(_: *Stagger, _: usize) @import("core").segments.Wait {
         return .mixer;
-    }
-    /// The host spins on the segments' last command buffers rather than sleeping until their completion wakes it.
-    pub fn polls(_: *const Stagger) bool {
-        return true;
     }
     pub fn handoff(_: *Stagger, _: *Lane, _: usize) !void {}
     pub fn pre(p: *Stagger, lane: *Lane, index: usize) !void {

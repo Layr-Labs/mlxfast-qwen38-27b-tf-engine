@@ -216,6 +216,10 @@ pub const Backend = struct {
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
+    /// The absorb a depth-one round runs ahead beside its verify (runtime_spec.zig); null if it failed to build.
+    spec: ?@import("runtime_spec.zig").Spec = null,
+    /// The early frame being encoded appends the keys and values `spec` computed, which its lead copies out (Spec.gather).
+    ahead: bool = false,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -242,7 +246,13 @@ pub const Backend = struct {
         const caches = try newCaches(a, target.device, c, c.layers);
         errdefer freeCaches(a, caches);
         const args = try target.device.buffer(RoundArgs.blocks * @sizeOf(RoundArgs), options);
-        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
+        errdefer args.deinit();
+        // without it every early frame computes its absorb itself, as before
+        const spec = @import("runtime_spec.zig").Spec.init(target.device, c, target.device.tensorUnits()) catch |err| blk: {
+            std.log.warn("qwen27: draft absorb ahead off: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args, .spec = spec };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -251,6 +261,7 @@ pub const Backend = struct {
     pub fn deinit(b: *Backend) void {
         b.setResident(null);
         b.frame.deinit();
+        if (b.spec) |*s| s.deinit();
         var prepared = b.prepared.valueIterator();
         while (prepared.next()) |adapter| adapter.deinit();
         b.prepared.deinit(b.allocator);

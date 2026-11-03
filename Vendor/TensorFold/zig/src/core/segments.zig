@@ -212,6 +212,8 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
+            // a family that asks (commitDue) ends the buffer here, whatever the cadence
+            if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "commitDue")) if (x.fam.commitDue()) return x.commitLane(k);
             if (x.every == 0 or i + 1 >= x.layers) return;
             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
             // host encodes the next chunk's layers

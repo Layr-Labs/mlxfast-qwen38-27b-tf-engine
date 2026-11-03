@@ -69,13 +69,21 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
 }
 fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
     const c = g.config;
+    var keys: [max_layers]op.View = undefined;
+    var values: [max_layers]op.View = undefined;
+    if (g.layers.len > max_layers) return error.DraftOperatorShape;
+    // keys and values computed ahead (an early frame's, runtime_spec.zig): only their appends are encoded here
+    if (ops.vtable.staged_kv) |staged| if (try staged(ops.ptr, frame, @intCast(positions.len), keys[0..g.layers.len], values[0..g.layers.len])) {
+        for (g.layers, 0..) |_, i| switch (sink) {
+            .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
+            .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
+        };
+        return;
+    };
     const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
     const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
     // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
     // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
-    var keys: [max_layers]op.View = undefined;
-    var values: [max_layers]op.View = undefined;
-    if (g.layers.len > max_layers) return error.DraftOperatorShape;
     for (g.layers, 0..) |layer, i| {
         if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
             keys[i] = try cols(ops, frame, kv, 0, c.kvWidth());

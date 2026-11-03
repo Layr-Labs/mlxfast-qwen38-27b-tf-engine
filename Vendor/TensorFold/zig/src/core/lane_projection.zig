@@ -654,6 +654,23 @@ pub const Projection = struct {
         return .{ .ref = .{ .buf = buffer }, .stride = stride };
     }
 
+    /// encodeSumsOf into `out` instead of the projection's own buffer (the same launch and words).
+    pub fn encodeSumsInto(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32, out: Ref) !Sums {
+        if (!p.reg) return error.SumsNeedReg;
+        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        const pipe = p.sums_pipe orelse return error.SumsNeedReg;
+        try checkRef(x, rows * p.k * 2, 2);
+        const stride: u32 = 16 * ((rows + 15) / 16);
+        try checkRef(out, @as(usize, stride) * p.group_count * 4, 4);
+        e.setPipeline(pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setValue(@as(i32, @intCast(rows)), 1);
+        e.setBuffer(out.buf, out.off, 2);
+        e.setValue(@as(i32, @intCast(stride)), 3);
+        e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
+        return .{ .ref = out, .stride = stride };
+    }
+
     /// A tile-list projection (Layout.tile_list): `slots` threadgroups, threadgroup j computing tile list[1 + j] while j <
     /// list[0] (u32 words an earlier dispatch wrote, at most `slots` tiles) into columns [32 j, 32 j + 32) of `y`'s rows.
     pub fn encodeTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
