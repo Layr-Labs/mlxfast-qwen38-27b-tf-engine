@@ -32,6 +32,23 @@ Q27_SPECIALIZE
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
   if (int(m) >= M) return;
+  const int base = int(m) * K + int(t) * E;
+  // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
+  // words start 32 bytes apart): HO, XO and XS may alias H, R and Wt as far as the compiler knows, so the scalar loop's
+  // loads each waited for the store before them. The arithmetic is that loop's, word for word and in the same order.
+  // H (the residual stream, stored behind the barrier that opened this interval) and the weights come from nothing in
+  // this barrier interval, so their words are requested before the wait below; only R's follow it.
+  bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 hw = ((const device uint4*)(H + base))[j];
+    h4[2 * j] = as_type<bfloat4>(hw.xy);
+    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
+  }
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 ww = ((const device uint4*)(Wt + int(t) * E))[j];
+    w4[2 * j] = as_type<bfloat4>(ww.xy);
+    w4[2 * j + 1] = as_type<bfloat4>(ww.zw);
+  }
   // wait_for above 0: this norm shares its barrier interval with the projection that writes R, whose threadgroups count
   // themselves on NC[0] past a device-scope fence; a row's threadgroup reads R once the count reaches wait_for (bounded),
   // past its own fence, and the last row's threadgroup leaves both words zero for the next pair
@@ -48,22 +65,10 @@ Q27_SPECIALIZE
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  const int base = int(m) * K + int(t) * E;
-  // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
-  // words start 32 bytes apart): HO, XO and XS may alias H, R and Wt as far as the compiler knows, so the scalar loop's
-  // loads each waited for the store before them. The arithmetic is that loop's, word for word and in the same order.
-  bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
   for (int j = 0; j < E / 8; j++) {
-    const uint4 hw = ((const device uint4*)(H + base))[j], rw = ((const device uint4*)(R + base))[j];
-    h4[2 * j] = as_type<bfloat4>(hw.xy);
-    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
+    const uint4 rw = ((const device uint4*)(R + base))[j];
     r4[2 * j] = as_type<bfloat4>(rw.xy);
     r4[2 * j + 1] = as_type<bfloat4>(rw.zw);
-  }
-  for (int j = 0; j < E / 8; j++) {
-    const uint4 ww = ((const device uint4*)(Wt + int(t) * E))[j];
-    w4[2 * j] = as_type<bfloat4>(ww.xy);
-    w4[2 * j + 1] = as_type<bfloat4>(ww.zw);
   }
   float hv[E];
   bfloat4 o4[E / 4];
