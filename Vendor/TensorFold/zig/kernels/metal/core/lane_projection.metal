@@ -727,6 +727,51 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
       } \
 }
+#ifndef TF_K16
+#define TF_K16 1
+#endif
+#if defined(TF_K16)
+// TF_K16: each 64-deep group as four 16-deep tensor ops into the same sums. The tensor op adds a K block's products
+// in 16-deep blocks, each as four quads (p[b] + p[b+1]) + (p[b+8] + p[b+9]) summed in order into the running sum
+// (measured bit for bit on the M5), so in-order 16-deep multiply_accumulates equal the 64-deep product exactly. A
+// 16-deep operand's registers are the first half of the 32-deep one's (left 0-7, right 0-15), its second 16 k the
+// second half: the low nibble pairs of a word feed one op, the high pairs the next, and only 16 right halfs stay live.
+#undef TF_TN_TILE
+#define TF_K16_HALF(h, xa, xb, opa_) { \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w+(h)]:cur1[2*(w-2)+(h)]; const int e=2*w; \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+      } \
+      opa_.run(xa,c16,P); \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w+(h)]:cur1[2*(w-2)+(h)]; const int e=2*w; \
+        b2[e]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      o16a.run(xb,c16,P); \
+}
+#define TF_TN_TILE(t) { \
+      const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      const uint4 cur0=nw0,cur1=nw1; \
+      thread half2* b2=(thread half2*)&c16[0]; \
+      TF_K16_HALF(0, xq0, xq1, o16m) \
+      TF_STREAM_LATE(t) \
+      TF_K16_HALF(1, xq2, xq3, o16a) \
+      TF_UNROLL \
+      for (int j = 0; j < 4; j++) { \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
+      } \
+}
+#endif
 #else
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
@@ -811,6 +856,19 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
 #define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>()
   auto cbl = TF_TN_RIGHT;
+#if defined(TF_K16) && TF_STREAM_RIGHT
+  constexpr auto d16m = matmul2d_descriptor(16, NT, 16, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto d16a = matmul2d_descriptor(16, NT, 16, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d16m, execution_simdgroup> o16m;
+  matmul2d<d16a, execution_simdgroup> o16a;
+  auto xq0 = o16m.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto xq1 = o16a.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto xq2 = o16a.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto xq3 = o16a.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto c16 = o16m.template get_right_input_cooperative_tensor<bfloat, half, float>();
+#undef TF_TN_DEST
+#define TF_TN_DEST o16m.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xq0)>, metal::remove_addrspace_t<decltype(c16)>, float>()
+#endif
 #if !TF_STREAM_RIGHT
   auto cbh = TF_TN_RIGHT;
 #endif
@@ -840,7 +898,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
+#if defined(TF_K16) && TF_STREAM_RIGHT
+    for (int i = 0; i < 8; i++) { xq0[i] = x64[i]; xq1[i] = x64[8 + i]; xq2[i] = x64[16 + i]; xq3[i] = x64[24 + i]; }
+#else
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#endif
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
