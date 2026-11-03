@@ -60,7 +60,10 @@ pub const Pending = struct { rows: u32 = 0, rounds: u32 = 0, slot: u32 = 0 };
 /// z, a and b in their own rows, or (zba_stride > 0) views into one fused zba row.
 /// `sums`: the gate also writes the out projection's group sums of its rows there (gdn.Round.sums).
 /// `warm`: encoded behind a decoded star scan's launch (gdn.Round.warm).
-pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null };
+/// `out_groups` (team-m5-08q): the caller's out projection can wait on a counted gate (forwardAfter's chained star rows):
+/// the gate then counts itself on the scan words' gate-to-out pair (gdn.out_words), stores its threadgroups here and ends
+/// on no barrier; left 0 when the gate took a barrier instead.
+pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars, zba_stride: u32 = 0, sums: ?gdn.Sums = null, own: ?Own = null, warm: ?gdn.Beside = null, out_groups: ?*u32 = null };
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
@@ -93,7 +96,8 @@ pub const Pool = struct {
     profiler: ?*profile.Trace = null,
     tree_mode: gdn.TreeMode = .auto,
     residency: ?metal.ResidencySet.Follow = null,
-    /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero.
+    /// The decoded star scan's count and its waiting gate's arrivals (gdn.Round.forwardStar), left zero; then the prepare's
+    /// pair (gdn.star_words) and the gate-to-out pair (gdn.out_words, team-m5-08q).
     scan_words: ?metal.Buffer = null,
     /// Read by a deferred star scan, the keep that stashes behind it and unstash only; every other reader of the committed
     /// states runs after the rows land (decode_round.Runner.settleGdn).
@@ -113,9 +117,9 @@ pub const Pool = struct {
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
         // words 0-1: the star scan's count and its gate's arrivals; words 2-3 (gdn.star_words): the prepare's count and the
-        // star scan's arrivals
-        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..16], 0);
+        // star scan's arrivals; words 4-5 (gdn.out_words, team-m5-08q): the gate's count and the out projection's arrivals
+        const scan_words = try device.buffer(32, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        @memset(scan_words.contents()[0..32], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -210,6 +214,10 @@ pub const Pool = struct {
         // any pending rows) while the projections and the prepare run, and reads the prepared rows once they are counted
         const chained = after != null and pool.profiler == null and pool.scan_words != null and prepared.star and prepared.usesSlots();
         const wait_prep: u32 = if (chained) prepared.prepareGroups() else 0;
+        // team-m5-08q: on chained rows a counted gate also counts itself for a waiting out projection (Refs.out_groups)
+        if (chained) if (refs.out_groups) |g| {
+            prepared.out_count = .{ .words = pool.scan_words.?, .offset = gdn.out_words, .groups = g };
+        };
         // made before the prepare counts itself: a failure past that point would leave the star's words unconsumed
         const pending: ?gdn.Pending = if (deferred) |d| made: {
             if (d.rows > pending_rows) return error.BadGdnPending;

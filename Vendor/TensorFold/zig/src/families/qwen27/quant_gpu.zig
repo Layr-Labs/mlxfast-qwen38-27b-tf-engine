@@ -811,8 +811,21 @@ pub const Kernels = struct {
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
+        return k.quantCountedOn(input_encoder, p, x, xs, y, rows, gu, 0, wait_for);
+    }
+
+    /// Whether `p` on these rows takes the waiting counted launch (quantCountedOn): a mixer's last kernel may then count
+    /// itself for its out projection instead of ending on a barrier (team-m5-08q).
+    pub fn outWaits(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.countedKey(p, rows, true) != null;
+    }
+
+    /// quantCountedAfter waiting on any producer's count: the u32 word at `offset` of `waited` holds the count, the next
+    /// word this launch's arrivals, and the last threadgroup to arrive leaves both zero (team-m5-08q: the GDN gate's or the
+    /// decoded attention merge's count, for the out projection).
+    pub fn quantCountedOn(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, waited: mtl.Buffer, offset: usize, wait_for: u32) !u32 {
+        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -828,7 +841,7 @@ pub const Kernels = struct {
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = waited, .off = offset }, wait_for);
         try span.end();
         return @intCast(entry.value_ptr.tile_count);
     }

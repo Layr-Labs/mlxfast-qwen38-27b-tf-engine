@@ -71,6 +71,9 @@ pub const Stages = struct {
         if (s.rows == 0 or s.rows > fr.capacity or lane.k != s.lane_k) return error.BadFrameRows;
         s.hidden = fr.get(.hidden);
         s.residual = fr.get(.residual);
+        fr.out_waits = false;
+        fr.mixer_count = null;
+        fr.mixer_xs = .sums;
         if (s.lead) |t| try t.encode(t.ptr, lane.enc);
         try m.glue.embedding(lane.enc, m.config, m.weights.embed, fr.get(.ids), s.hidden, s.rows);
         lane.enc.barrier();
@@ -102,6 +105,15 @@ pub const Stages = struct {
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
+        // team-m5-08q: whether post takes the waiting out projection on these rows (not the terminal block's last rows,
+        // not compacted rows): the hook's last kernel may then count itself for it and end on no barrier (f.mixer_count)
+        const f = s.rowsFrame();
+        const out = switch (m.weights.layers[index].mixer) {
+            .linear => |g| g.out,
+            .attention => |a| a.out,
+        };
+        f.out_waits = !(s.terminal_rows and index + 1 == m.config.layers) and !s.compact and m.kernels.outWaits(out, s.rows);
+        defer f.out_waits = false;
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
@@ -120,6 +132,12 @@ pub const Stages = struct {
         // read and cleared before any return, and used only by the block whose GDN gate or attention merge wrote it
         const gated = f.mixer_sums;
         f.mixer_sums = false;
+        // team-m5-08q: the mixer's last kernel counted itself for this block's out projection and ended on no barrier
+        const mixer_count = f.mixer_count;
+        f.mixer_count = null;
+        // team-m5-08q: where the mixer's group sums are (Frame.mixer_xs)
+        const mixer_xs = f.mixer_xs;
+        f.mixer_xs = .sums;
         var mixer_out = f.get(.mixer_out);
         if (s.terminal_rows and index + 1 == m.config.layers) {
             if (s.head == .none) return;
@@ -129,16 +147,18 @@ pub const Stages = struct {
             s.compact = true;
         }
         const dims = f.get(if (s.compact) .last_dims else .dims);
+        // team-m5-08q: a counted mixer's words are left zero only by the waiting out projection below
+        if (mixer_count != null and (!gated or s.compact or m.kernels.prompt)) return error.BadFrameRows;
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
-        if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
+        if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, mixer_xs, s.rows) else null, s.hidden, s.residual, s.rows)) {
             e.barrier();
             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+        } else if (if (gated and !s.compact) (if (mixer_count) |c| try m.kernels.quantCountedOn(e, out, mixer_out, sums(f, mixer_xs, s.rows), f.get(.output), s.rows, c.words, c.offset, c.wait) else try m.kernels.quantCounted(e, out, mixer_out, sums(f, mixer_xs, s.rows), f.get(.output), s.rows)) else null) |counted| {
             // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
             try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
         } else {
-            try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
+            try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, mixer_xs, s.rows) else null, dims, f.get(.output), s.rows);
             e.barrier();
             try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         }

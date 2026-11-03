@@ -224,13 +224,20 @@ pub const Attention = struct {
     split_tail: ?mtl.Pipeline = null,
     prefix_quarter: ?mtl.Pipeline = null,
     /// The counted decoded chain's words: [0..2) the prefix's count and its tail's or merge's arrivals, [2..4) the split
-    /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
-    /// left zero by its last waiter.
+    /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals, [6..8) the
+    /// merge's count and its out projection's arrivals (team-m5-08q); each pair is left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
     /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
     /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
     warm: ?Warm = null,
+    /// team-m5-08q: set by a caller whose out projection can wait on the merge (Kernels.quantCountedOn): a counted chain's
+    /// merge then also counts its threadgroups on chain_words' [6..8) pair, stores how many in `groups`, and ends on no
+    /// barrier; `groups` stays 0 where the merge took a barrier instead.
+    out_count: ?OutCount = null,
     pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
+    pub const OutCount = struct { groups: *u32 };
+    /// team-m5-08q: byte offset of the merge-to-out pair in chain_words.
+    pub const out_words: usize = 24;
     pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
@@ -569,7 +576,16 @@ pub const Attention = struct {
         // a split tail's count follows the prefix's; a fused chain's merge waits on the prefix's own
         e.setBuffer(words, if (split) 8 else 0, 13);
         e.setValue(if (chain == null) 0 else if (split) tail_groups else prefix_groups, 14);
+        // team-m5-08q: on the counted chain, a waiting out projection: every merge group counts itself once its rows and
+        // sums are stored, and the out projection waits on that count in this barrier interval instead of behind a barrier
+        const out_count = if (chain != null and sums != null) a.out_count else null;
+        e.setBuffer(words, if (out_count != null) out_words else 0, 15); // never written: count_out 0
+        e.setValue(@as(u32, @intFromBool(out_count != null)), 16);
         e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.rows * g.group(), 1), mtl.Size.of(32, 1, 1));
+        if (out_count) |o| {
+            o.groups.* = g.kv_heads * plan.rows * g.group();
+            return;
+        }
         e.barrier();
     }
     pub fn keep(a: *const Attention, e: mtl.ComputeEncoder, scratch: *const Scratch, binding: *const Binding, kept: u32, caches: []const Cache) !void {

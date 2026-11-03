@@ -961,6 +961,8 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          constant uint& sums_stride [[buffer(6)]],
                          device atomic_uint* NC [[buffer(7)]],
                          constant uint& wait_for [[buffer(8)]],
+                         device atomic_uint* PC [[buffer(9)]],
+                         constant uint& count_out [[buffer(10)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint3 groups [[threadgroups_per_grid]],
                          uint t [[thread_index_in_threadgroup]],
@@ -987,7 +989,9 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (row >= p.rows || p.dv != 128) return;
+  // team-m5-08q: a row's work runs under its condition rather than past an early return, so that every simdgroup reaches
+  // the count below; the work itself is the record's, line for line (not re-indented)
+  if (row < p.rows && p.dv == 128) {
   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
   const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
   float values[4];
@@ -1012,6 +1016,17 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
       float acc = 0.0f;
       for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
       sums[g * int(sums_stride) + int(row)] = acc;
+    }
+  }
+  }
+  // team-m5-08q: count_out above 0: the out projection that reads these rows and sums shares this launch's barrier
+  // interval; every group counts itself on PC[0] once its rows and sums are stored, past a device-scope fence, and the out
+  // projection's threadgroups wait on that count (lane_projection's TF_WAIT), the last of them leaving both words zero
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
     }
   }
 }

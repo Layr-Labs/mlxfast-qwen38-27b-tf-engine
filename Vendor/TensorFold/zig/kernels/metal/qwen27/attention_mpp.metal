@@ -313,6 +313,7 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
     device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
     device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
+    device atomic_uint* TC [[buffer(15)]], constant uint& count_out [[buffer(16)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
   const uint lane = thread_index_in_simdgroup;
@@ -381,6 +382,9 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
       XS[(int64_t)(col / 64) * sums_stride + node] = acc;
     }
   }
+  // team-m5-08q: count_out above 0: the out projection that reads these rows and sums shares this launch's barrier
+  // interval and waits on TC[0], which every group counts once stored (lane_projection's TF_WAIT)
+  if (count_out != 0u) q27_count(TC, tid);
 }
 
 // Independent output halves preserve the original tail arithmetic; used for small one-chunk trees.
