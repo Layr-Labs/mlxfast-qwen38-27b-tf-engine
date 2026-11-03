@@ -168,7 +168,7 @@ pub const Kernels = struct {
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
-    /// Code bytes warm reads ahead of a decoded out projection (warm_mb MiB), set on first use.
+    /// Code bytes warm reads ahead of a decoded out projection (TF_Q27_WARM_MB, default warm_mb; 0 turns it off).
     warm_bytes: ?usize = null,
     /// warmTiles' line touch (tf_q27_warm_tiles) and the word it could store (it never does), made at load
     /// (prepareWarmTiles).
@@ -685,6 +685,7 @@ pub const Kernels = struct {
         return key;
     }
 
+    /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
     /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
     /// and padding included) and of all its decoded metadata (the indexed table and indices, else the pairs), with no
     /// barrier. Encoded inside a latency-bound barrier interval (a star scan, an attention prefix), it moves those lines
@@ -703,14 +704,10 @@ pub const Kernels = struct {
     fn warmPrefix(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, want: usize) !void {
         if (want == 0 or p.bits != 4 or p.group != 64 or p.runs.len != 0) return;
         const codes = projection.storedColumns(p.n, p.batch) * p.k / 2;
+        const code_room = p.words.buffer.length() -| p.words.offset;
+        const take = @min(want, codes, code_room);
         const meta: projection.Ref = p.index orelse p.pairs;
         const meta_bytes: usize = if (p.index == null) @as(usize, p.n) * (p.k / 64) * 4 else if (p.index12) lane.indexed12Bytes(p.n, p.k, 64) else lane.indexedBytes(p.n, p.k, 64);
-        return k.warmLines(e, p.words, @min(want, codes), meta, meta_bytes);
-    }
-
-    /// tf_q27_warm over the leading `code_bytes` of `words` and `meta_bytes` of `meta`, each cut at its buffer's end.
-    fn warmLines(k: *Kernels, e: mtl.ComputeEncoder, words: Ref, code_bytes: usize, meta: Ref, meta_bytes: usize) !void {
-        const take = @min(code_bytes, words.buffer.length() -| words.offset);
         const meta_take = @min(meta_bytes, meta.buffer.length() -| meta.offset);
         if (take < 128) return;
         if (k.warm_pipe == null) {
@@ -725,7 +722,7 @@ pub const Kernels = struct {
         // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
         const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
         e.setPipeline(k.warm_pipe.?);
-        e.setBuffer(words.buffer, words.offset, 0);
+        e.setBuffer(p.words.buffer, p.words.offset, 0);
         e.setBuffer(meta.buffer, meta.offset, 1);
         e.setValue(lines, 2);
         e.setBuffer(k.warm_sink.?, 0, 3);
@@ -777,11 +774,12 @@ pub const Kernels = struct {
 
     fn warmBytes(k: *Kernels) usize {
         if (k.warm_bytes) |b| return b;
-        k.warm_bytes = @as(usize, warm_mb) << 20;
+        var mb: usize = warm_mb;
+        if (std.c.getenv("TF_Q27_WARM_MB")) |v| mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch warm_mb;
+        k.warm_bytes = mb << 20;
         return k.warm_bytes.?;
     }
 
-    /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
     pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
         return k.countedKey(p, rows, false) != null;
     }
