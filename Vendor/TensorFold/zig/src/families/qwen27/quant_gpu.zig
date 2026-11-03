@@ -7,9 +7,9 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
-/// Code MiB Kernels.warm reads ahead of a decoded out projection: about three fifths of its 15 MiB, as much as a star
+/// Code MiB Kernels.warm reads ahead of a decoded out projection: about four fifths of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
-const warm_mb = 9;
+const warm_mb = 12;
 /// Kernels.warm's threadgroups at most: a few a core, so the waiting launches behind them are placed at once.
 const warm_groups = 64;
 const warm_source =
@@ -139,7 +139,8 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
-pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane };
+/// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
+pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -174,6 +175,8 @@ pub const Kernels = struct {
     /// (prepareWarmTiles).
     warm_tiles_pipe: ?mtl.Pipeline = null,
     warm_tiles_sink: ?mtl.Buffer = null,
+    /// team-m5-08w: the 16-byte input norm failed to build on this chip (logged once): the record's kernel runs instead.
+    input_words_failed: bool = false,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -216,7 +219,7 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => sources.xsum,
             .norm => sources.norm_xs,
-            .input_norm => sources.norm_input,
+            .input_norm, .input_words => sources.norm_input,
             .mlp => sources.mlp_xs,
             .mlp_wide => sources.mlp_xs_wide,
             .ane_input, .mlp_ane, .add_ane => sources.mlp_ane,
@@ -226,6 +229,7 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => try std.fmt.allocPrint(k.allocator, "constexpr int K={d}, GS=64;", .{key.k}),
             .norm, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
+            .input_words => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};\n#define Q27_NORM_WORDS 1", .{key.k}),
             .mlp, .mlp_wide => try std.fmt.allocPrint(k.allocator, "constexpr int N={d};", .{key.n}),
             .ane_input, .mlp_ane, .add_ane => try std.fmt.allocPrint(k.allocator, "constant constexpr int H={d}, N={d}, A={d};", .{ key.k, key.n, key.tile }),
         };
@@ -238,7 +242,7 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => "custom_kernel_q27_xsum_bfloat16_t_int32_t_float",
             .norm => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
-            .input_norm => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
+            .input_norm, .input_words => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
             .mlp => "custom_kernel_q27_mlp_xs_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .mlp_wide => "custom_kernel_q27_mlp_xs_wide_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .ane_input => "q27_ane_input",
@@ -645,7 +649,7 @@ pub const Kernels = struct {
         errdefer span.cancel();
         const e = span.encoder;
 
-        e.setPipeline(try k.get(.{ .kind = if (residual != null) .norm else .input_norm, .k = width }));
+        e.setPipeline(if (residual != null) try k.get(.{ .kind = .norm, .k = width }) else try k.inputNorm(h, weight, out, width));
         if (residual) |r| {
             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
             bindAt(e, out, 8); // never read: wait_for 0
@@ -653,6 +657,20 @@ pub const Kernels = struct {
         } else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// team-m5-08w: the input norm's pipeline. q27_norm_input in 16-byte words where its row, its weights and its output
+    /// start 16-byte aligned (every call on this engine's frames and weights), else the record's one-word kernel, which
+    /// also stands in, logged once, if the 16-byte text fails to build on this chip.
+    fn inputNorm(k: *Kernels, h: Ref, weight: Ref, out: Ref, width: u32) !mtl.Pipeline {
+        const aligned = width % 8 == 0 and h.offset % 16 == 0 and weight.offset % 16 == 0 and out.offset % 16 == 0;
+        if (aligned and !k.input_words_failed) {
+            if (k.get(.{ .kind = .input_words, .k = width })) |p| return p else |err| {
+                k.input_words_failed = true;
+                std.log.warn("qwen27: the input norm keeps its one-word kernel (team-m5-08w): {s}", .{@errorName(err)});
+            }
+        }
+        return k.get(.{ .kind = .input_norm, .k = width });
     }
 
     /// `norm` (with `residual`) in the barrier interval of the quantCounted launch that writes `residual`: each row's
