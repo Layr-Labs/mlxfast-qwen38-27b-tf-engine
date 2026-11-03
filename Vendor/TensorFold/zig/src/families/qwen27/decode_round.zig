@@ -383,6 +383,27 @@ pub const Runner = struct {
         return &at.*.?;
     }
 
+    /// A staggered pass's segment bound before the floor to 64: each segment's share a quarter larger than the one
+    /// before it, because a row in a later segment costs strictly more wall time — its mixer waits for every earlier
+    /// segment's states and its attention reads every earlier row. Shares are `4^(parts-1-k) * 5^k` over their sum:
+    /// two parts cut at 4/9 and 5/9, three at 16/61, 20/61 and 25/61, four at 64/369, 80/369, 100/369, 125/369. Integer
+    /// only, and the caller floors every bound to a multiple of 64, the attention's key-block width, so each row's key
+    /// blocks still fall on the absolute boundaries one chunk of the same rows would give it.
+    fn staggerStart(n: u32, parts: usize, k: usize) u32 {
+        var w: u64 = 1;
+        var i: usize = 1;
+        while (i < parts) : (i += 1) w *= 4;
+        var total: u64 = 0;
+        var before: u64 = 0;
+        var j: usize = 0;
+        while (j < parts) : (j += 1) {
+            total += w;
+            if (j < k) before += w;
+            if (j + 1 < parts) w = w / 4 * 5;
+        }
+        return @intCast(@as(u64, n) * before / total);
+    }
+
     /// A prompt window as two segments (core/stagger.zig): the first `na` rows (a multiple of 64) in the model's frame on
     /// the model's queue, the rest in the second segment's frame on its own queue. Each layer's mixer of the second waits
     /// for the first's (its GDN states and conv windows, its K/V rows); everything else of the two runs side by side. Each
@@ -395,9 +416,10 @@ pub const Runner = struct {
         const slot = round.slots[0];
         const start = round.windows[0].start;
         for (round.windows[0].parents, 0..) |parent, row| if (parent != (if (row == 0) @as(i32, -1) else @as(i32, @intCast(row - 1)))) return error.NotAcceptedChain;
-        // segment k's first row: k n / parts, down to a multiple of 64; the last runs to n
+        // segment k's first row: a share a quarter larger than the segment before it (staggerStart), down to a multiple
+        // of 64; the last runs to n
         var firsts: [max + 1]u32 = undefined;
-        for (0..parts) |k| firsts[k] = @intCast(k * n / parts / 64 * 64);
+        for (0..parts) |k| firsts[k] = staggerStart(n, parts, k) / 64 * 64;
         firsts[parts] = n;
         for (0..parts) |k| if (firsts[k + 1] <= firsts[k]) return error.BadFrameRows;
         var frames: [max]*Frame = undefined;
