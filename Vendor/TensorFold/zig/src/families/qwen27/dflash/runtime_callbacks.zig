@@ -132,6 +132,28 @@ fn projectGroup(ptr: *anyopaque, epoch: u64, x: op.View, w: ck.Tensor, kind: u32
     try encodePrepared(b, e, x, y, adapter);
     return y;
 }
+/// Draft gate/up group and activation on one launch when a load-time exact-word check enabled it.
+fn projectSwiglu(ptr: *anyopaque, epoch: u64, x: op.View, gate: ck.Tensor, mode: op.Mode) !?op.View {
+    const b = backend(ptr);
+    if (mode == .bf16_reference or b.fused_count == 0 or b.admitting() or readsQ4Copy(b, x.rows) or x.rows == 0 or x.rows > 8) return null;
+    const adapter = b.prepared.get(@intFromPtr(gate.bytes.ptr) + @import("runtime_backend.zig").group_gu) orelse return null;
+    const p = adapter.swiglu orelse return null;
+    const input_sums = b.input_sums orelse return null;
+    if (!std.meta.eql(input_sums.view, x) or input_sums.sums.stride != sums_stride or x.dtype != .bf16 or x.stride != x.width or x.width != p.k or p.n / 2 != @as(usize, b.config.intermediate)) return null;
+    const width: u32 = @intCast(p.n / 2);
+    errdefer b.input_sums = null;
+    const e = try b.encoder(epoch);
+    const y = try b.frame.alloc(x.rows, width, .bf16);
+    const hs = (try sumsFor(b, x.rows, width)) orelse return null;
+    const input = try b.frame.ref(x);
+    const output = try b.frame.ref(y);
+    const sums = try b.frame.ref(hs);
+    b.access(e, &.{ try b.span(x), Span.whole(input_sums.sums.ref.buf) }, &.{ try b.span(y), try b.span(hs) });
+    try p.encodeSwiglu(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, adapter.meta(), input_sums.sums, .{ .buf = output.buf, .off = output.off }, .{ .buf = sums.buf, .off = sums.off }, x.rows);
+    offerSums(b, y, sums);
+    _ = b.draft_swiglu_hits.fetchAdd(1, .monotonic);
+    return y;
+}
 fn sliceCols(ptr: *anyopaque, epoch: u64, x: op.View, first: u32, width: u32) !op.View {
     const b = backend(ptr);
     _ = try b.encoder(epoch);
@@ -335,6 +357,10 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     const y = try b.frame.add(rows_ref, x.rows, slots * 32, Head.rescored_stride, .bf16);
     const input = try b.frame.ref(x);
     b.access(e, &.{ try b.span(x), Span.whole(sums.ref.buffer), try b.span(list) }, &.{try b.span(y)});
+    // beside the tile launch, behind the barrier above: its listed tiles' lines requested at once (Kernels.warmTiles), so
+    // its one SIMD group a tile finds them in the caches as it walks their K groups. Nothing it writes is read; one that
+    // fails to encode only loses its prefetch (the launch below sets its own pipeline and bindings).
+    b.target.kernels.warmTiles(e, b.head.linear, .{ .buffer = list_ref.buf, .offset = list_ref.off }, slots) catch {};
     try b.target.kernels.quantTiles(e, b.head.linear, .{ .buffer = input.buf, .offset = input.off }, sums, .{ .buffer = list_ref.buf, .offset = list_ref.off }, .{ .buffer = rows_ref.buf, .offset = rows_ref.off }, x.rows, slots, Head.rescored_stride);
     return .{ .logits = y, .token_ids = map };
 }
@@ -402,4 +428,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
 }
 pub const offer_sums = offerSums;
 pub const sums_rows = sums_stride;
-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .project_swiglu = projectSwiglu, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };

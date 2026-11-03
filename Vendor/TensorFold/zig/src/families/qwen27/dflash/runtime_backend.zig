@@ -204,6 +204,7 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
+    draft_swiglu_hits: std.atomic.Value(u64) = .init(0),
     /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
     /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
     precise: bool = false,
@@ -220,8 +221,10 @@ pub const Backend = struct {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
         errdefer primitives.deinit();
-        const attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
+        var attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
         errdefer attention.deinit();
+        attention.buildMerged(a, target.device, target.queue) catch |err| std.log.warn("draft shared-attention fused merge off: {s}", .{@errorName(err)});
+        if (attention.split_merge_xs != null) std.log.info("draft shared-attention fused merge enabled after bitwise check", .{});
         const topk = try core.bf16_topk_gpu.Ops.init(target.device);
         errdefer topk.deinit();
         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
@@ -233,6 +236,8 @@ pub const Backend = struct {
                 low.deinit();
                 head.plain = null;
             };
+            // the line warm beside the head's tile launch (Kernels.warmTiles) compiles here too; without it the warm is off
+            if (head.plain != null) target.kernels.prepareWarmTiles() catch |err| std.log.warn("draft head tile warm off: {s}", .{@errorName(err)});
         }
         // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
         // (a depth-1 block heads one mask row; every head launch of at most 8 rows shares this pipeline)
@@ -247,6 +252,7 @@ pub const Backend = struct {
     }
 
     pub fn deinit(b: *Backend) void {
+        std.log.info("Qwen DFlash fused activation dispatches: {d}", .{b.draft_swiglu_hits.load(.monotonic)});
         b.setResident(null);
         b.frame.deinit();
         var prepared = b.prepared.valueIterator();
@@ -405,9 +411,68 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        // Isolated drafter gate/up fused activation derived from public rejected ticket #99b1b0c7-94db-47bf-ba38-1f5e5409a077.
+        if (kind == group_gu and key_part == 'g') {
+            adapter.draftSwiglu(b.allocator, b.target.device) catch |err| {
+                std.log.warn("draft gate/up SwiGLU keeps its launch: {s}", .{@errorName(err)});
+            };
+            if (adapter.swiglu) |fused| if (!(b.swigluMatches(adapter) catch false)) {
+                std.log.warn("draft gate/up SwiGLU keeps its launch: exact-word match check failed", .{});
+                fused.deinit();
+                adapter.swiglu = null;
+            };
+        }
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
+    }
+    /// Retain the fused pipeline only if its activation and all group-sum words match the fallback path exactly.
+    fn swigluMatches(b: *Backend, adapter: core.affine4_lane.Adapter) !bool {
+        const fused = adapter.swiglu orelse return false;
+        const small = adapter.small orelse return false;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const device = b.target.device;
+        const rows: u32 = 2;
+        const n = fused.n;
+        const k = fused.k;
+        const half = n / 2;
+        const groups = half / core.draft_ops.sums_group;
+        const x = try device.buffer(rows * k * 2, mtl.ResourceOptions.shared);
+        defer x.deinit();
+        const gu = try device.buffer(rows * n * 2, mtl.ResourceOptions.shared);
+        defer gu.deinit();
+        const h0 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h0.deinit();
+        const h1 = try device.buffer(rows * half * 2, mtl.ResourceOptions.shared);
+        defer h1.deinit();
+        const s0 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s0.deinit();
+        const s1 = try device.buffer(groups * 16 * 4, mtl.ResourceOptions.shared);
+        defer s1.deinit();
+        for (x.slice(u16, rows * k), 0..) |*v, i| {
+            const f: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7919 + 13) % 4001)) - 2000)) / 1000.0;
+            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
+        for ([_]mtl.Buffer{ h0, h1 }) |h| @memset(h.slice(u16, rows * half), 0x7fc1);
+        for ([_]mtl.Buffer{ s0, s1 }) |sb| @memset(sb.slice(u32, groups * 16), 0x7fc00001);
+        const cb = b.target.queue.commandBuffer();
+        const e = cb.compute(.concurrent);
+        var ended = false;
+        errdefer if (!ended) e.end();
+        const sums = try small.encodeSumsOf(e, .{ .buf = x }, rows);
+        e.barrier();
+        try small.encodeSums(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = gu }, rows);
+        e.barrier();
+        try b.primitives.swigluSums(e, .{ .buf = gu }, .{ .buf = gu, .off = half * 2 }, .{ .buf = h0 }, .{ .ref = .{ .buf = s0 }, .stride = 16 }, .{ .rows = rows, .width = @intCast(half), .gate_stride = @intCast(n), .up_stride = @intCast(n), .y_stride = @intCast(half) });
+        try fused.encodeSwiglu(e, .{ .buf = x }, .{ .buf = adapter.words }, adapter.meta(), sums, .{ .buf = h1 }, .{ .buf = s1 }, rows);
+        e.end();
+        ended = true;
+        cb.commit();
+        cb.wait();
+        if (cb.failure() != null) return false;
+        if (!std.mem.eql(u16, h0.slice(u16, rows * half), h1.slice(u16, rows * half))) return false;
+        return std.mem.eql(u32, s0.slice(u32, groups * 16), s1.slice(u32, groups * 16));
     }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {

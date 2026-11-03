@@ -45,7 +45,7 @@ test "shared attention: split dispatch and scratch cover chunk boundaries and ca
             try p.encodeSplit(e, rows, n, n, 0.125, q, k, v, mask, out);
             try std.testing.expectEqual(@as(usize, 2), record.n);
             try std.testing.expectEqual(@as(u32, 1), record.passes[0].pipe);
-            try std.testing.expectEqual(mtl.Size.of(8, rows, chunks), record.passes[0].grid);
+            try std.testing.expectEqual(mtl.Size.of(32, rows, chunks), record.passes[0].grid);
             try std.testing.expectEqual(mtl.Size.of(32, 1, 1), record.passes[0].threads);
             try std.testing.expectEqual(@as(u32, 2), record.passes[1].pipe);
             try std.testing.expectEqual(mtl.Size.of(32, rows, 1), record.passes[1].grid);

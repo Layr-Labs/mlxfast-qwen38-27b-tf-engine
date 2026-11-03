@@ -9,6 +9,14 @@ kernel void q27_slice(device const ushort* X [[buffer(0)]], constant Slice& p [[
   if (t.x < p.width && t.y < p.rows) Y[t.y * p.width + t.x] = X[t.y * p.stride + p.offset + t.x];
 }
 
+struct SliceRows { uint rows, width, stride, offset, out_stride; };
+
+// q27_slice whose output rows stand out_stride elements apart (a prompt pass's taps into the drafter's ring rows).
+kernel void q27_slice_rows(device const ushort* X [[buffer(0)]], constant SliceRows& p [[buffer(1)]],
+                           device ushort* Y [[buffer(2)]], uint2 t [[thread_position_in_grid]]) {
+  if (t.x < p.width && t.y < p.rows) Y[t.y * p.out_stride + t.x] = X[t.y * p.stride + p.offset + t.x];
+}
+
 struct Add { uint rows, width; };
 
 kernel void q27_add(device const bfloat* X [[buffer(0)]], device const bfloat* R [[buffer(1)]],

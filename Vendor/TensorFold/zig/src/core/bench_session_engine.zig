@@ -231,7 +231,7 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.015;
+pub const dflash_floor = 0.020;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
@@ -252,7 +252,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
             try binding.ready();
-            try binding.resetNow();
+            try binding.resetNow(false);
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
             const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = depth }, &.{}, false, null, 0);
@@ -285,7 +285,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             const binding: *@This() = @ptrCast(@alignCast(ptr));
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
-            try binding.resetNow();
+            try binding.resetNow(true);
         }
 
         /// The lane host idle, as EngineDflashBinding.ready requires, and its thread hook run.
@@ -297,9 +297,11 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (h.on_thread) |start| try start.run(start.ctx);
         }
 
-        fn resetNow(binding: *@This()) !void {
+        /// `clear`: the reset op's, whose slot clear each request keeps; the seed's reset right behind it, and the prompt
+        /// reset a lane host pass makes, then find the slot zeroed and skip theirs (Runner.zeroed).
+        fn resetNow(binding: *@This(), clear: bool) !void {
             try binding.generation.settle();
-            try binding.generation.runner.reset(0);
+            if (clear) try binding.generation.runner.clear(0) else try binding.generation.runner.reset(0);
             try binding.generation.draft.reset();
             binding.depth = 0;
         }
@@ -359,7 +361,11 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // Short sleeps (20 us between checks) instead of yield-spinning a core for the whole request (the CPU and GPU share
+        // one package's power)
+        const sys = @import("sys").c;
+        const req: sys.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+        while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
         if (run.failed) return error.EngineFailed;
     }
 };
