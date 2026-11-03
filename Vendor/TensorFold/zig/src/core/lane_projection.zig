@@ -202,6 +202,8 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Two-tile prompt launches: 1, or 2 16-row blocks a SIMD group sharing each tile's code load and unpack (TF_PROMPT_TM).
+    prompt_tm: usize = 1,
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
@@ -245,6 +247,10 @@ pub const Layout = struct {
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
+        // two row blocks a SIMD group: two-tile prompt launches over whole tiles only
+        if (l.prompt_tm != 1 and (l.prompt_tm != 2 or l.prompt_tn != 2 or !l.prompt_sr or !l.reg or !l.reg_lean or l.format.bits != 4 or
+            l.format.group != 64 or l.rows8 or l.count or l.gu_count or l.wait or l.tile_list or l.indexed or l.indexed12 or
+            l.serial_sk2 or l.ranges.len != 0 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
@@ -345,6 +351,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.prompt_tm != 1) try text.print(a, "#define TF_PROMPT_TM {d}\n", .{l.prompt_tm});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
@@ -490,6 +497,8 @@ pub const Projection = struct {
     swiglu: bool = false,
     /// A swiglu launch's threads a group: four one-tile SIMD groups, or two two-tile ones (Layout.prompt_tn 2).
     swiglu_threads: usize = 128,
+    /// 16-row blocks a threadgroup's SIMD groups compute (Layout.prompt_tm): the grid's height is ceil(blocks / prompt_tm).
+    prompt_tm: usize = 1,
     /// Built with Layout.residual: encodeResid only.
     residual: bool = false,
     /// Built with Layout.count: encodeCounted only.
@@ -521,7 +530,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .prompt_tm = l.prompt_tm, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
     }
 
     pub fn deinit(p: Projection) void {
@@ -626,7 +635,7 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
-        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else (blocks + p.prompt_tm - 1) / p.prompt_tm, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
@@ -721,7 +730,7 @@ pub const Projection = struct {
             e.setBuffer(y.buf, y.off, 7);
         }
         if (counter) |c| e.setBuffer(c.buf, c.off, 6); // TF_COUNT: the norm's wait word
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) (blocks + p.prompt_tm - 1) / p.prompt_tm else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
