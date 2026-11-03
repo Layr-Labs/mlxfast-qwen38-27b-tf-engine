@@ -1006,11 +1006,11 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
   }
   *(device bfloat4*)(output + at) = y;
   if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
+    const uint first = lane & ~15u;
+    float acc = 0.0f;
+    for (int i = 0; i < 64; i++) acc += simd_shuffle(float(y[i & 3]), ushort(first + (i >> 2)));
     if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
+      const int g = int((head * p.dv + lane * 4) / 64);
       sums[g * int(sums_stride) + int(row)] = acc;
     }
   }
