@@ -231,7 +231,13 @@ pub const EngineDflashBinding = struct {
 pub const dflash_width = 7;
 /// A sibling the drafter gives less than this probability is left out: its verify row (GDN tree step, attention row,
 /// argmax) costs more of the round than its chance to land returns. The round's best draft is always verified.
-pub const dflash_floor = 0.020;
+/// A row is cheap exactly because the decode projections are row-invariant (rows8, above): the round already streams
+/// every weight it will read for 8 rows, so a sibling past the widest projection's rows adds a tree step, an attention
+/// row and an argmax over the head tiles it shares with the rows beside it -- it does not add a weight pass. That
+/// asymmetry is where the floor sits: a sibling under 0.020 was left out of rows the round pays for anyway, and with
+/// nothing but its own share of the head tiles to add, so the floor is set where a sibling's marginal cost overtakes
+/// that chance instead -- one row of tree step and attention beside a weight stream it does not repeat.
+pub const dflash_floor = 0.007;
 
 /// Bind the Metal DFlash Generation without importing a platform module into host or Linux builds.
 pub fn GenerationBinding(comptime generation: type) type {
