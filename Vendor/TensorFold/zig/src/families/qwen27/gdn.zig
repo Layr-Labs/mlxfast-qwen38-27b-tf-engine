@@ -216,7 +216,12 @@ pub const Round = struct {
         r.b.slot_steps.bind(e, 11);
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
-        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
+        // Eight simdgroups a threadgroup where the pipeline's threadgroup admits them: the kernel derives a thread's two
+        // value columns from its grid position and its lane, so the block's height is a scheduling choice -- eight warps
+        // keep a core's issue slots filled across the dependent delta update where four leave a gap between a warp's
+        // update and the next warp's. tf_delta_gdn_tree runs the same grid at eight (stateGrid).
+        const height: u16 = if (pair.maxThreads() >= 8 * 32) 8 else 4;
+        e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = height, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
         r.gate(e, post_rows);

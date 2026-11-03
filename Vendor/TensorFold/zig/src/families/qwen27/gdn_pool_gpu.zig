@@ -11,6 +11,11 @@ const Tensor = @import("gpu_weights.zig").Tensor;
 const profile = @import("core").gpu_profile;
 const Kernels = @import("gdn_library.zig").Kernels;
 
+/// Simdgroups a threadgroup of the pool's per-dimension launches: both kernels below derive a thread's whole slice from
+/// its grid position and its lane, so the block's height is a pure scheduling choice -- eight warps fill a core's issue
+/// slots back to back where four leave gaps between a warp's dependent delta update and the next warp's.
+const wide_group = 8;
+
 pub const PromptMarks = @import("gdn_marks_gpu.zig").Bank;
 
 const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing };
@@ -389,7 +394,9 @@ pub const Pool = struct {
         e.setValue(p, 5);
         const layer_words = std.math.cast(u32, pool.budget.slots * pool.budget.shape.state) orelse return error.BadGdnPending;
         e.setValue(abi.Unstash{ .rows = pool.pending.rows, .slot = pool.pending.slot, .pending_rows = pending_rows, .layer_words = layer_words }, 6);
-        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = 8 });
+        // a value dimension a thread, its lane's four words: the threadgroup is eight simdgroups (a taller block of dimensions),
+        // so a threadgroup's eight warps issue back to back instead of four and the launch's groups halve
+        e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * pool.budget.layers }, .{ .width = 32, .height = wide_group });
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
@@ -413,7 +420,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
-            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 8 });
+            e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = wide_group });
         }
     }
 
