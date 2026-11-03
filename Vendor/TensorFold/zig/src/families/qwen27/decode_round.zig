@@ -36,6 +36,17 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     return true;
 }
 
+/// Returns once the GPU reported the end of `cb`, reading its status instead of parking the thread until the completion
+/// handler wakes it: a round's small buffers are gated by work microseconds away, so the status flips before a wake
+/// would arrive. A committed buffer reports `completed` only after its handler ran, so the status read here is the one
+/// `waitUntilCompleted` would return on, and every caller keeps reading `failure()` afterwards.
+pub fn spin(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -661,7 +672,8 @@ pub const Runner = struct {
     pub fn settleSlot(r: *Runner, slot: u32) void {
         const cb = r.reading[slot] orelse return;
         r.reading[slot] = null;
-        cb.wait();
+        // a kept state's blit was committed a round or more before the slot is written again: it is done, so poll it
+        spin(cb);
         cb.release();
     }
 
@@ -705,7 +717,7 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        spin(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
@@ -747,10 +759,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         // the next prompt pass follows at once: poll rather than sleep until the completion wakes this thread
-        while (true) switch (cb.status()) {
-            .completed, .@"error" => break,
-            else => std.atomic.spinLoopHint(),
-        };
+        spin(cb);
         if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
