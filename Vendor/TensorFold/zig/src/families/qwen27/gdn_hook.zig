@@ -41,6 +41,12 @@ pub const Hook = struct {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
+        } else if (hook.quant.prompt) {
+            // prompt rows run zba's range first: the two projections read the same inputs and write disjoint
+            // rows (the pool's log vs the frame's mixed columns), so only the launch order moves
+            if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
+            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
+            e.barrier();
         } else {
             try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
