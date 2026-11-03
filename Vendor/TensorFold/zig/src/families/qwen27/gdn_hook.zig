@@ -56,7 +56,15 @@ pub const Hook = struct {
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        // the gate counts its live rows on the out projection's wait word instead of leaving a barrier: only a decoded star
+        // block whose projection takes the waiting launch, and not the last block, whose rows post compacts
+        const count: ?metal.Buffer = if (!hook.accepted_chain and after != null and beside == null and !hook.quant.prompt and
+            block + 1 != hook.linear_index.len and hook.quant.countableAfter(weight.out, rows)) hook.quant.gu_words else null;
+        if (hook.accepted_chain) {
+            try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside);
+        } else if (try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded, count)) |waited| {
+            frame.mixer_wait = waited;
+        }
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
