@@ -712,6 +712,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
+// After the last tile's tensor op reads an activation half, that half's operand loads the next group's half (a launch's
+// last group reloads its own, which nothing reads): the load runs under the rest of the group instead of before the
+// next group's first op, in the same registers.
+#define TF_X_NEXT(t, xl, off) if ((t) + 1 == TN) { \
+      xl.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xn + (off), dextents<int32_t, 2>(32, M), xstr)); }
 #define TF_STREAM_PF 0
 #if TF_STREAM_PF
 #define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
@@ -735,6 +740,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
       TF_STREAM_EARLY(t) \
       opm.run(xl0,cbl,P); \
+      TF_X_NEXT(t, xl0, 0) \
       TF_UNROLL \
       for(int w=0;w<4;w++){ \
         const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
@@ -745,6 +751,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
       TF_STREAM_LATE(t) \
       opa.run(xl1,cbl,P); \
+      TF_X_NEXT(t, xl1, 32) \
       TF_UNROLL \
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
@@ -829,11 +836,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // halves' registers in order (left: elements 0-15 then 16-31; right: 0-31 then 32-63)
   constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
   constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  constexpr auto d64 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
-  matmul2d<d64, execution_simdgroup> op64;
-  auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
@@ -862,13 +866,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+  // each K = 32 half of a group's 16x64 activation slice loads straight into the operand its tensor op reads
+#if TF_STREAM_RIGHT
+  if (first < last) {
+    xl0.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(32, M), xstr));
+    xl1.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv + 32, dextents<int32_t, 2>(32, M), xstr));
+  }
+#endif
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+#if TF_STREAM_RIGHT
+    const device bfloat* xn = xv + (g + 1 < last ? GS : 0); // the next group's slice (the last group's own)
+#else
+    xl0.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(32, M), xstr));
+    xl1.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv + 32, dextents<int32_t, 2>(32, M), xstr));
+#endif
     xv += GS;
-    TF_UNROLL
-    for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
