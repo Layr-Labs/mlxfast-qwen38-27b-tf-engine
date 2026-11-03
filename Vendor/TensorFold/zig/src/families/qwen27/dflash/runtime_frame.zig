@@ -167,7 +167,12 @@ pub const Frame = struct {
     pub fn checkUnchecked(f: *Frame) !void {
         var bad = false;
         for (f.unchecked[0..f.n_unchecked]) |cb| {
-            cb.wait();
+            // the queue reached them before the command the frame's poll waited for: a completed buffer needs its
+            // failure check alone, a blocking wait only one that has not reported yet
+            switch (cb.status()) {
+                .completed, .@"error" => {},
+                else => cb.wait(),
+            }
             bad = failed(cb) or bad;
             cb.release();
         }

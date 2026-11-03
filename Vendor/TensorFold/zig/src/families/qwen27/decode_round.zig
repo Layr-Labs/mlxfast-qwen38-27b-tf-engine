@@ -36,6 +36,16 @@ pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
     return true;
 }
 
+/// Spins on `cb` until the GPU reports it complete rather than sleeping until its completion handler wakes this thread
+/// (the pattern `resetSlot` and the polled passes already take): the host reaches its next encode tens of microseconds
+/// sooner, and a completed or failed buffer reads exactly as it does after `wait`.
+fn pollCompletion(cb: mtl.CommandBuffer) void {
+    while (true) switch (cb.status()) {
+        .completed, .@"error" => return,
+        else => std.atomic.spinLoopHint(),
+    };
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -661,7 +671,7 @@ pub const Runner = struct {
     pub fn settleSlot(r: *Runner, slot: u32) void {
         const cb = r.reading[slot] orelse return;
         r.reading[slot] = null;
-        cb.wait();
+        pollCompletion(cb);
         cb.release();
     }
 
@@ -705,7 +715,7 @@ pub const Runner = struct {
         };
         e.end();
         cb.commit();
-        cb.wait();
+        pollCompletion(cb);
         if (gpuFailed(cb, "a deferred GDN replay")) {
             r.failed = true;
             return error.RoundGpuFailure;
