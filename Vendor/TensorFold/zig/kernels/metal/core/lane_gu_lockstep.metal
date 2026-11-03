@@ -8,12 +8,15 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
  const int gt=2*int(tg.x)+ks,ut=gt+TF_N/64,gn=gt*32,un=ut*32;
  const int nb=4*(lane&1)+8*((lane>>3)&1),mb=((lane>>1)&3)+4*((lane>>4)&1);
- constexpr auto desc=matmul2d_descriptor(16,32,64,false,true,false,matmul2d_descriptor::mode::multiply);
- matmul2d<desc,execution_simdgroup> op;
- tensor<device bfloat,dextents<int32_t,2>,tensor_inline> a((device bfloat*)X,dextents<int32_t,2>(TF_K,M));
- auto a0=a.slice(0,0);auto cb=op.template get_right_input_cooperative_tensor<bfloat,half,float>();
- auto P=op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>,metal::remove_addrspace_t<decltype(cb)>,float>();
- thread half2* b2=(thread half2*)&cb[0];
+ constexpr auto dm=matmul2d_descriptor(16,32,32,false,true,false,matmul2d_descriptor::mode::multiply);
+ constexpr auto da=matmul2d_descriptor(16,32,32,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+ matmul2d<dm,execution_simdgroup> opm;
+ matmul2d<da,execution_simdgroup> opa;
+ auto xl0=opm.template get_left_input_cooperative_tensor<bfloat,half,float>();
+ auto xl1=opa.template get_left_input_cooperative_tensor<bfloat,half,float>();
+ auto cbl=opm.template get_right_input_cooperative_tensor<bfloat,half,float>();
+ auto P=opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>,metal::remove_addrspace_t<decltype(cbl)>,float>();
+ thread half2* b2=(thread half2*)&cbl[0];
  const device uint4* gw=W+((size_t)(gt/TF_TB)*80*TF_TB+gt%TF_TB)*64+lane;
  const device uint4* uw=W+((size_t)(ut/TF_TB)*80*TF_TB+ut%TF_TB)*64+lane;
  const device uint* tab=(const device uint*)SB;
@@ -39,7 +42,6 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
   for(int g=first;g<last;g++){
    const float x0=XS[g*stride+mb];
    const array<int32_t,2> xstr={1,TF_K};
-   tensor<device bfloat,dextents<int32_t,2>,tensor_inline> x((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(64,M),xstr);
    #pragma clang loop unroll(full)
    for(int turn=0;turn<2;turn++){
 #if defined(TF_SBI12)
@@ -47,8 +49,10 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
 #else
     const uint4 q0=tf_look(tab,ni0),q1=tf_look(tab,ni1);
 #endif
-    for(int w=0;w<8;w++){
-     const uint word=w<4?nw0[w]:nw1[w-4];const int e=16*(w&1)+2*(w>>1);
+    const uint4 cw0=nw0,cw1=nw1;
+    #pragma clang loop unroll(full)
+    for(int w=0;w<8;w+=2){
+     const uint word=w<4?cw0[w]:cw1[w-4];const int e=2*(w>>1);
      b2[e]=as_type<half2>(word&0x000F000Fu);b2[e+1]=as_type<half2>((word>>4)&0x000F000Fu);
      b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
     }
@@ -68,7 +72,16 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
      ni0=gi[(size_t)next*(TF_N/4)];ni1=gi[(size_t)next*(TF_N/4)+4];
 #endif
     }
-    op.run(x,cb,P);
+    xl0.load(tensor<device bfloat,dextents<int32_t,2>,tensor_inline>((device bfloat*)X+(size_t)g*64,dextents<int32_t,2>(32,M),xstr));
+    opm.run(xl0,cbl,P);
+    #pragma clang loop unroll(full)
+    for(int w=1;w<8;w+=2){
+     const uint word=w<4?cw0[w]:cw1[w-4];const int e=2*(w>>1);
+     b2[e]=as_type<half2>(word&0x000F000Fu);b2[e+1]=as_type<half2>((word>>4)&0x000F000Fu);
+     b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
+    }
+    xl1.load(tensor<device bfloat,dextents<int32_t,2>,tensor_inline>((device bfloat*)X+(size_t)g*64+32,dextents<int32_t,2>(32,M),xstr));
+    opa.run(xl1,cbl,P);
     for(int j=0;j<4;j++){
      const vec<bfloat,2> v0=as_type<vec<bfloat,2>>(q0[j]),v1=as_type<vec<bfloat,2>>(q1[j]);
      const float s0=float(v0.x),b0=float(v0.y),s1=float(v1.x),b1=float(v1.y);
