@@ -834,13 +834,30 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+#if TF_PROMPT_TN == 2
+  // Prime the first activation group. After its two halves have been copied below, x64 is free to stage the
+  // next group while this group's two tiles unpack codes and run their tensor products. This changes loads
+  // only: xl0/xl1, the tensor operations, scale/bias FMAs and ordered split reduction remain unchanged.
+  if (first < last) {
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+    xv += GS;
+  }
+#endif
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
+#if TF_PROMPT_TN != 2
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
+#endif
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#if TF_PROMPT_TN == 2
+    if (g + 1 < last) {
+      x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+      xv += GS;
+    }
+#endif
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
