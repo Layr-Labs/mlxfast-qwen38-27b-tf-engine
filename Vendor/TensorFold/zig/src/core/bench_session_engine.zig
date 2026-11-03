@@ -252,7 +252,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
             try binding.ready();
-            try binding.resetNow(false);
+            try binding.resetNow();
             binding.depth = depth;
             try binding.generation.prefill(tokens, binding.chunk);
             const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = depth }, &.{}, false, null, 0);
@@ -285,7 +285,7 @@ pub fn GenerationBinding(comptime generation: type) type {
             const binding: *@This() = @ptrCast(@alignCast(ptr));
             if (binding.host) |host| host.lock();
             defer if (binding.host) |host| host.unlock();
-            try binding.resetNow(true);
+            try binding.resetNow();
         }
 
         /// The lane host idle, as EngineDflashBinding.ready requires, and its thread hook run.
@@ -297,11 +297,9 @@ pub fn GenerationBinding(comptime generation: type) type {
             if (h.on_thread) |start| try start.run(start.ctx);
         }
 
-        /// `clear`: the reset op's, whose slot clear each request keeps; the seed's reset right behind it, and the prompt
-        /// reset a lane host pass makes, then find the slot zeroed and skip theirs (Runner.zeroed).
-        fn resetNow(binding: *@This(), clear: bool) !void {
+        fn resetNow(binding: *@This()) !void {
             try binding.generation.settle();
-            if (clear) try binding.generation.runner.clear(0) else try binding.generation.runner.reset(0);
+            try binding.generation.runner.reset(0);
             try binding.generation.draft.reset();
             binding.depth = 0;
         }
@@ -361,11 +359,14 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        // Short sleeps (20 us between checks) instead of yield-spinning a core for the whole request (the CPU and GPU share
-        // one package's power)
+        // Short sleeps instead of yield-spinning a core for the whole request (the CPU and GPU share one package's power);
+        // TF_BENCH_WAIT=yield: the yield loop; TF_BENCH_WAIT_US: the sleep between checks in microseconds (15)
         const sys = @import("sys").c;
-        const req: sys.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
-        while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
+        if (!std.mem.eql(u8, std.mem.span(sys.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
+            const us: u32 = if (sys.getenv("TF_BENCH_WAIT_US")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15 else 15;
+            const req: sys.timespec = .{ .sec = 0, .nsec = @intCast(@as(u64, @min(us, 999_999)) * std.time.ns_per_us) };
+            while (!run.done.load(.acquire)) _ = sys.nanosleep(&req, null);
+        } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
     }
 };
