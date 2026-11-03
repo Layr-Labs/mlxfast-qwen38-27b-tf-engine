@@ -194,14 +194,16 @@ pub const Pool = struct {
     pub const After = struct { counter: metal.Buffer, wait: u32 };
 
     pub fn forward(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside) !void {
-        return pool.forwardAfter(layer, plan, refs, e, beside, null, null, false);
+        _ = try pool.forwardAfter(layer, plan, refs, e, beside, null, null, false, null);
     }
 
     /// `deferred`: a lone depth-one star verify's scan applies the first `rows` pending rows before node 0
     /// (tf_delta_gdn_star_pending) and, on `persist`, writes the state they leave back over the committed one.
     /// `uploaded`: the caller validated the plan (prepare) and uploads its metadata once before its pass's first
     /// commit; the layer's launches read that copy.
-    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred, uploaded: bool) !void {
+    /// `count` (the out projection's wait word): a star gate counts its live rows there instead of leaving a barrier, and
+    /// the returned count is that projection's wait; null, or a path with no star gate, returns null.
+    pub fn forwardAfter(pool: *Pool, layer: usize, plan: DevicePlan, refs: Refs, e: metal.ComputeEncoder, beside: ?gdn.Beside, after: ?After, deferred: ?abi.Deferred, uploaded: bool, count: ?metal.Buffer) !?u32 {
         if (!uploaded) try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         var prepared = try pool.round(layer, plan, refs, false);
         prepared.warm = refs.warm;
@@ -222,14 +224,16 @@ pub const Pool = struct {
         if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows_held, a.counter, a.wait, if (chained) pool.scan_words else null) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
+        var waited: ?u32 = null;
         if (prepared.star and prepared.usesSlots()) {
             if (pending) |q| {
-                try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, q, wait_prep);
-            } else try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, wait_prep);
+                waited = try prepared.forwardStar(scan.encoder, pool.kernels.star_pending, pool.kernels.post_rows, beside, pool.scan_words, q, wait_prep, count);
+            } else waited = try prepared.forwardStar(scan.encoder, pool.kernels.star_pair, pool.kernels.post_rows, beside, pool.scan_words, null, wait_prep, count);
         } else if (deferred != null) {
             return error.BadGdnPlan;
         } else try prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows, beside);
         try scan.end();
+        return waited;
     }
 
     /// Whether a verify of `plan` scans one depth-one star window (gdn.Round's `star` and usesSlots on one segment): the

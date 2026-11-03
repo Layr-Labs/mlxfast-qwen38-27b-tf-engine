@@ -247,7 +247,7 @@ pub const Layout = struct {
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
-        if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
+        if (l.wait and (!(l.count or l.gu_count) or !l.reg_lean or l.prompt_sr or (l.serial_sk2 and !l.gu_count))) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
         if (l.groups != null and l.output != .f32) return error.PartialOutputNeedsFloat;
@@ -594,7 +594,7 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (p.gu_count) return error.InvalidSchedule;
-        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
+        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null, null, 0);
     }
 
     /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
@@ -602,11 +602,22 @@ pub const Projection = struct {
     pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
         if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
         try checkRef(counter, 8, 4);
-        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
+        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter, null, 0);
         return @intCast(p.n / 128);
     }
 
-    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
+    /// encodeSwigluCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the
+    /// arrivals this launch leaves zero) reaches `wait_for`: the norm that wrote `x` and `sums` shares this launch's
+    /// barrier interval (Layout.wait, with Layout.gu_count).
+    pub fn encodeSwigluCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !u32 {
+        if (!p.gu_count or !p.rows8 or !p.wait or wait_for == 0) return error.InvalidSchedule;
+        try checkRef(counter, 8, 4);
+        try checkRef(waited, 8, 4);
+        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter, waited, wait_for);
+        return @intCast(p.n / 128);
+    }
+
+    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref, waited: ?Ref, wait_for: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
@@ -626,6 +637,10 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
+        if (waited) |wd| { // TF_WAIT: the norm's count and this launch's arrivals
+            e.setBuffer(wd.buf, wd.off, 8);
+            e.setValue(wait_for, 9);
+        }
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
