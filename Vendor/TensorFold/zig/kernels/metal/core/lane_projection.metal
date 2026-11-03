@@ -599,16 +599,6 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 16 * 32];
-#if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
-#endif
-#if TF_TGPAD > 0
-  // the two-tile prompt launches' threadgroup-memory cap (TF_TGPAD) for the one-tile ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
-  if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
-#endif
-#endif
   if (TF_SK > 1) {
     if (ks > 0) for (int i = 0; i < 16; i++) part[((ks - 1) * 16 + i) * 32 + lane] = C[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -669,6 +659,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     device TF_OUT* yr = Y + (size_t)mb * TF_YS + TF_YCOL(tg.x, n0) + nb;
     for (int i = 0; i < 16; i++) if (TF_LIVE(i)) yr[16 * (i >> 3) + (i & 3)] = static_cast<TF_OUT>(C[i]);
   }
+#elif defined(TF_PROMPT_SR)
+  // prompt rows, one tile: a lane's 16 words are four quads of adjacent columns, as in the multi-tile prompt epilogue:
+  // words 4q .. 4q + 3 are row mb + 8 (q & 1), columns n0 + nb + 16 (q >> 1) on. With TF_N and TF_YS multiples of 4, a
+  // quad is in or out of the row whole and its first word's address is aligned for the vector, so each quad moves as one
+  // vector: the same words at the same addresses.
+  static_assert(TF_N % 4 == 0 && TF_YS % 4 == 0, "a lane's quads are whole and aligned");
+  if (ks == 0)
+    for (int q = 0; q < 4; q++) {
+      const int m = mb + 8 * (q & 1), n = n0 + nb + 16 * (q >> 1);
+      if (m < M && n < TF_N) {
+        vec<TF_OUT, 4> y;
+        for (int j = 0; j < 4; j++) y[j] = static_cast<TF_OUT>(C[4 * q + j]);
+        *(device vec<TF_OUT, 4>*)(Y + (size_t)m * TF_YS + n) = y;
+      }
+    }
 #else
   if (ks == 0)
     for (int i = 0; i < 16; i++) {
