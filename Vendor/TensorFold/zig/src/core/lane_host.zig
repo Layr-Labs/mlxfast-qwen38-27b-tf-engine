@@ -522,6 +522,9 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         defer scoring.close(h);
+        // the engine thread encodes and waits between the GPU's command buffers: at the user-interactive QoS each wake
+        // runs on a performance core at once (as the tensor-parallel send threads do)
+        if (comptime @import("builtin").os.tag == .macos) _ = @import("sys").c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0);
         if (!@import("lane_thread.zig").start(h)) return;
         // a family planner: prompt pieces and decode rows in one pass; else whole or `prefill_step` chunked prompts
         if (h.rounds) |rd| return rounds.run(h, rd);
