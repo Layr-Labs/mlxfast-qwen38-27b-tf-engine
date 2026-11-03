@@ -17,6 +17,23 @@ pub const Lane = struct {
     enc: mtl.ComputeEncoder,
     fence: Fence, // orders the segment's encoders: buffers are untracked, so encoders could overlap
     queue: mtl.Queue = undefined, // the segment's queue: its later command buffers come from it
+    /// The current mixer's optional successor release. Families may publish once shared writes are complete, before
+    /// their segment-private work. The default driver still releases after the complete mixer.
+    publish_event: ?mtl.Event = null,
+    publish_value: u64 = 0,
+    publish_mode: mtl.DispatchType = .serial,
+    published: bool = false,
+
+    pub fn publish(l: *Lane) void {
+        const ev = l.publish_event orelse return;
+        l.fence.update(l.enc);
+        l.enc.end();
+        l.cb.signalEvent(ev, l.publish_value);
+        l.enc = l.cb.compute(l.publish_mode);
+        l.fence.wait(l.enc);
+        l.publish_event = null;
+        l.published = true;
+    }
 };
 
 pub const rows = stagger.rows;
@@ -210,13 +227,19 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             try x.fam.handoff(&x.lanes[k], i);
         }
         pub fn signal(x: *const @This(), k: usize, i: usize) !void {
-            x.sync(&x.lanes[k], x.evs[k], i + 1, false);
+            // An opted-in mixer may already have released its successor after its last shared write.
+            if (!x.lanes[k].published) x.sync(&x.lanes[k], x.evs[k], i + 1, false);
         }
         pub fn pre(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.pre(&x.lanes[k], i);
         }
         pub fn mixer(x: *const @This(), k: usize, i: usize) !void {
-            try x.fam.mixer(&x.lanes[k], i);
+            const l = &x.lanes[k];
+            l.publish_event = if (k + 1 < x.lanes.len) x.evs[k] else null;
+            l.publish_value = i + 1;
+            l.publish_mode = x.mode;
+            l.published = false;
+            try x.fam.mixer(l, i);
             // `first` 0: the first commit follows the first layer's mixer (its MLP is encoded while the GPU runs it)
             if ((x.early or x.first == 0) and i == 0 and i + 1 < x.layers) try x.commitLane(k);
         }

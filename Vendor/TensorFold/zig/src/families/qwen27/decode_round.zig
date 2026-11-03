@@ -847,9 +847,11 @@ pub const Runner = struct {
         bindings: []attn.Binding,
         scratch_due: *bool,
         terminal_head: forward.Head,
+        publish_lane: ?*@import("core").segments.Lane = null,
     };
 
-    fn attentionPass(r: *Runner, pass: AttentionPass, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+    fn attentionPass(r: *Runner, pass: AttentionPass, input_encoder: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        var e = input_encoder;
         const plan = pass.plan.*;
         if (pass.scratch_due.*) {
             try pass.scratch.upload(plan);
@@ -897,6 +899,14 @@ pub const Runner = struct {
         // a prompt plan's packed preprocess also stores the round's keys and values in their cache slots: no append follows
         const cached: ?attn.Decoded = if (prepacked) .{ .scratch = pass.scratch, .binding = &pass.bindings[layer], .plan = &plan, .caches = caches, .value = value, .v_stride = 2 * kv } else null;
         try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = mixed, .key_stride = 2 * kv, .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = if (prepacked) pass.scratch.get(.qa) else f.get(.query), .packed_rows = if (prepacked) plan.tiles * 16 else 0, .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = pass.placed.h_end, .w_end = pass.placed.w_end, .plane = f.capacity, .geometry = r.geometry, .after = after, .decoded = decoded, .cached = cached });
+        // Only the aligned packed-cached preprocess writes K/V before encode. Its successor writes the disjoint suffix;
+        // this segment's remaining attention only reads below its own cache end (appended=true below skips append).
+        const cached_rows4 = prepacked and f.get(.q_gate).offset % 8 == 0 and mixed.offset % 8 == 0 and
+            pass.scratch.get(.qa).offset % 8 == 0 and f.get(.rotated_key).offset % 8 == 0;
+        if (cached_rows4) if (pass.publish_lane) |lane| {
+            lane.publish();
+            e = lane.enc;
+        };
         // Both prompt and decoded merges write post-gate group sums into `.sums`; forward.post consumes them.
         const out_sums = true;
         const xs = forward.sums(f, .sums, rows);
@@ -1010,7 +1020,7 @@ const Segment = struct {
     total: u32,
 
     fn mixer(s: *Segment) forward.Mixer {
-        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .tap = if (s.r.capture_taps) tapHook else null };
+        return .{ .ptr = s, .gdn = gdnHook, .attention = attentionHook, .attention_lane = attentionLane, .tap = if (s.r.capture_taps) tapHook else null };
     }
     fn gdnHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
@@ -1020,6 +1030,12 @@ const Segment = struct {
     fn attentionHook(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));
         return s.r.attentionPass(s.attention, e, block, weights, f, rows);
+    }
+    fn attentionLane(ptr: *anyopaque, lane: *@import("core").segments.Lane, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
+        const s: *Segment = @ptrCast(@alignCast(ptr));
+        var pass = s.attention;
+        pass.publish_lane = lane;
+        return s.r.attentionPass(pass, lane.enc, block, weights, f, rows);
     }
     fn tapHook(ptr: *anyopaque, e: mtl.ComputeEncoder, layer: usize, hidden: @import("projection.zig").Ref, rows: u32) !void {
         const s: *Segment = @ptrCast(@alignCast(ptr));

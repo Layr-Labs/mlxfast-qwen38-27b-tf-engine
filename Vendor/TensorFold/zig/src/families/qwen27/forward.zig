@@ -12,6 +12,8 @@ pub const Mixer = struct {
     ptr: *anyopaque,
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
+    /// Staggered attention may replace the encoder when it publishes immutable K/V to its successor.
+    attention_lane: ?*const fn (*anyopaque, *@import("core").segments.Lane, usize, wts.Attention, *Frame, u32) anyerror!void = null,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
 
@@ -108,7 +110,10 @@ pub const Stages = struct {
         const m = s.model;
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
-            .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
+            .attention => |a| if (s.hooks.attention_lane) |hook|
+                try hook(s.hooks.ptr, lane, index, a, s.rowsFrame(), s.rows)
+            else
+                try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
