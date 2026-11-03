@@ -407,7 +407,10 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        // the fused drafter gate/up (34816 x 5120) would get split()'s single slice, the fewest threadgroups per byte of any
+        // drafter projection; two 40-group K slices cut the drafter frame ~40 us (drafter-only sums; the target is untouched)
+        const slices: u32 = if (n == 34816 and k == 5120) 2 else try @import("../projection.zig").split(n, k);
+        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, slices, order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
