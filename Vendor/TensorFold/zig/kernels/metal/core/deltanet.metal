@@ -961,6 +961,8 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          constant uint& sums_stride [[buffer(6)]],
                          device atomic_uint* NC [[buffer(7)]],
                          constant uint& wait_for [[buffer(8)]],
+                         device atomic_uint* TC [[buffer(9)]],
+                         constant uint& count_out [[buffer(10)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint3 groups [[threadgroups_per_grid]],
                          uint t [[thread_index_in_threadgroup]],
@@ -1012,6 +1014,13 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
       float acc = 0.0f;
       for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
       sums[g * int(sums_stride) + int(row)] = acc;
+    }
+  }
+  if (count_out != 0u) {
+    simdgroup_barrier(mem_flags::mem_device);
+    if (lane == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
     }
   }
 }
