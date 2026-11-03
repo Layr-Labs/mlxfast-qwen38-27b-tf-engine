@@ -712,17 +712,25 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
+#if defined(TF_SWIGLU)
+// A SIMD group owns a matching gate/up tile, separated by half the output width in the batch-major codes.
+#define TF_STREAM_CODE_STEP(t) ((t) + 1 < TN ? (TF_N / 64) * KG * 64 : (g + 1 < last ? TF_TB * 64 - (TF_N / 64) * KG * 64 : 0))
+#define TF_STREAM_META_STEP(t) (TF_N / 8)
+#else
+#define TF_STREAM_CODE_STEP(t) ((t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0))
+#define TF_STREAM_META_STEP(t) ((t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4)
+#endif
 #define TF_STREAM_PF 0
 #if TF_STREAM_PF
-#define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#define TF_STREAM_EARLY(t) {       cp += TF_STREAM_CODE_STEP(t);       nw0 = cp[0]; nw1 = cp[32]; }
 #define TF_STREAM_LATE(t)
 #else
 #define TF_STREAM_EARLY(t)
-#define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#define TF_STREAM_LATE(t) {       cp += TF_STREAM_CODE_STEP(t);       nw0 = cp[0]; nw1 = cp[32]; }
 #endif
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
-      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      sp += TF_STREAM_META_STEP(t); \
       const uint4 cur0=nw0,cur1=nw1; \
       thread half2* b2=(thread half2*)&cbl[0]; \
       TF_UNROLL \
@@ -814,7 +822,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SWIGLU)
   Y += (size_t)r0 * (TF_N / 2); // SwiGLU rows are half the fused width
   HS += r0;
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks;
 #else
   Y += (size_t)r0 * TF_YS;
 #if defined(TF_RESID)
@@ -877,30 +885,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
   }
 #if defined(TF_SWIGLU)
-  // tf_lane_reg's fused prompt epilogue, with tile t of SIMD group ks as its tile 2 * ks + t: each tile's words round to
-  // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
-  // group's sum adds its values in order from zero.
-  threadgroup bfloat gu16[4 * 16 * 32];
+  // Each SIMD group owns matching gate/up fragments. BF16-round each operand at the original store point, then apply
+  // the unchanged SwiGLU expression directly in registers. Only activated values cross a threadgroup barrier, for the
+  // same ascending 64-column FP32 sum from +0. This removes the gu16 exchange and its barrier without reassociation.
   threadgroup float hb16[16 * 64];
   TF_UNROLL
-  for (int t = 0; t < TN; t++) {
-    TF_UNROLL
-    for (int i = 0; i < 16; i++) {
-      const int m = mb + 8 * ((i >> 2) & 1);
-      gu16[((2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
+  for (int i = 0; i < 16; i++) {
+    const int m = mb + 8 * ((i >> 2) & 1), c = ks * 32 + nb + 16 * (i >> 3) + (i & 3);
+    if (m < M) {
+      const float gf = float(static_cast<bfloat>(C[0][i]));
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(static_cast<bfloat>(C[1][i])));
+      Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+      hb16[m * 64 + c] = float(h);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t16 = ks * 32 + lane;
-  for (int at = t16; at < 16 * 64; at += 64) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
     for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
