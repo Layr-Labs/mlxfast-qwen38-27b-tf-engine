@@ -712,13 +712,49 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
+#define TF_STREAM_LATE(t) { cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0); nw0 = cp[0]; nw1 = cp[32]; }
+#else
+#define TF_STREAM_LATE(t)
+#endif
+#if defined(TF_PROMPT_K64)
+#if !defined(TF_SWIGLU) || TF_PROMPT_TN != 2 || TF_SK != 1
+#error "prompt K64 is restricted to TN2, one-split fused gate/up"
+#endif
+#define TF_TN_TILE(t) { \
+      const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      const uint4 cur0=nw0,cur1=nw1; \
+      thread half2* b2=(thread half2*)&cb64[0]; \
+      TF_UNROLL \
+      for(int w=0;w<8;w++){ \
+        const uint word=w<4?cur0[w]:cur1[w-4]; const int e=16*(w&1)+2*(w>>1); \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      TF_STREAM_LATE(t) \
+      tensor<device bfloat,dextents<int32_t,2>,tensor_inline> a((device bfloat*)(xv-GS),dextents<int32_t,2>(GS,M),xstr); \
+      auto P64 = op64.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>,metal::remove_addrspace_t<decltype(cb64)>,float>(); \
+      op64.run(a,cb64,P64); \
+      TF_UNROLL \
+      for (int j = 0; j < 4; j++) { \
+        const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
+        const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+        C[t][j] = fma(s0, P64[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, P64[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, P64[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, P64[12 + j], fma(b1, x1, C[t][12 + j])); \
+      } \
+}
+#elif TF_STREAM_RIGHT
 #define TF_STREAM_PF 0
 #if TF_STREAM_PF
 #define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
+#undef TF_STREAM_LATE
 #define TF_STREAM_LATE(t)
 #else
 #define TF_STREAM_EARLY(t)
-#define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
 #endif
 #define TF_TN_TILE(t) { \
       const uint4 q0 = sp[0], q1 = sp[4]; \
@@ -827,22 +863,32 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   // each 64-deep group as two 32-deep products into the same sums: a K=64 operand's registers are its two K=32
   // halves' registers in order (left: elements 0-15 then 16-31; right: 0-31 then 32-63)
+#if !defined(TF_PROMPT_K64)
   constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
   constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+#endif
   constexpr auto d64 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+#if !defined(TF_PROMPT_K64)
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
+#endif
   matmul2d<d64, execution_simdgroup> op64;
+#if !defined(TF_PROMPT_K64)
   auto x64 = op64.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl0 = opm.template get_left_input_cooperative_tensor<bfloat, half, float>();
   auto xl1 = opa.template get_left_input_cooperative_tensor<bfloat, half, float>();
 #define TF_TN_RIGHT opm.template get_right_input_cooperative_tensor<bfloat, half, float>()
 #define TF_TN_DEST opm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(xl0)>, metal::remove_addrspace_t<decltype(cbl)>, float>()
+#endif
+#if defined(TF_PROMPT_K64)
+  auto cb64 = op64.template get_right_input_cooperative_tensor<bfloat,half,float>();
+#else
   auto cbl = TF_TN_RIGHT;
 #if !TF_STREAM_RIGHT
   auto cbh = TF_TN_RIGHT;
 #endif
   auto P = TF_TN_DEST;
+#endif
   const half2 bias = half2(1024.0h);
 #if defined(TF_SWIGLU)
   const int first = TF_G0, last = TF_G0 + TF_GN; // one K split: the threadgroup's SIMD groups are the gate and up pairs
@@ -865,10 +911,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
+#if !defined(TF_PROMPT_K64)
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)(xv - GS), dextents<int32_t, 2>(GS, M), xstr));
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#endif
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4

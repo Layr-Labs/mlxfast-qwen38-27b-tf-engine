@@ -79,6 +79,7 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
+    prompt_k64: bool = false,
     /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
     /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
     serial: bool = false,
@@ -93,6 +94,31 @@ const Key = struct {
         return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0 and !key.parallel_sk2;
     }
 };
+
+/// Development kill switch: set TF_Q27_PROMPT_GU_K64=0 to retain the paired-K32 prompt kernel.
+/// Default-on is safe only for the exact validated target schedule below; device tensor-unit gating remains in lane.init.
+fn promptGuK64ShapeEnabled(p: projection.Linear) bool {
+    if (p.n != 34816 or p.k != 5120 or p.bits != 4 or p.group != 64 or (projection.promptSplit(p.n, p.k) orelse p.slices) != 1 or p.runs.len != 0 or p.raw != null or p.tile != 32) return false;
+    if (p.batch == 0 or p.batch % 2 != 0 or (p.n / 64) % p.batch != 0) return false;
+    return true;
+}
+
+fn promptGuK64Enabled(p: projection.Linear) bool {
+    if (!promptGuK64ShapeEnabled(p)) return false;
+    if (std.c.getenv("TF_Q27_PROMPT_GU_K64")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
+    return true;
+}
+
+test "prompt K64 selector follows prompt split when stored projection has decode split" {
+    const target = projection.Linear{ .words = undefined, .pairs = undefined, .n = 34816, .k = 5120, .tile = 32, .slices = 2, .bits = 4, .group = 64, .batch = 8 };
+    try std.testing.expectEqual(@as(u32, 2), target.slices);
+    try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(target.n, target.k));
+    try std.testing.expect(promptGuK64ShapeEnabled(target));
+
+    var excluded = target;
+    excluded.n = 10240;
+    try std.testing.expect(!promptGuK64ShapeEnabled(excluded));
+}
 
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
 /// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
@@ -311,6 +337,7 @@ pub const Kernels = struct {
             .prompt_sr = true,
             .batch = p.batch,
             .swiglu = true,
+            .prompt_k64 = promptGuK64Enabled(p),
         };
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
@@ -329,6 +356,7 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
+                .prompt_k64 = key.prompt_k64,
                 // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
                 .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
             });
