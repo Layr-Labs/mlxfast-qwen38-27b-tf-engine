@@ -349,11 +349,19 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        r.model.kernels.beginB2Interval(@intCast(round.ids.len), @intCast(r.model.config.layers));
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
         };
+        if (r.model.kernels.b2PublicationTimedOut()) {
+            // The bounded GPU wait let a group finish without its norm dependency. Its writes may be present, so this
+            // runner is permanently unusable; never expose tokens or permit a retry on this state.
+            r.failed = true;
+            r.active = null;
+            return error.B2PublishTimeout;
+        }
         if (r.model.ane) |share| share.drain() catch |err| {
             r.failed = true;
             return err;

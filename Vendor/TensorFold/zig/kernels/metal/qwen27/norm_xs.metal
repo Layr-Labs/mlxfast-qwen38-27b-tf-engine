@@ -14,6 +14,10 @@ typedef half float16_t;
   device float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
+#ifdef Q27_NORM_PUBLISH
+  device atomic_uint* NP [[buffer(10)]],
+  constant uint& npublish [[buffer(11)]],
+#endif
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -27,10 +31,12 @@ Q27_SPECIALIZE
   constexpr int TPG = K / E;
   threadgroup float red[TPG / 32];
   // the grid covers the real rows: row 0's threadgroup zeroes every padded row's group sums, as mlp_xs does
+  #ifndef Q27_NORM_LATE_H
   if (int(m) == 0) {
     const int pad = MP - M;
     if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
   }
+  #endif
   if (int(m) >= M) return;
   const int base = int(m) * K + int(t) * E;
   // Every load before the first store, in 16-byte words (Kernels.norm binds 16-byte aligned rows and weights; a thread's
@@ -39,11 +45,13 @@ Q27_SPECIALIZE
   // H (the residual stream, stored behind the barrier that opened this interval) and the weights come from nothing in
   // this barrier interval, so their words are requested before the wait below; only R's follow it.
   bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
+#ifndef Q27_NORM_LATE_H
   for (int j = 0; j < E / 8; j++) {
     const uint4 hw = ((const device uint4*)(H + base))[j];
     h4[2 * j] = as_type<bfloat4>(hw.xy);
     h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
   }
+  #endif
   for (int j = 0; j < E / 8; j++) {
     const uint4 ww = ((const device uint4*)(Wt + int(t) * E))[j];
     w4[2 * j] = as_type<bfloat4>(ww.xy);
@@ -65,6 +73,18 @@ Q27_SPECIALIZE
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  #ifdef Q27_NORM_LATE_H
+  // This B2 continuation consumes H and padded group sums only after the producer's counted stores are visible.
+  if (int(m) == 0) {
+    const int pad = MP - M;
+    if (pad > 0) for (int p = int(t); p < (K / 64) * pad; p += TPG) XS[(p / pad) * MP + M + (p % pad)] = 0.0f;
+  }
+  for (int j = 0; j < E / 8; j++) {
+    const uint4 hw = ((const device uint4*)(H + base))[j];
+    h4[2 * j] = as_type<bfloat4>(hw.xy);
+    h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
+  }
+  #endif
   for (int j = 0; j < E / 8; j++) {
     const uint4 rw = ((const device uint4*)(R + base))[j];
     r4[2 * j] = as_type<bfloat4>(rw.xy);
@@ -101,5 +121,14 @@ Q27_SPECIALIZE
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+#ifdef Q27_NORM_PUBLISH
+  if (npublish != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(NP, 1u, memory_order_relaxed);
+    }
+  }
+#endif
 
 }
