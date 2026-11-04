@@ -625,20 +625,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     gu16[(ks * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int t16 = ks * 32 + lane;
-  for (int at = t16; at < 16 * 64; at += 128) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+  // A whole activation row and its ordered 64-term sum belong to one SIMD
+  // group. The gu16 exchange above remains threadgroup-wide (gate/up owners
+  // differ); hb16 publication below only crosses lanes of this row's owner.
+  for (int m = ks; m < M; m += 4) {
+    for (int c = lane; c < 64; c += 32) {
+      const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+      Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+      hb16[m * 64 + c] = float(h);
+    }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < M) {
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (int m = 4 * lane + ks; m < M; m += 128) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
-    HS[int(tg.x) * stride + t16] = acc;
+    for (int i = 0; i < 64; i++) acc += hb16[m * 64 + i];
+    HS[int(tg.x) * stride + m] = acc;
   }
 #elif defined(TF_SWIGLU)
   threadgroup bfloat hb[8 * 64];
@@ -891,20 +893,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int t16 = ks * 32 + lane;
-  for (int at = t16; at < 16 * 64; at += 64) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+  // A whole activation row and its ordered 64-term sum belong to one SIMD
+  // group. The gu16 exchange above remains threadgroup-wide (gate/up owners
+  // differ); hb16 publication below only crosses lanes of this row's owner.
+  for (int m = ks; m < M; m += 2) {
+    for (int c = lane; c < 64; c += 32) {
+      const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+      Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+      hb16[m * 64 + c] = float(h);
+    }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < M) {
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (int m = 2 * lane + ks; m < M; m += 64) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
-    HS[int(tg.x) * stride + t16] = acc;
+    for (int i = 0; i < 64; i++) acc += hb16[m * 64 + i];
+    HS[int(tg.x) * stride + m] = acc;
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
