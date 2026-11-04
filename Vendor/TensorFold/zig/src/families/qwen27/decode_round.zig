@@ -6,6 +6,10 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 24 layers are on the GPU the host encodes the other 40 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 24;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -349,6 +353,7 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
@@ -1089,3 +1094,5 @@ fn fingerprint(round: *const Round) [32]u8 {
     hash.final(&out);
     return out;
 }
+// Commit cadence, in one place: a verify commits after its first layer's mixer, after that layer's MLP and every
+// commit_every layers; a staggered prompt segment after its first mixer, its first three layers and every commit_every. (1)
