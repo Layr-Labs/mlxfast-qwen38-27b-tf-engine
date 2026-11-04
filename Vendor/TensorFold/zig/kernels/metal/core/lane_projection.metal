@@ -15,6 +15,11 @@ using namespace mpp::tensor_ops;
 #ifndef TF_YS
 #define TF_YS TF_N
 #endif
+#if defined(TF_PROMPT_TN)
+#define TF_LANE_TILE_COUNT (TF_N / 32 / TF_PROMPT_TN)
+#else
+#define TF_LANE_TILE_COUNT (TF_N / 32)
+#endif
 // Output rows lie TF_YS elements apart, so a member of a fused stack writes its columns of the fused rows.
 #define TF_ODD_WORDS (TF_GROUP * TF_BITS / 32 % 2)
 
@@ -806,9 +811,40 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_RESID)
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]],
+#if defined(TF_MORTON_PROMPT)
+    uint2 tgs [[threadgroups_per_grid]],
+#endif
+    uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
-  const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+  uint tile_group = tg.x, block_id = tg.y;
+#if defined(TF_MORTON_PROMPT)
+  if (tgs.y == 1u) {
+    const uint linear = tg.x, blocks = (uint(mdims[0]) + 15u) / 16u;
+    if (blocks == 8u) {
+      const uint panel = linear >> 6u, code = linear & 63u;
+      const uint local_x = ((code >> 1u) & 1u) | (((code >> 3u) & 1u) << 1u) | (((code >> 5u) & 1u) << 2u);
+      const uint local_y = (code & 1u) | (((code >> 2u) & 1u) << 1u) | (((code >> 4u) & 1u) << 2u);
+      tile_group = (panel << 3u) + local_x;
+      block_id = local_y;
+    } else if (blocks == 4u) {
+      const uint panel = linear >> 4u, code = linear & 15u;
+      const uint local_x = ((code >> 1u) & 1u) | (((code >> 3u) & 1u) << 1u);
+      const uint local_y = (code & 1u) | (((code >> 2u) & 1u) << 1u);
+      tile_group = (panel << 2u) + local_x;
+      block_id = local_y;
+    } else if (blocks == 2u) {
+      const uint panel = linear >> 2u, code = linear & 3u;
+      tile_group = (panel << 1u) + ((code >> 1u) & 1u);
+      block_id = code & 1u;
+    } else {
+      tile_group = linear;
+      block_id = 0u;
+    }
+    if (tile_group >= TF_LANE_TILE_COUNT) return;
+  }
+#endif
+  const int r0 = int(block_id) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
 #if defined(TF_SWIGLU)
@@ -821,7 +857,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   H += (size_t)r0 * TF_YS;
   RO += (size_t)r0 * TF_YS;
 #endif
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tile_group)); // a range's TN-aligned tiles
 #endif
   XS += r0;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);

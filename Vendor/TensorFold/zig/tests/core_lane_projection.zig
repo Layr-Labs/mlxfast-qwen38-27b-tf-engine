@@ -23,8 +23,8 @@ const Data = struct {
     scales: []u16,
     biases: []u16,
 
-    fn init(l: core.Layout) !Data {
-        const d = Data{ .x = try a.alloc(u16, rows_max * l.k), .codes = try a.alloc(u8, l.n * l.k), .words = try a.alloc(u32, l.sourceWords()), .scales = try a.alloc(u16, l.n * l.k / l.format.group), .biases = try a.alloc(u16, l.n * l.k / l.format.group) };
+    fn init(l: core.Layout, rows: usize) !Data {
+        const d = Data{ .x = try a.alloc(u16, rows * l.k), .codes = try a.alloc(u8, l.n * l.k), .words = try a.alloc(u32, l.sourceWords()), .scales = try a.alloc(u16, l.n * l.k / l.format.group), .biases = try a.alloc(u16, l.n * l.k / l.format.group) };
         @memset(d.words, 0);
         var prng: std.Random.DefaultPrng = .init(0x1a9e + @as(u64, l.format.bits) * 1000 + l.format.group);
         const rnd = prng.random();
@@ -115,7 +115,7 @@ fn check(device: mtl.Device, queue: mtl.Queue, l: core.Layout, counts: *Counts) 
         };
         return error.AcceptedInvalidRowCount;
     };
-    const d = try Data.init(l);
+    const d = try Data.init(l, rows_max);
     defer d.deinit();
     const x = try buffer(device, d.x.len * 2);
     defer x.deinit();
@@ -196,7 +196,7 @@ fn strided(device: mtl.Device, queue: mtl.Queue, l: core.Layout) !void {
     defer p.deinit();
     const q = try core.Projection.init(a, device, fused);
     defer q.deinit();
-    const d = try Data.init(l);
+    const d = try Data.init(l, rows_max);
     defer d.deinit();
     const x = try buffer(device, d.x.len * 2);
     defer x.deinit();
@@ -231,6 +231,60 @@ fn strided(device: mtl.Device, queue: mtl.Queue, l: core.Layout) !void {
     std.debug.print("PASS b{d}g{d} n{d} {s}: output rows {d} apart equal the unstrided rows, gaps untouched\n", .{
         l.format.bits, l.format.group, l.n, @tagName(l.output), fused.y_stride.?,
     });
+}
+
+/// 128 synthetic prompt rows: the ordinary TN2 grid and the Morton TN2 grid must be raw-byte identical.
+fn checkMortonTn2(device: mtl.Device, queue: mtl.Queue) !void {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const rows = 128;
+    const ordinary = core.Layout{
+        .n = 1024,
+        .k = 512,
+        .format = .{ .bits = 4, .group = 64 },
+        .reg = true,
+        .precompute_sums = true,
+        .prompt_sr = true,
+        .reg_lean = true,
+        .tile_batch = 2,
+        .prompt_tn = 2,
+    };
+    var morton = ordinary;
+    morton.morton_prompt = true;
+    try ordinary.validate();
+    try morton.validate();
+    const p = try core.Projection.init(a, device, ordinary);
+    defer p.deinit();
+    const q = try core.Projection.init(a, device, morton);
+    defer q.deinit();
+    const d = try Data.init(ordinary, rows);
+    defer d.deinit();
+    const x = try buffer(device, d.x.len * 2);
+    defer x.deinit();
+    const w = try buffer(device, ordinary.weightWords() * 4);
+    defer w.deinit();
+    const sb = try buffer(device, ordinary.metadataElements() * 2);
+    defer sb.deinit();
+    const bytes = rows * ordinary.n * 2;
+    const plain = try buffer(device, bytes);
+    defer plain.deinit();
+    const swizzled = try buffer(device, bytes);
+    defer swizzled.deinit();
+    @memcpy(x.contents()[guard..][0 .. d.x.len * 2], std.mem.sliceAsBytes(d.x));
+    const packed_w = @as([*]u32, @ptrCast(@alignCast(w.contents() + guard)))[0..ordinary.weightWords()];
+    const packed_sb = @as([*]u16, @ptrCast(@alignCast(sb.contents() + guard)))[0..ordinary.metadataElements()];
+    try core.pack(ordinary, d.words, d.scales, d.biases, packed_w, packed_sb);
+    const cb = queue.commandBuffer();
+    const enc = cb.compute(.serial);
+    try p.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(plain, 0), rows);
+    try q.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(swizzled, 0), rows);
+    enc.end();
+    try finish(cb);
+    const expected = plain.contents()[guard..][0..bytes];
+    const got = swizzled.contents()[guard..][0..bytes];
+    if (!std.mem.eql(u8, expected, got)) return error.MortonTn2OutputMismatch;
+    for ([_]mtl.Buffer{ x, w, sb, plain, swizzled }) |b| try checkGuard(b);
+    std.debug.print("PASS TN2 Morton vs ordinary: {d} rows, {d} bytes identical\n", .{ rows, bytes });
 }
 
 fn packBench(io: std.Io, l: core.Layout) !void {
@@ -274,7 +328,8 @@ pub fn main(init: std.process.Init) !void {
     });
     const simd_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--simd");
     const flashnext_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--flashnext");
-    if (argv.len != 1 and !simd_only and !flashnext_only) return error.UnknownArgument;
+    const morton_tn2_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--morton-tn2");
+    if (argv.len != 1 and !simd_only and !flashnext_only and !morton_tn2_only) return error.UnknownArgument;
     try frozen.verify();
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -296,8 +351,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("SKIP simdgroup layout: requires a device without tensor units\n", .{});
         return;
     }
+    if (morton_tn2_only and !device.tensorUnits()) {
+        std.debug.print("SKIP TN2 Morton bit-equality check: this device has no Tensor Units\n", .{});
+        return;
+    }
     const queue = try device.queue();
     defer queue.deinit();
+    if (morton_tn2_only) return checkMortonTn2(device, queue);
     std.debug.print("Small synthetic projection checks on {s}; no model files\n", .{device.name()});
     var counts: Counts = .{};
     if (!device.tensorUnits() or flashnext_only) {
