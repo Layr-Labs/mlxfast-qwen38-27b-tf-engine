@@ -13,6 +13,7 @@ pub const Mixer = struct {
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
+    gdn_held: ?*const fn (*anyopaque, usize, wts.Gdn, *Frame, u32) bool = null,
 };
 
 /// Serial decode and prompt segments own separate frames and order shared caches at the mixer.
@@ -93,10 +94,17 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
-        if (s.norm_wait != 0) {
+        const held = s.norm_wait != 0 and switch (layer.mixer) {
+            .linear => |g| if (s.hooks.gdn_held) |q| q(s.hooks.ptr, index, g, f, s.rows) else false,
+            .attention => false,
+        };
+        if (held) {
+            try m.kernels.normHeld(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
+        } else if (s.norm_wait != 0) {
             try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
         } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        e.barrier();
+        if (!held) e.barrier();
+        f.norm_held = held;
         s.norm_wait = 0;
         s.summed = false;
         if (s.pending != null) {

@@ -338,7 +338,7 @@ pub const Runner = struct {
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
         var clears = Clears{ .r = r, .slots = round.slots };
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .gdn_held = gdnHeld }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -817,6 +817,24 @@ pub const Runner = struct {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
+    }
+
+    fn gdnHeld(ptr: *anyopaque, block: usize, weight: wts.Gdn, frame: *Frame, rows: u32) bool {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        const enabled = normHeldEnabled(if (std.c.getenv("TF_NORM_HELD")) |v| std.mem.span(v) else null);
+        if (!enabled or r.current_gdn == null or r.accepted_chain or (r.capture_taps and block > 0 and std.mem.indexOfScalar(usize, &r.taps.ids, block - 1) != null)) return false;
+        return GdnHook.holds(&r.model.kernels, r.accepted_chain, weight, frame, rows);
+    }
+
+    fn normHeldEnabled(value: ?[]const u8) bool {
+        return if (value) |v| !std.mem.eql(u8, v, "0") else true;
+    }
+
+    test "norm held defaults on for ranked environment and has an explicit off switch" {
+        try std.testing.expect(normHeldEnabled(null));
+        try std.testing.expect(normHeldEnabled("1"));
+        try std.testing.expect(!normHeldEnabled("0"));
+        try std.testing.expect(normHeldEnabled(""));
     }
 
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {

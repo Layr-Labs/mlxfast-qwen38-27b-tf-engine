@@ -143,7 +143,7 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
-pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
+pub const Kind = enum { projection, xsum, norm, norm_held, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -167,6 +167,7 @@ pub const Kernels = struct {
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
     count_words: ?mtl.Buffer = null,
+    held_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
@@ -206,6 +207,7 @@ pub const Kernels = struct {
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
+        if (k.held_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
@@ -222,29 +224,39 @@ pub const Kernels = struct {
             .projection => unreachable,
             .xsum => sources.xsum,
             .norm => sources.norm_xs,
+            .norm_held => sources.norm_xs,
             .input_norm, .input_words => sources.norm_input,
             .mlp => sources.mlp_xs,
             .mlp_wide => sources.mlp_xs_wide,
             .ane_input, .mlp_ane, .add_ane => sources.mlp_ane,
         };
-        const mark = std.mem.indexOf(u8, template, "Q27_SPECIALIZE") orelse return error.BadKernelSource;
+        var headed: []const u8 = template;
+        var owned_headed: ?[:0]u8 = null;
+        defer if (owned_headed) |v| k.allocator.free(v);
+        if (std.mem.indexOf(u8, template, "Q27_NORM_HELD_HEADER") != null) {
+            const generated = try normHeldHeader(k.allocator, template, key.kind == .norm_held);
+            owned_headed = generated;
+            headed = generated;
+        } else if (key.kind == .norm_held) return error.BadKernelSource;
+        const mark = std.mem.indexOf(u8, headed, "Q27_SPECIALIZE") orelse return error.BadKernelSource;
         const definitions = switch (key.kind) {
             .projection => unreachable,
             .xsum => try std.fmt.allocPrint(k.allocator, "constexpr int K={d}, GS=64;", .{key.k}),
             .norm, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
+            .norm_held => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
             .input_words => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};\n#define Q27_NORM_WORDS 1", .{key.k}),
             .mlp, .mlp_wide => try std.fmt.allocPrint(k.allocator, "constexpr int N={d};", .{key.n}),
             .ane_input, .mlp_ane, .add_ane => try std.fmt.allocPrint(k.allocator, "constant constexpr int H={d}, N={d}, A={d};", .{ key.k, key.n, key.tile }),
         };
         defer k.allocator.free(definitions);
-        const source = try std.mem.concat(k.allocator, u8, &.{ template[0..mark], definitions, template[mark + "Q27_SPECIALIZE".len ..] });
+        const source = try std.mem.concat(k.allocator, u8, &.{ headed[0..mark], definitions, headed[mark + "Q27_SPECIALIZE".len ..] });
         defer k.allocator.free(source);
         const library = try mtl.Library.fromSource(k.device, source, mtl.CompileOptions.mlx());
         defer library.deinit();
         const name: [:0]const u8 = switch (key.kind) {
             .projection => unreachable,
             .xsum => "custom_kernel_q27_xsum_bfloat16_t_int32_t_float",
-            .norm => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
+            .norm, .norm_held => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
             .input_norm, .input_words => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
             .mlp => "custom_kernel_q27_mlp_xs_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .mlp_wide => "custom_kernel_q27_mlp_xs_wide_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
@@ -256,6 +268,24 @@ pub const Kernels = struct {
         errdefer p.deinit();
         try k.cache.put(k.allocator, key, p);
         return p;
+    }
+
+    fn normHeldHeader(a: std.mem.Allocator, template: []const u8, enabled: bool) ![:0]u8 {
+        const mark = std.mem.indexOf(u8, template, "Q27_NORM_HELD_HEADER") orelse return error.BadKernelSource;
+        const signature = std.mem.indexOf(u8, template, "[[kernel]]") orelse return error.BadKernelSource;
+        if (mark > signature) return error.BadKernelSource;
+        const header = if (enabled) "#define Q27_NORM_HELD 1\n" else "";
+        return std.mem.concatWithSentinel(a, u8, &.{ template[0..mark], header, template[mark + "Q27_NORM_HELD_HEADER".len ..] }, 0);
+    }
+
+    test "norm held macro precedes signature and rejects a misplaced marker" {
+        const a = std.testing.allocator;
+        const good = try normHeldHeader(a, "Q27_NORM_HELD_HEADER\n[[kernel]] void k(device atomic_uint* CO) {}", true);
+        defer a.free(good);
+        const define_at = std.mem.indexOf(u8, good, "#define Q27_NORM_HELD 1") orelse return error.MissingMacro;
+        const signature_at = std.mem.indexOf(u8, good, "[[kernel]]") orelse return error.MissingSignature;
+        try std.testing.expect(define_at < signature_at);
+        try std.testing.expectError(error.BadKernelSource, normHeldHeader(a, "[[kernel]] void k() {} Q27_NORM_HELD_HEADER", true));
     }
 
     pub fn quant(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32) !void {
@@ -704,6 +734,61 @@ pub const Kernels = struct {
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
+    }
+
+    /// Counted input norm for a GDN block whose qkv and zba projections wait on the two held-word pairs.
+    pub fn normHeld(k: *Kernels, e: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
+        const words = k.count_words orelse return error.BadCoreProjectionRows;
+        if (wait_for == 0 or rows == 0 or rows > 8 or k.profiler != null) return error.BadCoreProjectionRows;
+        try wordAligned(.{ h, residual, weight, combined, out });
+        e.setPipeline(try k.get(.{ .kind = .norm_held, .k = width }));
+        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+        e.setBuffer(words, 0, 8);
+        e.setValue(wait_for, 9);
+        e.setBuffer(try k.heldWords(), 0, 10);
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+    }
+
+    fn heldWords(k: *Kernels) !mtl.Buffer {
+        if (k.held_words) |b| return b;
+        const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        @memset(b.contents()[0..16], 0);
+        k.held_words = b;
+        return b;
+    }
+
+    /// True exactly when the paired decoded projection can encode the counted consumer layout for these rows.
+    pub fn holdable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.profiler == null and k.countedKey(p, rows, false) != null;
+    }
+
+    /// Counted projection that waits on one of normHeld's producer/arrival word pairs before reading norm rows and sums.
+    pub fn quantHeld(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, half: u1) !u32 {
+        if (!k.holdable(p, rows)) return error.BadCoreProjectionRows;
+        var key = k.countedKey(p, rows, false).?;
+        key.wait = true;
+        const held = try k.heldWords();
+        if (k.count_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.count_words = b;
+        }
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices,
+                .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch,
+                .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true,
+            });
+            k.joined(entry.value_ptr);
+        }
+        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+        try entry.value_ptr.encodeCountedAfter(e, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi),
+            .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride },
+            .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? },
+            .{ .buf = held, .off = @as(usize, half) * 8 }, rows);
+        return @intCast(entry.value_ptr.tile_count);
     }
 
     /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches

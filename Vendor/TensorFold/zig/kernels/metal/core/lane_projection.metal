@@ -479,6 +479,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
   // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
   // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  #if defined(TF_SERIAL_SK2)
+  if (split == 0) {
+  #endif
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
@@ -488,6 +491,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  #if defined(TF_SERIAL_SK2)
+  }
+  #endif
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)

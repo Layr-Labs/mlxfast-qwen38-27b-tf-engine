@@ -3,6 +3,7 @@
 using namespace metal;
 typedef bfloat bfloat16_t;
 typedef half float16_t;
+Q27_NORM_HELD_HEADER
 [[kernel]] void custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float(
   const device bfloat16_t* H [[buffer(0)]],
   const device bfloat16_t* R [[buffer(1)]],
@@ -14,6 +15,9 @@ typedef half float16_t;
   device float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
+#if defined(Q27_NORM_HELD)
+  device atomic_uint* CO [[buffer(10)]],
+#endif
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -101,5 +105,13 @@ Q27_SPECIALIZE
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+#if defined(Q27_NORM_HELD)
+  threadgroup_barrier(mem_flags::mem_device);
+  if (t == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    atomic_fetch_add_explicit(&CO[0], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&CO[2], 1u, memory_order_relaxed);
+  }
+#endif
 
 }
