@@ -882,6 +882,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
   threadgroup float hb16[16 * 64];
+  // fewer of these threadgroups a core: reserve 2048 more bytes of threadgroup memory beside gu16 and hb16; the use below
+  // never runs (rows are never negative)
+  threadgroup float gupad[512];
+  if (mdims[0] == -12345) { gupad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = gupad[lane ^ 1]; }
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
