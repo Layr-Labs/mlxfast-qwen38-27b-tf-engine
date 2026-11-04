@@ -82,11 +82,32 @@ pub const Session = struct {
 };
 
 /// BF16 head matches the Python row backend; ties choose the lowest token ID.
+/// The first index of the largest bf16 logit; any nonfinite value is an error. 32 words a step: a step's nonfinite test
+/// and its maximum in vector lanes, and only a step whose maximum beats the best so far is searched for that maximum's
+/// first index, so the pick is the one-word loop's (the first of equal values, -0 equal to +0).
 pub fn argmax(values: []const u16) !u32 {
     if (values.len == 0 or values.len > std.math.maxInt(u32)) return error.BadLogits;
+    const width = 32;
+    const W = @Vector(width, u16);
     var best: f32 = -std.math.inf(f32);
     var id: u32 = 0;
-    for (values, 0..) |bits, i| {
+    var first: usize = 0;
+    while (first + width <= values.len) : (first += width) {
+        const bits: W = values[first..][0..width].*;
+        // exponent bits all set: an infinity or a NaN
+        if (@reduce(.Or, bits & @as(W, @splat(0x7f80)) == @as(W, @splat(0x7f80)))) return error.NonfiniteLogits;
+        const step: @Vector(width, f32) = @bitCast(@as(@Vector(width, u32), bits) << @splat(16));
+        const top = @reduce(.Max, step);
+        if (top > best) {
+            best = top;
+            const words: [width]f32 = step;
+            for (words, first..) |v, i| if (v == top) {
+                id = @intCast(i);
+                break;
+            };
+        }
+    }
+    for (values[first..], first..) |bits, i| {
         const v: f32 = @bitCast(@as(u32, bits) << 16);
         if (!std.math.isFinite(v)) return error.NonfiniteLogits;
         if (v > best) {
@@ -95,6 +116,32 @@ pub fn argmax(values: []const u16) !u32 {
         }
     }
     return id;
+}
+
+test "argmax over 32-word steps picks what the one-word loop picks" {
+    var prng = std.Random.DefaultPrng.init(27);
+    const r = prng.random();
+    const pool = [_]u16{ 0x0000, 0x8000, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x0001, 0x8001, 0x7f7f, 0xff7f };
+    var buf: [700]u16 = undefined;
+    for (0..3000) |trial| {
+        const len = 1 + r.uintLessThan(usize, buf.len);
+        for (buf[0..len]) |*b| b.* = if (trial % 3 == 0) (r.int(u16) & 0x7f7f) | (r.int(u16) & 0x8000) else pool[r.uintLessThan(usize, pool.len)];
+        if (trial % 17 == 0) buf[r.uintLessThan(usize, len)] = ([_]u16{ 0x7f80, 0xff80, 0x7fc0 })[trial % 3];
+        var best: f32 = -std.math.inf(f32);
+        var want: ?u32 = 0;
+        for (buf[0..len], 0..) |bits, i| {
+            const v: f32 = @bitCast(@as(u32, bits) << 16);
+            if (!std.math.isFinite(v)) {
+                want = null;
+                break;
+            }
+            if (v > best) {
+                best = v;
+                want = @intCast(i);
+            }
+        }
+        if (want) |w| try std.testing.expectEqual(w, try argmax(buf[0..len])) else try std.testing.expectError(error.NonfiniteLogits, argmax(buf[0..len]));
+    }
 }
 
 test "greedy selection handles negative logits and chooses the first tie" {
