@@ -501,7 +501,7 @@ pub const Attention = struct {
         const parts = if (g.shared_prefix) [3]Field{ .poa, .pma, .pla } else [3]Field{ .pob, .pmb, .plb };
         if (!g.shared_prefix and @as(usize, chunks) * plan.tiles * 16 > @as(usize, scratch.tail_chunks) * scratch.limits.rows * 16) return error.AttentionLimits;
         const threads: u32 = if (a.units) 128 else prompt_threads;
-        const pairs = threads / 64; // simdgroup pairs, each halving the head dim of one 16-row tile
+        const pairs = threads / (if (a.units) @as(u32, 32) else 64); // M5: one full tile per SIMD group; fallback: paired halves
         // rows before plan.live_from have no reader: start at the tile group holding the first live packed row
         const live = if (a.units) @min(plan.live_from, plan.rows) else 0; // the M5 kernel and merge take the offsets
         // Preserve the original four-tile origin used by the ordered key-step limit.

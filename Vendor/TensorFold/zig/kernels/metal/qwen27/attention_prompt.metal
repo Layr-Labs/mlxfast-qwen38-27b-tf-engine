@@ -47,26 +47,23 @@ inline void q27_mma_o(thread q27f8& c0, thread q27f8& c1, q27h8 a, q27b8 b0, q27
   for (int i = 0; i < 8; i++) { c0[i] = cc[i]; c1[i] = cc[8 + i]; }
 }
 
-// Running state of one tile half: O over its 128 columns, and each row's max and sum (log2 domain).
-struct Q27PromptRun { q27f8 O[8]; float m0, m1, l0, l1; };
+// Running state of one full tile: O over its 256 columns, and each row's max and sum (log2 domain).
+struct Q27PromptRun { q27f8 O[16]; float m0, m1, l0, l1; };
 
 // One 32-key step at `kt`: S halves summed low first, masked by each row's key count, then softmax and O += PV.
 template <bool EDGE>
 inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const device bfloat* q, const device bfloat* k, const device bfloat* v,
-    threadgroup float (*xs)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
-  q27f8 s0 = 0.0f, s1 = 0.0f;
-  _Pragma("clang loop unroll_count(4)") // whole unrolling hoists every K load ahead of the products and runs slower
-  for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
+    ushort lane, short fm, short fn, int n0, int n1, float scale2) {
+  // A SIMD group owns a full tile. Accumulate the two independent 128-dimension
+  // score halves from positive zero, then add low+high exactly as the paired path.
+  q27f8 lo0 = 0.0f, lo1 = 0.0f, hi0 = 0.0f, hi1 = 0.0f;
+  _Pragma("clang loop unroll_count(4)")
+  for (int d = 0; d < 8; d++) q27_mma_s(lo0, lo1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
+  _Pragma("clang loop unroll_count(4)")
+  for (int d = 0; d < 8; d++) q27_mma_s(hi0, hi1, q27_frag<false>(q + PH + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + PH + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + PH + d * 16, PD, fm, fn, kt + 16, kend));
+  q27f8 s0, s1;
   _Pragma("clang loop unroll(full)")
-  for (int i = 0; i < 8; i++) { xs[sg][lane][i] = s0[i]; xs[sg][lane][8 + i] = s1[i]; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  _Pragma("clang loop unroll(full)")
-  for (int i = 0; i < 8; i++) {
-    const float o0 = xs[sg ^ 1][lane][i], o1 = xs[sg ^ 1][lane][8 + i];
-    s0[i] = h ? o0 + s0[i] : s0[i] + o0;
-    s1[i] = h ? o1 + s1[i] : s1[i] + o1;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < 8; i++) { s0[i] = lo0[i] + hi0[i]; s1[i] = lo1[i] + hi1[i]; }
   float x0 = -INFINITY, x1 = -INFINITY;
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 4; i++) {
@@ -98,25 +95,23 @@ inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const devi
   if (x0 != -INFINITY) { r.l0 = r.l0 * f0 + y0; r.m0 = nm0; }
   if (x1 != -INFINITY) { r.l1 = r.l1 * f1 + y1; r.m1 = nm1; }
   _Pragma("clang loop unroll(full)")
-  for (int j = 0; j < 8; j++) for (int i = 0; i < 4; i++) { r.O[j][i] *= f0; r.O[j][4 + i] *= f1; }
+  for (int j = 0; j < 16; j++) for (int i = 0; i < 4; i++) { r.O[j][i] *= f0; r.O[j][4 + i] *= f1; }
   _Pragma("clang loop unroll(full)")
-  for (int j = 0; j < 8; j += 2) {
+  for (int j = 0; j < 16; j += 2) {
     q27_mma_o(r.O[j], r.O[j + 1], p0, q27_frag<EDGE>(v + kt * PD + j * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(v + kt * PD + (j + 1) * 16, PD, fm, fn, kt, kend));
     q27_mma_o(r.O[j], r.O[j + 1], p1, q27_frag<EDGE>(v + (kt + 16) * PD + j * 16, PD, fm, fn, kt + 16, kend), q27_frag<EDGE>(v + (kt + 16) * PD + (j + 1) * 16, PD, fm, fn, kt + 16, kend));
   }
 }
 
-// One chunk's partial per packed row: a simdgroup pair halves the head dim; only the last step reads bounded.
+// One chunk's partial per packed row: one SIMD group owns the full head tile; only the last step reads bounded.
 template <int SG>
 kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]], constant Q27PromptArgs& args [[buffer(2)]],
     device float* PO [[buffer(3)]], device float* PM [[buffer(4)]], device float* PL [[buffer(5)]],
     uint3 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
   const short qid = lane >> 2, fm = (qid & 4) | ((lane >> 1) & 3), fn = ((qid & 2) | (lane & 1)) * 4;
-  const short h = sg & 1;
-  const int tile = args.tile0 + int(tg.z) * (SG / 2) + (sg >> 1);
+  const int tile = args.tile0 + int(tg.z) * SG + sg;
   const int hk = int(tg.x), c = int(tg.y);
   const bool live = tile * 16 < args.rp;
-  threadgroup float xs[SG][32][16];
 #ifndef TF_ATTN_TGPAD
 #define TF_ATTN_TGPAD 8192
 #endif
@@ -124,35 +119,35 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   // fewer of these threadgroups a core: reserve TF_ATTN_TGPAD more bytes of threadgroup memory; the use never runs (the
   // prompt's row count is never negative)
   threadgroup float tgpad[TF_ATTN_TGPAD / 4];
-  if (args.rows < -12345) { tgpad[lane] = float(lane); threadgroup_barrier(mem_flags::mem_threadgroup); xs[0][0][0] = tgpad[lane ^ 1]; }
+  if (args.rows < -12345) { tgpad[lane] = float(lane); threadgroup_barrier(mem_flags::mem_threadgroup); PO[0] = tgpad[lane ^ 1]; }
 #endif
   const int r0 = tile * 16 + fm, r1 = r0 + 8;
   const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
   const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
   const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.rows);
-  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * PH;
-  const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride + h * PH;
-  const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride + h * PH;
+  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD;
+  const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride;
+  const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride;
   Q27PromptRun r;
   _Pragma("clang loop unroll(full)")
-  for (int j = 0; j < 8; j++) r.O[j] = 0.0f;
+  for (int j = 0; j < 16; j++) r.O[j] = 0.0f;
   r.m0 = -INFINITY; r.m1 = -INFINITY; r.l0 = 0.0f; r.l1 = 0.0f;
-  // Keep the original four-tile key-step limit when a launch splits that group into two pairs.
+  // Keep the original four-tile key-step limit, now with four independent tiles per group.
   // Keys past its last live row are masked for every row; all FP32 update orders stay unchanged.
-  const int first_row = (args.tile0 + (int(tg.z) * (SG / 2) / 4) * 4) * 16, last_row = min(args.rows * PG, first_row + 4 * 16) - 1;
+  const int first_row = (args.tile0 + (int(tg.z) * SG / 4) * 4) * 16, last_row = min(args.rows * PG, first_row + 4 * 16) - 1;
   const int kstop = last_row >= first_row ? min(kend, args.start + last_row / PG + 1) : kbeg;
   int kt = kbeg;
-  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
-  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
+  for (; kt + PTK <= kend && kt < kstop; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, lane, fm, fn, n0, n1, args.scale2);
+  if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, lane, fm, fn, n0, n1, args.scale2);
   if (!live) return;
   const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
   _Pragma("clang loop unroll(full)")
-  for (int j = 0; j < 8; j++) {
-    device float* dst = PO + (base + fm) * PD + h * PH + j * 16 + fn;
+  for (int j = 0; j < 16; j++) {
+    device float* dst = PO + (base + fm) * PD + j * 16 + fn;
     *(device float4*)dst = float4(r.O[j][0], r.O[j][1], r.O[j][2], r.O[j][3]);
     *(device float4*)(dst + 8 * PD) = float4(r.O[j][4], r.O[j][5], r.O[j][6], r.O[j][7]);
   }
-  if (h == 0 && (lane & 9) == 0) {
+  if ((lane & 9) == 0) {
     PM[base + fm] = r.m0; PL[base + fm] = r.l0;
     PM[base + fm + 8] = r.m1; PL[base + fm + 8] = r.l1;
   }
