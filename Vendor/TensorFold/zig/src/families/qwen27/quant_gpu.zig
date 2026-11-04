@@ -859,7 +859,7 @@ pub const Kernels = struct {
     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
         if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or (p.batch != 4 and p.batch != 8) or p.index == null) return null;
         if (k.countedKey(down, rows, true) == null) return null;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
         if (!key.serialSk2()) return null;

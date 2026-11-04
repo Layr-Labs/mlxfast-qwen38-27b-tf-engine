@@ -322,7 +322,7 @@ pub const Layout = struct {
 fn lockstepGu(l:Layout)bool{
     return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
         l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
-        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
+        l.indexed and !l.prompt_sr and l.prompt_tn==1 and (l.tile_batch==8 or l.tile_batch==4) and
         l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
         l.ranges.len==0 and l.y_stride==null and !l.residual;
 }
@@ -791,6 +791,18 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "four-tile decoded gate-up keeps the counted lockstep kernel" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const layout = Layout{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .serial_sk2 = true, .rows8 = true, .reg_lean = true, .tile_batch = 4, .swiglu = true, .indexed = true, .precompute_sums = true, .gu_count = true };
+    const generated = try source(arena.allocator(), layout);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "#define TF_TB 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "kernel void tf_lane_lockstep") != null);
+    var sabotaged = layout;
+    sabotaged.tile_batch = 3;
+    try std.testing.expectError(error.InvalidSchedule, sabotaged.validate());
 }
 
 test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {
