@@ -142,6 +142,22 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
+
+test "MLP down parallel SK2 retains the counted producer and waiter layout" {
+    const kernels = Kernels{ .allocator = std.testing.allocator, .device = undefined };
+    const p = projection.Linear{ .words = undefined, .pairs = undefined, .n = 5120, .k = 17408, .tile = 32, .slices = 2 };
+    const producer = kernels.countedKey(p, 8, false).?;
+    const waiter = kernels.countedKey(p, 8, true).?;
+    try std.testing.expectEqual(@as(u32, 2), producer.slices);
+    try std.testing.expectEqual(@as(u32, 2), waiter.slices);
+    try std.testing.expect(!producer.serialSk2());
+    try std.testing.expect(!waiter.serialSk2());
+    try std.testing.expect(!producer.wait);
+    try std.testing.expect(waiter.count and waiter.wait);
+
+    const layout = lane.Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .reg = true, .rows8 = true, .reg_lean = true, .tile_batch = 8, .indexed = true, .count = true, .wait = true };
+    try layout.validate();
+}
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 

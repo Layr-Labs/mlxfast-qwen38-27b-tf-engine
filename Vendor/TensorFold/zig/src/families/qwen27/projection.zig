@@ -21,7 +21,7 @@ pub fn split(n: usize, k: usize) !u32 {
 
 /// K splits fastest on an M5 Ultra, each shape streamed over every layer's matrix (tf-qwen27-bench QWEN27_DISTINCT).
 fn m5Split(n: usize, k: usize) ?u32 {
-    const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 10240, .k = 5120, .sk = 2 }, .{ .n = 6240, .k = 5120, .sk = 4 }, .{ .n = 5120, .k = 6144, .sk = 4 }, .{ .n = 12288, .k = 5120, .sk = 2 }, .{ .n = 2048, .k = 5120, .sk = 8 }, .{ .n = 5120, .k = 17408, .sk = 4 } };
+    const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 10240, .k = 5120, .sk = 2 }, .{ .n = 6240, .k = 5120, .sk = 4 }, .{ .n = 5120, .k = 6144, .sk = 4 }, .{ .n = 12288, .k = 5120, .sk = 2 }, .{ .n = 2048, .k = 5120, .sk = 8 }, .{ .n = 5120, .k = 17408, .sk = 2 } };
     for (table) |t| if (t.n == n and t.k == k) return t.sk;
     return null;
 }
@@ -115,6 +115,13 @@ test "stacked gate-up keeps the member K split rather than recomputing it from s
     try std.testing.expectEqual(@as(u32, 8), try split(48, 5120));
     try std.testing.expectEqual(@as(u32, 8), try split(6144, 5120));
     try std.testing.expectEqual(@as(u32, 8), try split(5120, 17408));
+}
+
+test "M5 decode MLP down uses parallel SK2 without changing prompt split" {
+    try std.testing.expectEqual(@as(u32, 8), try split(5120, 17408));
+    try std.testing.expectEqual(@as(?u32, 2), m5Split(5120, 17408));
+    try std.testing.expectEqual(@as(?u32, 2), promptSplit(5120, 17408));
+    try std.testing.expectEqual(@as(?u32, 4), m5Split(5120, 6144));
 }
 
 fn prepareRows(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, n: usize, k: usize, tile: u32, slices: u32) !Linear {
