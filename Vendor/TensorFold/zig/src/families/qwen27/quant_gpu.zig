@@ -730,6 +730,13 @@ pub const Kernels = struct {
     }
 
     /// tf_q27_warm over the leading `code_bytes` of `words` and `meta_bytes` of `meta`, each cut at its buffer's end.
+    /// warm of the leading `code_bytes` of any read-only code buffer and `meta_bytes` of its metadata (a drafter projection's
+    /// prepared copy), with no barrier; warmBytes() 0 still turns it off.
+    pub fn warmRange(k: *Kernels, e: mtl.ComputeEncoder, words: Ref, code_bytes: usize, meta: Ref, meta_bytes: usize) !void {
+        if (k.warmBytes() == 0) return;
+        return k.warmLines(e, words, code_bytes, meta, meta_bytes);
+    }
+
     fn warmLines(k: *Kernels, e: mtl.ComputeEncoder, words: Ref, code_bytes: usize, meta: Ref, meta_bytes: usize) !void {
         const take = @min(code_bytes, words.buffer.length() -| words.offset);
         const meta_take = @min(meta_bytes, meta.buffer.length() -| meta.offset);

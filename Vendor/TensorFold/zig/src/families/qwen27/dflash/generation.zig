@@ -94,6 +94,17 @@ pub const Generation = struct {
         g.kept.deinit();
         g.taps.deinit();
     }
+    /// A read-only warm of the drafter's fusion projection (its prepared copy's codes and metadata, the first weights an
+    /// early frame streams), encoded last in a verify's tail. One the backend cannot name, or that fails to encode, only
+    /// loses its prefetch: it reads nothing the frame or the verify writes and stores nothing.
+    fn warmFrameHead(g: *Generation, e: mtl.ComputeEncoder) void {
+        const b = &g.draft.backend;
+        if (b.precise) return; // the frame then reads the q4 copy (readsQ4Copy)
+        const adapter = b.prepared.get(@intFromPtr(g.draft.graph.fusion.bytes.ptr)) orelse return;
+        const p = adapter.projection;
+        const meta = adapter.meta();
+        g.runner.model.kernels.warmRange(e, .{ .buffer = adapter.words }, p.weight_bytes, .{ .buffer = meta.buf, .offset = meta.off }, p.metadata_bytes) catch {};
+    }
     fn absorb(g: *Generation, path: []const u32) !void {
         try g.absorbRows(path);
         if (g.draft.committed_end != g.runner.offsets[0]) return error.BadDraftPosition;
@@ -171,6 +182,11 @@ pub const Generation = struct {
         g.draft.backend.precise = false;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
+        // the drafter's scratch, freed at the last phase close, is made again on a helper thread while the GPU runs this
+        // pass (Frame.refill): the catch-up frame behind it then waits on no allocation. Nothing here touches the frame.
+        const frame = &g.draft.backend.frame;
+        const refill: ?std.Thread = if (frame.refillDue()) std.Thread.spawn(.{}, @TypeOf(frame.*).refill, .{frame}) catch null else null;
+        defer if (refill) |t| t.join();
         var first: usize = 0;
         while (first < ids.len) {
             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
@@ -259,6 +275,10 @@ pub const Generation = struct {
             if (!p.sieve) try g.commit.head(e, result, .{ .buf = logits.buffer, .off = logits.offset }, .{ .rows = shape.rows, .width = width, .stride = width });
             p.shape = shape;
             g.picked.?.update(e);
+            // behind the picks' fence update, so neither the next round's frame (which waits on that fence) nor any barrier
+            // waits for it: the frame's first weights stream into the system cache over the tail's last level and the
+            // frame's lead, ahead of its fusion projection. Only the poll behind the buffer's end waits for it.
+            if (p.early) g.warmFrameHead(e);
         }
         /// The keep, encoded and committed behind the verify's last command buffer while the GPU still runs it,
         /// so its replay starts on the picks' fence instead of after the host wakes, reads and encodes. An early round
