@@ -27,6 +27,10 @@ pub const Hook = struct {
     ptr: *anyopaque,
     run: *const fn (*anyopaque) anyerror!void,
 };
+/// Where a pass's first command buffer committed ahead (decode_round.Runner.commitFirst) leaves the rest of the pass: it ran
+/// the embedding, the norms and mixers of layers [0, layers] and the MLPs of layers [0, layers), and its stages ended with
+/// these streams and pending output, its last mixer's Frame.mixer_sums in `sums` (Stages.ahead).
+pub const Ahead = struct { layers: usize, hidden: Ref, residual: Ref, pending: ?Ref, sums: bool };
 pub const Stages = struct {
     model: *Model,
     rows: u32,
@@ -54,6 +58,8 @@ pub const Stages = struct {
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
     settle: ?Hook = null,
+    /// The last layer count a periodic commit may follow (segments' commitsUntil; 0: every `every` layers to the end).
+    commit_until: usize = 0,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -65,6 +71,13 @@ pub const Stages = struct {
     lane_k: usize = 0,
     /// Where the head writes its logits (null: this frame's): the model frame's, for a second segment's last row.
     logits: ?Ref = null,
+    /// A pass's first command buffer committed ahead (decode_round.Runner.commitFirst): its embedding takes these ids, and
+    /// its norms, mixers and MLPs these [rows, stride] words, in place of the frame's, which the host writes for the rest of
+    /// the pass.
+    first_ids: ?Ref = null,
+    first_dims: ?Ref = null,
+    /// The rest of such a pass: what its first command buffer ran, and where it left the rows (Ahead).
+    after_first: ?Ahead = null,
     fn rowsFrame(s: *Stages) *Frame {
         return s.frame orelse &s.model.frame;
     }
@@ -75,8 +88,15 @@ pub const Stages = struct {
         s.hidden = fr.get(.hidden);
         s.residual = fr.get(.residual);
         if (s.lead) |t| try t.encode(t.ptr, lane.enc);
+        if (s.after_first) |a| {
+            if (s.clear != null or s.images != null) return error.BadFrameRows;
+            s.hidden = a.hidden;
+            s.residual = a.residual;
+            s.pending = a.pending;
+            return;
+        }
         if (lane.k == 0) if (s.clear) |t| try t.encode(t.ptr, lane.enc);
-        try m.glue.embedding(lane.enc, m.config, m.weights.embed, fr.get(.ids), s.hidden, s.rows);
+        try m.glue.embedding(lane.enc, m.config, m.weights.embed, s.first_ids orelse fr.get(.ids), s.hidden, s.rows);
         lane.enc.barrier();
         if (s.images) |rows| {
             m.glue.imageRows(lane.enc, s.hidden, rows, fr.get(.takes), @intCast(m.config.hidden), s.rows);
@@ -93,9 +113,14 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
+        if (s.after_first) |a| if (index <= a.layers) {
+            if (s.norm_wait != 0 or s.summed) return error.BadFrameRows;
+            return;
+        };
+        const dims = s.first_dims orelse f.get(.dims);
         if (s.norm_wait != 0) {
-            try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
-        } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+            try m.kernels.normAfter(e, s.hidden, s.pending.?, wts.ref(layer.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, s.norm_wait);
+        } else try m.kernels.norm(e, if (s.summed) s.residual else s.hidden, if (s.summed) null else s.pending, wts.ref(layer.norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
         e.barrier();
         s.norm_wait = 0;
         s.summed = false;
@@ -106,12 +131,17 @@ pub const Stages = struct {
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
+        if (s.after_first) |a| if (index <= a.layers) {
+            if (index == a.layers) s.rowsFrame().mixer_sums = a.sums;
+            return;
+        };
         switch (m.weights.layers[index].mixer) {
             .linear => |g| try s.hooks.gdn(s.hooks.ptr, lane.enc, index, g, s.rowsFrame(), s.rows),
             .attention => |a| try s.hooks.attention(s.hooks.ptr, lane.enc, index, a, s.rowsFrame(), s.rows),
         }
     }
     pub fn post(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
+        if (s.after_first) |a| if (index < a.layers) return;
         const m = s.model;
         const f = s.rowsFrame();
         const e = lane.enc;
@@ -132,7 +162,7 @@ pub const Stages = struct {
             s.rows = 1;
             s.compact = true;
         }
-        const dims = f.get(if (s.compact) .last_dims else .dims);
+        const dims = if (s.compact) f.get(.last_dims) else s.first_dims orelse f.get(.dims);
         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
         if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
@@ -196,6 +226,10 @@ pub const Stages = struct {
         if (s.norm_wait == 0) lane.enc.barrier();
         s.pending = f.get(.output);
     }
+    /// What these stages, a first command buffer's run through layer `layers`'s mixer, leave the rest of their pass.
+    pub fn ahead(s: *Stages, layers: usize) Ahead {
+        return .{ .layers = layers, .hidden = s.hidden, .residual = s.residual, .pending = s.pending, .sums = s.rowsFrame().mixer_sums };
+    }
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
         if (s.terminal_rows and s.head == .none) return;
         const m = s.model;
@@ -228,6 +262,9 @@ pub const Stages = struct {
     /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
     pub fn polls(s: *const Stages) bool {
         return s.rows <= 16;
+    }
+    pub fn commitsUntil(s: *const Stages) usize {
+        return s.commit_until;
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);
