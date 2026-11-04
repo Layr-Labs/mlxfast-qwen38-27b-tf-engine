@@ -233,6 +233,47 @@ fn strided(device: mtl.Device, queue: mtl.Queue, l: core.Layout) !void {
     });
 }
 
+/// The flattened row/tile pairing must preserve every output bit for a full eight-block prompt chunk.
+fn mortonDispatch(device: mtl.Device, queue: mtl.Queue) !void {
+    const base = core.Layout{ .n = 5120, .k = 512, .format = .{ .bits = 4, .group = 64 }, .sk = 1, .precompute_sums = true, .reg = true, .prompt_sr = true, .reg_lean = true };
+    var reordered = base;
+    reordered.morton_prompt = true;
+    const ordinary = try core.Projection.init(a, device, base);
+    defer ordinary.deinit();
+    const morton = try core.Projection.init(a, device, reordered);
+    defer morton.deinit();
+    const d = try Data.init(base);
+    defer d.deinit();
+    const rows = 128;
+    const x = try buffer(device, rows * base.k * 2);
+    defer x.deinit();
+    const w = try buffer(device, base.weightWords() * 4);
+    defer w.deinit();
+    const sb = try buffer(device, base.metadataElements() * 2);
+    defer sb.deinit();
+    const out_bytes = rows * base.n * 2;
+    const plain = try buffer(device, out_bytes);
+    defer plain.deinit();
+    const walked = try buffer(device, out_bytes);
+    defer walked.deinit();
+    for (0..rows) |r| {
+        const src = (r % rows_max) * base.k;
+        @memcpy(x.contents()[guard + r * base.k * 2 ..][0 .. base.k * 2], std.mem.sliceAsBytes(d.x[src .. src + base.k]));
+    }
+    const packed_w = @as([*]u32, @ptrCast(@alignCast(w.contents() + guard)))[0..base.weightWords()];
+    const packed_sb = @as([*]u16, @ptrCast(@alignCast(sb.contents() + guard)))[0..base.metadataElements()];
+    try core.pack(base, d.words, d.scales, d.biases, packed_w, packed_sb);
+    const cb = queue.commandBuffer();
+    const enc = cb.compute(.serial);
+    try ordinary.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(plain, 0), rows);
+    try morton.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(walked, 0), rows);
+    enc.end();
+    try finish(cb);
+    if (!std.mem.eql(u8, plain.contents()[guard..][0..out_bytes], walked.contents()[guard..][0..out_bytes])) return error.MortonOutputMismatch;
+    for ([_]mtl.Buffer{ x, w, sb, plain, walked }) |b| try checkGuard(b);
+    std.debug.print("PASS Morton prompt dispatch: 128 rows x 160 tiles match ordinary output bit-for-bit\n", .{});
+}
+
 fn packBench(io: std.Io, l: core.Layout) !void {
     try l.validate();
     const w = try a.alloc(u32, l.sourceWords());
@@ -274,7 +315,8 @@ pub fn main(init: std.process.Init) !void {
     });
     const simd_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--simd");
     const flashnext_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--flashnext");
-    if (argv.len != 1 and !simd_only and !flashnext_only) return error.UnknownArgument;
+    const morton_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--morton");
+    if (argv.len != 1 and !simd_only and !flashnext_only and !morton_only) return error.UnknownArgument;
     try frozen.verify();
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -299,6 +341,13 @@ pub fn main(init: std.process.Init) !void {
     const queue = try device.queue();
     defer queue.deinit();
     std.debug.print("Small synthetic projection checks on {s}; no model files\n", .{device.name()});
+    if (morton_only) {
+        if (!device.tensorUnits()) {
+            std.debug.print("SKIP Morton prompt dispatch: requires tensor units\n", .{});
+            return;
+        }
+        return mortonDispatch(device, queue);
+    }
     var counts: Counts = .{};
     if (!device.tensorUnits() or flashnext_only) {
         for ([_]usize{ 1, 2, 4 }) |sk| for ([_]usize{ 1, 2 }) |pf| {
