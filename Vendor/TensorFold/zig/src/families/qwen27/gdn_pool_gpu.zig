@@ -258,7 +258,7 @@ pub const Pool = struct {
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
         // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else if (prompt and plan.host.chain) prepared.prepareChain(pre.encoder, pool.kernels.pre_chain) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();

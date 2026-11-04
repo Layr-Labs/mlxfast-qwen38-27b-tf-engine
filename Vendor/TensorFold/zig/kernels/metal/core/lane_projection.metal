@@ -909,7 +909,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
 #ifndef TF_TGPAD
-#define TF_TGPAD 8192
+// four K slices (the z columns beside the scan): no reserve beside their 12 KB part array
+#define TF_TGPAD (TF_SK == 4 ? 0 : 8192)
 #endif
 #if TF_TGPAD > 0
   // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
