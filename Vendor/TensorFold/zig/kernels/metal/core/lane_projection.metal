@@ -789,11 +789,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 // TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
 // stream's next rows, H + the output, as the norm after it would have formed them.
-// TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
-// group 1 their up tiles TF_N / 64 tiles on, and the threadgroup applies tf_lane_reg's fused prompt epilogue to them.
+// TF_SWIGLU prompt TN2: each SIMD group computes two adjacent tiles (gate or up). TN4 keeps the two SIMD groups but
+// each computes four adjacent tiles, then the fused epilogue emits two separate 64-column sums.
 #if defined(TF_SWIGLU)
-#if TF_PROMPT_TN != 2 || TF_SK != 1
-#error "the two-tile SwiGLU launch takes two tiles and one K split"
+#if (TF_PROMPT_TN != 2 && !(TF_PROMPT_TN == 4 && TF_N == 34816 && TF_K == 5120)) || TF_SK != 1
+#error "the prompt SwiGLU launch supports guarded TN2/TN4 with one K split"
 #endif
 [[max_total_threads_per_threadgroup(64)]]
 #else
@@ -814,7 +814,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SWIGLU)
   Y += (size_t)r0 * (TF_N / 2); // SwiGLU rows are half the fused width
   HS += r0;
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = TF_PROMPT_TN * int(tg.x) + ks * (TF_N / 64);
 #else
   Y += (size_t)r0 * TF_YS;
 #if defined(TF_RESID)
@@ -880,14 +880,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // tf_lane_reg's fused prompt epilogue, with tile t of SIMD group ks as its tile 2 * ks + t: each tile's words round to
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
-  threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  threadgroup bfloat gu16[2 * TF_PROMPT_TN * 16 * 32];
+  threadgroup float hb16[16 * (TF_PROMPT_TN * 32)];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
     for (int i = 0; i < 16; i++) {
       const int m = mb + 8 * ((i >> 2) & 1);
-      gu16[((2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
+      gu16[((TF_PROMPT_TN * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -895,16 +895,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int at = t16; at < 16 * 64; at += 64) {
     const int m = at / 64, c = at % 64;
     if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    for (int hslice = 0; hslice < TF_PROMPT_TN / 2; hslice++) {
+      const int c128 = c + 64 * hslice;
+      const int tile = c128 >> 5, col = c128 & 31;
+      const float gf = float(gu16[(tile * 16 + m) * 32 + col]);
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((TF_PROMPT_TN + tile) * 16 + m) * 32 + col]));
+      Y[(size_t)m * (TF_N / 2) + int(tg.x) * (TF_PROMPT_TN * 32) + c128] = h;
+      hb16[m * (TF_PROMPT_TN * 32) + c128] = float(h);
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < M) {
-    float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
-    HS[int(tg.x) * stride + t16] = acc;
+  if (ks == 0 && lane < M) {
+    for (int hslice = 0; hslice < TF_PROMPT_TN / 2; hslice++) {
+      float acc = 0.0f;
+      for (int i = 0; i < 64; i++) acc += hb16[lane * (TF_PROMPT_TN * 32) + hslice * 64 + i];
+      HS[(int(tg.x) * (TF_PROMPT_TN / 2) + hslice) * stride + lane] = acc;
+    }
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];

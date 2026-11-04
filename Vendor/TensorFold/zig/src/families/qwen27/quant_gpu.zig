@@ -265,7 +265,7 @@ pub const Kernels = struct {
     /// Decoded rows' fused gate/up projection with the MLP activation in its epilogue: `out` and `out_sums` get what
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
-        // prompt rows: the fused SwiGLU epilogue with the gate and up pairs on two tiles a SIMD group (gateUpActivatedPrompt)
+        // prompt rows: the fused SwiGLU epilogue with two SIMD groups, each owning a TN2/TN4 gate or up tile range
         if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
@@ -329,8 +329,8 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
-                .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
+                // The exact Qwen 3.8 gate/up target may use TN4; the environment switch is a local rollback control.
+                .prompt_tn = promptSwiGluTiles(p.n, p.k, key.batch, tn4PromptEnabled()),
             });
             k.joined(entry.value_ptr);
         }
@@ -964,4 +964,27 @@ fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
+}
+
+fn tn4PromptEnabled() bool {
+    if (std.c.getenv("MLX_Q27_PROMPT_GU_TN4")) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
+    return true;
+}
+
+fn promptSwiGluTiles(n: u32, k: u32, batch: u32, allow_tn4: bool) usize {
+    if (batch == 0) return 1;
+    if (allow_tn4 and n == 34816 and k == 5120 and batch % 4 == 0 and (n / 64) % batch == 0) {
+        return 4;
+    }
+    if (batch % 2 == 0 and (n / 64) % batch == 0) return 2;
+    return 1;
+}
+
+test "prompt SwiGLU TN4 selects only the exact target and honors its kill switch" {
+    try std.testing.expectEqual(@as(usize, 4), promptSwiGluTiles(34816, 5120, 8, true));
+    try std.testing.expectEqual(@as(usize, 2), promptSwiGluTiles(34816, 5120, 8, false));
+    try std.testing.expectEqual(@as(usize, 2), promptSwiGluTiles(12288, 5120, 8, true));
+    try std.testing.expectEqual(@as(usize, 1), promptSwiGluTiles(34816, 5120, 6, true));
+    try std.testing.expectEqual(@as(usize, 1), promptSwiGluTiles(34816, 5120, 1, true));
+    try std.testing.expectEqual(@as(usize, 1), promptSwiGluTiles(34816, 5120, 0, true));
 }

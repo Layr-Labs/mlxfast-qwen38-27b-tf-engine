@@ -246,8 +246,13 @@ pub const Layout = struct {
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
         if (l.swiglu and (!swiglu_rows or !l.reg_lean or l.output != .bf16 or l.ranges.len != 0 or l.groups != null or
             l.y_stride != null or l.n % 128 != 0)) return error.InvalidSchedule;
-        // a two-tile SwiGLU launch: SIMD group 0 the gate pair, 1 the up pair, each pair inside one code batch
-        if (l.swiglu and l.prompt_tn != 1 and (l.prompt_tn != 2 or l.sk != 1 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
+        // Prompt SwiGLU keeps gate/up on two SIMD groups; TN4 is only valid for the exact Qwen 3.8 target shape.
+        if (l.swiglu and l.prompt_tn != 1) {
+            const tn2 = l.prompt_tn == 2 and l.sk == 1 and (l.n / 64) % l.tile_batch == 0;
+            const tn4 = l.prompt_tn == 4 and l.n == 34816 and l.k == 5120 and l.sk == 1 and
+                l.prompt_sr and !l.rows8 and l.tile_batch % 4 == 0 and (l.n / 64) % l.tile_batch == 0;
+            if (!tn2 and !tn4) return error.InvalidSchedule;
+        }
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
@@ -297,6 +302,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
+        if (l.swiglu and !l.rows8 and l.prompt_tn > 1) return l.sk * 32 * l.format.group + l.prompt_tn * 4096;
         return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
     }
 
@@ -495,7 +501,8 @@ pub const Projection = struct {
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
-    /// A swiglu launch's threads a group: four one-tile SIMD groups, or two two-tile ones (Layout.prompt_tn 2).
+    prompt_tn: usize = 1,
+    /// A swiglu launch's threads a group: four one-tile decoded groups, or two SIMD groups for prompt TN2/TN4.
     swiglu_threads: usize = 128,
     /// Built with Layout.residual: encodeResid only.
     residual: bool = false,
@@ -523,7 +530,7 @@ pub const Projection = struct {
         const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn > 1 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -531,7 +538,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .prompt_tn = l.prompt_tn, .swiglu_threads = if (l.prompt_tn > 1 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -626,6 +633,7 @@ pub const Projection = struct {
 
     fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
         if (!p.swiglu) return error.InvalidSchedule;
+        const launch_groups = swigluPromptGroups(p.n, p.prompt_tn, p.rows8) orelse return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
@@ -644,7 +652,7 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
-        e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
+        e.dispatchGroups(mtl.Size.of(launch_groups, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
@@ -744,6 +752,16 @@ pub const Projection = struct {
     }
 };
 
+/// Threadgroups for SwiGLU: decoded/one-tile paths retain four outputs per group; prompt TN2/TN4 groups cover
+/// `prompt_tn * 32` columns in each gate and up half.
+fn swigluPromptGroups(n: usize, prompt_tn: usize, rows8: bool) ?usize {
+    if (rows8 or prompt_tn == 1) return if (n % 128 == 0) n / 128 else null;
+    if (prompt_tn != 2 and prompt_tn != 4) return null;
+    const columns = 64 * prompt_tn;
+    if (n % columns != 0) return null;
+    return n / columns;
+}
+
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
 
@@ -790,6 +808,48 @@ test "serial SK2 keeps logical split and is off by default" {
     try l.validate();
     l.sk = 2;
     l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "prompt SwiGLU TN4 layout keeps HS groups, tile coverage and shared-memory bounds" {
+    var l = Layout{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 1, .reg = true, .precompute_sums = true, .prompt_sr = true, .tile_batch = 8, .reg_lean = true, .swiglu = true, .prompt_tn = 4 };
+    try l.validate();
+    try std.testing.expectEqual(@as(usize, 18432), l.threadgroupBytes());
+    try std.testing.expectEqual(@as(?usize, 136), swigluPromptGroups(l.n, l.prompt_tn, false));
+    const generated = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "#define TF_SWIGLU 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "#define TF_PROMPT_TN 4\n") != null);
+
+    // The 1088 32-column tiles are covered once: gate [0,544), then up [544,1088).
+    var seen: [1088]bool = undefined;
+    @memset(&seen, false);
+    for (0..136) |tgx| for (0..2) |split| for (0..4) |t| {
+        const tile = 4 * tgx + split * (l.n / 64) + t;
+        try std.testing.expect(tile < seen.len);
+        try std.testing.expect(!seen[tile]);
+        seen[tile] = true;
+    };
+    for (seen) |x| try std.testing.expect(x);
+
+    // Each 128-column threadgroup emits two group-major 64-column sums; together they fill all 272 groups once.
+    var sum_seen: [272]bool = undefined;
+    @memset(&sum_seen, false);
+    for (0..136) |tgx| for (0..2) |half| {
+        const group = 2 * tgx + half;
+        try std.testing.expect(!sum_seen[group]);
+        sum_seen[group] = true;
+    };
+    for (sum_seen) |x| try std.testing.expect(x);
+
+    // Wrong launch divisor (the TN2 N/128 grid) doubles the grid and would alias the output layout.
+    try std.testing.expectEqual(@as(usize, 272), l.n / 128);
+    try std.testing.expect((l.n / 128) != swigluPromptGroups(l.n, l.prompt_tn, false).?);
+
+    l.n += 128;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.n = 34816;
+    l.tile_batch = 6;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 
