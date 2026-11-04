@@ -203,6 +203,8 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Prompt DOWN: one N64/K64 memory-right product instead of four N32/K32 register products.
+    prompt_n64: bool = false,
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
@@ -251,6 +253,7 @@ pub const Layout = struct {
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
+        if (l.prompt_n64 and (!l.reg or !l.reg_lean or !l.prompt_sr or !l.residual or l.swiglu or l.rows8 or l.serial_sk2 or l.prompt_tn != 2 or l.n != 5120 or l.k != 17408 or l.sk != 2 or l.tile_batch != 8 or l.format.bits != 4 or l.format.group != 64 or l.ranges.len != 0 or l.groups != null or l.indexed or l.y_stride != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
@@ -297,6 +300,7 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
+        if (l.prompt_n64) return l.sk * 64 * 64 * @sizeOf(f16) + @max(l.sk -| 1, 1) * 32 * 32 * @sizeOf(f32);
         return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
     }
 
@@ -352,6 +356,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.prompt_n64) try text.appendSlice(a, "#define TF_PROMPT_N64 1\n");
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");

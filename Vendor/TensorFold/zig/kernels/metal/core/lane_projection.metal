@@ -688,7 +688,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 #endif
 
-#if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN)
+#if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN) && !defined(TF_PROMPT_N64)
 #ifndef TF_TB
 #define TF_TB 1
 #endif
@@ -966,5 +966,75 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
 #endif
+}
+#endif
+
+#if defined(TF_PROMPT_N64)
+#ifndef TF_UNROLL
+#define TF_UNROLL _Pragma("clang loop unroll(full)")
+#endif
+// One group keeps the parent's two output tiles and K splits. A split's code stage is private;
+// each (tile,lane,word,nibble) writes one unique (N,K) word, before the native N64/K64 op reads it.
+[[max_total_threads_per_threadgroup(32 * TF_SK)]]
+[[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+    const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
+    uint ks [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const int r0 = int(tg.y) * 16, M = min(mdims[0] - r0, 16), stride = mdims[1];
+  if (M <= 0) return; // uniform for the complete threadgroup
+  X += (size_t)r0 * TF_K; XS += r0; H += (size_t)r0 * TF_YS; RO += (size_t)r0 * TF_YS;
+  const int tile0 = 2 * int(tg.x);
+  constexpr auto shape = matmul2d_descriptor(16, 64, 64, false, true, true, matmul2d_descriptor::mode::multiply);
+  matmul2d<shape, execution_simdgroup> op;
+  auto a = op.template get_left_input_cooperative_tensor<bfloat, half, float>();
+  threadgroup half codes[TF_SK * 64 * 64];
+  threadgroup float partial[(TF_SK - 1) * 32 * 32];
+  auto b = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(codes + ks * 4096, dextents<int32_t, 2>(64, 64));
+  auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>, metal::remove_addrspace_t<decltype(b)>, float>();
+  float C[32]; int row[32], col[32];
+  TF_UNROLL for (int i = 0; i < 32; ++i) {
+    C[i] = 0.0f;
+    const auto at = P.get_multidimensional_index(i); col[i] = at[0]; row[i] = at[1];
+  }
+  const int first = TF_G0 + (ks * TF_GN) / TF_SK, last = TF_G0 + ((ks + 1) * TF_GN) / TF_SK;
+  const array<int32_t, 2> xstr = {1, TF_K};
+  for (int g = first; g < last; ++g) {
+    TF_UNROLL for (int tile = 0; tile < 2; ++tile) {
+      const device uint4* cp = W + ((size_t)((tile0 + tile) / TF_TB) * KG * TF_TB + (tile0 + tile) % TF_TB) * 64 + lane + (size_t)g * TF_TB * 64;
+      const uint4 lo = cp[0], hi = cp[32];
+      TF_UNROLL for (int w = 0; w < 8; ++w) {
+        const uint word = w < 4 ? lo[w] : hi[w - 4];
+        const int n = tile * 32 + ((lane >> 1) & 3) + ((lane >> 2) & 4) + 8 * (w >> 1);
+        TF_UNROLL for (int j = 0; j < 8; ++j) {
+          const int k = 32 * (w & 1) + 4 * (lane & 1) + (lane & 8) + 2 * (j & 1) + (j >> 2) + 8 * (j & 2);
+          codes[ks * 4096 + n * 64 + k] = as_type<half>(ushort((word >> (4 * j)) & 15u));
+        }
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    a.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)X + g * 64, dextents<int32_t, 2>(64, M), xstr));
+    op.run(a, b, P);
+    // The code stage may be reused only after all tensor reads of this split have retired.
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    TF_UNROLL for (int i = 0; i < 32; ++i) {
+      const int n = tile0 * 32 + col[i];
+      const float scale = float(SB[((size_t)g * TF_N + n) * 2]);
+      const float bias = float(SB[((size_t)g * TF_N + n) * 2 + 1]);
+      const float sum = row[i] < M ? XS[(size_t)g * stride + row[i]] : 0.0f;
+      C[i] = fma(scale, P[i], fma(bias, sum, C[i]));
+    }
+  }
+  if (ks > 0) { TF_UNROLL for (int i = 0; i < 32; ++i) partial[((ks - 1) * 32 + i) * 32 + lane] = C[i]; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) {
+    for (int split = 1; split < TF_SK; ++split) { TF_UNROLL for (int i = 0; i < 32; ++i) C[i] += partial[((split - 1) * 32 + i) * 32 + lane]; }
+    TF_UNROLL for (int i = 0; i < 32; ++i) {
+      const int n = tile0 * 32 + col[i];
+      if (row[i] < M && n < TF_N) {
+        const size_t at = (size_t)row[i] * TF_YS + n;
+        RO[at] = bfloat(float(H[at]) + float(bfloat(C[i])));
+      }
+    }
+  }
 }
 #endif
