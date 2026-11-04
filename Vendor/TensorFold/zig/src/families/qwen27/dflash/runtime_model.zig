@@ -123,6 +123,31 @@ pub const Model = struct {
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
         }
     }
+    /// Whether absorbAhead takes a fresh prompt's committed taps up to `end` of its `total` now: nothing in the ring counted
+    /// yet, the session empty or ahead-absorbed from row 0, nothing open, the prepared q4 path, the prompt inside one window
+    /// and one flush pass, and each 128-row launch of this append, of the one left for the first round and of the single
+    /// append they replace over 16 rows (the prompt loop, Adapter.encode), so every row takes the kernel it took.
+    pub fn canAbsorbAhead(m: *const Model, end: u64, total: u64) bool {
+        const b = &m.backend;
+        const s = m.session.context;
+        if (b.failed or b.frame.active or b.transaction != null or b.staged != null or b.batch.len != 0 or m.early != null or m.preparation.mode != .prepared_q4_reference) return false;
+        if (m.committed_end != 0 or s.begin != 0 or (s.end == 0) == m.session.ready or end <= s.end or end >= total or total > flush_rows or total >= m.graph.config.window) return false;
+        const step = @import("core").lane_projection.reg_rows;
+        for ([_]u64{ end - s.end, total - end, total }) |rows| if (rows % step != 0 and rows % step <= 16) return false;
+        return true;
+    }
+    /// The prompt's taps [session end, end) into the session (flush's absorb: one frame and its wait) before the ring
+    /// counts them: the caller's pass has stored them on the GPU (a staggered pass's ended segments, its laneDone).
+    pub fn absorbAhead(m: *Model, end: u64, total: u64) !void {
+        if (!m.canAbsorbAhead(end, total)) return error.BadDraftContext;
+        const first = m.session.context.end;
+        const rows: u32 = @intCast(end - first);
+        var positions: [flush_rows]u64 = undefined;
+        for (positions[0..rows], 0..) |*position, i| position.* = first + i;
+        const stride = @as(usize, m.graph.config.tapWidth()) * 2;
+        const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, @intCast(first)) * stride }, rows, m.graph.config.tapWidth());
+        try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = end });
+    }
     /// Whether prepareNext encodes a 2-row block (a depth-one round's) now: the drafter has every committed tap, nothing
     /// open, and either count of new taps leaves the frame's launches as they are (runtime_context.sameForEither).
     pub fn canPrepare(m: *const Model, block: u32) bool {
@@ -318,9 +343,13 @@ pub const Model = struct {
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;
         const slot: u32 = @intCast(m.session.context.end % window);
-        if (m.session.ready and behind > 0 and behind <= 128 and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
+        // the taps the session lacks and the block that reads them in one frame: a fresh session's whole prompt too (the
+        // seed's catch-up, up to flush_rows rows), so the GPU runs the block right behind the append instead of idling
+        // while the host waits for a flush frame and encodes the block's own
+        const fresh_start = !m.session.ready and m.session.context.end == m.session.context.begin;
+        if ((m.session.ready or fresh_start) and behind > 0 and behind <= flush_rows and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
             const rows: u32 = @intCast(behind);
-            var positions: [128]u64 = undefined;
+            var positions: [flush_rows]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
