@@ -4,6 +4,9 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
 #if defined(TF_GU_COUNT)
  device atomic_uint* GC [[buffer(7)]],
 #endif
+#if defined(TF_GU_WAIT)
+ device atomic_uint* WC [[buffer(8)]],constant uint& wait_for [[buffer(9)]],uint2 tgs [[threadgroups_per_grid]],
+#endif
  uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
  const int gt=2*int(tg.x)+ks,ut=gt+TF_N/64,gn=gt*32,un=ut*32;
@@ -25,6 +28,17 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  const device uint2* ui=(const device uint2*)(tab+TF_SBI)+(un+nb)/4;
 #endif
  float G[16],U[16],G0[16],U0[16];
+#if defined(TF_GU_WAIT)
+ // X and XS come from the norm in this launch's barrier interval, whose row threadgroups count themselves on WC[0] past a
+ // device-scope fence: thread 0 waits on the count (bounded) and passes its own fence before any row is read; the last
+ // threadgroup to arrive leaves both words zero for the next pair
+ if(ks==0&&lane==0){
+  for(uint spin=0;spin<(1u<<24)&&atomic_load_explicit(&WC[0],memory_order_relaxed)<wait_for;spin++){}
+  atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
+  if(atomic_fetch_add_explicit(&WC[1],1u,memory_order_relaxed)+1u==tgs.x*tgs.y){atomic_store_explicit(&WC[0],0u,memory_order_relaxed);atomic_store_explicit(&WC[1],0u,memory_order_relaxed);}
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+#endif
  for(int split=0;split<2;split++){
   const int first=split*40,last=first+40;
   for(int i=0;i<16;i++){G[i]=0.0f;U[i]=0.0f;}
