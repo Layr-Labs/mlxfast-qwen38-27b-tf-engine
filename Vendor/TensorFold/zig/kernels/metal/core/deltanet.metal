@@ -1132,12 +1132,14 @@ kernel void tf_delta_gdn_post_rows16(device const bfloat* recurrence [[buffer(0)
       for (uint part = 0; part < 4; ++part) parked[(local * 2 + lane / 16) * 65 + (lane & 15) * 4 + part] = float(y[part]);
   }
   if (sums_stride == 0) return;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg != 0) return;
-  const uint local = lane / 2, half_of_head = lane & 1, row = base + local;
+  // Each SIMD group produced four complete rows. Its sums read only those rows' parked words,
+  // so retire its own stores without waiting for the other three groups' independent rows.
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane >= 8) return;
+  const uint local = sg * 4 + lane / 2, half_of_head = lane & 1, row = base + local;
   if (row >= p.rows) return;
   float acc = 0.0f;
-  for (uint i = 0; i < 64; ++i) acc += parked[lane * 65 + i];
+  for (uint i = 0; i < 64; ++i) acc += parked[(local * 2 + half_of_head) * 65 + i];
   sums[(head * 2 + half_of_head) * sums_stride + row] = acc;
 }
 // Projected rows and ancestor indices reconstruct the accepted tail without persisting every node's conv window.
