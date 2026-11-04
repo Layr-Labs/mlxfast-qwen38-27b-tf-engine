@@ -419,12 +419,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint4 nw0 = wl[(size_t)TF_G0 * TF_TB * TF_RW], nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)TF_G0 * TF_TB * TF_RW + 32];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
+#if defined(TF_SEQ_META)
+  const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + (size_t)tile * KG * 4 + nb / 4;
+  uint3 ni = ixs[(size_t)TF_G0 * 4];
+#else
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
   uint3 ni = ixs[(size_t)TF_G0 * (TF_N / 8)];
+#endif
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
+#if defined(TF_SEQ_META)
+  const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (size_t)tile * KG * 8 + nb / 4;
+  uint2 ni0 = ixs[(size_t)TF_G0 * 8], ni1 = ixs[(size_t)TF_G0 * 8 + 4];
+#else
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
+#endif
 #endif
   const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
 #endif
@@ -448,14 +458,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // the same words as wl[g * TF_TB * 64], sbv[(g * TF_N + n0 + nb) / 4] and XS[g * stride + mb] (TF_N, n0 + nb are
   // multiples of 4), without the per-group 64-bit index arithmetic
   const device uint4* cp = wl + (size_t)first * TF_TB * TF_RW;
+#if defined(TF_SEQ_META)
+  const device uint4* sp = sbv + ((size_t)tile * KG + first) * 8 + nb / 4;
+#else
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
+#endif
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = TF_BITS == 2 ? uint4(0) : cp[32]; }
   for (int g = first; g < last; g++) {
     const tf_reg_load cur = {nw0, nw1, sp[0], sp[4], xp[0], xp[8]};
+#if defined(TF_SEQ_META)
+    sp += 8;
+#else
     sp += TF_N / 4;
+#endif
     xp += stride;
 #else
 #if !defined(TF_CHAIN_WALK)
@@ -464,14 +482,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * TF_RW]; nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)first * TF_TB * TF_RW + 32]; }
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
+#if defined(TF_SEQ_META)
+  const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + (size_t)tile * KG * 4 + nb / 4;
+  uint3 ni = 0;
+  if (first < last) ni = ixs[(size_t)first * 4];
+#else
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
   uint3 ni = 0;
   if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+#endif
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
+#if defined(TF_SEQ_META)
+  const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (size_t)tile * KG * 8 + nb / 4;
+  uint2 ni0 = 0, ni1 = 0;
+  if (first < last) { ni0 = ixs[(size_t)first * 8]; ni1 = ixs[(size_t)first * 8 + 4]; }
+#else
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+#endif
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
@@ -495,7 +525,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_SBI)
     const uint4 q0 = tf_look(tab, ni0), q1 = tf_look(tab, ni1);
 #else
+#if defined(TF_SEQ_META)
+    // tile-major pairs: this tile's groups contiguous, so the loop streams them in order
+    const size_t seq_q = ((size_t)tile * KG + g) * 8 + nb / 4;
+    const uint4 q0 = sbv[seq_q], q1 = sbv[seq_q + 4];
+#else
     const uint4 q0 = sbv[((size_t)g * TF_N + n0 + nb) / 4], q1 = sbv[((size_t)g * TF_N + n0 + nb + 16) / 4];
+#endif
 #endif
 #if defined(TF_ROWS8)
     const tf_reg_load cur = {nw0, nw1, q0, q1, XS[g * stride + mb], 0.0f};
@@ -532,9 +568,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
+#if defined(TF_SEQ_META)
+    ni = ixs[(size_t)min(g + 1, end - 1) * 4];
+#else
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
+#endif
 #elif defined(TF_SBI)
+#if defined(TF_SEQ_META)
+    { const size_t gi = (size_t)min(g + 1, end - 1) * 8; ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#else
     { const size_t gi = (size_t)min(g + 1, end - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#endif
 #endif
 #endif
 #else

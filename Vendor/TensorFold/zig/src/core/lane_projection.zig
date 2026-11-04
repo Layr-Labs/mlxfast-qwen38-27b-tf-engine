@@ -18,6 +18,12 @@ pub fn indexedBytes(n: usize, k: usize, group: usize) usize {
 /// The same with at most 4096 distinct pairs: 12-bit indices, each group's tile as four u32[3] of eight indices low bits first
 /// (columns 0-3 and 16-19 of the tile, then 4-7 and 20-23, ...), so a lane's two quads are one load.
 pub const indexed12_layout = "u32[sb_table12] then u32[K/group][N/32][4][3]";
+/// Tile-major metadata for class-A reg adapters (Layout.seq_meta): each 32-column tile's groups contiguous, so a decode
+/// threadgroup streams its tile's groups in order instead of striding N columns a group. A permutation of the native
+/// layouts above: every pair, index and table word unchanged, only their order.
+pub const seq_metadata_layout = "bf16[N/32][K/group][32][scale,bias]";
+pub const seq_indexed_layout = "u32[sb_table] then u16[N/32][K/group][32]";
+pub const seq_indexed12_layout = "u32[sb_table12] then u32[N/32][K/group][4][3]";
 pub const sb_table12 = 4096;
 
 pub fn indexed12Bytes(n: usize, k: usize, group: usize) usize {
@@ -222,6 +228,11 @@ pub const Layout = struct {
     /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
     /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
     m8: bool = false,
+    /// Tile-major metadata (seq_metadata_layout, seq_indexed_layout, seq_indexed12_layout): a decode threadgroup streams
+    /// its tile's groups in order instead of striding N columns a group. Lean reg launches only (rows8, prompt_sr, count,
+    /// wait, m8 share the addressing); every word equals the native layout's, and callers adopt it only once the transpose
+    /// rebuilds every weight bit-for-bit on the CPU (affine4_lane), with no kernel launched before adoption.
+    seq_meta: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -241,6 +252,7 @@ pub const Layout = struct {
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
+        if (l.seq_meta and (!l.reg or !l.reg_lean or l.serial_sk2 or l.prompt_tn != 1 or l.swiglu or l.residual or l.tile_list)) return error.InvalidSchedule;
         if (l.tile_batch == 0 or (l.tile_batch != 1 and !l.reg)) return error.InvalidSchedule;
         // decoded rows: rows8 on the serial split; prompt rows: 16-row blocks on one split
         const swiglu_rows = (l.rows8 and l.serial_sk2) or (!l.rows8 and !l.serial_sk2 and l.sk == 1);
@@ -349,6 +361,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.m8) try text.appendSlice(a, "#define TF_M8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
+    if (l.seq_meta) try text.appendSlice(a, "#define TF_SEQ_META 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
@@ -391,6 +404,82 @@ pub fn pack(l: Layout, w: []const u32, scales: []const u16, biases: []const u16,
         const sb = (g * l.n + n) * 2;
         out_sb[sb] = scales[n * ng + g];
         out_sb[sb + 1] = biases[n * ng + g];
+    };
+}
+
+/// A sequential transpose's tile and group counts: whole 32-column tiles and whole groups only.
+fn seqShape(n: usize, k: usize, group: usize) !struct { tiles: usize, kg: usize } {
+    if (n == 0 or n % 32 != 0 or k == 0 or group == 0 or k % group != 0) return error.InvalidShape;
+    return .{ .tiles = n / 32, .kg = k / group };
+}
+
+/// Native pairs ([K/group][N][scale, bias]) into tile-major order ([N/32][K/group][32][scale, bias]): a permutation, every
+/// pair's words unchanged. Storage disjoint; lengths are both N * (K/group) * 2.
+pub fn seqPairs(n: usize, k: usize, group: usize, native: []const u16, out: []u16) !void {
+    const shape = try seqShape(n, k, group);
+    if (native.len != n * shape.kg * 2 or out.len != native.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(native), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| for (0..32) |c| {
+        const src = (g * n + t * 32 + c) * 2;
+        const dst = ((t * shape.kg + g) * 32 + c) * 2;
+        out[dst] = native[src];
+        out[dst + 1] = native[src + 1];
+    };
+}
+
+/// seqPairs' inverse: tile-major pairs back into native order. A sequential buffer rebuilds its native bytes bit-for-bit
+/// through this exactly when the transpose wrote every pair once, to its own place.
+pub fn unseqPairs(n: usize, k: usize, group: usize, seq: []const u16, out: []u16) !void {
+    const shape = try seqShape(n, k, group);
+    if (seq.len != n * shape.kg * 2 or out.len != seq.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(seq), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| for (0..32) |c| {
+        const src = ((t * shape.kg + g) * 32 + c) * 2;
+        const dst = (g * n + t * 32 + c) * 2;
+        out[dst] = seq[src];
+        out[dst + 1] = seq[src + 1];
+    };
+}
+
+/// An indexed body (u16[K/group][N] past the table) into tile-major order (u16[N/32][K/group][32]); the table itself is
+/// order-free and copies verbatim. Lengths are both N * (K/group).
+pub fn seqIndex(n: usize, k: usize, group: usize, native: []const u16, out: []u16) !void {
+    const shape = try seqShape(n, k, group);
+    if (native.len != n * shape.kg or out.len != native.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(native), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| for (0..32) |c| {
+        out[(t * shape.kg + g) * 32 + c] = native[g * n + t * 32 + c];
+    };
+}
+
+/// seqIndex's inverse: a tile-major index body back into native order.
+pub fn unseqIndex(n: usize, k: usize, group: usize, seq: []const u16, out: []u16) !void {
+    const shape = try seqShape(n, k, group);
+    if (seq.len != n * shape.kg or out.len != seq.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(seq), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| for (0..32) |c| {
+        out[g * n + t * 32 + c] = seq[(t * shape.kg + g) * 32 + c];
+    };
+}
+
+/// An indexed12 body (u32[K/group][N/32][4][3] past the table) into tile-major block order (u32[N/32][K/group][4][3]):
+/// whole 12-word blocks move, their packing unchanged. Lengths are both (K/group) * (N/32) * 12.
+pub fn seqIndex12(n: usize, k: usize, group: usize, native: []const u32, out: []u32) !void {
+    const shape = try seqShape(n, k, group);
+    if (native.len != shape.kg * shape.tiles * 12 or out.len != native.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(native), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| {
+        @memcpy(out[(t * shape.kg + g) * 12 ..][0..12], native[(g * shape.tiles + t) * 12 ..][0..12]);
+    };
+}
+
+/// seqIndex12's inverse: a tile-major indexed12 body back into native block order.
+pub fn unseqIndex12(n: usize, k: usize, group: usize, seq: []const u32, out: []u32) !void {
+    const shape = try seqShape(n, k, group);
+    if (seq.len != shape.kg * shape.tiles * 12 or out.len != seq.len) return error.InvalidStorage;
+    if (overlap(std.mem.sliceAsBytes(seq), std.mem.sliceAsBytes(out))) return error.OverlappingStorage;
+    for (0..shape.tiles) |t| for (0..shape.kg) |g| {
+        @memcpy(out[(g * shape.tiles + t) * 12 ..][0..12], seq[(t * shape.kg + g) * 12 ..][0..12]);
     };
 }
 
@@ -945,4 +1034,178 @@ test "reg order puts every code in the tensor op's right-input register for its 
     try bad.validate();
     bad.format.group = 128;
     try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
+test "sequential metadata is a tile-major permutation that rebuilds every pair bit-for-bit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng: std.Random.DefaultPrng = .init(0x5e9);
+    // the drafter's shape classes, group 64: linears, fused groups and the head's trimmed rows
+    const shapes = [_][2]usize{ .{ 4096, 5120 }, .{ 1024, 5120 }, .{ 5120, 4096 }, .{ 17408, 5120 }, .{ 5120, 17408 }, .{ 1280, 5120 }, .{ 5120, 25600 }, .{ 256, 5120 }, .{ 2048, 5120 }, .{ 6144, 5120 }, .{ 34816, 5120 }, .{ 4128, 5120 } };
+    for (shapes) |shape| {
+        const n, const k = .{ shape[0], shape[1] };
+        const native = try a.alloc(u16, n * (k / 64) * 2);
+        prng.random().bytes(std.mem.sliceAsBytes(native));
+        const seq = try a.alloc(u16, native.len);
+        @memset(std.mem.sliceAsBytes(seq), 0xA5);
+        try seqPairs(n, k, 64, native, seq);
+        // spot checks of the mapping: first, last and an interior pair of each order
+        for ([_][2]usize{ .{ 0, 0 }, .{ 0, 31 }, .{ n / 32 - 1, k / 64 - 1 }, .{ 1, 2 } }) |tg| {
+            const t, const g = .{ tg[0] % (n / 32), tg[1] % (k / 64) };
+            for ([_]usize{ 0, 7, 31 }) |c| {
+                const x = (g * n + t * 32 + c) * 2;
+                const y = ((t * (k / 64) + g) * 32 + c) * 2;
+                try std.testing.expectEqual(native[x], seq[y]);
+                try std.testing.expectEqual(native[x + 1], seq[y + 1]);
+            }
+        }
+        // the rebuild: tile-major back to native, bit-for-bit
+        const rebuilt = try a.alloc(u16, native.len);
+        try unseqPairs(n, k, 64, seq, rebuilt);
+        try std.testing.expectEqualSlices(u16, native, rebuilt);
+        // and the other way: native from a transposed rebuild equals the transpose
+        const again = try a.alloc(u16, native.len);
+        try seqPairs(n, k, 64, rebuilt, again);
+        try std.testing.expectEqualSlices(u16, seq, again);
+        try std.testing.expectError(error.InvalidStorage, seqPairs(n, k, 64, native[0 .. native.len - 2], seq));
+        try std.testing.expectError(error.OverlappingStorage, seqPairs(n, k, 64, native, native));
+    }
+    try std.testing.expectError(error.InvalidShape, seqPairs(48, 256, 64, &.{}, &.{}));
+    try std.testing.expectError(error.InvalidShape, seqPairs(64, 96, 64, &.{}, &.{}));
+}
+
+test "sequential index bodies rebuild every index bit-for-bit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng: std.Random.DefaultPrng = .init(0x12e4);
+    for ([_][2]usize{ .{ 4096, 5120 }, .{ 256, 5120 }, .{ 34816, 5120 }, .{ 5120, 17408 } }) |shape| {
+        const n, const k = .{ shape[0], shape[1] };
+        const kg = k / 64;
+        const native = try a.alloc(u16, n * kg);
+        for (native, 0..) |*v, i| v.* = @truncate((i *% 65521) ^ prng.random().int(u16));
+        const seq = try a.alloc(u16, native.len);
+        try seqIndex(n, k, 64, native, seq);
+        // the last column of the last group lands at the last tile's last column
+        try std.testing.expectEqual(native[(kg - 1) * n + (n - 1)], seq[(n / 32 * kg - 1) * 32 + 31]);
+        const rebuilt = try a.alloc(u16, native.len);
+        try unseqIndex(n, k, 64, seq, rebuilt);
+        try std.testing.expectEqualSlices(u16, native, rebuilt);
+        try std.testing.expectError(error.OverlappingStorage, seqIndex(n, k, 64, native, native));
+        const native12 = try a.alloc(u32, kg * (n / 32) * 12);
+        prng.random().bytes(std.mem.sliceAsBytes(native12));
+        const seq12 = try a.alloc(u32, native12.len);
+        try seqIndex12(n, k, 64, native12, seq12);
+        // an interior block moves whole
+        const t: usize = (n / 32) / 2;
+        const g: usize = kg / 2;
+        try std.testing.expectEqualSlices(u32, native12[(g * (n / 32) + t) * 12 ..][0..12], seq12[(t * kg + g) * 12 ..][0..12]);
+        const rebuilt12 = try a.alloc(u32, native12.len);
+        try unseqIndex12(n, k, 64, seq12, rebuilt12);
+        try std.testing.expectEqualSlices(u32, native12, rebuilt12);
+        try std.testing.expectError(error.OverlappingStorage, seqIndex12(n, k, 64, native12, native12));
+    }
+}
+
+test "sequential kernel addresses name each value's transposed home" {
+    // TF_SEQ_META read addresses transcribed from kernels/metal/core/lane_projection.metal, checked against real
+    // transpose outputs holding position-distinctive values: every quad the kernel loads must hold its native
+    // (group, column). A mismatch is a kernel addressing bug, caught on the host with no GPU work.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const group: usize = 64;
+    for ([_][2]usize{ .{ 64, 128 }, .{ 128, 256 }, .{ 256, 512 }, .{ 512, 1024 } }) |shape| {
+        const n, const k = .{ shape[0], shape[1] };
+        const tiles = n / 32;
+        const kg = k / group;
+        // pairs: pair (g, col) holds (idx, idx ^ 0xBEEF) with idx = g * n + col, unique a position
+        const native_p = try a.alloc(u16, n * kg * 2);
+        for (0..kg) |g| for (0..n) |c| {
+            const idx: u16 = @intCast(g * n + c);
+            native_p[(g * n + c) * 2] = idx;
+            native_p[(g * n + c) * 2 + 1] = idx ^ 0xBEEF;
+        };
+        const seq_p = try a.alloc(u16, native_p.len);
+        try seqPairs(n, k, group, native_p, seq_p);
+        // the kernel's pair quads: q0 = sbv[seq_q], q1 = sbv[seq_q + 4] with
+        // seq_q = (tile * KG + g) * 8 + nb / 4 (uint4 words of 4 pairs)
+        for (0..tiles) |t| for (0..kg) |g| for (0..32) |lane| {
+            const nb: usize = 4 * (lane & 1) + 8 * ((lane >> 3) & 1);
+            const seq_q: usize = (t * kg + g) * 8 + nb / 4;
+            for (0..4) |j| {
+                const o0 = seq_q * 8 + j * 2;
+                const e0 = (g * n + t * 32 + nb + j) * 2;
+                try std.testing.expectEqual(native_p[e0], seq_p[o0]);
+                try std.testing.expectEqual(native_p[e0 + 1], seq_p[o0 + 1]);
+                const o1 = (seq_q + 4) * 8 + j * 2;
+                const e1 = (g * n + t * 32 + nb + 16 + j) * 2;
+                try std.testing.expectEqual(native_p[e1], seq_p[o1]);
+                try std.testing.expectEqual(native_p[e1 + 1], seq_p[o1 + 1]);
+            }
+        };
+        // the prompt and decode prefetches step the same pointer 8 uint4s a group from `first`
+        for (0..tiles) |t| for (0..kg) |first| for (first..kg) |g| {
+            const stepped: usize = (t * kg + first) * 8 + (g - first) * 8;
+            try std.testing.expectEqual((t * kg + g) * 8, stepped);
+        };
+        // indexed: index (g, col) holds its own position
+        const native_i = try a.alloc(u16, n * kg);
+        for (native_i, 0..) |*v, i| v.* = @intCast(i);
+        const seq_i = try a.alloc(u16, native_i.len);
+        try seqIndex(n, k, group, native_i, seq_i);
+        // the kernel's index quads: ni0 = ixs[g * 8], ni1 = ixs[g * 8 + 4] with
+        // ixs = body + tile * KG * 8 + nb / 4 (uint2 words of 4 indices)
+        for (0..tiles) |t| for (0..kg) |g| for (0..32) |lane| {
+            const nb: usize = 4 * (lane & 1) + 8 * ((lane >> 3) & 1);
+            const base: usize = t * kg * 8 + nb / 4 + g * 8;
+            for (0..4) |j| {
+                const w0: u16 = @intCast(g * n + t * 32 + nb + j);
+                try std.testing.expectEqual(w0, seq_i[base * 4 + j]);
+                const w1: u16 = @intCast(g * n + t * 32 + nb + 16 + j);
+                try std.testing.expectEqual(w1, seq_i[(base + 4) * 4 + j]);
+            }
+        };
+        // indexed12: block (g, t) word w holds its own native position; whole 12-word blocks move
+        const native_12 = try a.alloc(u32, kg * tiles * 12);
+        for (native_12, 0..) |*v, i| v.* = @intCast(i);
+        const seq_12 = try a.alloc(u32, native_12.len);
+        try seqIndex12(n, k, group, native_12, seq_12);
+        // the kernel's packed word: ni = ixs[g * 4] with ixs = body + tile * KG * 4 + nb / 4
+        for (0..tiles) |t| for (0..kg) |g| for (0..32) |lane| {
+            const nb: usize = 4 * (lane & 1) + 8 * ((lane >> 3) & 1);
+            const at: usize = (t * kg + g) * 4 + nb / 4;
+            const from: usize = (g * tiles + t) * 4 + nb / 4;
+            for (0..3) |w| try std.testing.expectEqual(native_12[from * 3 + w], seq_12[at * 3 + w]);
+        };
+    }
+}
+
+test "sequential metadata takes lean reg launches only and only adds its define" {
+    var l = Layout{ .n = 5120, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .rows8 = true };
+    try std.testing.expect(!l.seq_meta);
+    const plain = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_SEQ_META") == null);
+    l.seq_meta = true;
+    try l.validate();
+    const seq = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(seq);
+    const define = "#define TF_SEQ_META 1\n";
+    const at = std.mem.indexOf(u8, seq, define) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(plain[0..at], seq[0..at]);
+    try std.testing.expectEqualStrings(plain[at..], seq[at + define.len ..]);
+    // the sharing layouts keep native metadata
+    for ([_]Layout{
+        .{ .n = 5120, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .rows8 = true, .serial_sk2 = true, .seq_meta = true },
+        .{ .n = 5120, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .prompt_sr = true, .prompt_tn = 2, .tile_batch = 2, .seq_meta = true },
+        .{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 1, .reg = true, .precompute_sums = true, .reg_lean = true, .swiglu = true, .seq_meta = true },
+        .{ .n = 5120, .k = 6144, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .prompt_sr = true, .prompt_tn = 2, .tile_batch = 2, .residual = true, .seq_meta = true },
+    }) |bad| try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    var plain_reg = l;
+    plain_reg.reg_lean = false;
+    try std.testing.expectError(error.InvalidSchedule, plain_reg.validate());
+    var coop = Layout{ .n = 5120, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .cooperative = true, .seq_meta = true };
+    try std.testing.expectError(error.InvalidSchedule, coop.validate());
 }
