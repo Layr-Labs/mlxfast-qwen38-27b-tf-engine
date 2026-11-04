@@ -212,8 +212,9 @@ const prompt_threads = 256;
 /// cached: a prompt plan's rows (packed_rows above 0, one stream): the packed preprocess also stores the round's keys and
 /// values in their cache slots (q27_head_norm_rope_packed_cached), with no rotated_key rows (`encode` with `appended`).
 pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{}, after: ?After = null, decoded: ?Decoded = null, cached: ?Decoded = null };
-/// Decoded rows of one stream whose preprocess also packs the prefix's query and appends the round's keys and values
-/// (q27_head_norm_rope_decoded), counting itself for the prefix that shares its barrier interval (`encode` with `appended`).
+/// Decoded rows of one stream whose preprocess packs the prefix's query and appends the round's keys and values
+/// instead of storing its query and rotated-key rows (q27_head_norm_rope_decoded: no launch reads them), counting
+/// itself for the prefix that shares its barrier interval (`encode` with `appended`).
 /// The same words name where a prompt plan's packed preprocess stores them (Preprocess.cached).
 pub const Decoded = struct { scratch: *const Scratch, binding: *const Binding, plan: *const Plan, caches: []const Cache, value: Ref, v_stride: u32 };
 /// Counted projections a decoded preprocess waits on in its barrier interval (quant_gpu.Kernels.quantCounted).
@@ -475,13 +476,13 @@ pub const Attention = struct {
             e.setPipeline(a.io[if (wide) 17 else 2]);
             bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
             e.setValue(args, 5);
-            e.dispatchThreads(mtl.Size.of(if (wide) g.dim / 8 else g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 1, 1));
+            e.dispatchThreads(mtl.Size.of(if (wide) g.dim / 8 else g.dim, g.kv_heads, plan.rows), if (wide) mtl.Size.of(32, 1, 1) else mtl.Size.of(32, 2, 1));
         }
         if (!prepacked and !appended) {
             e.setPipeline(a.io[0]);
             bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
             e.setValue(args, 3);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 1, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 2, 1)); // eight words a thread
         }
         if (a.promptPath(plan, prompt)) {
             if (!appended) e.barrier();
@@ -539,7 +540,7 @@ pub const Attention = struct {
             e.setPipeline(a.io[1]);
             bind(e, .{ q, scratch.get(.qb) });
             e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 2, 1)); // eight words a thread
         }
         // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
         if (!appended) e.barrier();
@@ -624,12 +625,12 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), scratch.get(.keep_k), scratch.get(.keep_v) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
         e.barrier();
         e.setPipeline(a.io[6]);
         bind(e, .{ scratch.get(.keep_k), scratch.get(.keep_v), binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
         e.barrier();
     }
     /// `keep`'s gather into a caller's own K/V lanes, without barriers: layers with distinct lanes gather side by side.
@@ -640,7 +641,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
     }
     /// The checks and resource uses of `keepGather`, without its dispatch (the all-layer launch reads through pointers).
     pub fn keepUse(e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache) !void {
@@ -660,7 +661,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[6]);
         bind(e, .{ keys, values, binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
     /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding reads; `layers` receives the
@@ -677,7 +678,7 @@ pub const Attention = struct {
         e.setBytes(std.mem.sliceAsBytes(layers), 0);
         e.setBuffer(lanes, 0, 1);
         e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept * @as(u32, @intCast(bindings.len))), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept * @as(u32, @intCast(bindings.len))), mtl.Size.of(32, 2, 1));
     }
     /// `keepScatter` for every binding in one launch, from the lanes and table `keepGatherLayers` filled.
     pub fn keepScatterLayers(a: *const Attention, e: mtl.ComputeEncoder, geometry: planning.Geometry, kept: u32, layers: []const KeepLayer, lanes: mtl.Buffer, lane_words: u32) void {
@@ -686,7 +687,7 @@ pub const Attention = struct {
         e.setBytes(std.mem.sliceAsBytes(layers), 0);
         e.setBuffer(lanes, 0, 1);
         e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
-        e.dispatchThreads(mtl.Size.of(geometry.dim, geometry.kv_heads, kept * @as(u32, @intCast(layers.len))), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(geometry.dim, geometry.kv_heads, kept * @as(u32, @intCast(layers.len))), mtl.Size.of(32, 2, 1));
     }
 };
 /// attention_io.metal's Q27KeepLayer: GPU addresses of one binding's cache pointers, metadata and keep map.

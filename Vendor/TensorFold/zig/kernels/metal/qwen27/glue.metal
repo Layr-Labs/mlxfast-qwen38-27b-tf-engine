@@ -131,9 +131,10 @@ struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta;
 // packed_rows (kv head h / g's rows, row r's head h at r * g + h % g, rows * g on repeating row 0's first head).
 // A stream's key and value caches, as the attention binding's caches table holds them.
 struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
-// DEC (decoded rows of one stream): beside QY and KY, a q head's rounded values also land where q27_attn_pack_a packs
-// them (QA, packed_rows rows a kv head, rows * g on repeating row 0's first head), and a k head's rotated key and its
-// value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
+// DEC (decoded rows of one stream): instead of QY and KY (no launch reads them: encode with `appended` runs neither
+// pack nor append), a q head's rounded values land where q27_attn_pack_a packs them (QA, packed_rows rows a kv head,
+// rows * g on repeating row 0's first head), and a k head's rotated key and its value row land where q27_attn_append
+// writes them (the row's cache slot from the plan's meta and nodes).
 // CACHE (prompt rows of one stream, with PACK): a k head's rotated key lands in its cache slot instead of KY (nothing then
 // reads KY) and its value row in its value slot, where q27_attn_append writes them, so no append follows.
 template <bool PACK, bool DEC, bool CACHE = false>
@@ -363,8 +364,13 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
     ya[j] = bfloat(value);
     yb[j] = bfloat(nb[j]);
   }
-  *(device bfloat4*)(y + 4 * lane) = ya;
-  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+  // DEC (q27_head_norm_rope_decoded): QY and KY are not stored. The round's query packs into QA and its keys and
+  // values append to their caches below; encode with `appended` runs neither pack nor append, the only readers of QY
+  // and KY, so no launch reads these words (r32 dead-store audit).
+  if (!DEC) {
+    *(device bfloat4*)(y + 4 * lane) = ya;
+    *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+  }
   if (PACK && query && row == 0 && head == kv_head * g)
     for (uint r = a.rows * g; r < a.packed_rows; ++r) {
       device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
@@ -424,10 +430,10 @@ Q27_HEAD_NORM_ROPE(q27_head_norm_rope_held, false)
 Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed_held, true)
 #undef Q27_HEAD_NORM_ROPE
 
-// The decoded rows' one-pass kernel (DEC): q27_head_norm_rope's outputs, the packed query the prefix reads and the round's
-// keys and values in their cache slots, so no q27_attn_pack_a or q27_attn_append follows. It waits on its counted
-// projections as q27_head_norm_rope does; count_out above 0: every group counts itself on PC[0] once stored, for the
-// prefix that shares its barrier interval.
+// The decoded rows' one-pass kernel (DEC): the packed query the prefix reads and the round's keys and values in their
+// cache slots, so no q27_attn_pack_a or q27_attn_append follows; QY and KY are not stored (no launch reads them). It
+// waits on its counted projections as q27_head_norm_rope does; count_out above 0: every group counts itself on PC[0]
+// once stored, for the prefix that shares its barrier interval.
 kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
                  device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
                  constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
