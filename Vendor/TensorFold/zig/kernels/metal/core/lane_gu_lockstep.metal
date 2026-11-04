@@ -31,10 +31,20 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
   const device uint4* gp=gw+(size_t)first*TF_TB*64;
   const device uint4* up=uw+(size_t)first*TF_TB*64;
   uint4 nw0=gp[0],nw1=gp[32];
+#if defined(TF_GU_U_LOOKAHEAD2)
+  // Turn 1 stages U[g+1] alongside the existing G[g+1] lookahead for the next pair.
+  uint4 uw0=0,uw1=0;
+#endif
 #if defined(TF_SBI12)
   uint3 ni=gi[(size_t)first*(TF_N/8)];
+#if defined(TF_GU_U_LOOKAHEAD2)
+  uint3 u_next_i=uint3(0);
+#endif
 #else
   uint2 ni0=gi[(size_t)first*(TF_N/4)],ni1=gi[(size_t)first*(TF_N/4)+4];
+#if defined(TF_GU_U_LOOKAHEAD2)
+  uint2 u_next_i0=uint2(0),u_next_i1=uint2(0);
+#endif
 #endif
   for(int g=first;g<last;g++){
    const float x0=XS[g*stride+mb];
@@ -53,11 +63,27 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
      b2[e+8]=as_type<half2>((word>>8)&0x000F000Fu);b2[e+9]=as_type<half2>((word>>12)&0x000F000Fu);
     }
     if(turn==0){
+#if defined(TF_GU_U_LOOKAHEAD2)
+     if(g==first){nw0=up[0];nw1=up[32];
+#if defined(TF_SBI12)
+      ni=ui[(size_t)g*(TF_N/8)];
+#else
+      ni0=ui[(size_t)g*(TF_N/4)];ni1=ui[(size_t)g*(TF_N/4)+4];
+#endif
+     }else{nw0=uw0;nw1=uw1;
+#if defined(TF_SBI12)
+      ni=u_next_i;
+#else
+      ni0=u_next_i0;ni1=u_next_i1;
+#endif
+     }
+#else
      nw0=up[0];nw1=up[32];
 #if defined(TF_SBI12)
      ni=ui[(size_t)g*(TF_N/8)];
 #else
      ni0=ui[(size_t)g*(TF_N/4)];ni1=ui[(size_t)g*(TF_N/4)+4];
+#endif
 #endif
     }else{
      const int advance=g+1<last?TF_TB*64:0;gp+=advance;up+=advance;nw0=gp[0];nw1=gp[32];
@@ -66,6 +92,15 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
      ni=gi[(size_t)next*(TF_N/8)];
 #else
      ni0=gi[(size_t)next*(TF_N/4)];ni1=gi[(size_t)next*(TF_N/4)+4];
+#endif
+#if defined(TF_GU_U_LOOKAHEAD2)
+     if(g+1<last){uw0=up[0];uw1=up[32];
+#if defined(TF_SBI12)
+      u_next_i=ui[(size_t)next*(TF_N/8)];
+#else
+      u_next_i0=ui[(size_t)next*(TF_N/4)];u_next_i1=ui[(size_t)next*(TF_N/4)+4];
+#endif
+     }
 #endif
     }
     op.run(x,cb,P);

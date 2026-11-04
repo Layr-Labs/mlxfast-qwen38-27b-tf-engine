@@ -327,6 +327,22 @@ fn lockstepGu(l:Layout)bool{
         l.ranges.len==0 and l.y_stride==null and !l.residual;
 }
 
+/// Per-mechanism rollback for the lockstep GU's second U lookahead; enabled by default in this candidate.
+fn lockstepGuULookahead2Value(value: ?[]const u8) bool {
+    return if (value) |v| !std.mem.eql(u8, v, "0") else true;
+}
+
+fn lockstepGuULookahead2Enabled() bool {
+    const value = std.c.getenv("MLXFAST_GU_U_LOOKAHEAD2") orelse return true;
+    return lockstepGuULookahead2Value(std.mem.span(value));
+}
+
+test "lockstep GU second U lookahead kill switch defaults on and accepts zero" {
+    try std.testing.expect(lockstepGuULookahead2Value(null));
+    try std.testing.expect(!lockstepGuULookahead2Value("0"));
+    try std.testing.expect(lockstepGuULookahead2Value("1"));
+}
+
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
     const g = l.groupCut();
@@ -361,7 +377,10 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if(lockstepGu(l)) {
+        if (lockstepGuULookahead2Enabled()) try text.appendSlice(a, "#define TF_GU_U_LOOKAHEAD2 1\n");
+        try text.appendSlice(a,ks.core_lane_lockstep);
+    }
     return text.toOwnedSlice(a);
 }
 
