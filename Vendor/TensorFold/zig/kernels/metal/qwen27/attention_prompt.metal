@@ -165,8 +165,10 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     constant Q27PromptArgs& args [[buffer(3)]], device bfloat* OUT [[buffer(4)]],
     device const bfloat* QG [[buffer(5)]], device float* XS [[buffer(6)]],
     constant uint& sums_stride [[buffer(7)]], constant uint& gated [[buffer(8)]],
-    uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-  const int hk = int(tg.x), r = args.row0 + int(tg.y);
+    uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  // four packed rows a threadgroup, one a simdgroup (no threadgroup memory or barrier: each keeps its row's work); a
+  // last group's rows past the grid's land in the padded branch below, which writes nothing past the sums stride
+  const int hk = int(tg.x), r = args.row0 + int(tg.y) * 4 + int(sg);
   constexpr int DP = PD / 32;
   const int node = r / PG, head = hk * PG + r % PG;
   // Padded sum rows have no attention partial or output address to read.
@@ -185,7 +187,11 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     const float nm = max(m, mc);
     const float f1 = fast::exp2(m - nm), f2 = fast::exp2(mc - nm);
     l = l * f1 + lc * f2;
-    for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
+    // the lane's eight partial words as two 16-byte loads (a row's words start 1 KiB apart, the lane's 32 bytes in)
+    const device float4* po = (const device float4*)(PO + row * PD + lane * DP);
+    const float4 p0 = po[0], p1 = po[1];
+    const float p[DP] = {p0[0], p0[1], p0[2], p0[3], p1[0], p1[1], p1[2], p1[3]};
+    for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + p[i] * f2;
     m = nm;
   }
   // the lane's eight gate words in one 16-byte load before any store, its eight output words in one 16-byte store (rows
