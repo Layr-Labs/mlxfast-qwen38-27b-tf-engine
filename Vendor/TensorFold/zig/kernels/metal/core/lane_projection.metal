@@ -865,10 +865,27 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
+#if !TF_SIMD_FRAGS
+    // M5 canonical 16x64 left fragments: four 16-column blocks, two four-word row spans a lane per block.
+    // Construct the two K32 operands directly; do not keep a separate K64 cooperative object live.
+    TF_UNROLL
+    for (int f = 0; f < 4; f++) {
+      const device bfloat* lo = xv + (size_t)mb * TF_K + nb + f * 16;
+      const device bfloat* hi = lo + 8 * TF_K;
+      const bfloat4 a = mb < M ? *(const device bfloat4*)lo : bfloat4(0);
+      const bfloat4 b = mb + 8 < M ? *(const device bfloat4*)hi : bfloat4(0);
+      TF_UNROLL
+      for (int j = 0; j < 4; j++) {
+        if (f < 2) { xl0[f * 8 + j] = a[j]; xl0[f * 8 + 4 + j] = b[j]; }
+        else { xl1[(f - 2) * 8 + j] = a[j]; xl1[(f - 2) * 8 + 4 + j] = b[j]; }
+      }
+    }
+#else
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
-    xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#endif
+    xv += GS;
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
