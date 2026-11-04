@@ -330,26 +330,28 @@ pub const Backend = struct {
         defer b.stash = null;
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(b.allocator);
+        var seq_cache: core.affine4_lane.SeqCache = .empty;
+        defer seq_cache.deinit(b.allocator);
         var kept = b.checkpoint.tensors.iterator();
         while (kept.next()) |entry| if (linear(entry.key_ptr.*, entry.value_ptr.rank)) {
             const t = entry.value_ptr.*;
-            try b.prepareOne(order, entry.key_ptr.*, @intFromPtr(t.buffer.contents() + t.offset), t.dtype, t.shape, t.host(u16));
+            try b.prepareOne(order, &seq_cache, entry.key_ptr.*, @intFromPtr(t.buffer.contents() + t.offset), t.dtype, t.shape, t.host(u16));
         };
         var later = b.checkpoint.deferred.iterator();
         while (later.next()) |entry| if (linear(entry.key_ptr.*, entry.value_ptr.rank)) {
             const d = entry.value_ptr.*;
             try rows.resize(b.allocator, d.bytes / 2);
             try b.checkpoint.read(entry.key_ptr.*, 0, std.mem.sliceAsBytes(rows.items));
-            try b.prepareOne(order, entry.key_ptr.*, @intFromPtr((try b.checkpoint.view(entry.key_ptr.*)).ptr), d.dtype, d.shape, rows.items);
+            try b.prepareOne(order, &seq_cache, entry.key_ptr.*, @intFromPtr((try b.checkpoint.view(entry.key_ptr.*)).ptr), d.dtype, d.shape, rows.items);
         };
         const expected = b.config.linearCount();
-        if (b.stash != null) try b.buildGroups(order, &stash);
+        if (b.stash != null) try b.buildGroups(order, &stash, &seq_cache);
         if ((if (units) b.prepared.count() - b.fused_count - b.precise_count else b.tiled.count()) != expected) return error.DraftTensorCoverage;
     }
     /// The key bit of a linear's q4 copy beside its copy below 4 bits (no tensor address reaches it).
     pub const precise_key: usize = 1 << 62;
     /// One bf16 [n][k] linear's q4 copy under `key`: an M5 lane adapter, or (no `order`) the same bits on tiles.
-    fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
+    fn prepareOne(b: *Backend, order: ?core.lane_projection.RegOrder, seq_cache: *core.affine4_lane.SeqCache, name: []const u8, key: usize, dtype: core.checkpoint_metal.DType, shape: @FieldType(core.checkpoint_metal.Tensor, "shape"), rows: []const u16) !void {
         if (dtype != .bf16 or shape[0] % 32 != 0 or shape[1] % 64 != 0) return error.DraftPreparationUnqualified;
         const bits: u8 = if (order != null) draftBits(name) else 4;
         var prepared_words = if (bits != 4 and low_reg) try core.affine4.prepareNibbles(b.allocator, rows, shape[0], shape[1], bits) else try core.affine4.prepareBits(b.allocator, rows, shape[0], shape[1], bits, if (bits != 4) low_group else 64);
@@ -364,7 +366,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.initStream(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o, seq_cache);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -379,7 +381,7 @@ pub const Backend = struct {
                     const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
                     try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
                 };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                const exact = try core.affine4_lane.Adapter.initStream(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o, seq_cache);
                 try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
                 b.precise_count += 1;
             }
@@ -418,7 +420,7 @@ pub const Backend = struct {
         const end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
         return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
     }
-    fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
+    fn fuse(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, seq_cache: *core.affine4_lane.SeqCache, layer: usize, parts: []const u8, key_part: u8, kind: usize) !void {
         var n: usize = 0;
         var k: usize = 0;
         var bits: u8 = 0;
@@ -452,20 +454,20 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.initStream(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order, seq_cache);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
-    fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
+    fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash, seq_cache: *core.affine4_lane.SeqCache) !void {
         for (0..b.config.layers) |layer| {
-            try b.fuse(order, st, layer, "kv", 'k', group_kv);
+            try b.fuse(order, st, seq_cache, layer, "kv", 'k', group_kv);
             const fused = b.fused_count;
-            try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
+            try b.fuse(order, st, seq_cache, layer, "qkv", 'q', group_qkv);
             if (b.fused_count != fused) b.qkv_layers += 1;
-            try b.fuse(order, st, layer, "gu", 'g', group_gu);
+            try b.fuse(order, st, seq_cache, layer, "gu", 'g', group_gu);
             // the q4 copies' gate/up group of a layer drafted below 4 bits (stashed as G and U)
             const before = b.fused_count;
-            try b.fuse(order, st, layer, "GU", 'G', group_gu);
+            try b.fuse(order, st, seq_cache, layer, "GU", 'G', group_gu);
             if (b.fused_count != before) {
                 b.fused_count -= 1;
                 b.precise_count += 1;
