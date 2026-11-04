@@ -111,9 +111,13 @@ kernel void tf_draft_rms_xs(device const bfloat* X [[buffer(0)]],device const bf
     Y[size_t(block.y)*a.y_stride+block.x*a.dim+col]=y;
     out[col]=y;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Four consecutive columns per thread: each 64-column chunk is produced
+  // by 16 adjacent threads, entirely inside one SIMD group. Assign its ordered
+  // sum to that same group's first two lanes; normalization above still uses
+  // the original whole-threadgroup reductions and publication barriers.
+  simdgroup_barrier(mem_flags::mem_threadgroup);
   const uint groups=a.dim/TF_XS_GROUP;
-  for(uint g=t;g<groups;g+=threads.x){
+  if(lane<2)for(uint g=2*sg+lane;g<groups;g+=threads.x/16){
     float acc=0.0f;
     for(uint i=0;i<TF_XS_GROUP;i++)acc+=float(out[g*TF_XS_GROUP+i]);
     XS[size_t(g)*xs_stride+block.y]=acc;
@@ -241,9 +245,13 @@ kernel void tf_dynamic_conv2_rms_xs(device const bfloat* X [[buffer(0)]],device 
     Y[size_t(row)*a.y_stride+col]=y;
     out[col]=y;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Four consecutive columns per thread: each 64-column chunk is produced
+  // by 16 adjacent threads, entirely inside one SIMD group. Assign its ordered
+  // sum to that same group's first two lanes; normalization above still uses
+  // the original whole-threadgroup reductions and publication barriers.
+  simdgroup_barrier(mem_flags::mem_threadgroup);
   const uint xs_groups=a.dim/TF_XS_GROUP;
-  for(uint g=t;g<xs_groups;g+=threads.x){
+  if(lane<2)for(uint g=2*sg+lane;g<xs_groups;g+=threads.x/16){
     float acc=0.0f;
     for(uint i=0;i<TF_XS_GROUP;i++)acc+=float(out[g*TF_XS_GROUP+i]);
     XS[size_t(g)*xs_stride+row]=acc;
