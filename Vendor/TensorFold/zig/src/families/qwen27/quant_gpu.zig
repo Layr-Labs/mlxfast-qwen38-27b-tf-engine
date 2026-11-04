@@ -700,7 +700,9 @@ pub const Kernels = struct {
     /// once a threadgroup too, but only parallel split-K launches wait.
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
+        // the wide K-split-2 projections (GDN qkv, attention query+gate) on 6-8 rows: two SIMD groups a tile, one K half
+        // each, as the uncounted launch takes them (wideDecodeSk2), instead of one SIMD group walking both halves
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait, .parallel_sk2 = !wait and p.slices == 2 and wideDecodeSk2(p.n, p.k, rows, false) };
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
@@ -817,16 +819,28 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
+        // a wide shape's other row-count build too, at its first call, so no later round compiles a pipeline
+        if (wideDecodeSk2(p.n, p.k, 8, false)) {
+            var other = key;
+            other.parallel_sk2 = !key.parallel_sk2;
+            _ = try k.countedEntry(p, other);
+        }
+        const entry = try k.countedEntry(p, key);
+        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+        try entry.encodeCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? });
+        try span.end();
+        return @intCast(entry.tile_count);
+    }
+
+    /// quantCounted's pipeline for `key` (a countedKey without wait), built on first use.
+    fn countedEntry(k: *Kernels, p: projection.Linear, key: Key) !*lane.Projection {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
             entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .serial_sk2 = key.serialSk2() });
             k.joined(entry.value_ptr);
         }
-        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? });
-        try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        return entry.value_ptr;
     }
 
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
