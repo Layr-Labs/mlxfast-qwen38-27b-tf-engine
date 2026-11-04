@@ -17,6 +17,9 @@ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []co
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
 const precise_below: f32 = 0.95;
+/// A round whose tree's best two siblings lie less than this apart in the selector's log-probabilities was an uncertain
+/// draft: the frames after it draft on the q4 copies too, whatever the acceptance share.
+const uncertain_below: f64 = 0.25;
 /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
 fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
     const m: *@import("../model.zig").Model = @ptrCast(@alignCast(ptr));
@@ -57,6 +60,10 @@ pub const Generation = struct {
     /// Moving share of rounds a sibling landed in (each round's weight `accept_step`): below `precise_below` the frames
     /// draft on the q4 copies of the linears drafted below 4 bits, which miss fewer siblings where they are missed.
     accept_share: f32 = 1,
+    /// The drafter scratch's refill (Frame.refill) while a prefill's pass runs: joined before the drafter's first frame.
+    refill: ?std.Thread = null,
+    /// The rows of the prompt chunk in flight, for aheadDue.
+    ahead_total: u64 = 0,
     pub fn init(a: std.mem.Allocator, runner: *Runner, draft: *Draft) !Generation {
         if (runner.model != draft.backend.target or runner.model.config.hidden != draft.graph.config.hidden or runner.model.config.layers != draft.graph.config.target_layers) return error.TargetBinding;
         runner.capture_taps = true;
@@ -152,8 +159,26 @@ pub const Generation = struct {
         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
         const direct = g.tapsInto(ids.len);
         defer g.runner.taps.into = null;
+        // the taps land in the ring's slots: each segment but the last of a staggered pass gives its rows' taps to the
+        // drafter as it ends on the GPU, while the later segments still run (Model.absorbAhead); only a chunk that is the
+        // whole prompt (the last, with nothing committed before it), so `ahead_total` is the prompt's rows
+        g.ahead_total = ids.len;
+        if (direct and last) g.runner.rows_done = .{ .ptr = g, .due = aheadDue, .run = aheadRun };
+        defer g.runner.rows_done = null;
         try (TargetSession.Session{ .runner = g.runner }).promptChunk(ids, last);
         try g.absorbChunk(ids.len, direct);
+    }
+    fn aheadDue(ptr: *anyopaque, end: u32) bool {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        return g.keep == null and g.draft.canAbsorbAhead(end, g.ahead_total);
+    }
+    fn aheadRun(ptr: *anyopaque, end: u32) anyerror!void {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        if (g.refill) |t| { // the scratch the frame takes, made beside the pass
+            t.join();
+            g.refill = null;
+        }
+        try g.draft.absorbAhead(end, g.ahead_total);
     }
     /// `promptChunk` with decoded rows' arithmetic (an earlier reply's tokens).
     pub fn decodeChunk(g: *Generation, ids: []const u32, last: bool) !void {
@@ -171,6 +196,14 @@ pub const Generation = struct {
         g.draft.backend.precise = false;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
+        // the drafter's scratch, freed at the last phase close, is made again on a helper thread while the GPU runs this
+        // pass (Frame.refill): the catch-up frame behind it then waits on no allocation. Nothing here touches the frame.
+        const frame = &g.draft.backend.frame;
+        g.refill = if (frame.refillDue()) std.Thread.spawn(.{}, @TypeOf(frame.*).refill, .{frame}) catch null else null;
+        defer if (g.refill) |t| {
+            t.join();
+            g.refill = null;
+        };
         var first: usize = 0;
         while (first < ids.len) {
             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
@@ -475,7 +508,9 @@ pub const Generation = struct {
         g.pending = accepted.pending orelse accepted.bonus;
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
-        g.draft.backend.precise = g.accept_share < precise_below;
+        // the tree's scores run best first: a tree of one sibling has no second close to its best
+        const margin = if (tree.scores.len > 1) tree.scores[0] - tree.scores[1] else std.math.inf(f64);
+        g.draft.backend.precise = g.accept_share < precise_below or margin < uncertain_below;
         var landed: u32 = 0;
         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
         const tokens = try g.allocator.dupe(u32, accepted.tokens);
