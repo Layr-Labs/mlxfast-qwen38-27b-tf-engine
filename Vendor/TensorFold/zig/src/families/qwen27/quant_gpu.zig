@@ -79,8 +79,11 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
-    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
-    /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
+    gu_parts: u32 = 1,
+    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8) and of the GDN z|b|a projection (6240 x 5120,
+    /// K split 4), whose b and a tiles' one-tile launch (gdn_hook) takes it: one SIMD group a tile runs the K chains in
+    /// turn (lane_projection.Layout.serial_sk2) instead of a SIMD group a chain in one threadgroup. Two-tile launches (z's)
+    /// keep their parallel K splits.
     serial: bool = false,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
@@ -97,17 +100,18 @@ const Key = struct {
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
 /// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
 fn wideDecodeSk2(n: u32, input_width: u32, rows: u32, prompt: bool) bool {
-    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 6 and rows <= 8;
+    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 5 and rows <= 8;
 }
 
 test "wide decode SK2 keeps row and phase boundaries distinct" {
     for ([_]u32{ 34816, 10240 }) |n| {
-        for ([_]u32{ 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
-        for ([_]u32{ 0, 1, 2, 3, 4, 5, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 5, 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 0, 1, 2, 3, 4, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
         try std.testing.expect(!wideDecodeSk2(n, 5120, 8, true));
         try std.testing.expect(!wideDecodeSk2(n, 2560, 8, false));
     }
-    try std.testing.expect(wideDecodeSk2(12288, 5120, 8, false));
+    for ([_]u32{ 5, 6, 8 }) |rows| try std.testing.expect(wideDecodeSk2(12288, 5120, rows, false));
+    for ([_]u32{ 4, 9 }) |rows| try std.testing.expect(!wideDecodeSk2(12288, 5120, rows, false));
     for ([_]u32{ 5120, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
 }
 
@@ -142,6 +146,17 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
+test "GU quarter counters are selected only for their paired four-split down" {
+    const good = projection.Linear{ .words = undefined, .pairs = undefined, .n = 5120, .k = 17408, .tile = 32, .slices = 4 };
+    try std.testing.expectEqual(@as(u32, 4), Kernels.guParts(good, true));
+    try std.testing.expectEqual(@as(u32, 1), Kernels.guParts(good, false));
+    inline for (.{ .{ "n", @as(u32, 10240) }, .{ "k", @as(u32, 5120) }, .{ "slices", @as(u32, 2) }, .{ "slices", @as(u32, 8) } }) |change| {
+        var other = good;
+        @field(other, change[0]) = change[1];
+        try std.testing.expectEqual(@as(u32, 1), Kernels.guParts(other, true));
+    }
+}
+
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
@@ -167,7 +182,7 @@ pub const Kernels = struct {
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
     count_words: ?mtl.Buffer = null,
-    /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
+    /// The decoded gate/up's four partition counts and the waiting down's arrivals, left zero before its final TC count.
     gu_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
@@ -457,7 +472,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.k == 5120 and ((p.n == 2048 and sk == 8) or (p.n == 6240 and sk == 4)) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -700,7 +715,7 @@ pub const Kernels = struct {
     /// once a threadgroup too, but only parallel split-K launches wait.
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait, .gu_parts = guParts(p, wait) };
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
@@ -802,6 +817,11 @@ pub const Kernels = struct {
         return k.warm_bytes.?;
     }
 
+    /// Only this down shape has four equal K splits matching the guarded GU's 272 output groups.
+    fn guParts(p: projection.Linear, wait: bool) u32 {
+        return if (wait and p.n == 5120 and p.k == 17408 and p.slices == 4) 4 else 1;
+    }
+
     /// Whether quantCounted takes `p` for `rows` decoded rows (checked before either of a pair is encoded).
     pub fn countable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
         return k.countedKey(p, rows, false) != null;
@@ -845,7 +865,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .gu_parts = key.gu_parts });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
@@ -860,12 +880,12 @@ pub const Kernels = struct {
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
         if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
         if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
-        if (k.countedKey(down, rows, true) == null) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
+        const down_key = k.countedKey(down, rows, true) orelse return null;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true, .gu_parts = down_key.gu_parts };
         if (!key.serialSk2()) return null;
         if (k.gu_words == null) {
-            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
-            @memset(b.contents()[0..8], 0);
+            const b = try k.device.buffer(20, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..20], 0);
             k.gu_words = b;
         }
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -874,7 +894,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true, .gu_parts = key.gu_parts });
             k.joined(entry.value_ptr);
         }
         const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
