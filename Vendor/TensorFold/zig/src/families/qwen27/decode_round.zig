@@ -4,8 +4,11 @@ const mtl = @import("metal");
 const Model = @import("model.zig").Model;
 const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
-/// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
-const commit_every = 8;
+/// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest. A decoded verify and
+/// every segment of a staggered prompt pass commit on this cadence; six keeps at most two layers of the pass's dispatch
+/// stream ahead of the GPU while the chunk's own tail (a star scan, an attention merge) still runs, so a chunk's kernels
+/// reach the queue before the previous chunk's last barrier retires.
+const commit_every = 6;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
