@@ -172,7 +172,9 @@ pub const Head = struct {
         defer p.deinit();
         const order = if (reg) try lane.RegOrder.init(device) else null;
         defer if (order) |o| o.deinit();
-        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.split(width, k), order);
+        var seq_cache: core.affine4_lane.SeqCache = .empty;
+        defer seq_cache.deinit(a);
+        h.plain = try core.affine4_lane.Adapter.initStream(a, device, p, try projection.split(width, k), order, &seq_cache);
     }
     /// The spans' rows of `name` ([rows][row_bytes] in the checkpoint), packed in span order into `out`.
     fn spanRows(ck: *const @import("core").checkpoint_metal.Checkpoint, name: []const u8, rows: usize, row_bytes: usize, out: []u8) !void {
