@@ -689,6 +689,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 
 #if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN)
+#if defined(TF_PROMPT_M32)
+#define TF_PM 32
+#else
+#define TF_PM 16
+#endif
 #ifndef TF_TB
 #define TF_TB 1
 #endif
@@ -710,6 +715,23 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 1
 #else
 #define TF_STREAM_RIGHT 0
+#endif
+#if defined(TF_PROMPT_M32)
+#define TF_TN_FMA(t) \
+        TF_UNROLL \
+        for (int h = 0; h < TF_PM; h += 16) { \
+          const float sx0 = xsum[h / 8], sx1 = xsum[h / 8 + 1]; \
+          C[t][h + j] = fma(s0, P[h + j], fma(b0, sx0, C[t][h + j])); \
+          C[t][h + 4 + j] = fma(s0, P[h + 4 + j], fma(b0, sx1, C[t][h + 4 + j])); \
+          C[t][h + 8 + j] = fma(s1, P[h + 8 + j], fma(b1, sx0, C[t][h + 8 + j])); \
+          C[t][h + 12 + j] = fma(s1, P[h + 12 + j], fma(b1, sx1, C[t][h + 12 + j])); \
+        }
+#else
+#define TF_TN_FMA(t) \
+        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
+        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
+        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
+        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j]));
 #endif
 #if TF_STREAM_RIGHT
 #define TF_STREAM_PF 0
@@ -749,10 +771,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
         const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
-        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
-        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
-        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
-        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
+        TF_TN_FMA(t) \
       } \
 }
 #else
@@ -780,10 +799,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       for (int j = 0; j < 4; j++) { \
         const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]); \
         const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
-        C[t][j] = fma(s0, P[j], fma(b0, x0, C[t][j])); \
-        C[t][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[t][4 + j])); \
-        C[t][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[t][8 + j])); \
-        C[t][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[t][12 + j])); \
+        TF_TN_FMA(t) \
       } \
 }
 #endif
@@ -808,28 +824,28 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
-  const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+  const int r0 = int(tg.y) * TF_PM, rows = mdims[0] - r0;
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
 #if defined(TF_SWIGLU)
   Y += (size_t)r0 * (TF_N / 2); // SwiGLU rows are half the fused width
   HS += r0;
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_PM), stride = mdims[1], tile0 = 2 * int(tg.x) + ks * (TF_N / 64);
 #else
   Y += (size_t)r0 * TF_YS;
 #if defined(TF_RESID)
   H += (size_t)r0 * TF_YS;
   RO += (size_t)r0 * TF_YS;
 #endif
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, 16), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_PM), stride = mdims[1], tile0 = tf_tile(TN * int(tg.x)); // a range's TN-aligned tiles
 #endif
   XS += r0;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   // each 64-deep group as two 32-deep products into the same sums: a K=64 operand's registers are its two K=32
   // halves' registers in order (left: elements 0-15 then 16-31; right: 0-31 then 32-63)
-  constexpr auto dm = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
-  constexpr auto da = matmul2d_descriptor(16, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  constexpr auto d64 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto dm = matmul2d_descriptor(TF_PM, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto da = matmul2d_descriptor(TF_PM, NT, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto d64 = matmul2d_descriptor(TF_PM, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<dm, execution_simdgroup> opm;
   matmul2d<da, execution_simdgroup> opa;
   matmul2d<d64, execution_simdgroup> op64;
@@ -853,22 +869,34 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
-  float C[TN][16];
+  float C[TN][TF_PM];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
-    for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
+    for (int i = 0; i < TF_PM; i++) C[t][i] = 0.0f;
   }
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
-    const float x0 = xp[0], x1 = xp[8];
-    xp += stride;
-    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
-    xv += GS;
+#if defined(TF_PROMPT_M32)
+    float xsum[4];
     TF_UNROLL
-    for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+    for (int h = 0; h < 4; h++) xsum[h] = mb + 8 * h < M ? xp[8 * h] : 0.0f;
+#else
+    const float x0 = xp[0], x1 = xp[8];
+#endif
+    xp += stride;
+#if defined(TF_PROMPT_M32)
+    // Direct K32 loads avoid assuming that M32/K64's register layout is concatenated.
+    xl0.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(32, M), xstr));
+    xl1.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)(xv + 32), dextents<int32_t, 2>(32, M), xstr));
+#else
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+    TF_UNROLL
+    for (int i = 0; i < TF_PM; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#endif
+    xv += GS;
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
@@ -885,7 +913,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < TF_PM; i++) {
       const int m = mb + 8 * ((i >> 2) & 1);
       gu16[((2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
     }
@@ -907,7 +935,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
-  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * TF_PM * 32];
 #ifndef TF_TGPAD
 #define TF_TGPAD 8192
 #endif
@@ -922,7 +950,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       TF_UNROLL
       for (int t = 0; t < TN; t++) {
         TF_UNROLL
-        for (int i = 0; i < 16; i++) part[(((ks - 1) * TN + t) * 16 + i) * 32 + lane] = C[t][i];
+        for (int i = 0; i < TF_PM; i++) part[(((ks - 1) * TN + t) * TF_PM + i) * 32 + lane] = C[t][i];
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -931,7 +959,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
         TF_UNROLL
         for (int t = 0; t < TN; t++) {
           TF_UNROLL
-          for (int i = 0; i < 16; i++) C[t][i] += part[(((s2 - 1) * TN + t) * 16 + i) * 32 + lane];
+          for (int i = 0; i < TF_PM; i++) C[t][i] += part[(((s2 - 1) * TN + t) * TF_PM + i) * 32 + lane];
         }
       }
     }
@@ -944,8 +972,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     TF_UNROLL
     for (int t = 0; t < TN; t++) {
       TF_UNROLL
-      for (int q = 0; q < 4; q++) {
-        const int m = mb + 8 * (q & 1), n = (tile0 + t) * NT + nb + 16 * (q >> 1);
+      for (int q = 0; q < TF_PM / 4; q++) {
+        const int m = mb + 8 * (q & 1) + 16 * (q / 4), n = (tile0 + t) * NT + nb + 16 * ((q >> 1) & 1);
         if (m < M && n < TF_N) {
 #if defined(TF_RESID)
           // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as
