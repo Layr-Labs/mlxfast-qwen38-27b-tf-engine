@@ -712,6 +712,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_RIGHT 0
 #endif
 #if TF_STREAM_RIGHT
+// The prompt layout has four distinct metadata quads across 32 lanes (nb uses only lane bits 0 and 3).
+// The first lane of each identical-address set loads once; all members receive those exact uint4 words.
+inline uint4 tf_prompt_metadata(const device uint4* src, int lane) {
+  const ushort owner = ushort(lane & 9);
+  const uint4 words = lane == int(owner) ? src[0] : uint4(0);
+  return simd_shuffle(words, owner);
+}
 #define TF_STREAM_PF 0
 #if TF_STREAM_PF
 #define TF_STREAM_EARLY(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
@@ -721,7 +728,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #define TF_STREAM_LATE(t) {       cp += (t) + 1 < TN ? 64 : (g + 1 < last ? (TF_TB - TN + 1) * 64 : 0);       nw0 = cp[0]; nw1 = cp[32]; }
 #endif
 #define TF_TN_TILE(t) { \
-      const uint4 q0 = sp[0], q1 = sp[4]; \
+      const uint4 q0 = tf_prompt_metadata(sp, lane), q1 = tf_prompt_metadata(sp + 4, lane); \
       sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
       const uint4 cur0=nw0,cur1=nw1; \
       thread half2* b2=(thread half2*)&cbl[0]; \
