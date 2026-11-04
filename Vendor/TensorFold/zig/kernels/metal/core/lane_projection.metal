@@ -350,6 +350,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
 #define TF_CHAIN_WALK 1
 #endif
+// Decoded lean rows on small grids: keep group g and g + 1's codes in flight on each lane.
+#if defined(TF_DEEP) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR) && !defined(TF_CHAIN_WALK)
+#define TF_AHEAD2 1
+#else
+#define TF_AHEAD2 0
+#endif
 #if defined(TF_GU_TURNS)
 [[max_total_threads_per_threadgroup(64)]]
 #elif defined(TF_SWIGLU)
@@ -462,6 +468,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const int end = last;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = wl[(size_t)first * TF_TB * TF_RW]; nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)first * TF_TB * TF_RW + 32]; }
+#if TF_AHEAD2
+  const int ahead = min(first + 1, max(last - 1, first));
+  uint4 nx0 = 0, nx1 = 0;
+  if (first < last) { nx0 = wl[(size_t)ahead * TF_TB * TF_RW]; nx1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)ahead * TF_TB * TF_RW + 32]; }
+#endif
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -473,7 +484,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
+#if TF_AHEAD2
+  const device uint4* wp = wl + (size_t)ahead * TF_TB * TF_RW;
+#else
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
+#endif
 #endif
 #if defined(TF_WAIT)
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
@@ -530,7 +545,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
 #else
+#if TF_AHEAD2
+    { nw0 = nx0; nw1 = nx1; if (g + 2 < end) { wp += TF_TB * TF_RW; nx0 = wp[0]; nx1 = TF_BITS == 2 ? uint4(0) : wp[32]; } }
+#else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
+#endif
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)

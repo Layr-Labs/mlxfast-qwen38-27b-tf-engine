@@ -318,6 +318,13 @@ pub const Layout = struct {
     }
 };
 
+/// Decoded-row lean reg launches whose grid is at most 640 SIMD groups: keep two code groups in flight.
+pub fn deep(l: Layout) bool {
+    return l.reg and l.reg_lean and l.format.bits == 4 and l.format.group == 64 and l.rows8 and !l.prompt_sr and
+        !l.serial_sk2 and l.prompt_tn == 1 and !l.swiglu and
+        l.tiles() * l.sk <= 640;
+}
+
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
 fn lockstepGu(l:Layout)bool{
     return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
@@ -357,6 +364,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
+    if (deep(l)) try text.appendSlice(a, "#define TF_DEEP 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
@@ -945,4 +953,39 @@ test "reg order puts every code in the tensor op's right-input register for its 
     try bad.validate();
     bad.format.group = 128;
     try std.testing.expectError(error.UnsupportedRegFormat, bad.validate());
+}
+
+test "deep decoded code lookahead specializes the intended small-grid reg layouts" {
+    const kv = Layout{ .n = 2048, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 8, .reg = true, .reg_lean = true, .rows8 = true, .precompute_sums = true };
+    const output = Layout{ .n = 5120, .k = 6144, .format = .{ .bits = 4, .group = 64 }, .sk = 4, .reg = true, .reg_lean = true, .rows8 = true, .precompute_sums = true };
+    const down = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4, .reg = true, .reg_lean = true, .rows8 = true, .precompute_sums = true };
+    try std.testing.expect(deep(kv));
+    try std.testing.expect(deep(output));
+    try std.testing.expect(deep(down));
+
+    const generated = try source(std.testing.allocator, output);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "#define TF_DEEP 1\n") != null);
+
+    var too_wide = down;
+    too_wide.n = 6240;
+    try std.testing.expect(!deep(too_wide));
+    var serial = kv;
+    serial.serial_sk2 = true;
+    try std.testing.expect(!deep(serial));
+    var prompt = kv;
+    prompt.prompt_sr = true;
+    try std.testing.expect(!deep(prompt));
+    var gate_up = kv;
+    gate_up.swiglu = true;
+    try std.testing.expect(!deep(gate_up));
+    var full_rows = kv;
+    full_rows.rows8 = false;
+    try std.testing.expect(!deep(full_rows));
+    var two_bit = kv;
+    two_bit.format.bits = 2;
+    try std.testing.expect(!deep(two_bit));
+    var group32 = kv;
+    group32.format.group = 32;
+    try std.testing.expect(!deep(group32));
 }
