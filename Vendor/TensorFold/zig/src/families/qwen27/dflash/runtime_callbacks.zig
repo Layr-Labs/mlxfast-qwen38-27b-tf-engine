@@ -383,6 +383,8 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     const k = b.config.topk;
     const approx = try b.frame.alloc(x.rows, width, .bf16);
     try encodePrepared(b, e, x, approx, adapter);
+    // the head's 2-bit pass is the frame's last bandwidth-bound launch: the bridge's warm may start once it ends
+    b.frame.fenceBridgeEarly();
     const picks = try b.frame.alloc(x.rows, @sizeOf(@import("core").bf16_topk.Row), .u8);
     const approx_ref = try b.frame.ref(approx);
     const picks_ref = try b.frame.ref(picks);
