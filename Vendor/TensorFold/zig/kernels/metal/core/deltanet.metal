@@ -928,6 +928,90 @@ inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
   TF_UNROLL for (uint c = 0; c < 4; ++c)
     TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + (held ^ c) * p.dk + i] = state[c][i];
 }
+// Address-space-specific load only; conversions preserve the parent BF16 words exactly.
+inline void tf_delta_bf16x16_tg(threadgroup const bfloat* x, thread float (&f)[16]) {
+  const uint4 w0 = ((threadgroup const uint4*)x)[0], w1 = ((threadgroup const uint4*)x)[1];
+  const bfloat4 a0 = as_type<bfloat4>(w0.xy), a1 = as_type<bfloat4>(w0.zw), a2 = as_type<bfloat4>(w1.xy), a3 = as_type<bfloat4>(w1.zw);
+  TF_UNROLL for (uint i = 0; i < 4; ++i) {
+    f[i] = float(a0[i]); f[4 + i] = float(a1[i]); f[8 + i] = float(a2[i]); f[12 + i] = float(a3[i]);
+  }
+}
+inline void tf_delta_gdn_chain_staged(device const bfloat* query,
+    device const bfloat* key,
+    device const bfloat* value,
+    device const float* decay,
+    device const bfloat* mixing,
+    device const float* committed,
+    device const TfDeltaSegment* segments,
+    constant TfDeltaParams& p,
+    device bfloat* output,
+    device float* next_state,
+    uint3 position,
+    uint lane, uint tid, threadgroup uint4* K, threadgroup uint4* Q,
+    threadgroup uint4* V, threadgroup float* D, threadgroup bfloat* B) {
+  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+  const uint sub = lane & 7, dimension = position.y * 16 + (lane >> 3) * 4, key_head = head / (p.nv / p.nk);
+  const TfDeltaSegment span = segments[segment_index];
+  const uint state_stride = p.nv * p.dv * p.dk;
+  const uint column = (head * p.dv + dimension) * p.dk + sub * 16;
+  const uint held = (sub & 1) << 1 | (sub >> 1 & 1);
+  float state[4][16]; // state[c]: value column dimension + (held ^ c), its words at column + (held ^ c) * p.dk
+  TF_UNROLL for (uint c = 0; c < 4; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) state[c][i] = committed[span.state_slot * state_stride + column + (held ^ c) * p.dk + i];
+  // the row's key and query words, its (row, head) scalars, and its value and output words
+  const uint block = (position.y / 4) * 64;
+  // The four SIMD groups visit the same head/segment, with disjoint 16-column state slices.
+  // Stage only live rows, as BF16 bits. Arithmetic/reductions below retain the unmarked scan's exact order.
+  for (uint base = 0; base < span.rows; base += 16) {
+    const uint live = min(16u, span.rows - base);
+    for (uint word = tid; word < live * 16; word += 128) {
+      const uint row = span.first + base + word / 16;
+      const ulong at = (ulong(row) * p.nk + key_head) * p.dk + (word % 16) * 8;
+      K[word] = *(device const uint4*)(key + at);
+      Q[word] = *(device const uint4*)(query + at);
+    }
+    for (uint word = tid; word < live * 8; word += 128) {
+      const uint row = span.first + base + word / 8;
+      const ulong at = (ulong(row) * p.nv + head) * p.dv + block + (word % 8) * 8;
+      V[word] = *(device const uint4*)(value + at);
+    }
+    if (tid < live) {
+      const ulong at = ulong(span.first + base + tid) * p.nv + head;
+      D[tid] = decay[at]; B[tid] = mixing[at];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint inner = 0; inner < live; ++inner) {
+    const ulong vo = (ulong(span.first + base + inner) * p.nv + head) * p.dv + dimension;
+    float kf[16], qf[16], remembered[4], correction[4], result[4];
+    TF_UNROLL for (uint c = 0; c < 4; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
+    tf_delta_bf16x16_tg((threadgroup const bfloat*)(K + inner * 16) + sub * 16, kf);
+    const float forget = D[inner];
+    TF_UNROLL for (uint i = 0; i < 16; ++i)
+      TF_UNROLL for (uint c = 0; c < 4; ++c) {
+        state[c][i] = state[c][i] * forget;
+        remembered[c] += state[c][i] * kf[i];
+      }
+    const float mix = float(B[inner]);
+    const float own = (float(((threadgroup const bfloat*)(V + inner * 8))[dimension - block + held]) - tf_delta_slot_sum(remembered)) * mix;
+    correction[0] = own;
+    correction[1] = simd_shuffle_xor(own, 2);
+    correction[2] = simd_shuffle_xor(own, 1);
+    correction[3] = simd_shuffle_xor(own, 3);
+    tf_delta_bf16x16_tg((threadgroup const bfloat*)(Q + inner * 16) + sub * 16, qf);
+    TF_UNROLL for (uint i = 0; i < 16; ++i)
+      TF_UNROLL for (uint c = 0; c < 4; ++c) {
+        state[c][i] = state[c][i] + kf[i] * correction[c];
+        result[c] += state[c][i] * qf[i];
+      }
+    const float total = tf_delta_slot_sum(result);
+    if (sub < 4) output[vo + held] = bfloat(total);
+    }
+    // No lane overwrites a staged row until every SIMD group has consumed the chunk.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  TF_UNROLL for (uint c = 0; c < 4; ++c)
+    TF_UNROLL for (uint i = 0; i < 16; ++i) next_state[span.next_slot * state_stride + column + (held ^ c) * p.dk + i] = state[c][i];
+}
 #undef TF_UNROLL
 
 kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
@@ -941,8 +1025,20 @@ kernel void tf_delta_gdn_chain_wide(device const bfloat* query [[buffer(0)]],
                           device bfloat* output [[buffer(8)]],
                           device float* next_state [[buffer(9)]],
                           uint3 position [[thread_position_in_grid]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-  tf_delta_gdn_chain_wide_slots(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint3 local [[thread_position_in_threadgroup]],
+                          uint3 group_size [[threads_per_threadgroup]],
+                          uint3 grid_size [[threads_per_grid]]) {
+  // Uniform per threadgroup. Unrelated shapes and existing marked/debug dispatches retain the original scan.
+  if (p.dk == 128 && p.dv % 64 == 0 && group_size.x == 32 && group_size.y == 4 && group_size.z == 1 && grid_size.y == p.dv / 16) {
+    threadgroup uint4 K[16 * 16], Q[16 * 16], V[16 * 8];
+    threadgroup float D[16];
+    threadgroup bfloat B[16];
+    tf_delta_gdn_chain_staged(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane,
+        local.y * 32 + local.x, K, Q, V, D, B);
+  } else {
+    tf_delta_gdn_chain_wide_slots(query, key, value, decay, mixing, committed, segments, p, output, next_state, position, lane);
+  }
 }
 
 // marks[segment] (its rows, 0 unused): mark_state[segment * 4 + m] is the state a segment ending there would leave.
