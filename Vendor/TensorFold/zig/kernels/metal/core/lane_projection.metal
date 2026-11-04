@@ -12,6 +12,9 @@ using namespace mpp::tensor_ops;
 #ifndef TF_PRECOMPUTE_SUMS
 #define TF_PRECOMPUTE_SUMS 0
 #endif
+#ifndef TF_GU_PARTS
+#define TF_GU_PARTS 1
+#endif
 #ifndef TF_YS
 #define TF_YS TF_N
 #endif
@@ -476,9 +479,17 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
 #if defined(TF_WAIT)
-  // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
-  // device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded) and
-  // passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero for the next pair
+  // X and XS come from fenced, counted GU producers in this launch's barrier interval.
+#if TF_GU_PARTS > 1
+  // Each parallel K split reads exactly one contiguous quarter of GU's activated groups. Its SIMD group may start
+  // once those producers have published, without waiting for the other quarters. Only this split reads these inputs.
+  if (lane == 0) {
+    for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[ks], memory_order_relaxed) < wait_for / TF_GU_PARTS; spin++) {}
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  }
+  simdgroup_barrier(mem_flags::mem_device);
+#else
+  // The whole-input schedule waits once per threadgroup; its last arrival leaves both words zero for the next pair.
   if (ks == 0 && lane == 0) {
     for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&WC[0], memory_order_relaxed) < wait_for; spin++) {}
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
@@ -488,6 +499,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
 #endif
   for (int g = first; g < last; g++) {
 #if defined(TF_SBI12)
@@ -581,12 +593,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i];
 #if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
+#ifndef TF_TGPAD1
+#define TF_TGPAD1 0
 #endif
-#if TF_TGPAD > 0
-  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
+#if TF_TGPAD1 > 0
+  // the parallel prompt launches' threadgroup-memory reserve for the serial ones too; the use never runs (0: none)
+  threadgroup float tgpad1[TF_TGPAD1 / 4];
   if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
 #endif
 #endif
@@ -682,6 +694,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   threadgroup_barrier(mem_flags::mem_device);
   if (ks == 0 && lane == 0) {
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+#if defined(TF_WAIT) && TF_GU_PARTS > 1
+    // All four SIMD groups passed their waits and the final reduction barrier. The last finished down group clears
+    // every GU counter before counting itself on TC; a norm that observes TC complete therefore precedes reuse.
+    if (atomic_fetch_add_explicit(&WC[TF_GU_PARTS], 1u, memory_order_relaxed) + 1u == tgs.x * tgs.y) {
+      for (int split = 0; split <= TF_GU_PARTS; split++) atomic_store_explicit(&WC[split], 0u, memory_order_relaxed);
+    }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+#endif
     atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
   }
 #endif
