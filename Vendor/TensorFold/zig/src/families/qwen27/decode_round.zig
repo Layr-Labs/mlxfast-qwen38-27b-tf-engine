@@ -6,10 +6,15 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
-/// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
-/// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
-/// MLP and the next chunk's layers while the GPU runs them.
-const first_commit = 0;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 8 layers are on the GPU the host encodes the other 56 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 8;
+/// Layers a verify encodes before its first commit: the GPU (kept busy by the draft bridge) starts once the embedding and
+/// the whole first layer are encoded, and the host encodes the next chunk's layers while the GPU runs it. 1 rather than
+/// 0 (a commit after the first layer's mixer as well) saves a command-buffer boundary for the few launches of that
+/// layer's MLP the host encodes first. Prompt passes (segments' `early`) still commit after the first mixer.
+const first_commit = 1;
 /// Prompt rows a pass needs before it runs as staggered segments on their own queues (core/stagger.zig): each later
 /// segment's mixer of a layer waits for the one before it, so one segment's sequential GDN scan runs beside another's
 /// projections.
@@ -349,6 +354,7 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
