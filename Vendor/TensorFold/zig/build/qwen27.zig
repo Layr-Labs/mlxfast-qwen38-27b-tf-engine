@@ -13,6 +13,7 @@ pub const Shared = struct {
     tree_round_gpu: *std.Build.Module,
     tree_commit: *std.Build.Module,
     draft_ops: *std.Build.Module,
+    tune_once: *std.Build.Module,
 };
 
 /// The 27B's Metal sources, embedded by name (zig/kernels/metal/qwen27).
@@ -30,6 +31,7 @@ pub fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, metal: *st
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/deltanet_slots.metal"), "gdn_slots.metal");
     const bf16_topk = b.createModule(.{ .root_source_file = b.path("zig/src/core/bf16_topk.zig"), .target = target, .optimize = .ReleaseSafe });
     const tree_round = b.createModule(.{ .root_source_file = b.path("zig/src/core/tree_round.zig"), .target = target, .optimize = .ReleaseSafe });
+    const tune_once = b.createModule(.{ .root_source_file = b.path("zig/src/core/tune_once.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal } } });
     const s: Shared = .{
         .delta = b.createModule(.{ .root_source_file = b.path("zig/src/core/deltanet_kernels.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } }),
         .runtime_sources = b.createModule(.{ .root_source_file = files.add("qwen_runtime_sources.zig", index) }),
@@ -39,7 +41,8 @@ pub fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, metal: *st
         .tree_round = tree_round,
         .tree_round_gpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/tree_round_gpu.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "tree_round", .module = tree_round }, .{ .name = "tree_round_sources", .module = b.createModule(.{ .root_source_file = b.path("zig/tree_round_sources.zig") }) } } }),
         .tree_commit = b.createModule(.{ .root_source_file = b.path("zig/src/core/tree_commit_gpu.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "tree_round", .module = tree_round }, .{ .name = "tree_commit_sources", .module = b.createModule(.{ .root_source_file = b.path("zig/tree_commit_sources.zig") }) } } }),
-        .draft_ops = b.createModule(.{ .root_source_file = b.path("zig/src/core/draft_ops.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "draft_ops_sources", .module = b.createModule(.{ .root_source_file = b.path("zig/draft_ops_sources.zig") }) } } }),
+        .draft_ops = b.createModule(.{ .root_source_file = b.path("zig/src/core/draft_ops.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "draft_ops_sources", .module = b.createModule(.{ .root_source_file = b.path("zig/draft_ops_sources.zig") }) }, .{ .name = "tune_once", .module = tune_once } } }),
+        .tune_once = tune_once,
     };
     engine.addImport("core", engine);
     engine.addImport("core_delta", s.delta);
@@ -103,7 +106,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const qwen27 = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen27/qwen27.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal } } });
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "core", qwen_core }, .{ "core_lane", core_lane }, .{ "core_row", core_row }, .{ "bf16_topk", s.bf16_topk }, .{ "bf16_topk_gpu", s.bf16_topk_gpu }, .{ "tree_round", s.tree_round }, .{ "tree_round_gpu", s.tree_round_gpu }, .{ "tree_commit_gpu", s.tree_commit }, .{ "draft_ops", s.draft_ops }, .{ "kernel_sources", sources } }) |m| qwen_core.addImport(m[0], m[1]);
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "core_lane", core_lane }, .{ "qwen_runtime_sources", s.runtime_sources }, .{ "core_delta", s.delta }, .{ "qwen_gdn_source", s.gdn_source } }) |m| qwen27.addImport(m[0], m[1]);
-    for ([_]*std.Build.Module{ s.bf16_topk, s.tree_round, s.draft_ops }) |m| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ s.bf16_topk, s.tree_round, s.draft_ops, s.tune_once }) |m| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+
+    const linear32 = program(b, "tf-linear32-tune-check", "Build the tune-once linear32 pilot check on synthetic buffers, no models", "zig/tests/draft_linear32_tune.zig", target, false, &.{ .{ .name = "metal", .module = metal }, .{ .name = "draft_ops", .module = s.draft_ops } });
+    b.step("test-linear32-tune", "Run the tune-once linear32 pilot (bit check plus device-timed duel) on this Mac's GPU").dependOn(&b.addRunArtifact(linear32).step);
 
     const family: []const std.Build.Module.Import = &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal } };
     _ = program(b, "tf-qwen27-run", "Build the native greedy, chunk and prompt-speed check on real weights", "zig/tests/qwen27/run.zig", target, true, &.{ .{ .name = "qwen27", .module = qwen27 }, .{ .name = "core", .module = qwen_core }, .{ .name = "metal", .module = metal }, .{ .name = "core_lane", .module = core_lane }, .{ .name = "qwen_runtime_sources", .module = s.runtime_sources }, .{ .name = "qwen_gdn_source", .module = s.gdn_source } });

@@ -260,8 +260,12 @@ pub const Backend = struct {
     early: ?Lead = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
-        const primitives = try core.draft_ops.Ops.init(target.device);
+        var primitives = try core.draft_ops.Ops.init(target.device);
         errdefer primitives.deinit();
+        // Tune-once pilot at load (outside timed windows): bit-check and device-time the linear
+        // twin on synthetic buffers, adopt one fixed winner per boot. Never fails: any miss
+        // keeps the incumbent.
+        primitives.tuneLinear32(target.device);
         const attention = try core.shared_attention.Attention.init(a, target.device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .rotary_dim = c.head_dim, .capacity = c.window + 16, .output = .bf16, .split_chunk = 64 });
         errdefer attention.deinit();
         const topk = try core.bf16_topk_gpu.Ops.init(target.device);
@@ -364,7 +368,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try draftSplit(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -379,7 +383,7 @@ pub const Backend = struct {
                     const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
                     try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
                 };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try draftSplit(shape[0], shape[1]), o);
                 try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
                 b.precise_count += 1;
             }
@@ -452,7 +456,7 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try draftSplit(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
@@ -596,3 +600,10 @@ pub const Backend = struct {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
     }
 };
+
+/// The drafter's K slices: projection.split's, at most 4. split() was tuned on an M5 Ultra, which runs the drafter's
+/// small GEMVs fastest with 8 slices; the ranked M5 Max has run every occupancy change the opposite way. Only the
+/// drafter's own partial sums move; the target verifies every token.
+fn draftSplit(n: usize, k: usize) !u32 {
+    return @min(try @import("../projection.zig").split(n, k), 4);
+}

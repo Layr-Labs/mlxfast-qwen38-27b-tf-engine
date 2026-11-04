@@ -1,7 +1,17 @@
 //! Borrowed BF16 draft primitives encode into caller-owned command buffers with explicit rounding boundaries.
 const std = @import("std");
 const mtl = @import("metal");
+const tune = @import("tune_once");
 const source = @import("draft_ops_sources").text;
+/// The tune-once pilot's twin text: the launched source with every `size_t` narrowed to `uint`.
+/// The guard keeps the 64-bit incumbent unless the text carries exactly 46 such lines with 59
+/// sites (this tree's draft_ops.metal); only the linear pipeline is ever built from the twin.
+pub const linear32_expected_lines = 46;
+pub const linear32_expected_sites = 59;
+pub const linear32_lines = tune.countLinesWith(source, tune.narrow_from);
+pub const linear32_sites = tune.countOccurrences(source, tune.narrow_from);
+pub const linear32_guarded = linear32_lines == linear32_expected_lines and linear32_sites == linear32_expected_sites;
+pub const linear32_text = tune.narrow(source);
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 pub const Linear = extern struct { rows: u32, n: u32, k: u32, x_stride: u32, w_stride: u32, y_stride: u32 };
 pub const Norm = extern struct { rows: u32, heads: u32, dim: u32, x_stride: u32, y_stride: u32, round_normalized: u32 = 1, eps: f32 = 1e-6 };
@@ -27,6 +37,12 @@ pub const Ops = struct {
     /// Taken by the next convSums, convNormSums, swigluSums, normRope, normRopeRing or copyRows (its caller sets and
     /// clears it).
     wait: ?Wait = null,
+    /// The tune-once pilot's 32-bit-index twin of the linear pipeline, built only by the tune.
+    linear32: ?mtl.Pipeline = null,
+    /// Fixed winner per boot: linear() serves the twin only after the load-time tune adopted it.
+    use_linear32: bool = false,
+    /// The load-time tune ran (or was skipped): the winner is fixed, never re-tuned.
+    tuned: bool = false,
     pub fn init(device: mtl.Device) !Ops {
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -41,6 +57,7 @@ pub const Ops = struct {
     }
     pub fn deinit(ops: Ops) void {
         for (ops.pipes) |pipe| pipe.deinit();
+        if (ops.linear32) |twin| twin.deinit();
     }
     /// The wait words of the six launches that take one (buffers 14 and 15); none: a zero count, never read.
     fn bindWait(ops: Ops, e: mtl.ComputeEncoder, unused: Ref) void {
@@ -61,11 +78,81 @@ pub const Ops = struct {
         const wb = try span(p.n, p.w_stride, p.k);
         const yb = try span(p.rows, p.y_stride, p.n);
         try refs(out, yb, &.{ x, weight }, &.{ xb, wb });
-        e.setPipeline(ops.pipes[@backingInt(Kind.linear)]);
+        e.setPipeline(ops.linearPipe(p));
         bind(e, .{ x, weight });
         e.setValue(p, 2);
         e.setBuffer(out.buf, out.off, 3);
         e.dispatchGroups(mtl.Size.of((p.n + 7) / 8, p.rows, 1), mtl.Size.of(256, 1, 1));
+    }
+    /// The adopted linear pipeline: the 32-bit twin only when the tune adopted it and every
+    /// index of this launch stays below 2^31 (uint arithmetic then equals size_t's bit for bit),
+    /// else the 64-bit incumbent.
+    fn linearPipe(ops: Ops, p: Linear) mtl.Pipeline {
+        if (ops.use_linear32) {
+            if (ops.linear32) |twin| {
+                if (offsetsFitU31(p)) return twin;
+            }
+        }
+        return ops.pipes[@backingInt(Kind.linear)];
+    }
+    /// Load-time tune-once pilot for the drafter matmul: bit-check the 32-bit-index twin against
+    /// the incumbent on synthetic seeded shapes, then device-time both round robin and adopt the
+    /// twin only if bit-identical and faster, else the incumbent stays. Fixed winner per boot
+    /// (runs once). Holds no prompt or decode content: synthetic buffers only, freed before
+    /// return. Never fails the load: any miss keeps the incumbent.
+    pub fn tuneLinear32(ops: *Ops, device: mtl.Device) void {
+        if (ops.tuned) return;
+        ops.tuned = true;
+        if (!tune.tuneEnabled()) {
+            std.log.info("tune-once linear32: off (MLXFAST_TUNE=0), incumbent stays", .{});
+            return;
+        }
+        if (!linear32_guarded) {
+            std.log.warn("tune-once linear32: text guard mismatch ({d} lines, {d} sites), incumbent stays", .{ linear32_lines, linear32_sites });
+            return;
+        }
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const lib = mtl.Library.fromSource(device, &linear32_text, mtl.CompileOptions.mlx()) catch {
+            std.log.warn("tune-once linear32: twin library failed to compile, incumbent stays", .{});
+            return;
+        };
+        defer lib.deinit();
+        const twin = mtl.Pipeline.initOptional(device, lib, "tf_bf16_linear", false) catch {
+            std.log.warn("tune-once linear32: twin pipeline failed to build, incumbent stays", .{});
+            return;
+        };
+        const queue = device.queue() catch {
+            std.log.warn("tune-once linear32: no tune queue, incumbent stays", .{});
+            twin.deinit();
+            return;
+        };
+        defer queue.deinit();
+        const incumbent = ops.pipes[@backingInt(Kind.linear)];
+        for (tune_shapes, 0..) |shape, i| {
+            const seed: u64 = 0x9E3779B97F4A7C15 +% (@as(u64, @intCast(i)) *% 0xBF58476D1CE4E5B9);
+            bitCheckLinear(device, queue, incumbent, twin, shape, seed) catch {
+                std.log.warn("tune-once linear32: bit check failed (shape {d}), incumbent stays", .{i});
+                twin.deinit();
+                return;
+            };
+        }
+        if (tune.tuneForced()) {
+            ops.linear32 = twin;
+            ops.use_linear32 = true;
+            std.log.info("tune-once linear32: forced (MLXFAST_TUNE_FORCE=1), twin adopted after bit check", .{});
+            return;
+        }
+        const outcome = timeLinear32(device, queue, incumbent, twin) catch {
+            std.log.warn("tune-once linear32: timing failed, incumbent stays", .{});
+            twin.deinit();
+            return;
+        };
+        if (outcome.adopted) {
+            ops.linear32 = twin;
+            ops.use_linear32 = true;
+        } else twin.deinit();
+        std.log.info("tune-once linear32: {s} (inc {d:.3} ms, twin {d:.3} ms, wins {d}/{d})", .{ if (outcome.adopted) "twin adopted" else "incumbent stays", outcome.inc_med * 1000, outcome.cand_med * 1000, outcome.wins, outcome.cycles });
     }
     pub fn norm(ops: Ops, e: mtl.ComputeEncoder, x: Ref, gain: Ref, out: Ref, p: Norm) !void {
         const threads = try normThreads(p);
@@ -321,9 +408,118 @@ pub fn checkActivation(p: Activation) !void {
     _ = try span(p.rows, p.up_stride, p.width);
     _ = try span(p.rows, p.y_stride, p.width);
 }
+/// Whether every element index tf_bf16_linear computes for `p` stays below 2^31, so the
+/// 32-bit twin's uint arithmetic equals the incumbent's size_t arithmetic bit for bit.
+pub fn offsetsFitU31(p: Linear) bool {
+    if (p.rows == 0 or p.n == 0) return false;
+    const bar: u64 = 1 << 31;
+    const x_max = (@as(u64, p.rows) - 1) * p.x_stride + p.k;
+    const w_max = (@as(u64, p.n) - 1) * p.w_stride + p.k;
+    const y_max = (@as(u64, p.rows) - 1) * p.y_stride + p.n;
+    return x_max < bar and w_max < bar and y_max < bar;
+}
+/// A trial linear's shape: exact multiples, lane and column tails, strided rows, then
+/// production-sized drafter shapes.
+const TuneShape = struct { rows: u32, n: u32, k: u32, x_stride: u32, w_stride: u32, y_stride: u32 };
+const tune_shapes = [_]TuneShape{
+    .{ .rows = 1, .n = 8, .k = 32, .x_stride = 32, .w_stride = 32, .y_stride = 8 },
+    .{ .rows = 3, .n = 100, .k = 1000, .x_stride = 1000, .w_stride = 1000, .y_stride = 100 },
+    .{ .rows = 5, .n = 64, .k = 128, .x_stride = 160, .w_stride = 128, .y_stride = 96 },
+    .{ .rows = 8, .n = 5120, .k = 5120, .x_stride = 5120, .w_stride = 5120, .y_stride = 5120 },
+    .{ .rows = 2, .n = 2048, .k = 5120, .x_stride = 5120, .w_stride = 5120, .y_stride = 2048 },
+};
+const tune_time_shape = TuneShape{ .rows = 4, .n = 5120, .k = 5120, .x_stride = 5120, .w_stride = 5120, .y_stride = 5120 };
+const TrialCtx = struct { pipe: mtl.Pipeline, x: Ref, w: Ref, y: Ref, p: Linear, chain: usize };
+/// linear()'s binds and dispatch under `pipe`, `chain` launches back to back.
+fn encodeTrial(e: mtl.ComputeEncoder, ctx: *anyopaque) void {
+    const t: *TrialCtx = @ptrCast(@alignCast(ctx));
+    var i: usize = 0;
+    while (i < t.chain) : (i += 1) {
+        e.setPipeline(t.pipe);
+        e.setBuffer(t.x.buf, t.x.off, 0);
+        e.setBuffer(t.w.buf, t.w.off, 1);
+        e.setValue(t.p, 2);
+        e.setBuffer(t.y.buf, t.y.off, 3);
+        e.dispatchGroups(mtl.Size.of((t.p.n + 7) / 8, t.p.rows, 1), mtl.Size.of(256, 1, 1));
+    }
+}
+/// One launch of each pipeline on synthetic seeded buffers; every written output element must
+/// match bit for bit (stride padding is never written, so each row's `n` words are compared, not
+/// the whole buffer). The two outputs start from different fills, so a launch that never ran also
+/// mismatches.
+fn bitCheckLinear(device: mtl.Device, queue: mtl.Queue, incumbent: mtl.Pipeline, twin: mtl.Pipeline, shape: TuneShape, seed: u64) !void {
+    const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+    const p = Linear{ .rows = shape.rows, .n = shape.n, .k = shape.k, .x_stride = shape.x_stride, .w_stride = shape.w_stride, .y_stride = shape.y_stride };
+    try checkLinear(p);
+    if (!offsetsFitU31(p)) return error.TuneShapeTooWide;
+    const xb = try span(p.rows, p.x_stride, p.k);
+    const wb = try span(p.n, p.w_stride, p.k);
+    const yb = try span(p.rows, p.y_stride, p.n);
+    const x = try device.buffer(xb, opts);
+    defer x.deinit();
+    const w = try device.buffer(wb, opts);
+    defer w.deinit();
+    const y0 = try device.buffer(yb, opts);
+    defer y0.deinit();
+    const y1 = try device.buffer(yb, opts);
+    defer y1.deinit();
+    tune.fillBf16(x.slice(u16, xb / 2), seed);
+    tune.fillBf16(w.slice(u16, wb / 2), seed ^ 0xD1B54A32D192ED03);
+    @memset(y0.contents()[0..yb], 0xA5);
+    @memset(y1.contents()[0..yb], 0x5A);
+    var c0 = TrialCtx{ .pipe = incumbent, .x = .{ .buf = x }, .w = .{ .buf = w }, .y = .{ .buf = y0 }, .p = p, .chain = 1 };
+    var c1 = TrialCtx{ .pipe = twin, .x = .{ .buf = x }, .w = .{ .buf = w }, .y = .{ .buf = y1 }, .p = p, .chain = 1 };
+    _ = try tune.launchSeconds(queue, encodeTrial, &c0);
+    _ = try tune.launchSeconds(queue, encodeTrial, &c1);
+    var row: u32 = 0;
+    while (row < p.rows) : (row += 1) {
+        const off = @as(usize, row) * p.y_stride * 2;
+        const nbytes = @as(usize, p.n) * 2;
+        if (!std.mem.eql(u8, y0.contents()[off..][0..nbytes], y1.contents()[off..][0..nbytes])) return error.TuneBitMismatch;
+    }
+}
+/// The production-sized duel: two warmup cycles, then the timed round robin.
+fn timeLinear32(device: mtl.Device, queue: mtl.Queue, incumbent: mtl.Pipeline, twin: mtl.Pipeline) !tune.Outcome {
+    const shape = tune_time_shape;
+    const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+    const p = Linear{ .rows = shape.rows, .n = shape.n, .k = shape.k, .x_stride = shape.x_stride, .w_stride = shape.w_stride, .y_stride = shape.y_stride };
+    try checkLinear(p);
+    const xb = try span(p.rows, p.x_stride, p.k);
+    const wb = try span(p.n, p.w_stride, p.k);
+    const yb = try span(p.rows, p.y_stride, p.n);
+    const x = try device.buffer(xb, opts);
+    defer x.deinit();
+    const w = try device.buffer(wb, opts);
+    defer w.deinit();
+    const y = try device.buffer(yb, opts);
+    defer y.deinit();
+    tune.fillBf16(x.slice(u16, xb / 2), 0x243F6A8885A308D3);
+    tune.fillBf16(w.slice(u16, wb / 2), 0x452821E638D01377);
+    var c0 = TrialCtx{ .pipe = incumbent, .x = .{ .buf = x }, .w = .{ .buf = w }, .y = .{ .buf = y }, .p = p, .chain = 2 };
+    var c1 = TrialCtx{ .pipe = twin, .x = .{ .buf = x }, .w = .{ .buf = w }, .y = .{ .buf = y }, .p = p, .chain = 2 };
+    return tune.timeDuel(queue, encodeTrial, &c0, encodeTrial, &c1, tune.min_cycles, 2);
+}
 test "operator guards reject invalid width, stride and rounding before encoding" {
     try std.testing.expectError(error.BadDraftShape, checkLinear(.{ .rows = 0, .n = 64, .k = 128, .x_stride = 128, .w_stride = 128, .y_stride = 64 }));
     try std.testing.expectError(error.BadDraftShape, checkConv(.{ .rows = 8, .width = 64, .group = 3, .branch = 0, .x_stride = 64, .dynamic_stride = 16, .y_stride = 64 }));
     try std.testing.expectError(error.BadDraftShape, checkRope(.{ .rows = 8, .heads = 4, .dim = 127, .x_stride = 508, .y_stride = 508 }));
     try std.testing.expectError(error.BadDraftShape, normThreads(.{ .rows = 8, .heads = 4, .dim = 128, .x_stride = 512, .y_stride = 512, .round_normalized = 2 }));
+}
+test "linear32 twin guard holds on this tree's source" {
+    try std.testing.expectEqual(@as(usize, 46), linear32_lines);
+    try std.testing.expectEqual(@as(usize, 59), linear32_sites);
+    try std.testing.expect(linear32_guarded);
+    try std.testing.expectEqual(source.len - 59 * 2, linear32_text.len);
+    try std.testing.expectEqual(@as(usize, 0), tune.countOccurrences(&linear32_text, tune.narrow_from));
+    try std.testing.expect(std.mem.indexOf(u8, &linear32_text, "uint(row)*a.x_stride") != null);
+    try std.testing.expect(std.mem.indexOf(u8, &linear32_text, "uint(col)*a.w_stride") != null);
+    try std.testing.expect(std.mem.indexOf(u8, &linear32_text, "uint(row)*a.y_stride") != null);
+}
+test "linear32 serves only offsets below 2^31" {
+    try std.testing.expect(offsetsFitU31(.{ .rows = 8, .n = 5120, .k = 5120, .x_stride = 5120, .w_stride = 5120, .y_stride = 5120 }));
+    try std.testing.expect(!offsetsFitU31(.{ .rows = 0, .n = 8, .k = 8, .x_stride = 8, .w_stride = 8, .y_stride = 8 }));
+    try std.testing.expect(offsetsFitU31(.{ .rows = 2, .n = 2, .k = 1, .x_stride = (1 << 31) - 2, .w_stride = 1, .y_stride = 2 }));
+    try std.testing.expect(!offsetsFitU31(.{ .rows = 2, .n = 2, .k = 2, .x_stride = (1 << 31) - 2, .w_stride = 1, .y_stride = 2 }));
+    try std.testing.expect(!offsetsFitU31(.{ .rows = 3, .n = 2, .k = 1, .x_stride = 1 << 30, .w_stride = 1, .y_stride = 2 }));
+    try std.testing.expect(!offsetsFitU31(.{ .rows = 2049, .n = 1 << 20, .k = 8, .x_stride = 8, .w_stride = 8, .y_stride = 1 << 20 }));
 }
