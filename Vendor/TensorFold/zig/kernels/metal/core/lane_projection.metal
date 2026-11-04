@@ -688,6 +688,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 }
 #endif
 
+#if defined(TF_PACKED_ACT)
+// Compact 16-row tile. Pair row r with r+8 when live, each column quad occupying eight words then; a lone row uses four.
+inline ulong tf_act_packed_at(int r, int c, int rows) {
+  const int low = r & 7, pairs = max(rows - 8, 0);
+  const int words = low + 8 < rows ? 8 : 4;
+  return ulong(c / 16) * (16 * rows) + 16 * (low + min(low, pairs)) + (c % 16 / 4) * words + (r >= 8 ? 4 : 0) + (c & 3);
+}
+#endif
+
 #if TF_BITS == 4 && defined(TF_REG) && defined(TF_PROMPT_TN)
 #ifndef TF_TB
 #define TF_TB 1
@@ -860,15 +869,41 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
   const device float* xp = XS + first * stride + mb;
+#if defined(TF_PACKED_ACT) && !defined(TF_SWIGLU)
+  const device bfloat* xv = X + (size_t)first * GS * M;
+#else
   const device bfloat* xv = X + (size_t)first * GS;
+#endif
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
+#if defined(TF_PACKED_ACT) && !defined(TF_SWIGLU)
+    const int pair_words = mb + 8 < M ? 8 : 4;
+    const ulong home = 16 * (mb + min(mb, max(M - 8, 0))) + (nb / 4) * pair_words;
+    TF_UNROLL
+    for (int f = 0; f < 4; f++) {
+      bfloat4 lo = bfloat4(0), hi = bfloat4(0);
+      if (mb < M) {
+        const device bfloat* src = xv + f * 16 * M + home;
+        if (mb + 8 < M) {
+          const uint4 v = *(const device uint4*)src;
+          lo = as_type<bfloat4>(v.xy); hi = as_type<bfloat4>(v.zw);
+        } else lo = *(const device bfloat4*)src;
+      }
+      TF_UNROLL
+      for (int j = 0; j < 4; j++) {
+        if (f < 2) { xl0[f * 8 + j] = lo[j]; xl0[f * 8 + 4 + j] = hi[j]; }
+        else { xl1[(f - 2) * 8 + j] = lo[j]; xl1[(f - 2) * 8 + 4 + j] = hi[j]; }
+      }
+    }
+    xv += GS * M;
+#else
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+#endif
     TF_TN_TILE(0)
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
@@ -897,7 +932,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     if (m >= M) continue;
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+#if defined(TF_PACKED_ACT)
+    Y[tf_act_packed_at(m, int(tg.x) * 64 + c, M)] = h;
+#else
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+#endif
     hb16[at] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

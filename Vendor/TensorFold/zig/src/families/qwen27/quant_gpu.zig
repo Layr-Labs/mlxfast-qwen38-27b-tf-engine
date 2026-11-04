@@ -75,6 +75,7 @@ const Key = struct {
     sbi: bool = false,
     sbi12: bool = false,
     resid: bool = false,
+    packed_activation: bool = false,
     count: bool = false,
     wait: bool = false,
     tiles: u32 = 0,
@@ -266,7 +267,7 @@ pub const Kernels = struct {
     /// `quant` then `mlp` write there, without the gate/up rows. False (nothing encoded) where the shape does not take it.
     pub fn gateUpActivated(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
         // prompt rows: the fused SwiGLU epilogue with the gate and up pairs on two tiles a SIMD group (gateUpActivatedPrompt)
-        if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows);
+        if (k.prompt) return k.gateUpActivatedPrompt(input_encoder, p, x, xs, out, out_sums, rows, false);
         if (rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64) return false;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = p.index != null, .sbi12 = p.index != null and p.index12 };
@@ -285,6 +286,16 @@ pub const Kernels = struct {
         return true;
     }
 
+    /// The M5 prompt MLP pair, explicit data format opt-in. Decoded rows, compact paths and unsupported shapes keep row-major.
+    pub fn gateUpPacked(k: *Kernels, e: mtl.ComputeEncoder, gu: projection.Linear, down: projection.Linear,
+        x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !bool {
+        if (!k.prompt or !k.device.tensorUnits() or rows <= 8) return false;
+        if (gu.n != 34816 or gu.k != 5120 or gu.batch == 0 or gu.batch % 2 != 0 or (gu.n / 64) % gu.batch != 0) return false;
+        if (down.n != 5120 or down.k != 17408 or down.tile != 32 or down.raw != null or down.runs.len != 0 or down.bits != 4 or down.group != 64 or down.batch % 2 != 0 or down.batch == 0) return false;
+        if ((projection.promptSplit(down.n, down.k) orelse down.slices) != 2) return false;
+        return k.gateUpActivatedPrompt(e, gu, x, xs, out, out_sums, rows, true);
+    }
+
     /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch, two
     /// tiles a SIMD group (the gate pair, then the up pair) where the code batches allow.
     fn gateUpActivatedPrompt(
@@ -296,6 +307,7 @@ pub const Kernels = struct {
         out: Ref,
         out_sums: Ref,
         rows: u32,
+        fragment_packed: bool,
     ) !bool {
         if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
@@ -311,6 +323,7 @@ pub const Kernels = struct {
             .prompt_sr = true,
             .batch = p.batch,
             .swiglu = true,
+            .packed_activation = fragment_packed,
         };
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
@@ -329,6 +342,7 @@ pub const Kernels = struct {
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
+                .packed_activation = fragment_packed,
                 // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
                 .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
             });
@@ -354,11 +368,18 @@ pub const Kernels = struct {
     /// Prompt rows of a two-tile 5120-wide output projection with the residual add in its store: `residual` gets `hidden`
     /// + the output rows, each word as q27_norm_xs forms it, and no output rows are written; the norm after it then reads
     /// `residual` alone. False (nothing encoded) where the launch has no two-tile prompt form: decoded rows among them.
-    pub fn quantResid(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
+    pub fn quantResid(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
+        return k.quantResidFormat(e, p, x, xs, hidden, residual, rows, false);
+    }
+    pub fn quantResidPacked(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
+        return k.quantResidFormat(e, p, x, xs, hidden, residual, rows, true);
+    }
+
+    fn quantResidFormat(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32, fragment_packed: bool) !bool {
         if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
         if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
         const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true, .packed_activation = fragment_packed };
         const tn = promptTiles(key, p.n, 0);
         if (tn == 1 or key.serialSk2()) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
@@ -367,7 +388,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true, .packed_activation = fragment_packed });
             k.joined(entry.value_ptr);
         }
         var first: u32 = 0;
