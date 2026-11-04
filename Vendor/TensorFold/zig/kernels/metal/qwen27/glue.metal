@@ -122,7 +122,18 @@ kernel void q27_rope(device const uchar* X [[buffer(0)]], device const int* posi
   q27_write(Y, base + at.x, value, a.activation);
 }
 
-struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane, key_stride, rows, packed_rows; };
+struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane, key_stride, rows, packed_rows, rope_span; };
+
+// The rope table: cos/sin rows for every position of a fixed span, built once (q27_rope_table_fill) and sliced per
+// step by the fused norm+rope kernels below. The fill's arithmetic is the kernels' own, so a slice is bit-identical;
+// rope_span 0 (or a position past the span) recomputes instead.
+struct RopeTable { float theta; uint pairs, span; };
+kernel void q27_rope_table_fill(device float2* T [[buffer(0)]], constant RopeTable& a [[buffer(1)]],
+                                uint3 at [[thread_position_in_grid]]) {
+  if (at.x >= a.pairs || at.y >= a.span || at.z >= 3) return;
+  const float angle = float(at.y) * pow(a.theta, -float(at.x) / float(a.pairs));
+  T[(at.z * a.span + at.y) * a.pairs + at.x] = float2(cos(angle), sin(angle));
+}
 
 // q27_head_norm then q27_rope for bf16 prompt rows 256 wide: a row's q heads (`stride` apart) then k heads (rows
 // `key_stride` apart), four a group.
@@ -138,7 +149,7 @@ struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
 // reads KY) and its value row in its value slot, where q27_attn_append writes them, so no append follows.
 template <bool PACK, bool DEC, bool CACHE = false>
 inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
-                                    device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
+                                    device const int* positions, device const float2* rope_table, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
                                     uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
                                     device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
                                     device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
@@ -186,9 +197,16 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
   if (lane < pairs) {
     const uint d = lane;
     const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    c = cos(angle);
-    s = sin(angle);
+    const int p = positions[axis * a.plane + row];
+    if (a.rope_span != 0 && p >= 0 && uint(p) < a.rope_span) {
+      const float2 cs = rope_table[(axis * a.rope_span + uint(p)) * pairs + d];
+      c = cs.x;
+      s = cs.y;
+    } else {
+      const float angle = float(p) * pow(a.theta, -float(d) / float(pairs));
+      c = cos(angle);
+      s = sin(angle);
+    }
   }
   bfloat4 ya, yb;
   for (uint j = 0; j != 4; ++j) {
@@ -249,7 +267,8 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
 kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
                  device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
                  device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
-                 constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
+                 constant uint& wait_for [[buffer(9)]], device const float2* rope_table [[buffer(18)]], \
+                 uint2 group [[threadgroup_position_in_grid]], \
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
   if (wait_for != 0u) { \
@@ -263,7 +282,7 @@ kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[
     } \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
   } \
-  q27_head_norm_rope_rows_direct<PACK, false>(Q, K, QW, KW, positions, a, QY, KY, group, sg, lane); \
+  q27_head_norm_rope_rows_direct<PACK, false>(Q, K, QW, KW, positions, rope_table, a, QY, KY, group, sg, lane); \
 }
 Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope, false)
 Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope_packed, true)
@@ -276,9 +295,10 @@ kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]
                  constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]],
                  device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
                  device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+                 device const float2* rope_table [[buffer(18)]],
                  uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
-  q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
+  q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, rope_table, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
                                                     nodes, V, v_stride);
 }
 
@@ -288,7 +308,7 @@ kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]
 // meta and the caches table. The rows' own words (Q, K, V) are read behind the wait.
 struct Q27RopeHeld { float wa[4], wb[4]; float c, s; device bfloat* key; device bfloat* value; };
 template <bool DEC>
-inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat* KW, device const int* positions, constant HeadRope& a,
+inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat* KW, device const int* positions, device const float2* rope_table, constant HeadRope& a,
                                     uint2 group, uint sg, uint lane, thread Q27RopeHeld& h,
                                     device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
                                     device const int* nodes = nullptr) {
@@ -304,9 +324,16 @@ inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat
   if (lane < pairs) {
     const uint d = lane;
     const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    h.c = cos(angle);
-    h.s = sin(angle);
+    const int p = positions[axis * a.plane + row];
+    if (a.rope_span != 0 && p >= 0 && uint(p) < a.rope_span) {
+      const float2 cs = rope_table[(axis * a.rope_span + uint(p)) * pairs + d];
+      h.c = cs.x;
+      h.s = cs.y;
+    } else {
+      const float angle = float(p) * pow(a.theta, -float(d) / float(pairs));
+      h.c = cos(angle);
+      h.s = sin(angle);
+    }
   }
   if (DEC && !query) {
     const uint hk = head - a.heads;
@@ -402,11 +429,12 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
 kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
                  device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
                  device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
-                 constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
+                 constant uint& wait_for [[buffer(9)]], device const float2* rope_table [[buffer(18)]], \
+                 uint2 group [[threadgroup_position_in_grid]], \
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
   Q27RopeHeld held; \
-  q27_head_norm_rope_held<false>(QW, KW, positions, a, group, sg, lane, held); \
+  q27_head_norm_rope_held<false>(QW, KW, positions, rope_table, a, group, sg, lane, held); \
   if (wait_for != 0u) { \
     if (t == 0) { \
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {} \
@@ -435,11 +463,12 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
                  device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
                  device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
                  device atomic_uint* PC [[buffer(16)]], constant uint& count_out [[buffer(17)]],
+                 device const float2* rope_table [[buffer(18)]],
                  uint2 group [[threadgroup_position_in_grid]], uint2 groups [[threadgroups_per_grid]],
                  uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
   Q27RopeHeld held;
-  q27_head_norm_rope_held<true>(QW, KW, positions, a, group, sg, lane, held, caches, meta, nodes);
+  q27_head_norm_rope_held<true>(QW, KW, positions, rope_table, a, group, sg, lane, held, caches, meta, nodes);
   if (wait_for != 0u) {
     if (t == 0) {
       for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}

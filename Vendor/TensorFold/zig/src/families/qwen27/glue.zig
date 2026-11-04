@@ -20,7 +20,10 @@ pub const Embed = extern struct { width: u32, rows: u32, vocab: u32, bits: u32, 
 pub const Rope = extern struct { width: u32, heads: u32, rows: u32, rotary: u32, activation: Float, theta: f32, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0 };
 /// q27_head_norm_rope: Head then Rope for bf16 prompt rows, q heads `stride` apart, then k heads (rows `key_stride` apart);
 /// packed_rows above 0: q heads into one stream's packed rows as q27_attn_pack_a lays them out.
-pub const HeadRope = extern struct { width: u32, heads: u32, kv_heads: u32, stride: u32, rotary: u32, eps: f32, theta: f32, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32, rows: u32 = 0, packed_rows: u32 = 0 };
+/// rope_span above 0: angles come from the rope table's rows (q27_rope_table_fill's), 0 recomputes them.
+pub const HeadRope = extern struct { width: u32, heads: u32, kv_heads: u32, stride: u32, rotary: u32, eps: f32, theta: f32, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32, rows: u32 = 0, packed_rows: u32 = 0, rope_span: u32 = 0 };
+/// q27_rope_table_fill: cos/sin rows over `span` positions (3 axis planes) of `pairs` pairs at `theta`.
+pub const RopeTable = extern struct { theta: f32, pairs: u32, span: u32 };
 pub const Element = extern struct { width: u32, heads: u32, rows: u32, activation: Float };
 pub const Post = extern struct { width: u32, heads: u32, rows: u32, stride: u32, offset: u32, activation: Float, gain: Float, eps: f32 };
 
@@ -45,10 +48,12 @@ test "operator parameters match their Metal structs word for word" {
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Embed));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Rope));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(Rope, "h_end"));
-    try std.testing.expectEqual(@as(usize, 52), @sizeOf(HeadRope));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(HeadRope));
     try std.testing.expectEqual(@as(usize, 28), @offsetOf(HeadRope, "h_end"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(HeadRope, "key_stride"));
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(HeadRope, "packed_rows"));
+    try std.testing.expectEqual(@as(usize, 52), @offsetOf(HeadRope, "rope_span"));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(RopeTable));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Element));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Post));
     try std.testing.expectEqual(@as(usize, 20), @offsetOf(Norm, "eps"));

@@ -78,3 +78,120 @@ test "q27_rope: t = h = w is plain rope bit for bit, and an image row's pairs tu
         try std.testing.expectEqual(at[k][i], image[i]);
     };
 }
+
+const fused_heads = 2;
+const fused_kv = 2;
+const fused_rows = 3;
+const fused_rotary = 64;
+const fused_span = 64;
+
+const FusedRig = struct {
+    queue: mtl.Queue,
+    lib: mtl.Library,
+    fill: mtl.Pipeline,
+    direct: mtl.Pipeline,
+    held: mtl.Pipeline,
+    q: mtl.Buffer,
+    k: mtl.Buffer,
+    qw: mtl.Buffer,
+    kw: mtl.Buffer,
+    pos: mtl.Buffer,
+    qy: mtl.Buffer,
+    ky: mtl.Buffer,
+    table: mtl.Buffer,
+    nc: mtl.Buffer,
+
+    /// QY/KY for the planes' positions through `pipe`; rope_span 0 recomputes, fused_span slices the table.
+    fn run(r: *FusedRig, pipe: mtl.Pipeline, planes: [3][fused_rows]i32, h_end: u32, w_end: u32, rope_span: u32) ![2][fused_rows * fused_heads * width]u16 {
+        const p = r.pos.slice(i32, 3 * plane);
+        for (planes, 0..) |row, k| @memcpy(p[k * plane ..][0..fused_rows], &row);
+        const cb = r.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(pipe);
+        e.setBuffer(r.q, 0, 0);
+        e.setBuffer(r.k, 0, 1);
+        e.setBuffer(r.qw, 0, 2);
+        e.setBuffer(r.kw, 0, 3);
+        e.setBuffer(r.pos, 0, 4);
+        e.setValue(glue.HeadRope{ .width = width, .heads = fused_heads, .kv_heads = fused_kv, .stride = 2 * width, .rotary = fused_rotary, .eps = 1e-6, .theta = 1e7, .h_end = h_end, .w_end = w_end, .plane = plane, .key_stride = fused_kv * width, .rows = fused_rows, .rope_span = rope_span }, 5);
+        e.setBuffer(r.qy, 0, 6);
+        e.setBuffer(r.ky, 0, 7);
+        e.setBuffer(r.nc, 0, 8);
+        e.setValue(@as(u32, 0), 9);
+        e.setBuffer(r.table, 0, 18);
+        e.dispatchGroups(mtl.Size.of((fused_heads + fused_kv + 3) / 4, fused_rows, 1), mtl.Size.of(128, 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure() != null) return error.GpuFailure;
+        var out: [2][fused_rows * fused_heads * width]u16 = undefined;
+        @memcpy(&out[0], r.qy.slice(u16, out[0].len));
+        @memcpy(out[1][0 .. fused_rows * fused_kv * width], r.ky.slice(u16, fused_rows * fused_kv * width));
+        return out;
+    }
+};
+
+test "q27_head_norm_rope: the table's slices match the recompute bit for bit, in span and past it" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = mtl.Device.init() catch return error.SkipZigTest;
+    defer device.deinit();
+    var r: FusedRig = undefined;
+    r.queue = try device.queue();
+    defer r.queue.deinit();
+    r.lib = try mtl.Library.fromSource(device, source.glue, mtl.CompileOptions.mlx());
+    defer r.lib.deinit();
+    r.fill = try mtl.Pipeline.init(device, r.lib, "q27_rope_table_fill", false);
+    defer r.fill.deinit();
+    r.direct = try mtl.Pipeline.init(device, r.lib, "q27_head_norm_rope", false);
+    defer r.direct.deinit();
+    r.held = try mtl.Pipeline.init(device, r.lib, "q27_head_norm_rope_held", false);
+    defer r.held.deinit();
+    r.q = try device.buffer(fused_rows * fused_heads * 2 * width * 2, mtl.ResourceOptions.shared);
+    defer r.q.deinit();
+    r.k = try device.buffer(fused_rows * fused_kv * width * 2, mtl.ResourceOptions.shared);
+    defer r.k.deinit();
+    r.qw = try device.buffer(width * 2, mtl.ResourceOptions.shared);
+    defer r.qw.deinit();
+    r.kw = try device.buffer(width * 2, mtl.ResourceOptions.shared);
+    defer r.kw.deinit();
+    r.pos = try device.buffer(3 * plane * 4, mtl.ResourceOptions.shared);
+    defer r.pos.deinit();
+    r.qy = try device.buffer(fused_rows * fused_heads * width * 2, mtl.ResourceOptions.shared);
+    defer r.qy.deinit();
+    r.ky = try device.buffer(fused_rows * fused_kv * width * 2, mtl.ResourceOptions.shared);
+    defer r.ky.deinit();
+    r.table = try device.buffer(3 * fused_span * (fused_rotary / 2) * 8, mtl.ResourceOptions.shared);
+    defer r.table.deinit();
+    r.nc = try device.buffer(8, mtl.ResourceOptions.shared);
+    defer r.nc.deinit();
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    const bufs = [_]mtl.Buffer{ r.q, r.k, r.qw, r.kw };
+    for (bufs) |b| {
+        for (b.slice(u16, b.length() / 2)) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().floatNorm(f32))) >> 16);
+    }
+    // the table once, as Attention.init fills it
+    {
+        const cb = r.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(r.fill);
+        e.setBuffer(r.table, 0, 0);
+        e.setValue(glue.RopeTable{ .theta = 1e7, .pairs = fused_rotary / 2, .span = fused_span }, 1);
+        e.dispatchThreads(mtl.Size.of(fused_rotary / 2, fused_span, 3), mtl.Size.of(32, 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure() != null) return error.GpuFailure;
+    }
+    // plain and M-RoPE rows: an in-span position, the span's last row, and one past it (the kernel's recompute)
+    const cases = [_]struct { planes: [3][fused_rows]i32, h_end: u32, w_end: u32 }{
+        .{ .planes = .{ .{ 5, fused_span - 1, fused_span + 9 }, @splat(0), @splat(0) }, .h_end = 0, .w_end = 0 },
+        .{ .planes = .{ .{ 5, fused_span - 1, fused_span + 9 }, .{ 7, fused_span - 2, fused_span + 40 }, .{ 9, fused_span - 1, fused_span + 100 } }, .h_end = 33, .w_end = 30 },
+    };
+    for ([_]mtl.Pipeline{ r.direct, r.held }) |pipe| for (cases) |c| {
+        const ref = try r.run(pipe, c.planes, c.h_end, c.w_end, 0);
+        const got = try r.run(pipe, c.planes, c.h_end, c.w_end, fused_span);
+        try std.testing.expectEqualSlices(u16, &ref[0], &got[0]);
+        try std.testing.expectEqualSlices(u16, ref[1][0 .. fused_rows * fused_kv * width], got[1][0 .. fused_rows * fused_kv * width]);
+    };
+}

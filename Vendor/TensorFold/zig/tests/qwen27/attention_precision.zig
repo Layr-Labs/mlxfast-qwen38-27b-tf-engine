@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     if (!units) try q.simd_attention.check(device, queue);
     const library = try mtl.Library.fromSource(device, try q.simd_attention.library(a, units, true), mtl.CompileOptions.mlx());
     defer library.deinit();
-    var op = try attn.Attention.init(device, library);
+    var op = try attn.Attention.init(device, library, queue, 10000000, 64, capacity);
     defer op.deinit();
     const limits = attn.Limits{ .rows = most_rows, .streams = 1, .keys = capacity, .shared_prefix = units };
     var scratch = try attn.Scratch.init(device, limits);

@@ -309,7 +309,7 @@ pub fn main(init: std.process.Init) !void {
     defer queue.deinit();
     const library = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
     defer library.deinit();
-    var op = try q.Attention.init(device, library);
+    var op = try q.Attention.init(device, library, queue, 10000000, 64, 2048);
     defer op.deinit();
     var counts: Counts = .{};
     for (manifest.cases) |case| {

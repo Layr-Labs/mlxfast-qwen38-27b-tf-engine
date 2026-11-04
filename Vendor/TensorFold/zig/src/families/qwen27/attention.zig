@@ -230,11 +230,18 @@ pub const Attention = struct {
     /// tail's count and its merge's arrivals, [4..6) the decoded preprocess's count and its prefix's arrivals; each pair is
     /// left zero by its last waiter.
     chain_words: ?mtl.Buffer = null,
+    /// The rope table's cos/sin rows (q27_rope_table_fill's): 3 axis planes of `rope_span` positions of rope_rotary/2
+    /// pairs at `rope_theta`, filled once at init; preprocess slices it, and recomputes when its call differs.
+    rope_table: mtl.Buffer,
+    rope_fill: mtl.Pipeline,
+    rope_theta: f64,
+    rope_rotary: u32,
+    rope_span: u32,
     /// Encoded right behind a decoded prefix's launch, in its barrier interval: reads only what nothing in that interval
     /// writes and writes nothing anything reads (the out projection's Kernels.warm), so the counted chain is unchanged.
     warm: ?Warm = null,
     pub const Warm = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder) anyerror!void };
-    pub fn init(device: mtl.Device, library: mtl.Library) !Attention {
+    pub fn init(device: mtl.Device, library: mtl.Library, queue: mtl.Queue, theta: f64, rotary: u32, table_span: u32) !Attention {
         var p: [16]mtl.Pipeline = undefined;
         var pn: usize = 0;
         errdefer for (p[0..pn]) |pipe| pipe.deinit();
@@ -258,10 +265,37 @@ pub const Attention = struct {
         const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
         errdefer if (chain_words) |b| b.deinit();
         if (chain_words) |b| @memset(b.contents()[0..32], 0);
-        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .prefix_quarter = prefix_quarter, .chain_words = chain_words };
+        if (rotary == 0 or rotary % 2 != 0 or table_span == 0 or !std.math.isFinite(theta) or theta <= 0) return error.TargetAttentionShape;
+        const rope_fill = try mtl.Pipeline.init(device, library, "q27_rope_table_fill", false);
+        errdefer rope_fill.deinit();
+        const rope_table = try device.buffer(3 * @as(usize, table_span) * (rotary / 2) * 8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer rope_table.deinit();
+        try fillRopeTable(queue, rope_fill, rope_table, theta, rotary / 2, table_span);
+        return .{ .prefix = p, .io = io, .prompt = promptPipelines(device, library, units) catch |err| if (units) return err else null, .units = units, .split_tail = split_tail, .prefix_quarter = prefix_quarter, .chain_words = chain_words, .rope_table = rope_table, .rope_fill = rope_fill, .rope_theta = theta, .rope_rotary = rotary, .rope_span = table_span };
+    }
+    /// The table's rows on the GPU, synchronously: the fused kernels' own angle arithmetic, so a slice matches a
+    /// recompute bit for bit.
+    fn fillRopeTable(queue: mtl.Queue, pipe: mtl.Pipeline, table: mtl.Buffer, theta: f64, pairs: u32, table_span: u32) !void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(pipe);
+        e.setBuffer(table, 0, 0);
+        e.setValue(glue.RopeTable{ .theta = @floatCast(theta), .pairs = pairs, .span = table_span }, 1);
+        e.dispatchThreads(mtl.Size.of(pairs, table_span, 3), mtl.Size.of(@min(pairs, 32), 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.err("qwen27: the rope table fill failed: {s}", .{msg});
+            return error.GpuFailed;
+        }
     }
     pub fn deinit(a: *Attention) void {
         for (a.prefix ++ a.io) |pipe| pipe.deinit();
+        a.rope_table.deinit();
+        a.rope_fill.deinit();
         if (a.prompt) |pipes| for (pipes) |pipe| pipe.deinit();
         if (a.split_tail) |pipe| pipe.deinit();
         if (a.prefix_quarter) |pipe| pipe.deinit();
@@ -288,6 +322,8 @@ pub const Attention = struct {
         var timing = profile.begin(a.profiler, input_encoder, .attention_prepare);
         errdefer timing.cancel();
         const e = timing.encoder;
+        // the table's rows only when this call's angles are the table's; any other call recomputes as before
+        const rope_span: u32 = if (p.theta == a.rope_theta and g.rotary == a.rope_rotary) a.rope_span else 0;
 
         if (p.rows == 0 or p.rows > @import("gpu_frame.zig").max_rows or !std.math.isFinite(p.eps) or p.eps <= 0 or !std.math.isFinite(p.theta) or p.theta <= 0 or key_stride < g.kv_heads * g.dim) return error.TargetAttentionShape;
         const key_bytes = ((@as(usize, p.rows) - 1) * key_stride + g.kv_heads * g.dim) * 2;
@@ -329,7 +365,7 @@ pub const Attention = struct {
             }
             e.setPipeline(a.io[14]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
-            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = d.plan.tiles * 16 }, 5);
+            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = d.plan.tiles * 16, .rope_span = rope_span }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
             e.setBuffer(p.rotated_key.buffer, p.rotated_key.offset, 7);
             e.setBuffer(w.counter, 0, 8);
@@ -342,6 +378,7 @@ pub const Attention = struct {
             e.setValue(d.v_stride, 15);
             e.setBuffer(words, 16, 16);
             e.setValue(@as(u32, 1), 17);
+            e.setBuffer(a.rope_table, 0, 18);
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
             // no barrier: the prefix waits on this launch's count (encode with `appended`)
             return timing.end();
@@ -361,13 +398,14 @@ pub const Attention = struct {
             }
             e.setPipeline(a.io[18]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
-            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
+            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows, .rope_span = rope_span }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
             bindAt(e, c.binding.get(.caches), 11);
             bindAt(e, c.binding.get(.meta), 12);
             bindAt(e, c.scratch.get(.nodes), 13);
             bindAt(e, c.value, 14);
             e.setValue(c.v_stride, 15);
+            e.setBuffer(a.rope_table, 0, 18);
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
             e.barrier();
             return timing.end();
@@ -377,7 +415,7 @@ pub const Attention = struct {
             // the wait); prompt rows and every launch with no wait take the record's
             e.setPipeline(a.io[if (p.after != null) (if (p.packed_rows == 0) @as(usize, 15) else 16) else if (p.packed_rows == 0) @as(usize, 10) else 11]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
-            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
+            e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows, .rope_span = rope_span }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
             e.setBuffer(p.rotated_key.buffer, p.rotated_key.offset, 7);
             if (p.after) |w| {
@@ -387,6 +425,7 @@ pub const Attention = struct {
                 e.setBuffer(p.qg.buffer, p.qg.offset, 8); // never read: wait_for 0
                 e.setValue(@as(u32, 0), 9);
             }
+            e.setBuffer(a.rope_table, 0, 18);
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
             e.barrier();
             return timing.end();
@@ -475,13 +514,13 @@ pub const Attention = struct {
             e.setPipeline(a.io[if (wide) 17 else 2]);
             bind(e, .{ k, v, binding.get(.caches), binding.get(.meta), scratch.get(.nodes) });
             e.setValue(args, 5);
-            e.dispatchThreads(mtl.Size.of(if (wide) g.dim / 8 else g.dim, g.kv_heads, plan.rows), mtl.Size.of(32, 1, 1));
+            e.dispatchThreads(mtl.Size.of(if (wide) g.dim / 8 else g.dim, g.kv_heads, plan.rows), if (wide) mtl.Size.of(32, 1, 1) else mtl.Size.of(32, 2, 1));
         }
         if (!prepacked and !appended) {
             e.setPipeline(a.io[0]);
             bind(e, .{ q, scratch.get(.q_rows), scratch.get(.qa) });
             e.setValue(args, 3);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 1, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, args.packed_rows, g.kv_heads), mtl.Size.of(32, 2, 1)); // eight words a thread
         }
         if (a.promptPath(plan, prompt)) {
             if (!appended) e.barrier();
@@ -539,7 +578,7 @@ pub const Attention = struct {
             e.setPipeline(a.io[1]);
             bind(e, .{ q, scratch.get(.qb) });
             e.setValue(args, 2);
-            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 1, 1)); // eight words a thread
+            e.dispatchThreads(mtl.Size.of(g.dim / 8, 16, g.kv_heads * plan.rows), mtl.Size.of(32, 2, 1)); // eight words a thread
         }
         // an appended (decoded) preprocess counts itself and the prefix waits on it in this interval instead
         if (!appended) e.barrier();
@@ -624,12 +663,12 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), scratch.get(.keep_k), scratch.get(.keep_v) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
         e.barrier();
         e.setPipeline(a.io[6]);
         bind(e, .{ scratch.get(.keep_k), scratch.get(.keep_v), binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
         e.barrier();
     }
     /// `keep`'s gather into a caller's own K/V lanes, without barriers: layers with distinct lanes gather side by side.
@@ -640,7 +679,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[5]);
         bind(e, .{ binding.get(.caches), binding.get(.meta), binding.get(.keep_map), keys, values });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
     }
     /// The checks and resource uses of `keepGather`, without its dispatch (the all-layer launch reads through pointers).
     pub fn keepUse(e: mtl.ComputeEncoder, binding: *const Binding, kept: u32, caches: []const Cache) !void {
@@ -660,7 +699,7 @@ pub const Attention = struct {
         e.setPipeline(a.io[6]);
         bind(e, .{ keys, values, binding.get(.caches), binding.get(.meta), binding.get(.keep_map) });
         e.setValue(kept, 5);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept), mtl.Size.of(32, 2, 1));
     }
     /// `keepGather` for every binding in one launch: binding i gathers into lanes 2i (keys) and 2i + 1 (values) of
     /// `lanes`, each `lane_words` bf16 words, through the one keep `map` every binding reads; `layers` receives the
@@ -677,7 +716,7 @@ pub const Attention = struct {
         e.setBytes(std.mem.sliceAsBytes(layers), 0);
         e.setBuffer(lanes, 0, 1);
         e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
-        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept * @as(u32, @intCast(bindings.len))), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(g.dim, g.kv_heads, kept * @as(u32, @intCast(bindings.len))), mtl.Size.of(32, 2, 1));
     }
     /// `keepScatter` for every binding in one launch, from the lanes and table `keepGatherLayers` filled.
     pub fn keepScatterLayers(a: *const Attention, e: mtl.ComputeEncoder, geometry: planning.Geometry, kept: u32, layers: []const KeepLayer, lanes: mtl.Buffer, lane_words: u32) void {
@@ -686,7 +725,7 @@ pub const Attention = struct {
         e.setBytes(std.mem.sliceAsBytes(layers), 0);
         e.setBuffer(lanes, 0, 1);
         e.setValue(KeepLayers{ .kept = kept, .lane = lane_words }, 2);
-        e.dispatchThreads(mtl.Size.of(geometry.dim, geometry.kv_heads, kept * @as(u32, @intCast(layers.len))), mtl.Size.of(32, 1, 1));
+        e.dispatchThreads(mtl.Size.of(geometry.dim, geometry.kv_heads, kept * @as(u32, @intCast(layers.len))), mtl.Size.of(32, 2, 1));
     }
 };
 /// attention_io.metal's Q27KeepLayer: GPU addresses of one binding's cache pointers, metadata and keep map.
