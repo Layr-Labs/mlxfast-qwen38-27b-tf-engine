@@ -79,6 +79,8 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
+    /// Use the smaller tensor-op M descriptor only for a full eight-row decode tile.
+    m8: bool = false,
     /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
     /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
     serial: bool = false,
@@ -93,6 +95,30 @@ const Key = struct {
         return key.kind == .projection and key.bits == 4 and key.group == 64 and (two or four) and key.k == 5120 and key.skip == 0 and key.cut[0] == 0 and key.cut[1] == 0 and key.range[1] == 0 and !key.parallel_sk2;
     }
 };
+
+/// The M=8 descriptor has a distinct cooperative-tensor fragment layout. Keep it explicit in the cache key and only
+/// select it for the full decoded tile; prompt, SwiGLU, and indirect head-tile launches retain their existing layouts.
+fn useDecodeM8(rows: u32, reg: bool, swiglu: bool, tile_list: bool) bool {
+    return rows == 8 and reg and !swiglu and !tile_list;
+}
+
+test "decode M8 selector is limited to full non-SwiGLU row tiles and has a distinct cache key" {
+    try std.testing.expect(useDecodeM8(8, true, false, false));
+    try std.testing.expect(!useDecodeM8(7, true, false, false));
+    try std.testing.expect(!useDecodeM8(8, false, false, false));
+    try std.testing.expect(!useDecodeM8(8, true, true, false));
+    try std.testing.expect(!useDecodeM8(8, true, false, true));
+
+    const base = Key{ .kind = .projection, .n = 10240, .k = 5120, .rows8 = true };
+    const m8 = Key{ .kind = .projection, .n = 10240, .k = 5120, .rows8 = true, .m8 = true };
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(base, false);
+    try cache.put(m8, true);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(!cache.get(base).?);
+    try std.testing.expect(cache.get(m8).?);
+}
 
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
 /// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
@@ -457,7 +483,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8, .m8 = useDecodeM8(rows, reg and !k.prompt, false, false) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -466,7 +492,7 @@ pub const Kernels = struct {
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
             const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = (key.serialSk2() or key.serial) and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = (key.serialSk2() or key.serial) and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12, .m8 = key.m8 });
             k.joined(entry.value_ptr);
         }
         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
@@ -493,6 +519,7 @@ pub const Kernels = struct {
             .bits = p.bits,
             .group = p.group,
             .rows8 = reg and rows <= 8,
+            .m8 = useDecodeM8(rows, reg, false, false),
             .lean = reg,
             .batch = if (reg) p.batch else 1,
             .sbi = reg and p.index != null,
@@ -512,8 +539,10 @@ pub const Kernels = struct {
             .serial_sk2 = key.serialSk2(),
             .tile_batch = key.batch,
             .rows8 = key.rows8,
+            .m8 = key.m8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -700,7 +729,7 @@ pub const Kernels = struct {
     /// once a threadgroup too, but only parallel split-K launches wait.
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait, .m8 = useDecodeM8(rows, true, false, false) };
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
@@ -820,7 +849,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .serial_sk2 = key.serialSk2() });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .serial_sk2 = key.serialSk2(), .m8 = key.m8 });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
@@ -845,7 +874,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .m8 = key.m8 });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
