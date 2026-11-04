@@ -862,14 +862,26 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
+#if TF_PROMPT_TN == 2
+  // A SIMD group owns its activation fragment. Prime the first group; subsequent groups are staged between tiles.
+  // xl0/xl1 retain the current words through both output tiles, while x64 holds only the following group's words.
+  if (first < last)
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+#endif
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
+#if TF_PROMPT_TN != 2
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+#endif
     xv += GS;
     TF_UNROLL
     for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
     TF_TN_TILE(0)
+#if TF_PROMPT_TN == 2
+    if (g + 1 < last)
+      x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
+#endif
     TF_TN_TILE(1)
 #if TF_PROMPT_TN == 4
     TF_TN_TILE(2)
