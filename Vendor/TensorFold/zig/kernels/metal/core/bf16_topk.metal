@@ -1,4 +1,4 @@
-// One input scan builds local min-heaps, sorted once before exact score/lowest-token-ID merges.
+// Exact score/lowest-token-ID heaps; long spans may first filter by a radix prefix.
 #include <metal_stdlib>
 using namespace metal;
 // Each is also a constant in bf16_topk_gpu.zig, which does not compile when its value differs.
@@ -56,10 +56,33 @@ inline uint tf_tg_or(uint m, uint lane, threadgroup uint* masks) {
   for (uint g = 0; g < TF_TOPK_LANES / 32; g++) all |= masks[g];
   return all;
 }
+// An exact radix prefix filter for the heap path's long spans. Retain the
+// entire bucket containing rank k, including all score/ID ties. This saves
+// heap work only; the original comparator and final tournament still order
+// every retained entry. Small spans and k<8 keep the original single scan.
+inline uint tf_topk_prefix(const device ushort* logits, ulong begin, ulong end,
+                            uint k, uint lane, threadgroup atomic_uint* histogram) {
+  if (end - begin < 8192 || k < 8) return 0u; // uniform across this threadgroup
+  if (lane < 16) atomic_store_explicit(histogram + lane, 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (ulong token = begin + lane; token < end; token += TF_TOPK_LANES) {
+    const ushort raw = logits[token];
+    if ((raw & 0x7f80u) != 0x7f80u)
+      atomic_fetch_add_explicit(histogram + (tf_bf16_key(raw) >> 12), 1u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint count = 0;
+  for (int bucket = 15; bucket >= 0; --bucket) {
+    count += atomic_load_explicit(histogram + bucket, memory_order_relaxed);
+    if (count >= k) return uint(bucket) << 12;
+  }
+  return 0u; // fewer than k finite entries: preserve the original sentinels
+}
 // The scan, local heaps and tournament over tokens [begin, end) of one row, into one Row.
 inline void tf_topk_span(const device ushort* logits, device Row& out, ulong begin, ulong end, constant Params& p,
                          uint lane, threadgroup uint* keys, threadgroup uint* ids, threadgroup uint* score_bits,
-                         threadgroup uint* masks) {
+                         threadgroup uint* masks, threadgroup atomic_uint* histogram) {
+  const uint cutoff = tf_topk_prefix(logits, begin, end, p.k, lane, histogram);
   uint local_key[TF_TOPK_MAX_K], local_id[TF_TOPK_MAX_K], local_bits[TF_TOPK_MAX_K];
   for (uint i = 0; i < TF_TOPK_MAX_K; i++) { local_key[i] = 0; local_id[i] = 0xffffffffu; local_bits[i] = 0; }
   if (lane == 0) {
@@ -74,6 +97,7 @@ inline void tf_topk_span(const device ushort* logits, device Row& out, ulong beg
       continue;
     }
     const uint key = tf_bf16_key(raw), id = uint(token), bits = uint(raw) << 16;
+    if (key < cutoff) continue; // nonfinite mask was handled before this filter
     if (count < p.k) {
       uint at = count++;
       local_key[at] = key; local_id[at] = id; local_bits[at] = bits;
@@ -106,7 +130,8 @@ kernel void tf_bf16_topk(const device ushort* logits [[buffer(0)]],
                         device Row* output [[buffer(1)]], constant Params& p [[buffer(2)]],
                         uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
   threadgroup uint keys[TF_TOPK_LANES], ids[TF_TOPK_LANES], score_bits[TF_TOPK_LANES], masks[TF_TOPK_LANES];
-  tf_topk_span(logits + ulong(row) * p.stride, output[row], 0, p.vocab, p, lane, keys, ids, score_bits, masks);
+  threadgroup atomic_uint histogram[16];
+  tf_topk_span(logits + ulong(row) * p.stride, output[row], 0, p.vocab, p, lane, keys, ids, score_bits, masks, histogram);
 }
 
 // A wide row's spans each leave their top k and non-finite mask in part (the span's Row); the merge picks the row's.
@@ -116,7 +141,8 @@ kernel void tf_bf16_topk_span(const device ushort* logits [[buffer(0)]],
   threadgroup uint keys[TF_TOPK_LANES], ids[TF_TOPK_LANES], score_bits[TF_TOPK_LANES], masks[TF_TOPK_LANES];
   const ulong width = (ulong(p.vocab) + TF_TOPK_SPANS - 1) / TF_TOPK_SPANS;
   const ulong begin = min(ulong(tg.x) * width, ulong(p.vocab)), end = min(begin + width, ulong(p.vocab));
-  tf_topk_span(logits + ulong(tg.y) * p.stride, part[tg.y * TF_TOPK_SPANS + tg.x], begin, end, p, lane, keys, ids, score_bits, masks);
+  threadgroup atomic_uint histogram[16];
+  tf_topk_span(logits + ulong(tg.y) * p.stride, part[tg.y * TF_TOPK_SPANS + tg.x], begin, end, p, lane, keys, ids, score_bits, masks, histogram);
 }
 
 kernel void tf_bf16_topk_merge(const device Row* part [[buffer(0)]],
