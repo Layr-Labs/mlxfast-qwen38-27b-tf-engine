@@ -677,12 +677,14 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
 #endif
 #if defined(TF_COUNT)
-  // the norm that reads Y shares this launch's barrier interval: each threadgroup counts itself on TC[0] once its
-  // stores are past a device-scope fence (q27_norm_xs' wait_for)
-  threadgroup_barrier(mem_flags::mem_device);
-  if (ks == 0 && lane == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
+  // Only SIMD 0 writes Y after the ordered split-K reduction. Publish those stores from that SIMD; the other
+  // K slices keep the cross-SIMD reduction barrier above but have no device stores to publish here.
+  if (ks == 0) {
+    simdgroup_barrier(mem_flags::mem_device);
+    if (lane == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(TC, 1u, memory_order_relaxed);
+    }
   }
 #endif
 }
