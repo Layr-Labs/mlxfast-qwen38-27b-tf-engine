@@ -326,6 +326,7 @@ pub const Kernels = struct {
                 .precompute_sums = true,
                 .reg = true,
                 .prompt_sr = key.prompt_sr,
+                .max_rows = 512,
                 .tile_batch = key.batch,
                 .reg_lean = true,
                 .swiglu = true,
@@ -336,8 +337,8 @@ pub const Kernels = struct {
         }
         const half = p.n / 2;
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        while (first < rows) : (first += entry.value_ptr.max_rows) {
+            const n = @min(rows - first, entry.value_ptr.max_rows);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const sb = lane.Ref{ .buf = p.pairs.buffer, .off = p.pairs.offset };
@@ -367,12 +368,12 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .max_rows = 512, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
             k.joined(entry.value_ptr);
         }
         var first: u32 = 0;
-        while (first < rows) : (first += lane.reg_rows) {
-            const n = @min(rows - first, lane.reg_rows);
+        while (first < rows) : (first += entry.value_ptr.max_rows) {
+            const n = @min(rows - first, entry.value_ptr.max_rows);
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const hr = lane.Ref{ .buf = hidden.buffer, .off = hidden.offset + @as(usize, first) * p.n * 2 };
@@ -466,10 +467,11 @@ pub const Kernels = struct {
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
             const tn = promptTiles(key, p.n, skip);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = (key.serialSk2() or key.serial) and tn == 1, .prompt_sr = key.prompt_sr, .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
+            const serial = (key.serialSk2() or key.serial) and tn == 1;
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else if (range[1] > 0) &tiles else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = serial, .prompt_sr = key.prompt_sr, .max_rows = promptHostRows(key.prompt_sr, serial), .tile_batch = key.batch, .rows8 = key.rows8, .reg_lean = key.lean, .prompt_tn = tn, .indexed = key.sbi, .indexed12 = key.sbi12 });
             k.joined(entry.value_ptr);
         }
-        const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+        const step: u32 = if (entry.value_ptr.reg) entry.value_ptr.max_rows else 16;
         var first: u32 = 0;
         while (first < rows) : (first += step) {
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
@@ -964,4 +966,28 @@ fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
+}
+
+/// Larger host windows never opt serial or decoded pipelines into a different schedule.
+fn promptHostRows(prompt: bool, serial: bool) u32 {
+    return if (prompt and !serial) 512 else lane.reg_rows;
+}
+
+test "prompt host windows preserve serial fallback admission" {
+    const T = std.testing;
+    for ([_]u32{ 1, 8 }) |batch| {
+        const key = Key{ .kind = .projection, .n = 12288, .k = 5120, .slices = 2, .prompt_sr = true, .batch = batch };
+        const tn = promptTiles(key, key.n, 0);
+        const serial = (key.serialSk2() or key.serial) and tn == 1;
+        try T.expectEqual(@as(u32, if (batch == 1) 128 else 512), promptHostRows(key.prompt_sr, serial));
+        try (lane.Layout{ .n = key.n, .k = key.k, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .prompt_sr = true, .serial_sk2 = serial, .tile_batch = batch, .prompt_tn = tn, .max_rows = promptHostRows(true, serial) }).validate();
+    }
+    try T.expectEqual(@as(u32, 128), promptHostRows(true, true)); // split-eight K|V
+    try T.expectEqual(@as(u32, 128), promptHostRows(false, false)); // decoded/Gemma default
+    var invalid = lane.Layout{ .n = 5120, .k = 6144, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .reg_lean = true, .prompt_sr = true, .tile_batch = 8, .prompt_tn = 2, .max_rows = 512 };
+    try invalid.validate();
+    invalid.max_rows = 511;
+    try T.expectError(error.InvalidSchedule, invalid.validate());
+    invalid.max_rows = 2064;
+    try T.expectError(error.InvalidSchedule, invalid.validate());
 }

@@ -186,6 +186,8 @@ pub const Layout = struct {
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
     prompt_sr: bool = false,
+    /// Host window only: the reg grid still consists of independent 16-row blocks.
+    max_rows: u32 = reg_rows,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
@@ -231,6 +233,7 @@ pub const Layout = struct {
         if (l.y_stride) |s| if ((s < l.n and !l.tile_list) or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.tile_list and (!l.reg or !l.rows8 or !l.reg_lean or l.swiglu or l.residual or l.count or l.prompt_sr or
             l.prompt_tn != 1 or l.ranges.len != 0 or l.groups != null or l.output != .bf16 or l.y_stride == null or l.y_stride.? % 32 != 0)) return error.InvalidSchedule;
+        if (l.max_rows != reg_rows and (!l.reg or !l.prompt_sr or l.rows8 or l.serial_sk2 or l.max_rows < reg_rows or l.max_rows > 2048 or l.max_rows % 16 != 0)) return error.InvalidSchedule;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
@@ -487,6 +490,7 @@ pub const Projection = struct {
     y_stride: usize,
     tile_count: usize,
     sk: usize,
+    max_rows: u32 = reg_rows,
     sums_pipe: ?mtl.Pipeline = null,
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
@@ -529,9 +533,9 @@ pub const Projection = struct {
         if (l.precompute_sums) {
             sums_pipe = try mtl.Pipeline.init(device, lib, "tf_lane_sums", false);
             errdefer sums_pipe.?.deinit();
-            sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            sums_buffer = try device.buffer(@as(usize, if (l.reg) l.max_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .max_rows = l.max_rows, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -557,7 +561,7 @@ pub const Projection = struct {
     pub fn encodeSumsAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, dims: ?Ref) !void {
         if (!p.reg) return error.SumsNeedReg;
         if (p.residual) return error.InvalidSchedule;
-        if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > p.max_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         if (p.count) return error.InvalidSchedule;
         if (dims) |d| try checkRef(d, 8, 4);
@@ -568,7 +572,7 @@ pub const Projection = struct {
     /// q27_norm_xs forms the residual stream; no output rows are stored. `sums` null: the projection's own sums pass.
     pub fn encodeResid(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: ?Sums, h: Ref, ro: Ref, rows: u32) !void {
         if (!p.residual) return error.InvalidSchedule;
-        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (rows == 0 or rows > p.max_rows) return error.InvalidRows;
         if (sums) |s| {
             if (s.stride < rows) return error.InvalidRows;
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
@@ -626,7 +630,7 @@ pub const Projection = struct {
 
     fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
         if (!p.swiglu) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else p.max_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, 16);
@@ -657,7 +661,7 @@ pub const Projection = struct {
     /// the grid is the one for `rows`, and rows past the count sum to zero.
     pub fn encodeSumsOfAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32, count: ?Ref) !Sums {
         if (!p.reg) return error.SumsNeedReg;
-        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (rows == 0 or rows > p.max_rows) return error.InvalidRows;
         const pipe = p.sums_pipe orelse return error.SumsNeedReg;
         const buffer = p.sums_buffer orelse return error.SumsNeedReg;
         try checkRef(x, rows * p.k * 2, 2);
@@ -710,7 +714,7 @@ pub const Projection = struct {
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
         if (p.tile_list) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) p.max_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
