@@ -143,7 +143,7 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
-pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
+pub const Kind = enum { projection, xsum, norm, norm_held, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -169,6 +169,9 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// normHeld's count, twice (words 0 and 2), and the arrivals of the two quantHeld launches that wait on it (words 1
+    /// and 3): each waiter leaves its own pair zero.
+    held_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -207,6 +210,7 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.held_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
@@ -221,7 +225,7 @@ pub const Kernels = struct {
         const template = switch (key.kind) {
             .projection => unreachable,
             .xsum => sources.xsum,
-            .norm => sources.norm_xs,
+            .norm, .norm_held => sources.norm_xs,
             .input_norm, .input_words => sources.norm_input,
             .mlp => sources.mlp_xs,
             .mlp_wide => sources.mlp_xs_wide,
@@ -231,20 +235,22 @@ pub const Kernels = struct {
         const definitions = switch (key.kind) {
             .projection => unreachable,
             .xsum => try std.fmt.allocPrint(k.allocator, "constexpr int K={d}, GS=64;", .{key.k}),
-            .norm, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
+            .norm, .norm_held, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
             .input_words => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};\n#define Q27_NORM_WORDS 1", .{key.k}),
             .mlp, .mlp_wide => try std.fmt.allocPrint(k.allocator, "constexpr int N={d};", .{key.n}),
             .ane_input, .mlp_ane, .add_ane => try std.fmt.allocPrint(k.allocator, "constant constexpr int H={d}, N={d}, A={d};", .{ key.k, key.n, key.tile }),
         };
         defer k.allocator.free(definitions);
-        const source = try std.mem.concat(k.allocator, u8, &.{ template[0..mark], definitions, template[mark + "Q27_SPECIALIZE".len ..] });
+        // the held norm's count buffer is in its signature, ahead of the specialization mark
+        const lead: []const u8 = if (key.kind == .norm_held) "#define Q27_NORM_HELD 1\n" else "";
+        const source = try std.mem.concat(k.allocator, u8, &.{ lead, template[0..mark], definitions, template[mark + "Q27_SPECIALIZE".len ..] });
         defer k.allocator.free(source);
         const library = try mtl.Library.fromSource(k.device, source, mtl.CompileOptions.mlx());
         defer library.deinit();
         const name: [:0]const u8 = switch (key.kind) {
             .projection => unreachable,
             .xsum => "custom_kernel_q27_xsum_bfloat16_t_int32_t_float",
-            .norm => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
+            .norm, .norm_held => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
             .input_norm, .input_words => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
             .mlp => "custom_kernel_q27_mlp_xs_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
             .mlp_wide => "custom_kernel_q27_mlp_xs_wide_bfloat16_t_bfloat16_t_int32_t_bfloat16_t_float",
@@ -691,6 +697,58 @@ pub const Kernels = struct {
         e.setValue(wait_for, 9);
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// normAfter whose threadgroups each count themselves on held_words (words 0 and 2) once their stores are fenced,
+    /// for the two quantHeld launches that read its rows and sums in the same barrier interval (no barrier follows it).
+    pub fn normHeld(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !void {
+        const words = k.count_words orelse return error.BadCoreProjectionRows;
+        const held = try k.heldWords();
+        if (wait_for == 0 or rows == 0 or rows > 8 or k.profiler != null) return error.BadCoreProjectionRows;
+        try wordAligned(.{ h, residual, weight, combined, out });
+        const e = input_encoder;
+        e.setPipeline(try k.get(.{ .kind = .norm_held, .k = width }));
+        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+        e.setBuffer(words, 0, 8);
+        e.setValue(wait_for, 9);
+        e.setBuffer(held, 0, 10);
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+    }
+
+    fn heldWords(k: *Kernels) !mtl.Buffer {
+        if (k.held_words) |b| return b;
+        const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        @memset(b.contents()[0..16], 0);
+        k.held_words = b;
+        return b;
+    }
+
+    /// Whether quantHeld takes `p` for `rows` decoded rows: the counted launch's key (serial K chains included), no profiler.
+    pub fn holdable(k: *const Kernels, p: projection.Linear, rows: u32) bool {
+        return k.profiler == null and k.countedKey(p, rows, false) != null;
+    }
+
+    /// quantCounted (counting on count_words for the GDN prepare) whose threadgroups first wait on normHeld's count in
+    /// the same barrier interval: `half` 0 or 1 picks the waiter's word pair in held_words; `rows` norm threadgroups.
+    pub fn quantHeld(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, half: u1) !u32 {
+        if (!k.holdable(p, rows)) return error.BadCoreProjectionRows;
+        var key = k.countedKey(p, rows, false).?;
+        key.wait = true;
+        const held = try k.heldWords();
+        if (k.count_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.count_words = b;
+        }
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .serial_sk2 = key.serialSk2() });
+            k.joined(entry.value_ptr);
+        }
+        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+        try entry.value_ptr.encodeCountedAfter(input_encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = held, .off = @as(usize, half) * 8 }, rows);
+        return @intCast(entry.value_ptr.tile_count);
     }
 
     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their

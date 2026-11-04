@@ -14,6 +14,9 @@ typedef half float16_t;
   device float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
+#if defined(Q27_NORM_HELD)
+  device atomic_uint* CO [[buffer(10)]],
+#endif
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -101,5 +104,16 @@ Q27_SPECIALIZE
     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
   }
   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+#if defined(Q27_NORM_HELD)
+  // decoded rows (Kernels.normHeld): the mixer's two input projections share this launch's barrier interval and read
+  // XO and XS once this launch's M threadgroups have counted; each threadgroup counts itself on both waiters' words
+  // (CO[0] and CO[2]) once its stores are past a device-scope fence, and each waiter leaves its own pair zero
+  threadgroup_barrier(mem_flags::mem_device);
+  if (t == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    atomic_fetch_add_explicit(&CO[0], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&CO[2], 1u, memory_order_relaxed);
+  }
+#endif
 
 }

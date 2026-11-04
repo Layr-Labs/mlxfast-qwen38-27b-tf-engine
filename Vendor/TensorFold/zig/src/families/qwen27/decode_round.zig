@@ -6,6 +6,10 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 8 layers are on the GPU the host encodes the other 56 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 8;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -78,6 +82,9 @@ pub const Runner = struct {
     /// then cleared: work its caller left pending (Generation: the last round's keep), so planning and encoding overlap
     /// it.
     settle: ?forward.Hook = null,
+    /// Set by its caller around one prompt pass: as each segment but the last of a staggered pass ends on the GPU, `due`
+    /// then `run` with the absolute row its rows end at (segments.runCommittingEarly's laneDone).
+    rows_done: ?RowsDone = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
     /// A verify's attention plan, made by its first attention layer (planAttention) rather than before its first commit.
@@ -338,7 +345,7 @@ pub const Runner = struct {
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
         var clears = Clears{ .r = r, .slots = round.slots };
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null, .gdn_held = gdnHeld }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
         r.deferred = deferred;
         // a write-back lands every pending row: the keep stashes this round's from the first
         if (deferred) |d| if (d.persist != 0) {
@@ -349,6 +356,7 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
@@ -471,7 +479,8 @@ pub const Runner = struct {
         var due: [max]bool = @splat(true);
         var segments: [max]Segment = undefined;
         var stages: [max]forward.Stages = undefined;
-        var family = Stagger{};
+        var family = Stagger{ .rows_done = r.rows_done };
+        for (0..parts) |k| family.ends[k] = start + firsts[k + 1];
         // the slot's clear, if due, runs in the first segment's lane ahead of its embedding: every later segment's first
         // read of the slot's words (its first mixer) waits for the first's first mixer, behind it
         var clears = Clears{ .r = r, .slots = round.slots[0..1] };
@@ -819,6 +828,14 @@ pub const Runner = struct {
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
+    /// forward.Mixer.gdn_held: block `block`'s input norm may skip its barrier unless a tap copies the rows it stores.
+    fn gdnHeld(ptr: *anyopaque, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) bool {
+        const r: *Runner = @ptrCast(@alignCast(ptr));
+        if (r.current_gdn == null) return false;
+        if (r.capture_taps and block > 0 and std.mem.indexOfScalar(usize, &r.taps.ids, block - 1) != null) return false;
+        return GdnHook.holds(&r.model.kernels, r.accepted_chain, weights, frame, rows);
+    }
+
     fn attentionForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Attention, f: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
         const pass = AttentionPass{ .plan = r.current_attention orelse try r.planAttention(), .round = r.current_round orelse return error.RoundNotReady, .placed = r.current_placed, .scratch = &r.scratch, .bindings = r.bindings, .scratch_due = &r.scratch_due, .terminal_head = r.terminal_head };
@@ -1028,9 +1045,24 @@ const Segment = struct {
 };
 
 /// A staggered prompt pass's segments as one family for core/segments.zig: each hook goes to its lane's stages.
+/// Runner.rows_done.
+pub const RowsDone = struct { ptr: *anyopaque, due: *const fn (*anyopaque, u32) bool, run: *const fn (*anyopaque, u32) anyerror!void };
+
 const Stagger = struct {
     stages: [@import("core").segments.MAX]*forward.Stages = undefined,
+    rows_done: ?RowsDone = null,
+    /// Each segment's end row, absolute.
+    ends: [@import("core").segments.MAX]u32 = undefined,
     const Lane = @import("core").segments.Lane;
+
+    pub fn laneDue(p: *Stagger, k: usize) bool {
+        const h = p.rows_done orelse return false;
+        return h.due(h.ptr, p.ends[k]);
+    }
+    pub fn laneDone(p: *Stagger, k: usize) !void {
+        const h = p.rows_done orelse return;
+        return h.run(h.ptr, p.ends[k]);
+    }
 
     pub fn begin(p: *Stagger, lane: *Lane) !void {
         return p.stages[lane.k].begin(lane);

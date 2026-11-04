@@ -27,8 +27,16 @@ pub const Hook = struct {
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
 
+    /// Whether `forward` of these decoded rows takes the counted projections on quantHeld: the input norm then counts
+    /// itself and no barrier follows it (forward.Mixer.gdn_held).
+    pub fn holds(quant: *const Quant, accepted_chain: bool, weight: Weights.Gdn, frame: *Frame, rows: u32) bool {
+        return !accepted_chain and zTiles(weight.zba, frame, quant.prompt) == 0 and quant.holdable(weight.qkv, rows) and quant.holdable(weight.zba, rows);
+    }
+
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
+        const held = frame.norm_held;
+        frame.norm_held = false;
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
@@ -37,7 +45,13 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
+        if (held) {
+            // the input norm shares this interval and counts itself: both wait on it (each on its own word pair)
+            if (!holds(hook.quant, hook.accepted_chain, weight, frame, rows)) return error.BadGdnHook;
+            const a = try hook.quant.quantHeld(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows, 0);
+            const b = try hook.quant.quantHeld(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows, 1);
+            after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
+        } else if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
             const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
