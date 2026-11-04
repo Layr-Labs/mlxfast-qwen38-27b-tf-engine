@@ -283,8 +283,10 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        // four simdgroups a threadgroup: half as many groups of twice the size; each thread keeps its grid position and work
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        // eight simdgroups a threadgroup: one group covers all dv dimension blocks of its (head, segment), so the eight
+        // warps co-schedule on one core and share the identical per-row key and query fetches in L1; each 8-lane set keeps
+        // its grid position and work, and the sets are independent, so the arithmetic is unchanged
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = @min(8, r.p.dv / 16), .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
