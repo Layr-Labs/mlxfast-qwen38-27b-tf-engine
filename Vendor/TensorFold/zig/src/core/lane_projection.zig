@@ -180,8 +180,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
-    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or eight on
-    /// one-tile prompt rows.
+    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or four or
+    /// eight on one-tile prompt rows.
     serial_sk2: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
@@ -234,7 +234,7 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
-        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and ((l.sk != 4 and l.sk != 8) or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
@@ -580,19 +580,11 @@ pub const Projection = struct {
     /// A counting projection (Layout.count): encodeSums whose threadgroups each add one to `counter` (a u32 word the
     /// waiting norm leaves zero) once their stores are past a device-scope fence; tile_count of them a launch.
     pub fn encodeCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref) !void {
-        return p.encodeCountedAt(e, x, w, sb, sums, y, rows, counter, null);
-    }
-
-    /// encodeCounted reading its [rows, stride] words at `dims` when given (encodeSumsAt's: an earlier dispatch wrote them,
-    /// at least one and at most `rows` rows): the launch is the one for `rows`, so every one of its tile_count
-    /// threadgroups still counts itself once.
-    pub fn encodeCountedAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, dims: ?Ref) !void {
         if (!p.count or p.wait) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        if (dims) |d| try checkRef(d, 8, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, dims);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
     }
 
     /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
@@ -788,6 +780,12 @@ test "serial SK2 keeps logical split and is off by default" {
     l.prompt_sr = true;
     l.reg_lean = true;
     try l.validate();
+    // four chains: one-tile prompt rows too
+    l.sk = 4;
+    try l.validate();
+    l.prompt_sr = false;
+    l.reg_lean = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
