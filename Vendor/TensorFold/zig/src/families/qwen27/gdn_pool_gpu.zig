@@ -64,19 +64,25 @@ pub const Refs = struct { z: Ref, a: Ref, b: Ref, output: Ref, scalars: Scalars,
 /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (the prepare's tails, the scan's
 /// recurrent rows, the snapshots): its layer runs beside the first segment's next layer, which writes the pool's.
 pub const Own = struct {
+    /// Segment-private projected rows: may be written before its predecessor's mixer has finished reading its QKV.
+    qkv: metal.Buffer,
     tails: metal.Buffer,
     recurrent: metal.Buffer,
     snapshots: metal.Buffer,
 
-    pub fn init(pool: *const Pool, device: metal.Device) !Own {
+    pub fn init(pool: *const Pool, device: metal.Device, rows: usize) !Own {
+        if (rows == 0 or rows > pool.budget.rows) return error.BadGdnPoolIndex;
+        const qkv = try device.buffer(try abi.countBytes(u16, pool.budget.shape.qkv, rows), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+        errdefer qkv.deinit();
         const tails = try device.buffer(pool.get(.tails).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
         errdefer tails.deinit();
         const recurrent = try device.buffer(pool.get(.recurrent).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
         errdefer recurrent.deinit();
         const snapshots = try device.buffer(pool.get(.snapshots).length(), metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        return .{ .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
+        return .{ .qkv = qkv, .tails = tails, .recurrent = recurrent, .snapshots = snapshots };
     }
     pub fn deinit(o: Own) void {
+        o.qkv.deinit();
         o.tails.deinit();
         o.recurrent.deinit();
         o.snapshots.deinit();
@@ -456,7 +462,7 @@ pub const Pool = struct {
         const zs: usize = refs.zba_stride;
         const heads = pool.budget.shape.c.v_heads;
         const b = gdn.Buffers{
-            .qkv = try pool.layerSpan(.qkv, layer),
+            .qkv = if (refs.own) |o| try refSpan(.{ .buffer = o.qkv }, bytes.qkv) else try pool.layerSpan(.qkv, layer),
             .a = try refSpan(refs.a, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .b = try refSpan(refs.b, if (zs == 0) bytes.heads else ((p.rows - 1) * zs + heads) * 2),
             .z = try refSpan(refs.z, if (zs == 0) bytes.value else ((p.rows - 1) * zs + pool.budget.shape.value) * 2),

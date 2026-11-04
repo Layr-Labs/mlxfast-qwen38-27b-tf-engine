@@ -11,6 +11,8 @@ const ane_mlp = @import("ane_mlp.zig");
 pub const Mixer = struct {
     ptr: *anyopaque,
     gdn: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void,
+    /// Staggered prompts only: independent projections run after norm, before the predecessor's mixer wait.
+    gdn_pre: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Gdn, *Frame, u32) anyerror!void = null,
     attention: *const fn (*anyopaque, mtl.ComputeEncoder, usize, wts.Attention, *Frame, u32) anyerror!void,
     tap: ?*const fn (*anyopaque, mtl.ComputeEncoder, usize, Ref, u32) anyerror!void = null,
 };
@@ -54,6 +56,8 @@ pub const Stages = struct {
     /// Run once right before the forward's first commit (segments.runCommittingFrom's beforeCommit): what must land
     /// before any of its GPU work runs, so the host's planning and encoding before it overlap that wait.
     settle: ?Hook = null,
+    /// The last layer count a periodic commit may follow (segments' commitsUntil; 0: every `every` layers to the end).
+    commit_until: usize = 0,
     /// No consumer needs the final block's other rows after its cache updates.
     terminal_rows: bool = false,
     compact: bool = false,
@@ -103,6 +107,10 @@ pub const Stages = struct {
             std.mem.swap(Ref, &s.hidden, &s.residual);
             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
         }
+        if (s.hooks.gdn_pre) |project| switch (layer.mixer) {
+            .linear => |g| try project(s.hooks.ptr, e, index, g, f, s.rows),
+            .attention => {},
+        };
     }
     pub fn mixer(s: *Stages, lane: *@import("core").segments.Lane, index: usize) !void {
         const m = s.model;
@@ -228,6 +236,9 @@ pub const Stages = struct {
     /// Decoded rows (a verify's, a serial step's): the host polls the forward's last command buffer, its picks gate the round.
     pub fn polls(s: *const Stages) bool {
         return s.rows <= 16;
+    }
+    pub fn commitsUntil(s: *const Stages) usize {
+        return s.commit_until;
     }
     pub fn committed(s: *Stages) !void {
         if (s.after) |h| try h.run(h.ptr);

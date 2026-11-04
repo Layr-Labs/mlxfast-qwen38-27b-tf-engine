@@ -26,6 +26,22 @@ pub const Hook = struct {
     uploaded: bool = false,
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
+    /// Only staggered accepted prompts: QKV and b/a were encoded in the frame's pre stage before the mixer wait.
+    preprojected: bool = false,
+
+    fn projected(hook: *Hook, layer: usize) !@import("projection.zig").Ref {
+        return if (hook.own) |o| .{ .buffer = o.qkv } else hook.pool.projected(layer);
+    }
+
+    /// Independent of the predecessor's recurrent state/history. Later segments write their private QKV slab.
+    pub fn projectPrompt(hook: *Hook, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
+        if (!hook.accepted_chain or !hook.quant.prompt or block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
+        const sums = @import("forward.zig").sums(frame, .sums, rows);
+        const tiles = zTiles(weight.zba, frame, hook.quant.prompt);
+        try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.projected(hook.linear_index[block]), rows);
+        if (tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ tiles, weight.zba.n / 32 - tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
+        e.barrier();
+    }
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
@@ -37,12 +53,14 @@ pub const Hook = struct {
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
         var after: ?pool_gpu.Pool.After = null;
-        if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
-            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.pool.projected(layer), rows)) orelse return error.BadGdnHook;
+        if (hook.preprojected) {
+            if (!hook.accepted_chain or !hook.quant.prompt) return error.BadGdnHook;
+        } else if (!hook.accepted_chain and z.tiles == 0 and hook.quant.countable(weight.qkv, rows) and hook.quant.countable(weight.zba, rows)) {
+            const a = (try hook.quant.quantCounted(e, weight.qkv, frame.get(.input), sums, try hook.projected(layer), rows)) orelse return error.BadGdnHook;
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
         } else {
-            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
+            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.projected(layer), rows);
             if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
             e.barrier();
         }
