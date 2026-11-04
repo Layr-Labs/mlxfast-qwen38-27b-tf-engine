@@ -77,7 +77,7 @@ pub const Kernels = struct {
             "clear",
             "chain",
             "publish_conv",
-            "chain_wide",
+            "chain_block4",
             "chain_wide_marks",
             "mark_conv",
             "pre_step",
