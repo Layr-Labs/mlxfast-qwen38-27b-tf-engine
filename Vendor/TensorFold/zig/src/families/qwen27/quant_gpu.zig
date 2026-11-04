@@ -367,7 +367,7 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true, .peer_reduce = sk == 2 and tn == 2 });
             k.joined(entry.value_ptr);
         }
         var first: u32 = 0;

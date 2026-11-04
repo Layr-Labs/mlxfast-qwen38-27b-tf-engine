@@ -206,6 +206,8 @@ pub const Layout = struct {
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
+    /// Prompt SK2/TN2: each SIMD group reduces and stores one of the two output tiles.
+    peer_reduce: bool = false,
     /// Decoded rows (rows8, parallel K splits): each threadgroup counts itself on a counter word once its stores are past
     /// a device-scope fence (encodeCounted), for a norm that waits on that count in the same barrier interval.
     count: bool = false,
@@ -250,6 +252,8 @@ pub const Layout = struct {
         if (l.swiglu and l.prompt_tn != 1 and (l.prompt_tn != 2 or l.sk != 1 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
+        if (l.peer_reduce and (l.sk != 2 or l.prompt_tn != 2 or !l.reg or !l.prompt_sr or !l.reg_lean or
+            l.rows8 or l.serial_sk2 or l.swiglu or l.groups != null or l.ranges.len != 0 or l.y_stride != null or l.indexed or !l.residual)) return error.InvalidSchedule;
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
@@ -353,6 +357,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
+    if (l.peer_reduce) try text.appendSlice(a, "#define TF_PEER_REDUCE 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");

@@ -917,6 +917,29 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   threadgroup float tgpad[TF_TGPAD / 4];
   if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
 #endif
+#if defined(TF_PEER_REDUCE)
+#if TF_SK != 2 || TF_PROMPT_TN != 2 || !defined(TF_RESID)
+#error "peer reduction takes the two prompt residual tiles of two K splits"
+#endif
+  // Each split keeps the tile it will store and publishes the other tile to its peer.
+  // The same 1024 scratch words as the original SK2/TN2 epilogue, with disjoint producer/consumer halves.
+  // Group 1 must add the shared split-0 word on the LEFT: do not commute the parent's split0 + split1 sum.
+  if (ks == 0) {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) part[(16 + i) * 32 + lane] = C[1][i];
+  } else {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) part[i * 32 + lane] = C[0][i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks == 0) {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) C[0][i] = C[0][i] + part[i * 32 + lane];
+  } else {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) C[1][i] = part[(16 + i) * 32 + lane] + C[1][i];
+  }
+#else
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
@@ -936,13 +959,21 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       }
     }
   }
+#endif
   // a tile's 16 words of a lane are four quads of adjacent columns: words 4q .. 4q + 3 are row mb + 8 (q & 1), columns
   // nb + 16 (q >> 1) on. With n, TF_N and TF_YS multiples of 4, a quad is in or out of the row whole and its first word's
   // address is aligned for the vector, so each quad moves as one vector: the same words at the same addresses.
   static_assert(TF_N % 4 == 0 && TF_YS % 4 == 0, "a lane's quads are whole and aligned");
+#if defined(TF_PEER_REDUCE)
+  {
+#else
   if (ks == 0) {
+#endif
     TF_UNROLL
     for (int t = 0; t < TN; t++) {
+#if defined(TF_PEER_REDUCE)
+      if (t != ks) continue;
+#endif
       TF_UNROLL
       for (int q = 0; q < 4; q++) {
         const int m = mb + 8 * (q & 1), n = (tile0 + t) * NT + nb + 16 * (q >> 1);
