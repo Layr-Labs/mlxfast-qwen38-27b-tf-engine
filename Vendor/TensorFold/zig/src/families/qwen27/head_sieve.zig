@@ -1,6 +1,6 @@
 //! The greedy verify head's sieve (kernels/metal/qwen27/head_sieve.metal), the CUDA head_sieve's method on the reg lane
-//! layout: a 2-bit copy of the vocabulary head's codes (code >> 2, the same metadata words) built when a drafter binds;
-//! a greedy verify of at most 8 rows then streams it in place of the 4-bit words (half the head's code bytes), recomputes
+//! layout: a 1-bit copy of the vocabulary head's codes (code >> 3, the same metadata words) built when a drafter binds;
+//! a greedy verify of at most 8 rows then streams it in place of the 4-bit words (a quarter of the head's code bytes), recomputes
 //! each row's first tile (the 32-column tile of its best approximate logit) with the head's own tile-list launch
 //! (Kernels.quantTiles: each word the one the full launch writes), and then, in one indirect tile-list launch, only the
 //! tiles whose approximate logit plus kappa spreads of the dropped bits' term reaches the lower of that tile's exact best
@@ -9,7 +9,7 @@
 //! id's by less than kappa spreads. Statistical (kappa spreads), not a certified bound, as on the CUDA track.
 //! No logits row is written: the round's picks go straight to the matcher, and Runner.head_token stands in for the
 //! accepted row's logits that tree_commit's keep_head would have left in row 0.
-//! kappa is 6.
+//! kappa is 9.
 const std = @import("std");
 const mtl = @import("metal");
 const projection = @import("projection.zig");
@@ -41,7 +41,7 @@ pub const HeadSieve = struct {
     groups: u32,
     blocks: u32,
     kappa: f32,
-    /// The 2-bit copy and the per-round scratch: both owned by the runner's `owned` list (freed and made resident with it).
+    /// The 1-bit copy and the per-round scratch: both owned by the runner's `owned` list (freed and made resident with it).
     words: mtl.Buffer,
     scratch: mtl.Buffer,
     o_xq: usize,
@@ -75,7 +75,7 @@ pub const HeadSieve = struct {
             std.log.info("qwen27: head sieve off: head n {d} k {d} batch {d}", .{ head.n, head.k, head.batch });
             return null;
         }
-        const kappa: f32 = 6.0;
+        const kappa: f32 = 9.0;
         const tiles: u32 = head.n / 32;
         const groups: u32 = head.k / 64;
         // the head's shape and metadata form ahead of the kernels; kappa a literal (each value its own library)
@@ -131,7 +131,7 @@ pub const HeadSieve = struct {
         const o_y1 = take(&at, rows_max * first_stride * 2);
         const o_list = take(&at, (1 + @as(usize, tiles)) * 4);
         const o_args = take(&at, 4 * 4);
-        const words = try m.device.buffer(@as(usize, tiles) * groups * 512, options);
+        const words = try m.device.buffer(@as(usize, tiles) * groups * 256, options);
         owned.append(a, words) catch |err| {
             words.deinit();
             return err;
@@ -145,7 +145,7 @@ pub const HeadSieve = struct {
             f.join(f.ctx, words);
             f.join(f.ctx, scratch);
         }
-        // the 2-bit copy, once: a thread a lane's uint4 of a block
+        // the 1-bit copy, once: a thread a lane's uint2 of a block
         {
             const cb = m.queue.commandBuffer();
             const e = cb.compute(.serial);
@@ -156,9 +156,9 @@ pub const HeadSieve = struct {
             e.end();
             cb.commit();
             cb.wait();
-            if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 2-bit copy")) return error.HeadSieveGpuFailure;
+            if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 1-bit copy")) return error.HeadSieveGpuFailure;
         }
-        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
+        std.log.info("qwen27: head sieve: kappa {d:.2}, 1-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 256 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
         return .{ .pack = made[0], .prep = made[1], .scan = made[2], .scan8 = scan8, .top = made[3], .select = made[4], .pick = made[5], .head = head, .tiles = tiles, .groups = groups, .blocks = blocks, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_hm8 = o_hm8, .o_bk = o_bk, .o_bk8 = o_bk8, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
     }
 
@@ -194,7 +194,7 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_bk, 5);
         e.dispatchThreads(mtl.Size.of(@max(@as(usize, s.groups) * sums_stride, @as(usize, s.blocks) * rows_max), 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
-        // 2: every tile's best a + k s and best a, a row each, through the 2-bit copy. The 8-row scan is used once it
+        // 2: every tile's best a + k s and best a, a row each, through the 1-bit copy. The 8-row scan is used once it
         // has been proved bit-identical to this one on the first sieved round; until then (and on every round if it
         // differs) the 16-row scan feeds top/select/pick, and the 8-row scan runs into o_hm8 for the proof.
         if (s.use8 and s.scan8 != null) {

@@ -1,7 +1,7 @@
-// The greedy verify head's sieve (head_sieve.zig): a 2-bit copy of the vocabulary head's codes (code >> 2, the same
+// The greedy verify head's sieve (head_sieve.zig): a 1-bit copy of the vocabulary head's codes (code >> 3, the same
 // scales and biases) gives each (row, column) an approximate logit a and the spread s of the dropped bits' term (the
-// square root of 1.25 times the sum over groups of scale^2 times the group's sum of squares: 1.25 is the variance of a
-// uniform 2-bit residual about its middle 1.5). Each row's first tile (the 32-column tile of its best a) is recomputed
+// square root of 5.25 times the sum over groups of scale^2 times the group's sum of squares: 5.25 is the variance of a
+// uniform 3-bit residual about its middle 3.5). Each row's first tile (the 32-column tile of its best a) is recomputed
 // exactly by the head's own tile-list launch; the row's threshold is the lower of that tile's exact best and its best a,
 // and every tile whose a + k s reaches some row's threshold is recomputed the same way. Each row's token is the best of
 // those exact words: the highest bf16 logit, ties to the lowest id, tf_round_bf16_argmax's rule. A row's true best u
@@ -18,7 +18,7 @@ using namespace mpp::tensor_ops;
 #define TF_TB 8
 #define TF_SBI 4096
 #define TF_SBI12 1
-#define TF_SIEVE_KAPPA 6.0f
+#define TF_SIEVE_KAPPA 9.0f
 #endif
 #ifndef TF_SIEVE_M
 #define TF_SIEVE_M 16
@@ -31,15 +31,27 @@ constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at
 constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, generously
 
 // One 4-bit (tile, group) block of the head's reg words (TF_TB tiles interleaved by group: a lane's words 0-3, then
-// its words 4-7 32 lanes on) into the 2-bit reg block of tile_batch 1 (lane_projection.halveReg's form): word j keeps
-// codes >> 2 of word j in bits 0-1 of each nibble and those of word j + 4 in bits 2-3, so the 2-bit kernel's two masks
-// give back each word's codes >> 2 in place. One thread a lane's uint4 of a block: tiles * KG * 32 threads.
-kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+// its words 4-7 32 lanes on) into the 1-bit reg block of tile_batch 1: bit 8 * w + i keeps code >> 3 of word w's
+// nibble i, the lane's first four words in the low uint and its words 4-7 in the high uint, so the scan's bit masks
+// give back each word's codes >> 3 in place. One thread a lane's uint2 of a block: tiles * KG * 32 threads.
+inline uint tf_sieve_topbit(uint w) {
+  // bit 3 of each nibble (code >> 3) gathered to a byte, nibble i to bit i
+  uint t = (w >> 3) & 0x11111111u;
+  t = (t | (t >> 3)) & 0x03030303u;
+  t = (t | (t >> 6)) & 0x000F000Fu;
+  return (t | (t >> 12)) & 0xFFu;
+}
+kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint2* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
   if (t >= uint(TILES * KG * 32)) return;
   const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
   const size_t wide = ((size_t)(tile / TF_TB) * KG + g) * TF_TB + tile % TF_TB;
   const uint4 w0 = W[wide * 64 + lane], w1 = W[wide * 64 + 32 + lane];
-  W2[t] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
+  uint lo = 0, hi = 0;
+  for (int w = 0; w < 4; w++) {
+    lo |= tf_sieve_topbit(w0[w]) << (8 * w);
+    hi |= tf_sieve_topbit(w1[w]) << (8 * w);
+  }
+  W2[t] = uint2(lo, hi);
 }
 
 // Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
@@ -88,14 +100,14 @@ inline uint tf_sieve_key(float v) {
   return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
 }
 
-// The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 2-bit copy through tf_lane_reg's
+// The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 1-bit copy through tf_lane_reg's
 // decoded-row loop (rows8, one K split, codes as fp16 subnormals in the tensor op's right input, the head's own
-// metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
+// metadata words), with a = 8 s * (codes >> 3 product) + (b + 3.5 s) * row sum and s^2 * the row's sum of squares beside
 // it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row], and
 // that best a (when finite) into its block's key BK[(tile / TBLK) * 8 + row] (atomic max of tf_sieve_key).
 // dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
 [[max_total_threads_per_threadgroup(32)]]
-[[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+[[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint2* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
     device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
@@ -114,11 +126,11 @@ inline uint tf_sieve_key(float v) {
     C[i] = 0.0f;
     V[i] = 0.0f;
   }
-  // each group's words by 32-bit offsets that advance a fixed step a group from the tile's first group: the codes (wo),
+  // each group's words by uint2 offsets that advance a fixed step a group from the tile's first group: the codes (wo),
   // the metadata (io), the row sums (xo, qo) and the rows' group columns (xv), the same words as the products
   // tile * KG * 32 + g * 32, g * TF_N, g * stride, g * 16 and g * GS index (all below 2^32 for the heads fits() takes)
   uint wo = uint(tile) * uint(KG * 32) + uint(lane);
-  uint4 nw = W[wo];
+  uint2 nw = W[wo];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -145,18 +157,18 @@ inline uint tf_sieve_key(float v) {
     const uint4 q0 = sbv[io], q1 = sbv[io + 4];
     io += uint(TF_N / 4);
 #endif
-    const uint4 cw = nw;
+    const uint2 cw = nw;
     const float x0 = XS[xo], xq = XQ[qo];
     xo += uint(stride);
     qo += 16u;
     for (int w = 0; w < 8; w++) {
-      // codes >> 2 as fp16 subnormals (bits = code, value code * 2^-24); the scales carry the 2^24 back
-      const uint word = w < 4 ? (cw[w] & 0x33333333u) : ((cw[w - 4] >> 2) & 0x33333333u);
+      // codes >> 3 as fp16 subnormals (bits = code, value code * 2^-24); the scales carry the 2^24 back
+      const uint bits = w < 4 ? (cw.x >> (8 * w)) : (cw.y >> (8 * (w - 4)));
       const int e = 16 * (w & 1) + 2 * (w >> 1);
-      b2[e] = as_type<half2>(word & 0x000F000Fu);
-      b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
-      b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
-      b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
+      b2[e] = as_type<half2>(((bits & 0x10u) << 12) | (bits & 0x01u));
+      b2[e + 1] = as_type<half2>(((bits & 0x20u) << 11) | ((bits >> 1) & 0x01u));
+      b2[e + 8] = as_type<half2>(((bits & 0x40u) << 10) | ((bits >> 2) & 0x01u));
+      b2[e + 9] = as_type<half2>(((bits & 0x80u) << 9) | ((bits >> 3) & 0x01u));
     }
     // the next group's codes and indices under this one's tensor op (the last group reloads its own, unread)
     {
@@ -179,9 +191,9 @@ inline uint tf_sieve_key(float v) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
       const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
-      // code = 4 (code >> 2) + 1.5 + r: scale 4 s on the 2-bit product, bias b + 1.5 s on the row sum
-      C[j] = fma(4.0f * s0, P[j], fma(fma(1.5f, t0, b0), x0, C[j]));
-      C[4 + j] = fma(4.0f * s1, P[8 + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
+      // code = 8 (code >> 3) + 3.5 + r: scale 8 s on the 1-bit product, bias b + 3.5 s on the row sum
+      C[j] = fma(8.0f * s0, P[j], fma(fma(3.5f, t0, b0), x0, C[j]));
+      C[4 + j] = fma(8.0f * s1, P[8 + j], fma(fma(3.5f, t1, b1), x0, C[4 + j]));
       V[j] = fma(t0 * t0, xq, V[j]);
       V[4 + j] = fma(t1 * t1, xq, V[4 + j]);
     }
@@ -189,7 +201,7 @@ inline uint tf_sieve_key(float v) {
   // fmax drops a NaN operand: a row of NaN logits keeps -inf here, its first tile 0 and every tile listed
   float hi = -INFINITY, mid = -INFINITY;
   for (int i = 0; i < 8; i++) {
-    const float v = C[i], ks = TF_SIEVE_KAPPA * sqrt(1.25f * V[i]);
+    const float v = C[i], ks = TF_SIEVE_KAPPA * sqrt(5.25f * V[i]);
     hi = fmax(hi, v + ks + fma(fabs(v) + ks, SLACK_REL, SLACK_ABS));
     mid = fmax(mid, v);
   }
