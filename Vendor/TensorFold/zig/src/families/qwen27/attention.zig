@@ -211,7 +211,9 @@ const prompt_threads = 256;
 /// q27_attn_pack_a fills it (`encode` with `prepacked`); the fused norm and rope alone.
 /// cached: a prompt plan's rows (packed_rows above 0, one stream): the packed preprocess also stores the round's keys and
 /// values in their cache slots (q27_head_norm_rope_packed_cached), with no rotated_key rows (`encode` with `appended`).
-pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{}, after: ?After = null, decoded: ?Decoded = null, cached: ?Decoded = null };
+/// Borrowed frame scratch; readiness is an encoding-order fact, never a cross-pass cache hit.
+pub const AngleMemo = struct { values: Ref, ready: *bool };
+pub const Preprocess = struct { qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0, key_stride: u32 = 0, packed_rows: u32 = 0, geometry: planning.Geometry = .{}, after: ?After = null, decoded: ?Decoded = null, cached: ?Decoded = null, angle_memo: ?AngleMemo = null };
 /// Decoded rows of one stream whose preprocess also packs the prefix's query and appends the round's keys and values
 /// (q27_head_norm_rope_decoded), counting itself for the prefix that shares its barrier interval (`encode` with `appended`).
 /// The same words name where a prompt plan's packed preprocess stores them (Preprocess.cached).
@@ -221,7 +223,7 @@ pub const After = struct { counter: mtl.Buffer, wait: u32 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
-    io: [19]mtl.Pipeline,
+    io: [21]mtl.Pipeline,
     prompt: ?[2]mtl.Pipeline, // a prompt chunk's kernel and merge: tensor ops on the M5, simdgroup matrices before it
     units: bool,
     split_tail: ?mtl.Pipeline = null,
@@ -243,10 +245,10 @@ pub const Attention = struct {
             pipe.* = try mtl.Pipeline.init(device, library, try std.fmt.bufPrint(&name, "q27_attn_prefix_{d}", .{i}), false);
             pn += 1;
         }
-        var io: [19]mtl.Pipeline = undefined;
+        var io: [21]mtl.Pipeline = undefined;
         var n: usize = 0;
         errdefer for (io[0..n]) |pipe| pipe.deinit();
-        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded", "q27_head_norm_rope_held", "q27_head_norm_rope_packed_held", "q27_attn_append8", "q27_head_norm_rope_packed_cached" }, &io) |name, *pipe| {
+        for ([_][]const u8{ "q27_attn_pack_a", "q27_attn_pack_b", "q27_attn_append", "q27_attn_tail", "q27_attn_merge", "q27_attn_gather", "q27_attn_scatter", "q27_head_norm", "q27_rope", "q27_gate", "q27_head_norm_rope", "q27_head_norm_rope_packed", "q27_attn_gather_layers", "q27_attn_scatter_layers", "q27_head_norm_rope_decoded", "q27_head_norm_rope_held", "q27_head_norm_rope_packed_held", "q27_attn_append8", "q27_head_norm_rope_packed_cached", "q27_head_norm_rope_packed_cached_seed", "q27_head_norm_rope_packed_cached_read" }, &io) |name, *pipe| {
             pipe.* = try mtl.Pipeline.init(device, library, name, false);
             n += 1;
         }
@@ -359,7 +361,14 @@ pub const Attention = struct {
                 e.useResource(cache.keys.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
                 e.useResource(cache.values.buffer, mtl.ResourceUsage.read | mtl.ResourceUsage.write);
             }
-            e.setPipeline(a.io[18]);
+            if (p.angle_memo) |memo| {
+                const bytes = @as(usize, p.rows) * g.rotary * 4;
+                try spanAligned(memo.values, bytes, 8);
+                for (inputs) |src| try disjoint(memo.values, bytes, src.ref, src.bytes);
+                for (outputs) |dst| try disjoint(memo.values, bytes, dst.ref, dst.bytes);
+                e.setPipeline(a.io[if (memo.ready.*) @as(usize, 20) else 19]);
+                bindAt(e, memo.values, 16);
+            } else e.setPipeline(a.io[18]);
             bind(e, .{ p.qg, p.key, p.q_gain, p.k_gain, p.positions });
             e.setValue(glue.HeadRope{ .width = g.dim, .heads = g.heads, .kv_heads = g.kv_heads, .stride = 2 * g.dim, .rotary = g.rotary, .eps = p.eps, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane, .key_stride = key_stride, .rows = p.rows, .packed_rows = p.packed_rows }, 5);
             e.setBuffer(p.query.buffer, p.query.offset, 6);
@@ -370,6 +379,7 @@ pub const Attention = struct {
             e.setValue(c.v_stride, 15);
             e.dispatchGroups(mtl.Size.of(preprocessGroups(g), p.rows, 1), mtl.Size.of(128, 1, 1));
             e.barrier();
+            if (p.angle_memo) |memo| memo.ready.* = true;
             return timing.end();
         };
         if (rows4) {

@@ -136,12 +136,13 @@ struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
 // value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
 // CACHE (prompt rows of one stream, with PACK): a k head's rotated key lands in its cache slot instead of KY (nothing then
 // reads KY) and its value row in its value slot, where q27_attn_append writes them, so no append follows.
-template <bool PACK, bool DEC, bool CACHE = false>
+template <bool PACK, bool DEC, bool CACHE = false, uint MEMO = 0>
 inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
                                     device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
                                     uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
                                     device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
+                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0,
+                                    device float2* angles = nullptr) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
@@ -184,11 +185,19 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
   const uint pairs = a.rotary / 2;
   float c = 0.0f, s = 0.0f;
   if (lane < pairs) {
-    const uint d = lane;
-    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    c = cos(angle);
-    s = sin(angle);
+    if (MEMO == 2) {
+      const float2 cs = angles[row * pairs + lane];
+      c = cs.x;
+      s = cs.y;
+    } else {
+      const uint d = lane;
+      const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
+      const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
+      c = cos(angle);
+      s = sin(angle);
+      // One producer per row; no other head reads the table in this dispatch.
+      if (MEMO == 1 && head == 0) angles[row * pairs + lane] = float2(c, s);
+    }
   }
   bfloat4 ya, yb;
   for (uint j = 0; j != 4; ++j) {
@@ -281,6 +290,31 @@ kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]
   q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
                                                     nodes, V, v_stride);
 }
+
+
+// A frame-local prompt table: seeded by the first cached layer, read behind its existing device barrier.
+kernel void q27_head_norm_rope_packed_cached_seed(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]],
+                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
+                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]], device float2* angles [[buffer(16)]],
+                 uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+  q27_head_norm_rope_rows_direct<true, false, true, 1>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
+                                                    nodes, V, v_stride, angles);
+}
+
+kernel void q27_head_norm_rope_packed_cached_read(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
+                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]],
+                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
+                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]], device float2* angles [[buffer(16)]],
+                 uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+  q27_head_norm_rope_rows_direct<true, false, true, 2>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
+                                                    nodes, V, v_stride, angles);
+}
+
 
 // The words a head's simdgroup reads from outside a decoded launch's barrier interval, gathered before its wait on the
 // counted q and k|v projections (q27_head_norm_rope_held): the head's norm gains, the lane's rope cosine and sine (the
