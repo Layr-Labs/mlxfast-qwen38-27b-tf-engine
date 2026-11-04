@@ -141,7 +141,8 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
                                     device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
                                     uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
                                     device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
+                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0,
+                                    threadgroup const float2* angles = nullptr) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
@@ -184,11 +185,16 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
   const uint pairs = a.rotary / 2;
   float c = 0.0f, s = 0.0f;
   if (lane < pairs) {
-    const uint d = lane;
-    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
-    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
-    c = cos(angle);
-    s = sin(angle);
+    if (CACHE) {
+      c = angles[lane].x;
+      s = angles[lane].y;
+    } else {
+      const uint d = lane;
+      const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
+      const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
+      c = cos(angle);
+      s = sin(angle);
+    }
   }
   bfloat4 ya, yb;
   for (uint j = 0; j != 4; ++j) {
@@ -278,8 +284,18 @@ kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]
                  device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
                  uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
+  // All four heads of a prompt group rotate the same row with the same angles.
+  // Publish those exact scalars once, before any head's early-return or cache work.
+  threadgroup float2 angles[32];
+  if (sg == 0 && lane < a.rotary / 2) {
+    const uint d = lane, pairs = a.rotary / 2, row = group.y;
+    const uint axis = d % 3 == 1 && d < a.h_end ? 1u : (d % 3 == 2 && d < a.w_end ? 2u : 0u);
+    const float angle = float(positions[axis * a.plane + row]) * pow(a.theta, -float(d) / float(pairs));
+    angles[lane] = float2(cos(angle), sin(angle));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
-                                                    nodes, V, v_stride);
+                                                    nodes, V, v_stride, angles);
 }
 
 // The words a head's simdgroup reads from outside a decoded launch's barrier interval, gathered before its wait on the
