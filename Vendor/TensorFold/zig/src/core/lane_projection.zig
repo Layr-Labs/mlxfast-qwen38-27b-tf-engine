@@ -318,6 +318,12 @@ pub const Layout = struct {
     }
 };
 
+/// Decoded-row lean reg launches whose grid (tiles times parallel K slices) is at most 640 SIMD groups: TF_DEEP.
+pub fn deep(l: Layout) bool {
+    return l.reg and l.reg_lean and l.rows8 and !l.prompt_sr and !l.serial_sk2 and l.prompt_tn == 1 and !l.swiglu and
+        l.tiles() * l.sk <= 640;
+}
+
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
 fn lockstepGu(l:Layout)bool{
     return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
@@ -357,6 +363,9 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
+    // decoded rows on a grid of at most 640 SIMD groups keep two groups of codes in flight a lane (TF_DEEP): such a grid
+    // holds too few code loads in flight to keep the weight stream busy; the words and their order are unchanged
+    if (deep(l)) try text.appendSlice(a, "#define TF_DEEP 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
