@@ -891,20 +891,25 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int t16 = ks * 32 + lane;
-  for (int at = t16; at < 16 * 64; at += 64) {
-    const int m = at / 64, c = at % 64;
-    if (m >= M) continue;
-    const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
-    const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
-    Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+  // Keep the cross-group gate/up publication above. After it, each SIMD group owns whole rows of hb16,
+  // so its ordered row sums need only its own stores to complete, not the other group's activation work.
+  // Every output's BF16 rounding and each sum's left-to-right 64-value FP32 addition order are unchanged.
+  for (int m = ks; m < M; m += 2) {
+    TF_UNROLL
+    for (int ch = 0; ch < 2; ch++) {
+      const int c = lane + 32 * ch;
+      const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
+      const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
+      Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
+      hb16[m * 64 + c] = float(h);
+    }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t16 < M) {
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  const int sum_row = ks + 2 * lane;
+  if (sum_row < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
-    HS[int(tg.x) * stride + t16] = acc;
+    for (int i = 0; i < 64; i++) acc += hb16[sum_row * 64 + i];
+    HS[int(tg.x) * stride + sum_row] = acc;
   }
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
