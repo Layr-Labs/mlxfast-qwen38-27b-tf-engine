@@ -206,21 +206,27 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
   for (uint part = 0; part < 4; ++part)
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
-  // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
+  // Source-major private convolution: a shared input expands once, then updates each
+  // row that uses it. Each row still accumulates taps 0, 1, 2, 3 in that order.
+  float results[4][4] = {};
   _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
-    const uint source = first + s;
-    taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
-                                                         : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
+    if (s < count + 3) {
+      const uint source = first + s;
+      const bfloat4 packed = source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
+                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
+      const float4 input = float4(packed);
+      _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+        if (i < count && s >= i && s < i + 4) {
+          _Pragma("clang loop unroll(full)") for (uint part = 0; part < 4; ++part)
+            results[i][part] += weight[part][s - i] * input[part];
+        }
+      }
+    }
   }
   _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
     if (i < count) {
       const uint row = first + i;
-      float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      _Pragma("clang loop unroll(full)") for (uint tap = 0; tap < 4; ++tap) {
-        const bfloat4 input = taps[i + tap];
-        _Pragma("clang loop unroll(full)") for (uint part = 0; part < 4; ++part) result[part] += weight[part][tap] * float(input[part]);
-      }
+      const thread float* result = results[i];
       float activated[4];
       for (uint part = 0; part < 4; ++part) {
         const float rounded = float(bfloat(result[part]));
