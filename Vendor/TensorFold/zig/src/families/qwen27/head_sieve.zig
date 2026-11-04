@@ -242,11 +242,7 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_bk, 3);
         e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
-        // 4: the first tiles exactly, the head's own tile-list launch (slot r: row r's first tile). Beside it, behind the
-        // barrier that orders the list: its tiles' lines requested at once (Kernels.warmTiles), so its one SIMD group a
-        // row finds them in the caches as it walks their K groups. Nothing it writes is read; one that fails to encode
-        // only loses its prefetch (the launch below sets its own pipeline and bindings).
-        m.kernels.warmTiles(e, s.head, s.ref(s.o_first), rows) catch {};
+        // 4: the first tiles exactly, the head's own tile-list launch (slot r: row r's first tile).
         try m.kernels.quantTiles(e, s.head, x, xs, s.ref(s.o_first), s.ref(s.o_y1), rows, rows, first_stride);
         e.barrier();
         // 5: the rows' thresholds, and every tile some row's bound reaches
@@ -259,9 +255,7 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_args, 5);
         e.dispatchGroups(mtl.Size.of((s.tiles + 255) / 256, 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
-        // 6: the listed tiles exactly, as many threadgroups as tiles listed, rows the vocabulary apart in the logits buffer;
-        // beside it, the listed tiles' lines requested at once, as in 4
-        m.kernels.warmTiles(e, s.head, s.ref(s.o_list), s.tiles) catch {};
+        // 6: the listed tiles exactly, rows the vocabulary apart in the logits buffer.
         try m.kernels.quantTilesIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args));
         e.barrier();
         // 7: each row's token from those words
