@@ -15,7 +15,7 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
 /// What the context says follows `path` (the pending token first), at most `max` tokens; borrowed until the next call.
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
-const accept_step: f32 = 0.125;
+const accept_step: f32 = 0.0625;
 const precise_below: f32 = 0.95;
 /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
 fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
