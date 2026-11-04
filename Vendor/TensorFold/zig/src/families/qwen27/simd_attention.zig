@@ -33,7 +33,7 @@ const rewrites = [_][2][]const u8{
 /// The attention kernels as this chip builds them (before M5: the tail rewritten, the prompt kernels if `prompt`).
 pub fn library(a: std.mem.Allocator, units: bool, prompt: bool) ![]u8 {
     const source = @import("qwen_runtime_sources");
-    if (units) return a.dupe(u8, source.glue ++ source.attention_mpp ++ source.attention_io ++ source.attention_prompt);
+    if (units) return a.dupe(u8, "#define Q27_QA_FRAG 1\n" ++ source.glue ++ source.attention_mpp ++ source.attention_io ++ source.attention_prompt);
     const tail = try rewrite(a, source.glue ++ source.attention_mpp ++ source.attention_io);
     if (!prompt) return tail;
     defer a.free(tail);

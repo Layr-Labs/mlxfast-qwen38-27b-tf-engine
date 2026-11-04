@@ -122,6 +122,16 @@ kernel void q27_rope(device const uchar* X [[buffer(0)]], device const int* posi
   q27_write(Y, base + at.x, value, a.activation);
 }
 
+
+#if defined(Q27_QA_FRAG)
+inline ulong q27_query_fragment_at(uint row, uint col) {
+  return ulong(row / 16) * 4096 + (col / 16) * 256 + ((row & 7) * 4 + ((col & 15) / 4)) * 8 + ((row & 15) / 8) * 4 + (col & 3);
+}
+inline void q27_query_fragment_store(device bfloat* stream, uint row, uint col, bfloat4 value) {
+  *(device bfloat4*)(stream + q27_query_fragment_at(row, col)) = value;
+}
+#endif
+
 struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta; uint h_end, w_end, plane, key_stride, rows, packed_rows; };
 
 // q27_head_norm then q27_rope for bf16 prompt rows 256 wide: a row's q heads (`stride` apart) then k heads (rows
@@ -202,14 +212,29 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
     ya[j] = bfloat(value);
     yb[j] = bfloat(nb[j]);
   }
-  *(device bfloat4*)(y + 4 * lane) = ya;
-  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
-  if (PACK && query && row == 0 && head == kv_head * g)
-    for (uint r = a.rows * g; r < a.packed_rows; ++r) {
-      device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
-      *(device bfloat4*)(pad + 4 * lane) = ya;
-      *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
-    }
+#if defined(Q27_QA_FRAG)
+  if (PACK && query) {
+    device bfloat* stream = QY + ulong(kv_head) * a.packed_rows * a.width;
+    const uint packed_row = row * g + head - kv_head * g;
+    q27_query_fragment_store(stream, packed_row, 4 * lane, ya);
+    q27_query_fragment_store(stream, packed_row, 128 + 4 * lane, yb);
+    if (row == 0 && head == kv_head * g)
+      for (uint r = a.rows * g; r < a.packed_rows; ++r) {
+        q27_query_fragment_store(stream, r, 4 * lane, ya);
+        q27_query_fragment_store(stream, r, 128 + 4 * lane, yb);
+      }
+  } else
+#endif
+  {
+    *(device bfloat4*)(y + 4 * lane) = ya;
+    *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+    if (PACK && query && row == 0 && head == kv_head * g)
+      for (uint r = a.rows * g; r < a.packed_rows; ++r) {
+        device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
+        *(device bfloat4*)(pad + 4 * lane) = ya;
+        *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+      }
+  }
   if (DEC && query) {
     const uint gq = a.heads / a.kv_heads, hq = head / gq;
     device bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;

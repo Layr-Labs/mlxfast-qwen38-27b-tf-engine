@@ -19,6 +19,13 @@ inline q27b8 q27_frag(const device bfloat* p, int stride, short fm, short fn, in
   return q27b8(row + fm < limit ? *(const device vec<bfloat, 4>*)r0 : z, row + fm + 8 < limit ? *(const device vec<bfloat, 4>*)(r0 + 8 * stride) : z);
 }
 
+inline q27b8 q27_query_frag(const device bfloat* q, int d, short fm, short fn) {
+#if defined(Q27_QA_FRAG)
+  return as_type<q27b8>(*(device const uint4*)(q + d * 256 + (int(fm) * 4 + int(fn) / 4) * 8));
+#else
+  return q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16);
+#endif
+}
 // S[16][32] += Q[16][16] K[32][16]^T, fp32 sums.
 inline void q27_mma_s(thread q27f8& c0, thread q27f8& c1, q27b8 a, q27b8 b0, q27b8 b1) {
   constexpr auto d = matmul2d_descriptor(16, 32, 16, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -56,7 +63,7 @@ inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const devi
     threadgroup float (*xs)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
   q27f8 s0 = 0.0f, s1 = 0.0f;
   _Pragma("clang loop unroll_count(4)") // whole unrolling hoists every K load ahead of the products and runs slower
-  for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
+  for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_query_frag(q, d, fm, fn), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 8; i++) { xs[sg][lane][i] = s0[i]; xs[sg][lane][8 + i] = s1[i]; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -130,7 +137,11 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
   const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
   const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.rows);
+#if defined(Q27_QA_FRAG)
+  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * 8 * 256;
+#else
   const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * PH;
+#endif
   const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride + h * PH;
   const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride + h * PH;
   Q27PromptRun r;

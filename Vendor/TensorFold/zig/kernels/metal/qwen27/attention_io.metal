@@ -13,6 +13,20 @@ kernel void q27_attn_pack_a(device const bfloat* Q [[buffer(0)]], device const i
   const uint mapped = uint(rows[at.y]), node = mapped / a.group, head = at.z * a.group + mapped % a.group;
   ((device uint4*)(QA + (at.z * a.packed_rows + at.y) * a.dim))[at.x] = ((device const uint4*)(Q + (node * a.heads + head) * a.dim))[at.x];
 }
+// Prompt-only alternative; the decoded/tree producer above remains row-major.
+kernel void q27_attn_pack_a_fragment(device const bfloat* Q [[buffer(0)]], device const int* rows [[buffer(1)]],
+    device bfloat* QA [[buffer(2)]], constant Q27PackArgs& a [[buffer(3)]], uint3 at [[thread_position_in_grid]]) {
+  if (at.x >= a.dim / 8 || at.y >= a.packed_rows || at.z >= a.kv_heads) return;
+  const uint mapped = uint(rows[at.y]), node = mapped / a.group, head = at.z * a.group + mapped % a.group;
+#if defined(Q27_QA_FRAG)
+  const device bfloat* src = Q + (node * a.heads + head) * a.dim + at.x * 8;
+  device bfloat* stream = QA + ulong(at.z) * a.packed_rows * a.dim;
+  q27_query_fragment_store(stream, at.y, at.x * 8, *(device const bfloat4*)src);
+  q27_query_fragment_store(stream, at.y, at.x * 8 + 4, *(device const bfloat4*)(src + 4));
+#else
+  ((device uint4*)(QA + (at.z * a.packed_rows + at.y) * a.dim))[at.x] = ((device const uint4*)(Q + (node * a.heads + head) * a.dim))[at.x];
+#endif
+}
 kernel void q27_attn_pack_b(device const bfloat* Q [[buffer(0)]], device bfloat* QB [[buffer(1)]],
     constant Q27PackArgs& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
   if (at.x >= a.dim / 8 || at.y >= 16 || at.z >= a.kv_heads * a.rows) return;
