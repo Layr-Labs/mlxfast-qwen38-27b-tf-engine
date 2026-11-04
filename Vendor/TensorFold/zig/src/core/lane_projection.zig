@@ -212,6 +212,8 @@ pub const Layout = struct {
     /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
     /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
     gu_count: bool = false,
+    /// The indexed lockstep gate/up waits for a post-norm count before reading activations.
+    gu_wait: bool = false,
     /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
     /// same barrier interval (encodeCountedAfter).
     wait: bool = false,
@@ -253,6 +255,7 @@ pub const Layout = struct {
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
+        if (l.gu_wait and (!l.gu_count or !lockstepGu(l))) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
@@ -355,6 +358,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
+    if (l.gu_wait) try text.appendSlice(a, "#define TF_GU_WAIT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
@@ -363,6 +367,20 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.appendSlice(a, ks.core_lane_projection);
     if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
+}
+
+/// Add the fixed scheduling flags needed by a lockstep SwiGLU producer that waits for a prior publication.
+pub fn guWaitLayout(base: Layout) Layout {
+    var l = base;
+    l.precompute_sums = true;
+    l.reg = true;
+    l.serial_sk2 = true;
+    l.rows8 = true;
+    l.reg_lean = true;
+    l.swiglu = true;
+    l.gu_count = true;
+    l.gu_wait = true;
+    return l;
 }
 
 /// Exact byte copies of MLX affine W, S and B into the kernel's layouts (no dequantization); storage disjoint.
@@ -503,6 +521,7 @@ pub const Projection = struct {
     count: bool = false,
     /// Built with Layout.gu_count: encodeSwigluCounted only.
     gu_count: bool = false,
+    gu_wait: bool = false,
     /// Built with Layout.wait: encodeCountedAfter only.
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
@@ -531,7 +550,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .gu_wait = l.gu_wait, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -612,19 +631,23 @@ pub const Projection = struct {
     /// group sums at `sums`' stride, padded rows zero, as q27_mlp_xs writes them.
     pub fn encodeSwiglu(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32) !void {
         if (p.gu_count) return error.InvalidSchedule;
-        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
+        return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null, null, 0);
     }
 
     /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
     /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
-    pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
+    pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref, waited: ?Ref, wait_for: u32) !u32 {
         if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
         try checkRef(counter, 8, 4);
-        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
+        if (p.gu_wait) {
+            if (waited == null or wait_for == 0) return error.InvalidSchedule;
+            try checkRef(waited.?, 8, 4);
+        }
+        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter, waited, wait_for);
         return @intCast(p.n / 128);
     }
 
-    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
+    fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref, waited: ?Ref, wait_for: u32) !void {
         if (!p.swiglu) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
@@ -644,6 +667,11 @@ pub const Projection = struct {
         e.setBuffer(sums.ref.buf, sums.ref.off, 5);
         e.setBuffer(hs.buf, hs.off, 6);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
+        if (p.gu_wait) {
+            const c = waited orelse return error.InvalidSchedule;
+            e.setBuffer(c.buf, c.off, 8);
+            e.setValue(wait_for, 9);
+        }
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
 
@@ -791,6 +819,23 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "B2 lockstep waits require the serial-SK2 layout and emit their own switch" {
+    const base = Layout{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .tile_batch = 8, .indexed = true };
+    var l = guWaitLayout(base);
+    try l.validate();
+    const text = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SERIAL_SK2 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_GU_WAIT 1\n") != null);
+    const indexed12 = guWaitLayout(.{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .tile_batch = 8, .indexed = true, .indexed12 = true });
+    const text12 = try source(std.testing.allocator, indexed12);
+    defer std.testing.allocator.free(text12);
+    try std.testing.expect(std.mem.indexOf(u8, text12, "#define TF_SBI12 1\n") != null);
+    var sabotaged = l;
+    sabotaged.count = true;
+    try std.testing.expectError(error.InvalidSchedule, sabotaged.validate());
 }
 
 test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {

@@ -142,6 +142,21 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     }
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
+
+test "B2 lockstep wait key cannot alias the plain gate-up counter kernel" {
+    const plain = Key{ .kind = .projection, .n = 34816, .k = 5120, .slices = 2, .rows8 = true, .lean = true, .batch = 8, .swiglu = true, .sbi = true, .count = true };
+    var waited = plain;
+    waited.wait = true;
+    try std.testing.expect(plain.serialSk2() and waited.serialSk2());
+    try std.testing.expect(!std.meta.eql(plain, waited));
+    var cache = std.AutoHashMap(Key, u8).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(plain, 1);
+    try cache.put(waited, 2);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expectEqual(@as(?u8, 1), cache.get(plain));
+    try std.testing.expectEqual(@as(?u8, 2), cache.get(waited));
+}
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
 pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
@@ -163,12 +178,19 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    /// Set once at model load; absent env var enables the isolated B2 path on the ranked runner.
+    counted_b2_enabled: bool = true,
+    /// Host-side engagement counters; increment only after the corresponding dispatch was encoded successfully.
+    b2_norm_publishes: usize = 0,
+    b2_gate_waits: usize = 0,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
+    /// B2 post-norm publisher word and gate/up wait arrivals; consumer resets both words.
+    norm_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
@@ -195,6 +217,9 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.b2_norm_publishes != 0 or k.b2_gate_waits != 0) {
+            std.log.info("qwen27 B2 encoded fast paths: norm_publish={d} gate_wait={d}", .{ k.b2_norm_publishes, k.b2_gate_waits });
+        }
         k.setResident(null);
         if (k.row_pipelines) |*pipelines| pipelines.deinit();
         if (k.simd) |*pipelines| pipelines.deinit();
@@ -207,6 +232,7 @@ pub const Kernels = struct {
         k.lanes.deinit(k.allocator);
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
+        if (k.norm_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
@@ -214,6 +240,10 @@ pub const Kernels = struct {
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+    }
+
+    pub fn countedB2Hits(k: *const Kernels) [2]usize {
+        return .{ k.b2_norm_publishes, k.b2_gate_waits };
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -657,6 +687,8 @@ pub const Kernels = struct {
             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
             bindAt(e, out, 8); // never read: wait_for 0
             e.setValue(@as(u32, 0), 9);
+            bindAt(e, out, 10); // never read: npublish 0
+            e.setValue(@as(u32, 0), 11);
         } else bind(e, .{ h, weight, eps, dims, out, xs });
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
@@ -689,8 +721,60 @@ pub const Kernels = struct {
         bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
         e.setBuffer(words, 0, 8);
         e.setValue(wait_for, 9);
+        bindAt(e, out, 10); // never read: npublish 0
+        e.setValue(@as(u32, 0), 11);
         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
         try span.end();
+    }
+
+    /// `normAfter` with one integrated B2 publish: the same norm waits on the down projection then publishes its rows.
+    pub fn normAfterPublished(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !u32 {
+        const words = k.count_words orelse return error.BadCoreProjectionRows;
+        const pub_words = try k.normCounter();
+        if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
+        try wordAligned(.{ h, residual, weight, combined, out });
+        var span = profile.begin(k.profiler, input_encoder, .norm);
+        errdefer span.cancel();
+        const e = span.encoder;
+        e.setPipeline(try k.get(.{ .kind = .norm, .k = width }));
+        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+        e.setBuffer(words, 0, 8);
+        e.setValue(wait_for, 9);
+        e.setBuffer(pub_words, 0, 10);
+        e.setValue(rows, 11);
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+        try span.end();
+        k.b2_norm_publishes += 1;
+        return rows;
+    }
+
+    /// Plain post-norm as the B2 producer. Caller admits only a guard that guarantees rows in 1...8.
+    pub fn normPublished(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32) !u32 {
+        const words = try k.normCounter();
+        if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
+        try wordAligned(.{ h, residual, weight, combined, out });
+        var span = profile.begin(k.profiler, input_encoder, .norm);
+        errdefer span.cancel();
+        const e = span.encoder;
+        e.setPipeline(try k.get(.{ .kind = .norm, .k = width }));
+        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+        bindAt(e, out, 8);
+        e.setValue(@as(u32, 0), 9);
+        e.setBuffer(words, 0, 10);
+        e.setValue(rows, 11);
+        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+        try span.end();
+        k.b2_norm_publishes += 1;
+        return rows;
+    }
+
+    fn normCounter(k: *Kernels) !mtl.Buffer {
+        if (k.norm_words == null) {
+            const b = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..16], 0);
+            k.norm_words = b;
+        }
+        return k.norm_words.?;
     }
 
     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
@@ -877,8 +961,42 @@ pub const Kernels = struct {
             entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true });
             k.joined(entry.value_ptr);
         }
-        const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
+        const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? }, null, 0);
         try span.end();
+        return n;
+    }
+
+    pub fn gateUpCountable(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) bool {
+        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return false;
+        if (k.countedKey(down, rows, true) == null) return false;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
+        return key.serialSk2();
+    }
+
+    /// B2's gate/up launch waits for the post-norm publication and separately counts its outputs for the down projection.
+    pub fn gateUpCountedWait(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32, norm_wait: u32) !?u32 {
+        if (norm_wait == 0) return k.gateUpCounted(input_encoder, p, down, x, xs, out, out_sums, rows);
+        if (!k.gateUpCountable(p, down, rows)) return error.BadCoreProjectionRows;
+        const wait_words = try k.normCounter();
+        if (k.gu_words == null) {
+            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(b.contents()[0..8], 0);
+            k.gu_words = b;
+        }
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true, .wait = true };
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
+        errdefer span.cancel();
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, lane.guWaitLayout(.{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = p.slices, .tile_batch = p.batch, .indexed = true, .indexed12 = p.index12 }));
+            k.joined(entry.value_ptr);
+        }
+        const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? }, .{ .buf = wait_words }, norm_wait);
+        try span.end();
+        k.b2_gate_waits += 1;
         return n;
     }
 

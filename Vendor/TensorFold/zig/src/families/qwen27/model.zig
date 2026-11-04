@@ -82,7 +82,8 @@ pub const Model = struct {
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
         m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
         errdefer m.weights.deinit();
-        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
+        // Ranked jobs that clear environment variables get the B2 path by default; set this only to make a local control.
+        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits(), .counted_b2_enabled = platform.c.getenv("TF_Q27_B2_DISABLE") == null };
         errdefer m.kernels.deinit();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
