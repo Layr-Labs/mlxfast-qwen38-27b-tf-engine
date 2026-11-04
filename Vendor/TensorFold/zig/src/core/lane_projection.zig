@@ -327,6 +327,16 @@ fn lockstepGu(l:Layout)bool{
         l.ranges.len==0 and l.y_stride==null and !l.residual;
 }
 
+/// Per-mechanism rollback for the lockstep GU's second U lookahead.
+fn lockstepGuULookahead2Value(value: ?[]const u8) bool {
+    return if (value) |v| !std.mem.eql(u8, v, "0") else true;
+}
+
+fn lockstepGuULookahead2Enabled() bool {
+    const value = std.c.getenv("MLXFAST_GU_U_LOOKAHEAD2") orelse return true;
+    return lockstepGuULookahead2Value(std.mem.span(value));
+}
+
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
     const g = l.groupCut();
@@ -361,7 +371,10 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if (lockstepGu(l)) {
+        if (lockstepGuULookahead2Enabled()) try text.appendSlice(a, "#define TF_GU_U_LOOKAHEAD2 1\n");
+        try text.appendSlice(a, ks.core_lane_lockstep);
+    }
     return text.toOwnedSlice(a);
 }
 
@@ -791,6 +804,34 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "lockstep GU second U lookahead kill switch defaults on and accepts zero" {
+    try std.testing.expect(lockstepGuULookahead2Value(null));
+    try std.testing.expect(!lockstepGuULookahead2Value("0"));
+    try std.testing.expect(lockstepGuULookahead2Value("1"));
+}
+
+test "lockstep GU second U lookahead engages on the decoded Qwen27 shape" {
+    const l = Layout{
+        .n = 34816,
+        .k = 5120,
+        .format = .{ .bits = 4, .group = 64 },
+        .sk = 2,
+        .reg = true,
+        .rows8 = true,
+        .swiglu = true,
+        .reg_lean = true,
+        .serial_sk2 = true,
+        .indexed = true,
+        .tile_batch = 8,
+        .precompute_sums = true,
+    };
+    try std.testing.expect(lockstepGu(l));
+    const generated = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "#define TF_GU_U_LOOKAHEAD2 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "kernel void tf_lane_lockstep") != null);
 }
 
 test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {

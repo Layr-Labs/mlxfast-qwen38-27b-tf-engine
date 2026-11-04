@@ -299,6 +299,32 @@ pub fn main(init: std.process.Init) !void {
     const queue = try device.queue();
     defer queue.deinit();
     std.debug.print("Small synthetic projection checks on {s}; no model files\n", .{device.name()});
+    if (device.tensorUnits()) {
+        // Compile the exact production lockstep GU source, including the default-on second U lookahead.
+        const gu_probe = core.Layout{
+            .n = 34816,
+            .k = 5120,
+            .format = .{ .bits = 4, .group = 64 },
+            .sk = 2,
+            .reg = true,
+            .rows8 = true,
+            .swiglu = true,
+            .reg_lean = true,
+            .serial_sk2 = true,
+            .indexed = true,
+            .tile_batch = 8,
+            .precompute_sums = true,
+        };
+        const gu_source = try core.source(a, gu_probe);
+        defer a.free(gu_source);
+        if (std.mem.indexOf(u8, gu_source, "#define TF_GU_U_LOOKAHEAD2 1\n") == null or
+            std.mem.indexOf(u8, gu_source, "kernel void tf_lane_lockstep") == null)
+        {
+            return error.GULookaheadNotSelected;
+        }
+        const gu_projection = try core.Projection.init(a, device, gu_probe);
+        defer gu_projection.deinit();
+    }
     var counts: Counts = .{};
     if (!device.tensorUnits() or flashnext_only) {
         for ([_]usize{ 1, 2, 4 }) |sk| for ([_]usize{ 1, 2 }) |pf| {
