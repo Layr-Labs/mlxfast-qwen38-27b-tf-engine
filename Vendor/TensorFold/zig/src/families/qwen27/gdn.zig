@@ -44,6 +44,7 @@ pub const Buffers = struct {
     mixing: Span,
     tails: Span,
     snapshots: Span,
+    spill: Span,
     recurrent: Span,
     output: Span,
     next_state: Span,
@@ -78,6 +79,7 @@ pub const Buffers = struct {
         try b.decay.check(sizes.decay);
         try b.tails.check(sizes.tails);
         try b.snapshots.check(sizes.snapshots);
+        try b.spill.check(sizes.state);
         try b.parents.check(try abi.countBytes(i32, p.rows, 1));
         try b.windows.check(try abi.countBytes(u32, p.rows, p.taps));
         try b.row_slots.check(try abi.countBytes(u32, p.rows, 1));
@@ -85,12 +87,12 @@ pub const Buffers = struct {
         try b.keeps.check(try abi.countBytes(abi.Keep, plan.keeps.len, 1));
         try b.slot_steps.check(plan.slot_steps.len * @sizeOf(@import("core").tree_slots.Step));
         try b.kept_rows.check(try abi.countBytes(u32, plan.kept_rows.len, 1));
-        inline for (.{ "state", "next_state", "decay", "snapshots", "parents", "windows", "row_slots", "segments", "keeps", "kept_rows", "slot_steps" }) |name| if (@field(b, name).offset % 4 != 0) return error.BadGdnBuffer;
+        inline for (.{ "state", "next_state", "decay", "snapshots", "spill", "parents", "windows", "row_slots", "segments", "keeps", "kept_rows", "slot_steps" }) |name| if (@field(b, name).offset % 4 != 0) return error.BadGdnBuffer;
         if ((kinds.conv == .f32 and b.conv_weight.offset % 4 != 0) or (kinds.a_log == .f32 and b.a_log.offset % 4 != 0) or (kinds.dt == .f32 and b.dt.offset % 4 != 0) or (kinds.norm == .f32 and b.norm.offset % 4 != 0)) return error.BadGdnBuffer;
         const reads = [_]Span{ b.qkv, b.a, b.b, b.z, b.conv_weight, b.a_log, b.dt, b.norm, b.history, b.state, b.parents, b.windows, b.row_slots, b.segments, b.keeps, b.kept_rows, b.slot_steps };
         // an in-place round's next state is its state: each scan thread reads its own words before it writes them
         const in_place = b.next_state.buffer.id == b.state.buffer.id and b.next_state.offset == b.state.offset and b.next_state.bytes == b.state.bytes;
-        const writes = [_]Span{ b.query, b.key, b.value, b.decay, b.mixing, b.tails, b.snapshots, b.recurrent, b.output, if (in_place) .{ .buffer = b.state.buffer, .bytes = 0 } else b.next_state, b.next_history, b.before orelse Span{ .buffer = b.state.buffer, .bytes = 0 } };
+        const writes = [_]Span{ b.query, b.key, b.value, b.decay, b.mixing, b.tails, b.snapshots, b.spill, b.recurrent, b.output, if (in_place) .{ .buffer = b.state.buffer, .bytes = 0 } else b.next_state, b.next_history, b.before orelse Span{ .buffer = b.state.buffer, .bytes = 0 } };
         inline for (writes, 0..) |write, index| {
             inline for (reads) |read| if (write.overlaps(read)) return error.AliasedGdnState;
             inline for (writes[0..index]) |other| if (write.overlaps(other)) return error.AliasedGdnState;
@@ -165,6 +167,18 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// prepareRows for a prompt chain's rows on `chain` (tf_delta_gdn_pre_chain): 32 rows a group of 128.
+    pub fn prepareChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 31) / 32 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
     /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
     /// so any other shape is refused rather than run unsynchronised.
@@ -216,6 +230,7 @@ pub const Round = struct {
         r.b.slot_steps.bind(e, 11);
         r.b.state.bind(e, 12);
         (r.b.before orelse r.b.state).bind(e, 13);
+        r.b.spill.bind(e, 14);
         e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
@@ -232,7 +247,8 @@ pub const Round = struct {
             r.b.slot_steps.bind(e, 11);
             r.b.state.bind(e, 12);
             (r.b.before orelse r.b.state).bind(e, 13);
-        }
+            r.b.spill.bind(e, 14);
+        } else r.b.spill.bind(e, 11);
         r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
@@ -251,6 +267,7 @@ pub const Round = struct {
         const counted = counter != null and beside == null and r.gateRows() and r.p.dv % 8 == 0;
         e.setPipeline(star);
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state }, 0);
+        r.b.spill.bind(e, 6);
         r.b.segments.bind(e, 7);
         e.setValue(r.p, 8);
         r.b.recurrent.bind(e, 9);
@@ -374,10 +391,13 @@ pub const Round = struct {
     pub fn commit(r: Round, e: metal.ComputeEncoder) void {
         e.setPipeline(r.pipelines.replay);
         bind(e, .{ r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.kept_rows, r.b.keeps }, 0);
-        e.setValue(r.p, 7);
+        var p = r.p;
+        p.from_spill = 0; // this round's scan pairing is the caller's own; replay from the committed state
+        e.setValue(p, 7);
         r.b.next_state.bind(e, 8);
         r.b.segments.bind(e, 9);
         (r.b.before orelse r.b.state).bind(e, 10);
+        r.b.spill.bind(e, 11);
         r.stateGrid(e);
         e.barrier();
         e.setPipeline(r.pipelines.conv_commit);

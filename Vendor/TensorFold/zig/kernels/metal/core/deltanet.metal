@@ -7,6 +7,7 @@ struct TfDeltaParams {
   float eps;
   uint zba_stride;  // 0: z, a and b in their own rows; else one fused row of this many values (z, b, a)
   uint advance;     // 1: a shared round's one-row windows (always kept) step their state in place; the replay skips them
+  uint from_spill;  // 1: this commit follows its round's scan, whose spills are fresh; the replay resumes from them
 };
 struct TfDeltaSegment { uint first, rows, state_slot, next_slot; };
 struct TfDeltaKeep { uint first, rows, state_slot, next_slot; };
@@ -189,13 +190,14 @@ inline void tf_delta_gdn_pre_rows4_direct(device const bfloat* projection, devic
 
 // tf_delta_gdn_pre_rows4_direct for a prompt chain's rows, whose row r takes taps r .. r + 3 (one window; the host checks
 // it, gdn_plan.Plan.chain): a simdgroup's rows share their taps, so it loads each tap once, count + 3 loads for its count
-// rows where the window lookups made 4 count, and reads one slot word. Every row's arithmetic is
+// rows where the window lookups made 4 count, and reads one slot word: 32 rows a group, up to 8 a simdgroup (11 tap loads
+// and one weight load for 8 rows, where two 4-row simdgroups took 14 and two). Every row's arithmetic is
 // tf_delta_gdn_pre_rows4_direct's, in its order, on the same words.
 inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
     device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  const uint head = group.y, base = group.z * 32, in_group = metal::min(32u, p.rows - base), per = (in_group + 3) / 4;
   if (sg * per >= in_group) return;
   const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
@@ -207,13 +209,13 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
   // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
-  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
+  bfloat4 taps[11];
+  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 11; ++s) {
     const uint source = first + s;
     taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
   }
-  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 8; ++i) {
     if (i < count) {
       const uint row = first + i;
       float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -571,6 +573,7 @@ kernel void tf_delta_gdn_tree(device const bfloat* query [[buffer(0)]],
                          constant TfDeltaParams& p [[buffer(8)]],
                          device bfloat* output [[buffer(9)]],
                          device float* snapshots [[buffer(10)]],
+                         device float* spill [[buffer(11)]],
                          uint3 position [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -596,6 +599,8 @@ kernel void tf_delta_gdn_tree(device const bfloat* query [[buffer(0)]],
     TF_TREE_NODE(8) TF_TREE_NODE(9) TF_TREE_NODE(10) TF_TREE_NODE(11) TF_TREE_NODE(12) TF_TREE_NODE(13) TF_TREE_NODE(14) TF_TREE_NODE(15)
 #undef TF_TREE_NODE
 #undef TF_PICK
+    // the root's state (node 0, the row every non-empty kept path starts at) for the commit to resume from
+    for (uint part = 0; part < 4; ++part) spill[span.state_slot * state_stride + column + part] = kept0[part];
     return;
   }
   for (uint node = 0; node < span.rows; ++node) {
@@ -610,10 +615,15 @@ kernel void tf_delta_gdn_tree(device const bfloat* query [[buffer(0)]],
     const float result = tf_delta_delta_read(state, q, lane, count);
     if (lane == 0) output[at * p.dv + dimension] = bfloat(result);
     for (uint part = 0; part < count; ++part) snapshots[row * state_stride + column + part] = state[part];
+    if (node == 0)
+      for (uint part = 0; part < count; ++part) spill[span.state_slot * state_stride + column + part] = state[part];
   }
 }
 
 // C = 4 (128-wide heads) gives every per-lane loop a constant trip count (arrays in registers); C = 0 reads p.
+// `from_spill` (this commit follows its round's scan): a non-empty keep starts at the scan's spill row
+// (the segment's root), so the replay starts from the spilled state and skips that row's step; a keep of only the spill
+// row copies the spill, and an empty keep replays from the committed state as before.
 template <uint C>
 inline void tf_delta_gdn_replay_body(device const bfloat* key,
     device const bfloat* value,
@@ -624,6 +634,8 @@ inline void tf_delta_gdn_replay_body(device const bfloat* key,
     device const TfDeltaKeep* keeps,
     constant TfDeltaParams& p,
     device float* next,
+    device const float* spill,
+    bool from_spill,
     uint3 position,
     uint lane) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -631,9 +643,11 @@ inline void tf_delta_gdn_replay_body(device const bfloat* key,
   const uint state_stride = p.nv * p.dv * p.dk;
   const uint column = (head * p.dv + dimension) * p.dk + lane * count;
   const TfDeltaKeep keep = keeps[segment_index];
+  const bool skip = from_spill && keep.rows > 0;
+  device const float* first = skip ? spill : committed;
   float state[C ? C : 8];
-  for (uint part = 0; part < count; ++part) state[part] = committed[keep.state_slot * state_stride + column + part];
-  for (uint step = 0; step < keep.rows; ++step) {
+  for (uint part = 0; part < count; ++part) state[part] = first[keep.state_slot * state_stride + column + part];
+  for (uint step = skip ? 1 : 0; step < keep.rows; ++step) {
     const uint row = kept_rows[keep.first + step], at = row * p.nv + head;
     device const bfloat* k = key + (row * p.nk + key_head) * p.dk;
     tf_delta_delta_update(state, k, decay[at], float(value[at * p.dv + dimension]), float(mixing[at]), lane, count);
@@ -652,6 +666,7 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
                            device float* next [[buffer(8)]],
                            device const TfDeltaSegment* segments [[buffer(9)]],
                            device const float* before [[buffer(10)]],
+                           device const float* spill [[buffer(11)]],
                            uint3 position [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
   const uint segment = position.z / p.nv;
@@ -665,8 +680,9 @@ kernel void tf_delta_gdn_replay(device const bfloat* key [[buffer(0)]],
     }
     return;
   }
-  if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
-  else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, position, lane);
+  const bool from_spill = p.from_spill != 0;
+  if (p.dk == 128) tf_delta_gdn_replay_body<4>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, spill, from_spill, position, lane);
+  else tf_delta_gdn_replay_body<0>(key, value, decay, mixing, committed, kept_rows, keeps, p, next, spill, from_spill, position, lane);
 }
 
 // A deferred keep's rows: the pending row its first kept row lands at, the rows left after it, and the log's and pending

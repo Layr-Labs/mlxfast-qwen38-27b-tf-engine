@@ -201,7 +201,7 @@ test "qwen27 bank: real two-layer verify and empty keep use partial strides and 
     const bank = f.pool.before.?.id;
     for (0..2) |layer| {
         try std.testing.expectEqual(bank, f.pool.before.?.id);
-        try f.pool.commit(layer, .{ .host = keep, .metadata = f.metadata }, e);
+        try f.pool.commit(layer, .{ .host = keep, .metadata = f.metadata }, e, false);
         for (try f.pool.committed(layer, 1, true)) |word| try std.testing.expectEqual(@as(u8, @intCast(0x21 + layer)), word);
     }
     try std.testing.expectEqual(@as(usize, 2), record.restores);

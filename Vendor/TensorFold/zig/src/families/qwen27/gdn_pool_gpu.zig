@@ -13,7 +13,7 @@ const Kernels = @import("gdn_library.zig").Kernels;
 
 pub const PromptMarks = @import("gdn_marks_gpu.zig").Bank;
 
-const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing };
+const Field = enum { state, history, next_history, qkv, query, key, value, decay, mixing, snapshots, tails, recurrent, pending_key, pending_value, pending_decay, pending_mixing, spill };
 /// The pending rows' fields, as tf_delta_gdn_stash, tf_delta_gdn_star_pending and tf_delta_gdn_unstash bind them.
 const pending_fields = [_]Field{ .pending_key, .pending_value, .pending_decay, .pending_mixing };
 
@@ -258,7 +258,7 @@ pub const Pool = struct {
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
         // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else if (prompt and plan.host.chain) prepared.prepareChain(pre.encoder, pool.kernels.pre_chain) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
@@ -306,23 +306,25 @@ pub const Pool = struct {
         try publication.end();
     }
 
-    pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+    /// `from_spill`: this commit follows its round's scan, so the replay resumes from the scan's spills
+    /// (gdn_plan.spillRow); false replays from the committed state as before.
+    pub fn commit(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder, from_spill: bool) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         try plan.metadata.upload(plan.host);
-        return pool.commitDevice(layer, plan, e);
+        return pool.commitDevice(layer, plan, e, from_spill);
     }
 
     /// Caller-generated keep descriptors remain on the GPU while the admitted host plan fixes dispatch bounds.
-    pub fn commitDevice(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitScan(layer, plan, e);
+    pub fn commitDevice(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder, from_spill: bool) !void {
+        try pool.commitScan(layer, plan, e, from_spill);
         e.barrier();
         try pool.commitPublish(layer, plan, e);
         e.barrier();
     }
 
     /// A commit's replay, in place, and its conv window, unfenced.
-    pub fn commitScan(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitReplay(layer, plan, e);
+    pub fn commitScan(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder, from_spill: bool) !void {
+        try pool.commitReplay(layer, plan, e, from_spill);
         const p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         const m = plan.metadata;
         const next_history = try pool.layerSpan(.next_history, layer);
@@ -339,8 +341,8 @@ pub const Pool = struct {
     /// commitScan and commitPublish in one fence-free pass: the replay, and the conv window written straight over
     /// history by tf_delta_gdn_conv_keep (a thread a channel reads every source tap before it writes), so the keep
     /// needs no next_history staging, no publish_conv launch and no fence between the two.
-    pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
-        try pool.commitReplay(layer, plan, e);
+    pub fn commitKeep(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder, from_spill: bool) !void {
+        try pool.commitReplay(layer, plan, e, from_spill);
         try pool.commitConvKeep(layer, plan, e);
     }
 
@@ -394,11 +396,12 @@ pub const Pool = struct {
     }
 
     /// The replay half of a commit, in place; skipped when every window's verify already stepped its state.
-    fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+    fn commitReplay(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder, from_spill: bool) !void {
         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
         if (!inPlace(plan.host)) return error.GdnSlotMoves;
         var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, commit_kinds);
         p.advance = @intFromBool(pool.advances(plan.host));
+        p.from_spill = @intFromBool(from_spill);
         const state = try pool.layerSpan(.state, layer);
         const m = plan.metadata;
         // windows the verify stepped in place replay nothing: skip the launch when that is all of them
@@ -414,6 +417,7 @@ pub const Pool = struct {
             e.setBuffer(m.keeps.buffer, m.keeps.offset, 6);
             e.setValue(p, 7);
             e.setBuffer(state.buffer, state.offset, 8);
+            (try pool.layerSpan(.spill, layer)).bind(e, 11);
             e.dispatchThreads(.{ .width = 32, .height = p.dv, .depth = p.nv * plan.host.keeps.len }, .{ .width = 32, .height = 8 });
         }
     }
@@ -474,6 +478,7 @@ pub const Pool = struct {
             .mixing = try pool.layerSpan(.mixing, layer),
             .tails = try refSpan(.{ .buffer = if (refs.own) |o| o.tails else pool.get(.tails) }, bytes.tails),
             .snapshots = try refSpan(.{ .buffer = if (refs.own) |o| o.snapshots else pool.get(.snapshots) }, bytes.snapshots),
+            .spill = try pool.layerSpan(.spill, layer),
             .recurrent = try refSpan(.{ .buffer = if (refs.own) |o| o.recurrent else pool.get(.recurrent) }, bytes.value),
             .output = try refSpan(refs.output, bytes.value),
             .next_state = if (inPlace(plan)) try pool.layerSpan(.state, layer) else return error.GdnSlotMoves,

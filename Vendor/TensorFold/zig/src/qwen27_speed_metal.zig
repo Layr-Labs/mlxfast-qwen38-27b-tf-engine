@@ -95,6 +95,7 @@ pub const Params = extern struct {
     eps: f32,
     zba_stride: u32,
     advance: u32,
+    from_spill: u32,
 };
 pub const Recorder = struct {
     bindings: [19]?Binding = @splat(null),

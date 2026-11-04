@@ -14,6 +14,7 @@ pub const Params = extern struct {
     eps: f32 = 1e-6,
     zba_stride: u32 = 0,
     advance: u32 = 0,
+    from_spill: u32 = 0,
 };
 pub const Segment = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };
 pub const Fixture = struct {

@@ -75,6 +75,8 @@ pub const Budget = struct {
     snapshots: usize,
     conv_tails: usize,
     scratch: usize,
+    /// Every verify scan's spill row state, one a layer and slot, laid out like `state` (gdn_plan.spillRow).
+    spill: usize,
     /// The pending rows' key, value, decay and mixing words, `pending_rows` a layer (gdn_pool_gpu.Pool.stash).
     pending: [4]usize,
 
@@ -106,12 +108,13 @@ pub const Budget = struct {
             .snapshots = snapshot,
             .conv_tails = tails,
             .scratch = try std.math.add(usize, try std.math.add(usize, snapshot, tails), outputs),
+            .spill = try abi.countBytes(f32, shape.state, layer_slots),
             .pending = .{ try abi.countBytes(u16, shape.c.k_heads * shape.c.dk, pending), try abi.countBytes(u16, shape.value, pending), try abi.countBytes(f32, shape.c.v_heads, pending), try abi.countBytes(u16, shape.c.v_heads, pending) },
         };
     }
 
-    pub fn allocationSizes(b: Budget) [16]usize {
-        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2, b.pending[0], b.pending[1], b.pending[2], b.pending[3] };
+    pub fn allocationSizes(b: Budget) [17]usize {
+        return .{ b.state, b.history, b.history, b.projections, b.query, b.key, b.value, b.decay, b.mixing, b.snapshots, b.conv_tails, b.rows * b.shape.value * 2, b.pending[0], b.pending[1], b.pending[2], b.pending[3], b.spill };
     }
 
     pub fn stateOffset(b: Budget, layer: usize, slot: usize) !usize {
@@ -129,6 +132,6 @@ pub const Budget = struct {
     }
 
     pub fn totalBytes(b: Budget) usize {
-        return 2 * b.state + 2 * b.history + b.projections + b.logBytes() + b.scratch + b.pending[0] + b.pending[1] + b.pending[2] + b.pending[3];
+        return 2 * b.state + 2 * b.history + b.projections + b.logBytes() + b.scratch + b.pending[0] + b.pending[1] + b.pending[2] + b.pending[3] + b.spill;
     }
 };

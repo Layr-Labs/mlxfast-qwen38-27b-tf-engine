@@ -49,6 +49,7 @@ fn one(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, pipeline: mtl
     const snapshots = try rig.scratch(256);
     const steps = try rig.input(std.mem.sliceAsBytes(f.steps));
     const before = try rig.scratch(f.state.len * 4);
+    const spill = try rig.scratch(f.state.len * 4);
     const original_inputs = try a.dupe(u8, try rig.inputBytes());
     defer a.free(original_inputs);
     var first: ?[]u8 = null;
@@ -69,6 +70,7 @@ fn one(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, pipeline: mtl
         e.setBuffer(steps.buf, steps.off, 11);
         e.setBuffer(state.buf, state.off, 12);
         e.setBuffer(before.buf, before.off, 13);
+        e.setBuffer(spill.buf, spill.off, 14);
         e.dispatchThreads(mtl.Size.of(32, 128, 48 * 2), mtl.Size.of(32, 4, 1));
         try rig.finish(pass);
         const bytes = rig.bytes(output, f.output.len * 2);

@@ -92,7 +92,7 @@ test "qwen27 speed: shared in-place verify then empty and full keeps restore sta
             .{ .window = window, .state_slot = 1, .next_slot = 1, .path = if (empty_second) &.{} else &.{0} },
         });
         defer keep.deinit();
-        try pool.commit(0, .{ .host = keep, .metadata = metadata }, e);
+        try pool.commit(0, .{ .host = keep, .metadata = metadata }, e, false);
         try std.testing.expectEqualSlices(u8, original, state);
         try std.testing.expectEqual(empty_second, std.mem.eql(u8, second, other));
         try std.testing.expectEqualSlices(u8, old_history, history);

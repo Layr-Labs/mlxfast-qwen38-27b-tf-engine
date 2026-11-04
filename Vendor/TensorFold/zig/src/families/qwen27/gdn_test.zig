@@ -12,8 +12,9 @@ fn config() Config {
 const native = abi.WeightKinds{ .conv = .bf16, .a_log = .f32, .dt = .bf16, .norm = .f32 };
 
 test "GDN Metal records have fixed offsets without enum padding" {
-    try std.testing.expectEqual(@as(usize, 44), @sizeOf(abi.Params));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(abi.Params));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(abi.Params, "eps"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(abi.Params, "from_spill"));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(abi.Segment));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(abi.Keep));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(@import("core").tree_slots.Step));
@@ -243,6 +244,38 @@ test "depth one siblings keep none first or second draft with matching state and
         try std.testing.expectEqual(@as(u64, want_tokens.len), journal.committed_total);
         try std.testing.expect(journal.committed_total <= 2);
     }
+}
+
+test "the spill row is each segment's root, which every non-empty keep starts at" {
+    const a = std.testing.allocator;
+    var star = try Window.init(a, 10, &.{ -1, 0, 0 }, 4, 64);
+    defer star.deinit();
+    var chain = try Window.init(a, 20, &.{ -1, 0, 1 }, 4, 64);
+    defer chain.deinit();
+    const shape = try abi.Shape.init(config());
+    for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 } }) |path| {
+        var plan = try plan_mod.Plan.init(a, try shape.params(6, 2, native), &.{
+            .{ .window = star, .state_slot = 0, .next_slot = 0, .path = path },
+            .{ .window = chain, .state_slot = 1, .next_slot = 1, .path = &.{ 0, 1, 2 } },
+        });
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(u32, 0), plan_mod.spillRow(plan.segments[0]));
+        try std.testing.expectEqual(@as(u32, 3), plan_mod.spillRow(plan.segments[1]));
+        try std.testing.expect(plan_mod.resumable(plan));
+    }
+    var empty = try plan_mod.Plan.init(a, try shape.params(6, 2, native), &.{
+        .{ .window = star, .state_slot = 0, .next_slot = 0, .path = &.{} },
+        .{ .window = chain, .state_slot = 1, .next_slot = 1, .path = &.{} },
+    });
+    defer empty.deinit();
+    try std.testing.expect(plan_mod.resumable(empty));
+    var kept = try plan_mod.Plan.init(a, try shape.params(6, 2, native), &.{
+        .{ .window = star, .state_slot = 0, .next_slot = 0, .path = &.{ 0, 1 } },
+        .{ .window = chain, .state_slot = 1, .next_slot = 1, .path = &.{ 0, 1, 2 } },
+    });
+    defer kept.deinit();
+    kept.kept_rows[0] = 1; // a keep that does not start at the spill row refuses the resume
+    try std.testing.expect(!plan_mod.resumable(kept));
 }
 
 test "depth one sibling terminal and remaining-one commits retain only the root state" {

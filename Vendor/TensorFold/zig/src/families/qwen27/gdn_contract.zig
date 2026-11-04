@@ -40,6 +40,8 @@ pub const Params = extern struct {
     /// 0: z, a and b in their own rows; else one fused zba row of this many values (z, then b, then a).
     zba_stride: u32 = 0,
     advance: u32 = 0, // 1: a shared round's one-row windows step their state in the scan; the replay skips them
+    /// 1: this commit follows its round's scan, whose spills are fresh; the replay resumes from them.
+    from_spill: u32 = 0,
 };
 
 pub const Segment = extern struct { first: u32, rows: u32, state_slot: u32, next_slot: u32 };

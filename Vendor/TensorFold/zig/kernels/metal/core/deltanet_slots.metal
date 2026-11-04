@@ -16,6 +16,7 @@ kernel void tf_delta_gdn_tree_slots(device const bfloat* query [[buffer(0)]],
                          device const TfDeltaSlotStep* steps [[buffer(11)]],
                          device float* advanced [[buffer(12)]],
                          device float* before [[buffer(13)]],
+                         device float* spill [[buffer(14)]],
                          uint3 position [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -35,6 +36,9 @@ kernel void tf_delta_gdn_tree_slots(device const bfloat* query [[buffer(0)]],
     _Pragma("clang loop unroll(full)")
     for (uint j = 0; j < SLOTS; ++j) if (int(j) == step.read_slot) s = kept[j];
     s = tf_delta_tree_node(s, query, key, value, decay, mixing, p, output, step.row, head, key_head, dimension, lane);
+    // the root's state (the row every non-empty kept path starts at) for the commit's resume
+    if (step.row == span.first)
+      for (uint part = 0; part < 4; ++part) spill[span.state_slot * state_stride + column + part] = s[part];
     _Pragma("clang loop unroll(full)")
     for (uint j = 0; j < SLOTS; ++j) if (int(j) == step.write_slot) kept[j] = s;
     last = s;
@@ -83,6 +87,7 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
                          device const TfDeltaSlotStep* steps [[buffer(11)]],
                          device float* advanced [[buffer(12)]],
                          device float* before [[buffer(13)]],
+                         device float* spill [[buffer(14)]],
                          uint3 position [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -105,6 +110,12 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
       s1 = kept1;
     }
     tf_delta_tree_node2(s0, s1, query, key, value, decay, mixing, p, output, step.row, head, key_head, dimension, lane);
+    // the root's states (the row every non-empty kept path starts at) for the commit's resume
+    if (step.row == span.first)
+      for (uint part = 0; part < 4; ++part) {
+        spill[span.state_slot * state_stride + column + part] = s0[part];
+        spill[span.state_slot * state_stride + column + p.dk + part] = s1[part];
+      }
     if (step.write_slot == 0) {
       kept0 = s0;
       kept1 = s1;
@@ -122,7 +133,7 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
       advanced[at + p.dk] = last1[part];
     }
 }
-#define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device const bfloat*, device const bfloat*, device const bfloat*, device const float*, device const bfloat*, device const float*, device const int*, device const TfDeltaSegment*, constant TfDeltaParams&, device bfloat*, device float*, device const TfDeltaSlotStep*, device float*, device float*, uint3, uint);
+#define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device const bfloat*, device const bfloat*, device const bfloat*, device const float*, device const bfloat*, device const float*, device const int*, device const TfDeltaSegment*, constant TfDeltaParams&, device bfloat*, device float*, device const TfDeltaSlotStep*, device float*, device float*, device float*, uint3, uint);
 TF_TREE_SLOTS(1)
 TF_TREE_SLOTS(2)
 TF_TREE_SLOTS(4)
@@ -246,16 +257,21 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
     }
 }
 // A star's node 0 (the row at kq, at, vo) and every child of it (the next rows - 1 rows), three at a time: each child
-// once, from node 0's states; node 0's outputs are stored last.
+// once, from node 0's states; node 0's outputs are stored last. Node 0's states also spill (the row every non-empty
+// kept path starts at) for the commit's resume, beside the outputs so no store stands between the rows' loads.
 inline void tf_delta_star_rows(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
                                device const bfloat* value, device const float* decay, device const bfloat* mixing,
                                device bfloat* output, uint rows, uint kq, uint at, uint vo, uint kq_step, uint at_step,
-                               uint vo_step, uint lane) {
+                               uint vo_step, device float* spill, uint spill_base, uint column, uint dk, uint lane) {
   const float2 node = tf_delta_star_node(r0, r1, query, key, value, decay, mixing, kq, at, vo);
   uint c = 1, ckq = kq + kq_step, cat = at + at_step, cvo = vo + vo_step;
   for (; c + 3 <= rows; c += 3) tf_delta_star_children<3>(r0, r1, query, key, value, decay, mixing, output, ckq, cat, cvo, kq_step, at_step, vo_step, lane);
   if (c + 2 == rows) tf_delta_star_children<2>(r0, r1, query, key, value, decay, mixing, output, ckq, cat, cvo, kq_step, at_step, vo_step, lane);
   else if (c + 1 == rows) tf_delta_star_children<1>(r0, r1, query, key, value, decay, mixing, output, ckq, cat, cvo, kq_step, at_step, vo_step, lane);
+  for (uint part = 0; part < 4; ++part) {
+    spill[spill_base + column + part] = r0[part];
+    spill[spill_base + column + dk + part] = r1[part];
+  }
   if (lane == 0) {
     output[vo] = bfloat(node.x);
     output[vo + 1] = bfloat(node.y);
@@ -286,6 +302,7 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
                                    device const float* decay [[buffer(3)]],
                                    device const bfloat* mixing [[buffer(4)]],
                                    device const float* committed [[buffer(5)]],
+                                   device float* spill [[buffer(6)]],
                                    device const TfDeltaSegment* segments [[buffer(7)]],
                                    constant TfDeltaParams& p [[buffer(8)]],
                                    device bfloat* output [[buffer(9)]],
@@ -309,7 +326,7 @@ kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
   const uint kq_step = p.nk * p.dk, at_step = p.nv, vo_step = p.nv * p.dv; // node 0's row: span.first
   const uint kq = (span.first * p.nk + key_head) * p.dk + lane * 4, at = span.first * p.nv + head, vo = at * p.dv + d0;
   tf_delta_gdn_star_wait(PC, wait_prep, groups, t);
-  tf_delta_star_rows(r0, r1, query, key, value, decay, mixing, output, span.rows, kq, at, vo, kq_step, at_step, vo_step, lane);
+  tf_delta_star_rows(r0, r1, query, key, value, decay, mixing, output, span.rows, kq, at, vo, kq_step, at_step, vo_step, spill, base, column, p.dk, lane);
   // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
   if (count_out != 0u) {
     threadgroup_barrier(mem_flags::mem_device);
@@ -358,6 +375,7 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
                                       device const float* decay [[buffer(3)]],
                                       device const bfloat* mixing [[buffer(4)]],
                                       device float* committed [[buffer(5)]],
+                                      device float* spill [[buffer(6)]],
                                       device const TfDeltaSegment* segments [[buffer(7)]],
                                       constant TfDeltaParams& p [[buffer(8)]],
                                       device bfloat* output [[buffer(9)]],
@@ -396,7 +414,7 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
   float4 r0 = float4(a[0], a[1], a[2], a[3]), r1 = float4(b[0], b[1], b[2], b[3]);
   const uint kq = (span.first * p.nk + key_head) * p.dk + lane * 4, at = span.first * p.nv + head, vo = at * p.dv + d0;
   tf_delta_gdn_star_wait(PC, wait_prep, groups, t);
-  tf_delta_star_rows(r0, r1, query, key, value, decay, mixing, output, span.rows, kq, at, vo, kq_step, at_step, vo_step, lane);
+  tf_delta_star_rows(r0, r1, query, key, value, decay, mixing, output, span.rows, kq, at, vo, kq_step, at_step, vo_step, spill, base, column, p.dk, lane);
   // count_out above 0: the gate that reads `output` shares this launch's barrier interval and waits on SC[0]
   if (count_out != 0u) {
     threadgroup_barrier(mem_flags::mem_device);

@@ -96,3 +96,19 @@ pub const Plan = struct {
         plan.* = undefined;
     }
 };
+
+/// The row every verify scan spills: the segment's root (local row 0, global `segment.first`). Every non-empty kept
+/// path starts there (`Window.keep` and `validatePlan` require it; the GPU keep writer requires `path[0] == 0`), so a
+/// commit that follows the scan resumes from the spill and skips that row's replay step. Mirrors the kernels' pick.
+pub fn spillRow(segment: abi.Segment) u32 {
+    return segment.first;
+}
+
+/// Whether a commit of `plan` may resume from its scan's spills: every non-empty keep starts at its spill row.
+pub fn resumable(plan: Plan) bool {
+    for (plan.segments, plan.keeps) |segment, keep| {
+        if (keep.rows == 0) continue;
+        if (plan.kept_rows[keep.first] != spillRow(segment)) return false;
+    }
+    return true;
+}

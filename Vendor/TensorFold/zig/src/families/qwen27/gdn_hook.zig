@@ -61,7 +61,7 @@ pub const Hook = struct {
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers) return error.BadGdnHook;
-        try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e);
+        try hook.pool.commit(hook.linear_index[block], devicePlan(hook.plan.*, frame), e, false);
     }
 };
 
