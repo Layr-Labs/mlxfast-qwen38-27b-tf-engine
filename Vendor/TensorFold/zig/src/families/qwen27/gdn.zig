@@ -283,8 +283,10 @@ pub const Round = struct {
         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments }, 0);
         e.setValue(r.p, 7);
         bind(e, .{ r.b.recurrent, r.b.next_state }, 8);
-        // four simdgroups a threadgroup: half as many groups of twice the size; each thread keeps its grid position and work
-        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 }) else r.stateGrid(e);
+        // two simdgroups a threadgroup: finer scheduling granularity than the shipped four; each 8-lane set keeps
+        // its grid position and work, and the sets are independent, so the arithmetic is unchanged. The measured
+        // curve so far: height 8 scored 1.79692 (-0.71 percent relative vs the leader's shipped 4 at 1.80980).
+        if (wide) e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 16, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = @min(2, r.p.dv / 16), .depth = 1 }) else r.stateGrid(e);
         if (beside) |b| try b.encode(b.ptr, e);
         e.barrier();
     }
