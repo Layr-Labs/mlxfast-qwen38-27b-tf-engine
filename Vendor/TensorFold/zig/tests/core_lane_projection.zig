@@ -233,6 +233,72 @@ fn strided(device: mtl.Device, queue: mtl.Queue, l: core.Layout) !void {
     });
 }
 
+/// Compare the five-row wide-decode SK2 serial and parallel schedules on the same synthetic input.
+/// Each result is also checked against the independent f64 dot-product oracle.
+fn checkSk2Row5(device: mtl.Device, queue: mtl.Queue) !void {
+    const rows = 5;
+    const serial_layout = core.Layout{
+        .n = 10240,
+        .k = 5120,
+        .format = .{ .bits = 4, .group = 64 },
+        .sk = 2,
+        .output = .f32,
+        .precompute_sums = true,
+        .reg = true,
+        .rows8 = true,
+        .reg_lean = true,
+        .serial_sk2 = true,
+    };
+    var parallel_layout = serial_layout;
+    parallel_layout.serial_sk2 = false;
+    try serial_layout.validate();
+    try parallel_layout.validate();
+    const serial = try core.Projection.init(a, device, serial_layout);
+    defer serial.deinit();
+    const parallel = try core.Projection.init(a, device, parallel_layout);
+    defer parallel.deinit();
+    const d = try Data.init(serial_layout);
+    defer d.deinit();
+    const x = try buffer(device, d.x.len * 2);
+    defer x.deinit();
+    const w = try buffer(device, serial_layout.weightWords() * 4);
+    defer w.deinit();
+    const sb = try buffer(device, serial_layout.metadataElements() * 2);
+    defer sb.deinit();
+    const out_bytes = rows * serial_layout.n * 4;
+    const serial_out = try buffer(device, out_bytes);
+    defer serial_out.deinit();
+    const parallel_out = try buffer(device, out_bytes);
+    defer parallel_out.deinit();
+    @memcpy(x.contents()[guard..][0 .. d.x.len * 2], std.mem.sliceAsBytes(d.x));
+    const packed_w = @as([*]u32, @ptrCast(@alignCast(w.contents() + guard)))[0..serial_layout.weightWords()];
+    const packed_sb = @as([*]u16, @ptrCast(@alignCast(sb.contents() + guard)))[0..serial_layout.metadataElements()];
+    try core.pack(serial_layout, d.words, d.scales, d.biases, packed_w, packed_sb);
+    const cb = queue.commandBuffer();
+    const enc = cb.compute(.serial);
+    try serial.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(serial_out, 0), rows);
+    try parallel.encode(enc, ref(x, 0), ref(w, 0), ref(sb, 0), ref(parallel_out, 0), rows);
+    enc.end();
+    try finish(cb);
+    const a_values = @as([*]const f32, @ptrCast(@alignCast(serial_out.contents() + guard)))[0 .. rows * serial_layout.n];
+    const b_values = @as([*]const f32, @ptrCast(@alignCast(parallel_out.contents() + guard)))[0 .. rows * parallel_layout.n];
+    var max_pair_delta: f64 = 0;
+    var max_oracle_error: f64 = 0;
+    for (0..rows) |r| for (0..serial_layout.n) |n| {
+        const want = oracle(serial_layout, d, r, n);
+        const av = a_values[r * serial_layout.n + n];
+        const bv = b_values[r * parallel_layout.n + n];
+        if (!std.math.isFinite(av) or !std.math.isFinite(bv)) return error.NonFiniteSk2Output;
+        const ae = @abs(@as(f64, av) - want.value);
+        const be = @abs(@as(f64, bv) - want.value);
+        if (ae > want.bound or be > want.bound) return error.CpuReferenceMismatch;
+        max_oracle_error = @max(max_oracle_error, @max(ae, be));
+        max_pair_delta = @max(max_pair_delta, @abs(@as(f64, av) - bv));
+    };
+    for ([_]mtl.Buffer{ x, w, sb, serial_out, parallel_out }) |buf| try checkGuard(buf);
+    std.debug.print("PASS SK2 row5 serial/parallel: max pair delta {d:.9}, max oracle error {d:.9}\n", .{ max_pair_delta, max_oracle_error });
+}
+
 fn packBench(io: std.Io, l: core.Layout) !void {
     try l.validate();
     const w = try a.alloc(u32, l.sourceWords());
@@ -274,7 +340,8 @@ pub fn main(init: std.process.Init) !void {
     });
     const simd_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--simd");
     const flashnext_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--flashnext");
-    if (argv.len != 1 and !simd_only and !flashnext_only) return error.UnknownArgument;
+    const sk2_row5_only = argv.len == 2 and std.mem.eql(u8, argv[1], "--sk2-row5");
+    if (argv.len != 1 and !simd_only and !flashnext_only and !sk2_row5_only) return error.UnknownArgument;
     try frozen.verify();
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -298,6 +365,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const queue = try device.queue();
     defer queue.deinit();
+    if (sk2_row5_only) {
+        if (!device.tensorUnits()) {
+            std.debug.print("SKIP SK2 row5 comparison: this device has no Tensor Units\n", .{});
+            return;
+        }
+        return checkSk2Row5(device, queue);
+    }
     std.debug.print("Small synthetic projection checks on {s}; no model files\n", .{device.name()});
     var counts: Counts = .{};
     if (!device.tensorUnits() or flashnext_only) {
