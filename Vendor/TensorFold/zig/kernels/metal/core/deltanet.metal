@@ -187,15 +187,16 @@ inline void tf_delta_gdn_pre_rows4_direct(device const bfloat* projection, devic
   }
 }
 
-// tf_delta_gdn_pre_rows4_direct for a prompt chain's rows, whose row r takes taps r .. r + 3 (one window; the host checks
+// tf_delta_gdn_pre_rows4_direct for a chain's rows, whose row r takes taps r .. r + 3 (one window; the host checks
 // it, gdn_plan.Plan.chain): a simdgroup's rows share their taps, so it loads each tap once, count + 3 loads for its count
-// rows where the window lookups made 4 count, and reads one slot word. Every row's arithmetic is
+// rows where the window lookups made 4 count, and reads one slot word: 32 rows a group, up to 8 a simdgroup (11 tap loads
+// and one weight load for 8 rows, where two 4-row simdgroups took 14 and two). Every row's arithmetic is
 // tf_delta_gdn_pre_rows4_direct's, in its order, on the same words.
 inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
     device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  const uint head = group.y, base = group.z * 32, in_group = metal::min(32u, p.rows - base), per = (in_group + 3) / 4;
   if (sg * per >= in_group) return;
   const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
@@ -207,13 +208,13 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
   // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
-  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
+  bfloat4 taps[11];
+  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 11; ++s) {
     const uint source = first + s;
     taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
   }
-  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 8; ++i) {
     if (i < count) {
       const uint row = first + i;
       float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -253,7 +254,8 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
   }
 }
 
-// tf_delta_gdn_pre_rows on a prompt chain's rows (tf_delta_gdn_pre_chain4): no wait, no count.
+// tf_delta_gdn_pre_rows on a chain's rows (tf_delta_gdn_pre_chain4): prompt chunks and short chain-like verifies.
+// wait_for above 0 takes tf_delta_gdn_pre_rows' wait on the counted projections; count_out counts for a star scan.
 kernel void tf_delta_gdn_pre_chain(device const bfloat* projection [[buffer(0)]],
                         device const bfloat* a [[buffer(1)]],
                         device const bfloat* b [[buffer(2)]],
@@ -269,10 +271,38 @@ kernel void tf_delta_gdn_pre_chain(device const bfloat* projection [[buffer(0)]]
                         device bfloat* value [[buffer(12)]],
                         device float* decay [[buffer(13)]],
                         device bfloat* mixing [[buffer(14)]],
+                        device atomic_uint* NC [[buffer(15)]],
+                        constant uint& wait_for [[buffer(16)]],
+                        device atomic_uint* PC [[buffer(17)]],
+                        constant uint& count_out [[buffer(18)]],
                         uint3 group [[threadgroup_position_in_grid]],
+                        uint3 groups [[threadgroups_per_grid]],
+                        uint t [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+  // wait_for above 0: this prepare shares its barrier interval with the decoded qkv and zba projections it reads, whose
+  // threadgroups count themselves on NC[0] past a device-scope fence (lane_projection's TF_COUNT); a group reads them once
+  // the count reaches wait_for (bounded), past its own fence, and the last group leaves both words zero for the next pair
+  if (wait_for != 0u) {
+    if (t == 0) {
+      for (uint spin = 0; spin < (1u << 24) && atomic_load_explicit(&NC[0], memory_order_relaxed) < wait_for; spin++) {}
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      const uint total = groups.x * groups.y * groups.z;
+      if (atomic_fetch_add_explicit(&NC[1], 1u, memory_order_relaxed) + 1u == total) {
+        atomic_store_explicit(&NC[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&NC[1], 0u, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (p.dk == 128 && p.dv == 128 && p.taps == 4) tf_delta_gdn_pre_chain4(projection, a, b, history, weights, decay_weight, time_bias, row_slot, p, query, key, value, decay, mixing, group, sg, lane);
+  if (count_out != 0u) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (t == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      atomic_fetch_add_explicit(&PC[0], 1u, memory_order_relaxed);
+    }
+  }
 }
 
 // tf_delta_gdn_pre past 16 rows of 128-wide heads: 4 simdgroups a group, 16 rows. Prompt rows and every launch with no

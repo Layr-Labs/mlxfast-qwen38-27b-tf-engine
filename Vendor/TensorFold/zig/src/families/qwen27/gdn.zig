@@ -165,9 +165,25 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// prepareRows for a chain's rows on `chain` (tf_delta_gdn_pre_chain): 32 rows a group of 128.
+    pub fn prepareChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        r.b.qkv.bind(e, 15); // never read: wait_for 0
+        e.setValue(@as(u32, 0), 16);
+        r.b.qkv.bind(e, 17); // never written: count_out 0
+        e.setValue(@as(u32, 0), 18);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 31) / 32 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
-    /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
-    /// so any other shape is refused rather than run unsynchronised.
+    /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows and
+    /// tf_delta_gdn_pre_chain paths wait, so any other shape is refused rather than run unsynchronised.
     /// `star` (its words 2 and 3, left zero): the star scan that reads the prepared rows shares this barrier interval too;
     /// each group counts itself there once its rows are stored, no barrier follows, and forwardStar's scan waits on
     /// prepareGroups of them.
@@ -186,9 +202,31 @@ pub const Round = struct {
         if (star == null) e.barrier();
     }
 
+    /// prepareChain in the barrier interval of the counted decoded projections it reads (no barrier before it):
+    /// tf_delta_gdn_pre_chain's wait on `counter` reaching `wait`, and its count for a star scan, as prepareRowsAfter.
+    pub fn prepareChainAfter(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline, counter: metal.Buffer, wait: u32, star: ?metal.Buffer) !void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return error.BadGdnPrepare;
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return error.BadGdnPrepare;
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.setBuffer(counter, 0, 15);
+        e.setValue(wait, 16);
+        if (star) |s| e.setBuffer(s, star_words, 17) else e.setBuffer(counter, 0, 17); // never written: count_out 0
+        e.setValue(@as(u32, @intFromBool(star != null)), 18);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 31) / 32 }, .{ .width = 128, .height = 1, .depth = 1 });
+        if (star == null) e.barrier();
+    }
+
     /// The threadgroups prepareRows launches: the count a star scan in its barrier interval waits on.
     pub fn prepareGroups(r: Round) u32 {
         return (2 * r.p.nk + r.p.nv) * ((r.p.rows + 15) / 16);
+    }
+
+    /// The threadgroups prepareChain launches: prepareGroups' count on the chain's 32-row groups.
+    pub fn prepareChainGroups(r: Round) u32 {
+        return (2 * r.p.nk + r.p.nv) * ((r.p.rows + 31) / 32);
     }
 
     /// One-row segments kept in place: tf_delta_gdn_pre_step writes each slot's next conv window into its history.

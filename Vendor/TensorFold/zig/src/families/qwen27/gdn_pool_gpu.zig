@@ -209,7 +209,8 @@ pub const Pool = struct {
         // decoded star rows: the star scan joins the counted prepare's barrier interval, loading its states (and replaying
         // any pending rows) while the projections and the prepare run, and reads the prepared rows once they are counted
         const chained = after != null and pool.profiler == null and pool.scan_words != null and prepared.star and prepared.usesSlots();
-        const wait_prep: u32 = if (chained) prepared.prepareGroups() else 0;
+        const chain = plan.host.chain;
+        const wait_prep: u32 = if (chained) (if (chain) prepared.prepareChainGroups() else prepared.prepareGroups()) else 0;
         // made before the prepare counts itself: a failure past that point would leave the star's words unconsumed
         const pending: ?gdn.Pending = if (deferred) |d| made: {
             if (d.rows > pending_rows) return error.BadGdnPending;
@@ -219,7 +220,10 @@ pub const Pool = struct {
         } else null;
         if (deferred != null and !(prepared.star and prepared.usesSlots())) return error.BadGdnPlan;
         var pre = profile.begin(pool.profiler, e, .gdn_prepare);
-        if (after) |a| try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows_held, a.counter, a.wait, if (chained) pool.scan_words else null) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+        // a chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
+        if (after) |a| {
+            if (chain) try prepared.prepareChainAfter(pre.encoder, pool.kernels.pre_chain, a.counter, a.wait, if (chained) pool.scan_words else null) else try prepared.prepareRowsAfter(pre.encoder, pool.kernels.pre_rows_held, a.counter, a.wait, if (chained) pool.scan_words else null);
+        } else if (chain) prepared.prepareChain(pre.encoder, pool.kernels.pre_chain) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, e, .gdn_scan);
         if (prepared.star and prepared.usesSlots()) {
@@ -257,8 +261,8 @@ pub const Pool = struct {
         try plan.metadata.upload(plan.host);
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
+        // a chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else if (plan.host.chain) prepared.prepareChain(pre.encoder, pool.kernels.pre_chain) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();

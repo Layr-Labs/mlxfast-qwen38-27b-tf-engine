@@ -45,7 +45,7 @@ pub const Kernels = struct {
     pre_rows_held: metal.Pipeline,
     /// clear in 16-byte stores (tf_delta_gdn_clear4): four state words and eight conv words a thread.
     clear4: metal.Pipeline,
-    /// pre_rows for a prompt chain's rows (row r's taps r .. r + 3): each simdgroup loads its rows' taps once.
+    /// pre_rows for a chain's rows (row r's taps r .. r + 3): each simdgroup loads its rows' taps once.
     pre_chain: metal.Pipeline,
     /// tf_delta_gdn_post for 128-wide heads on bfloat4 rows: a simdgroup a row, 4 rows a group.
     post_rows: metal.Pipeline,

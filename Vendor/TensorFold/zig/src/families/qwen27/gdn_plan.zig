@@ -17,7 +17,7 @@ pub const Plan = struct {
     slot_steps: []tree_slots.Step = &.{},
     compact: bool = false,
     slot_peak: usize = 0, // the most register slots any window's schedule holds live
-    /// One window of more than 16 rows whose row r takes conv sources r .. r + taps - 1 (a prompt chain's rows):
+    /// One window whose row r takes conv sources r .. r + taps - 1 (a chain's rows, prompt or short verify):
     /// tf_delta_gdn_pre_chain takes it.
     chain: bool = false,
 
@@ -77,8 +77,8 @@ pub const Plan = struct {
             first += n;
             keep_first += @intCast(input.path.len);
         }
-        // past 16 rows only (prompt chunks): decoded rounds' plans keep the record's work
-        var chain = inputs.len == 1 and rows > 16;
+        // one window whose row r takes sources r .. r + taps - 1 (prompt chunks and short chain-like verifies)
+        var chain = inputs.len == 1;
         if (chain) for (0..rows) |row| for (0..p.taps) |tap| {
             if (windows[row * p.taps + tap] != row + tap) chain = false;
         };
