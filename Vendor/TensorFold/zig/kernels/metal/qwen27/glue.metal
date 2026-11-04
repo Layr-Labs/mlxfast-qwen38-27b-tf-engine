@@ -2,29 +2,29 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float q27_read(device const uchar* p, uint i, uint type) {
-  if (type == 0) return float(((device const bfloat*)p)[i]);
-  if (type == 1) return float(((device const half*)p)[i]);
-  return ((device const float*)p)[i];
+inline float q27_read(device coherent(device) const uchar* p, uint i, uint type) {
+  if (type == 0) return float(((device coherent(device) const bfloat*)p)[i]);
+  if (type == 1) return float(((device coherent(device) const half*)p)[i]);
+  return ((device coherent(device) const float*)p)[i];
 }
 
 inline float q27_round(float v, uint type) {
   return type == 0 ? float(bfloat(v)) : type == 1 ? float(half(v)) : v;
 }
 
-inline void q27_write(device uchar* p, uint i, float v, uint type) {
-  if (type == 0) ((device bfloat*)p)[i] = bfloat(v);
-  else if (type == 1) ((device half*)p)[i] = half(v);
-  else ((device float*)p)[i] = v;
+inline void q27_write(device coherent(device) uchar* p, uint i, float v, uint type) {
+  if (type == 0) ((device coherent(device) bfloat*)p)[i] = bfloat(v);
+  else if (type == 1) ((device coherent(device) half*)p)[i] = half(v);
+  else ((device coherent(device) float*)p)[i] = v;
 }
 
 struct Norm { uint width, rows, activation, gain, residual; float eps; };
 
 // Each thread owns 16 contiguous values, then simd_sum and simdgroups in increasing order as row_glue.add_norm.
 [[max_total_threads_per_threadgroup(1024)]]
-kernel void q27_norm(device const uchar* X [[buffer(0)]], device const uchar* R [[buffer(1)]],
-                     device const uchar* W [[buffer(2)]], constant Norm& a [[buffer(3)]],
-                     device uchar* H [[buffer(4)]], device uchar* Y [[buffer(5)]],
+kernel void q27_norm(device coherent(device) const uchar* X [[buffer(0)]], device coherent(device) const uchar* R [[buffer(1)]],
+                     device coherent(device) const uchar* W [[buffer(2)]], constant Norm& a [[buffer(3)]],
+                     device coherent(device) uchar* H [[buffer(4)]], device coherent(device) uchar* Y [[buffer(5)]],
                      uint2 group [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float sums[32];
@@ -49,8 +49,8 @@ kernel void q27_norm(device const uchar* X [[buffer(0)]], device const uchar* R 
 struct Head { uint width, rows, stride, activation, gain; float eps; };
 
 // Head RMSNorm retains its native-input rounding before gain multiplication, as the shared Metal RMS implementation.
-kernel void q27_head_norm(device const uchar* X [[buffer(0)]], device const uchar* W [[buffer(1)]],
-                          constant Head& a [[buffer(2)]], device uchar* Y [[buffer(3)]],
+kernel void q27_head_norm(device coherent(device) const uchar* X [[buffer(0)]], device coherent(device) const uchar* W [[buffer(1)]],
+                          constant Head& a [[buffer(2)]], device coherent(device) uchar* Y [[buffer(3)]],
                           uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                           uint threads [[threads_per_threadgroup]]) {
@@ -88,9 +88,9 @@ kernel void q27_head_norm(device const uchar* X [[buffer(0)]], device const ucha
 struct Embed { uint width, rows, vocab, bits, group, metadata; };
 
 // Native metadata promotes to FP32 for affine decode, then the activation rounds once.
-kernel void q27_embed(device const uint* ids [[buffer(0)]], device const uint* words [[buffer(1)]],
-                      device const uchar* scales [[buffer(2)]], device const uchar* biases [[buffer(3)]],
-                      constant Embed& a [[buffer(4)]], device uchar* out [[buffer(5)]],
+kernel void q27_embed(device coherent(device) const uint* ids [[buffer(0)]], device coherent(device) const uint* words [[buffer(1)]],
+                      device coherent(device) const uchar* scales [[buffer(2)]], device coherent(device) const uchar* biases [[buffer(3)]],
+                      constant Embed& a [[buffer(4)]], device coherent(device) uchar* out [[buffer(5)]],
                       uint2 at [[thread_position_in_grid]]) {
   if (at.x >= a.width || at.y >= a.rows || ids[at.y] >= a.vocab) return;
   const uint bit = at.x * a.bits, shift = bit % 32, index = ids[at.y] * (a.width * a.bits / 32) + bit / 32;
@@ -105,8 +105,8 @@ kernel void q27_embed(device const uint* ids [[buffer(0)]], device const uint* w
 struct Rope { uint width, heads, rows, rotary, activation; float theta; uint h_end, w_end, plane; };
 
 // Rotate paired halves at each row's position: pair d's axis plane under M-RoPE, plane 0 (t) otherwise.
-kernel void q27_rope(device const uchar* X [[buffer(0)]], device const int* positions [[buffer(1)]],
-                     constant Rope& a [[buffer(2)]], device uchar* Y [[buffer(3)]],
+kernel void q27_rope(device coherent(device) const uchar* X [[buffer(0)]], device coherent(device) const int* positions [[buffer(1)]],
+                     constant Rope& a [[buffer(2)]], device coherent(device) uchar* Y [[buffer(3)]],
                      uint3 at [[thread_position_in_grid]]) {
   if (at.x >= a.width || at.y >= a.heads || at.z >= a.rows) return;
   const uint base = (at.z * a.heads + at.y) * a.width, pairs = a.rotary / 2;
@@ -130,26 +130,26 @@ struct HeadRope { uint width, heads, kv_heads, stride, rotary; float eps, theta;
 // values norm_q and norm_k held, pair d's angle from lane d. PACK: q heads land as q27_attn_pack_a packs one stream of
 // packed_rows (kv head h / g's rows, row r's head h at r * g + h % g, rows * g on repeating row 0's first head).
 // A stream's key and value caches, as the attention binding's caches table holds them.
-struct Q27HeadCaches { device bfloat* keys; device bfloat* values; };
+struct Q27HeadCaches { device coherent(device) bfloat* keys; device coherent(device) bfloat* values; };
 // DEC (decoded rows of one stream): beside QY and KY, a q head's rounded values also land where q27_attn_pack_a packs
 // them (QA, packed_rows rows a kv head, rows * g on repeating row 0's first head), and a k head's rotated key and its
 // value row land where q27_attn_append writes them (the row's cache slot from the plan's meta and nodes).
 // CACHE (prompt rows of one stream, with PACK): a k head's rotated key lands in its cache slot instead of KY (nothing then
 // reads KY) and its value row in its value slot, where q27_attn_append writes them, so no append follows.
 template <bool PACK, bool DEC, bool CACHE = false>
-inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const bfloat* K, device const bfloat* QW, device const bfloat* KW,
-                                    device const int* positions, constant HeadRope& a, device bfloat* QY, device bfloat* KY,
-                                    uint2 group, uint sg, uint lane, device bfloat* QA = nullptr,
-                                    device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
+inline void q27_head_norm_rope_rows_direct(device coherent(device) const bfloat* Q, device coherent(device) const bfloat* K, device coherent(device) const bfloat* QW, device coherent(device) const bfloat* KW,
+                                    device coherent(device) const int* positions, constant HeadRope& a, device coherent(device) bfloat* QY, device coherent(device) bfloat* KY,
+                                    uint2 group, uint sg, uint lane, device coherent(device) bfloat* QA = nullptr,
+                                    device coherent(device) const Q27HeadCaches* caches = nullptr, device coherent(device) const int* meta = nullptr,
+                                    device coherent(device) const int* nodes = nullptr, device coherent(device) const bfloat* V = nullptr, uint v_stride = 0) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
-  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
-  device const bfloat* w = query ? QW : KW;
+  device coherent(device) const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
+  device coherent(device) const bfloat* w = query ? QW : KW;
   const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
-  device bfloat* key = nullptr;
-  device bfloat* value = nullptr;
+  device coherent(device) bfloat* key = nullptr;
+  device coherent(device) bfloat* value = nullptr;
   if (CACHE && !query) {
     const uint hk = head - a.heads;
     const int st = nodes[4 * row + 1], base = 8 + st * 12;
@@ -157,9 +157,9 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
     key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
     value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
   }
-  device bfloat* y = !query ? (CACHE ? key : KY + (row * a.kv_heads + head - a.heads) * a.width)
+  device coherent(device) bfloat* y = !query ? (CACHE ? key : KY + (row * a.kv_heads + head - a.heads) * a.width)
                             : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
-  const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
+  const bfloat4 xa = *(device coherent(device) const bfloat4*)(x + 4 * lane), xb = *(device coherent(device) const bfloat4*)(x + 128 + 4 * lane);
   float sa = 0.0f, sb = 0.0f;
   for (uint j = 0; j != 4; ++j) {
     const float value = float(xa[j]);
@@ -202,42 +202,42 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
     ya[j] = bfloat(value);
     yb[j] = bfloat(nb[j]);
   }
-  *(device bfloat4*)(y + 4 * lane) = ya;
-  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+  *(device coherent(device) bfloat4*)(y + 4 * lane) = ya;
+  *(device coherent(device) bfloat4*)(y + 128 + 4 * lane) = yb;
   if (PACK && query && row == 0 && head == kv_head * g)
     for (uint r = a.rows * g; r < a.packed_rows; ++r) {
-      device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
-      *(device bfloat4*)(pad + 4 * lane) = ya;
-      *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+      device coherent(device) bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
+      *(device coherent(device) bfloat4*)(pad + 4 * lane) = ya;
+      *(device coherent(device) bfloat4*)(pad + 128 + 4 * lane) = yb;
     }
   if (DEC && query) {
     const uint gq = a.heads / a.kv_heads, hq = head / gq;
-    device bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
-    *(device bfloat4*)(packed + 4 * lane) = ya;
-    *(device bfloat4*)(packed + 128 + 4 * lane) = yb;
+    device coherent(device) bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
+    *(device coherent(device) bfloat4*)(packed + 4 * lane) = ya;
+    *(device coherent(device) bfloat4*)(packed + 128 + 4 * lane) = yb;
     if (row == 0 && head == hq * gq)
       for (uint r = a.rows * gq; r < a.packed_rows; ++r) {
-        device bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
-        *(device bfloat4*)(pad + 4 * lane) = ya;
-        *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+        device coherent(device) bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
+        *(device coherent(device) bfloat4*)(pad + 4 * lane) = ya;
+        *(device coherent(device) bfloat4*)(pad + 128 + 4 * lane) = yb;
       }
   }
   if (DEC && !query) {
     const uint hk = head - a.heads;
     const int st = nodes[4 * row + 1], base = 8 + st * 12;
     const uint slot = uint(meta[base + 4]) + row - uint(meta[base + 6]);
-    device bfloat* key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
-    *(device bfloat4*)(key + 4 * lane) = ya;
-    *(device bfloat4*)(key + 128 + 4 * lane) = yb;
-    device bfloat* value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
-    device const bfloat* source = V + row * v_stride + hk * a.width;
-    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
-    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
+    device coherent(device) bfloat* key = caches[st].keys + ulong(hk) * uint(meta[base + 7]) + slot * a.width;
+    *(device coherent(device) bfloat4*)(key + 4 * lane) = ya;
+    *(device coherent(device) bfloat4*)(key + 128 + 4 * lane) = yb;
+    device coherent(device) bfloat* value = caches[st].values + ulong(hk) * uint(meta[base + 8]) + slot * a.width;
+    device coherent(device) const bfloat* source = V + row * v_stride + hk * a.width;
+    *(device coherent(device) bfloat4*)(value + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 4 * lane);
+    *(device coherent(device) bfloat4*)(value + 128 + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 128 + 4 * lane);
   }
   if (CACHE && !query) {
-    device const bfloat* source = V + row * v_stride + (head - a.heads) * a.width;
-    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
-    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
+    device coherent(device) const bfloat* source = V + row * v_stride + (head - a.heads) * a.width;
+    *(device coherent(device) bfloat4*)(value + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 4 * lane);
+    *(device coherent(device) bfloat4*)(value + 128 + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 128 + 4 * lane);
   }
 }
 
@@ -246,9 +246,9 @@ inline void q27_head_norm_rope_rows_direct(device const bfloat* Q, device const 
 // count their threadgroups on NC[0] past a device fence; each group reads them once the count reaches wait_for (bounded),
 // past its own fence, and the last group leaves both words zero for the next pair (as tf_delta_gdn_pre_rows does)
 #define Q27_HEAD_NORM_ROPE_DIRECT(NAME, PACK) \
-kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
-                 device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
-                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
+kernel void NAME(device coherent(device) const bfloat* Q [[buffer(0)]], device coherent(device) const bfloat* K [[buffer(1)]], device coherent(device) const bfloat* QW [[buffer(2)]], \
+                 device coherent(device) const bfloat* KW [[buffer(3)]], device coherent(device) const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
+                 device coherent(device) bfloat* QY [[buffer(6)]], device coherent(device) bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
                  constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
@@ -271,11 +271,11 @@ Q27_HEAD_NORM_ROPE_DIRECT(q27_head_norm_rope_packed, true)
 
 // A prompt plan's rows (one stream, no wait): q27_head_norm_rope_packed with each k head's rotated key and value row
 // stored in their cache slots (CACHE) instead of the key in KY, so no q27_attn_append8 follows.
-kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
-                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
-                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]],
-                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
-                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+kernel void q27_head_norm_rope_packed_cached(device coherent(device) const bfloat* Q [[buffer(0)]], device coherent(device) const bfloat* K [[buffer(1)]],
+                 device coherent(device) const bfloat* QW [[buffer(2)]], device coherent(device) const bfloat* KW [[buffer(3)]], device coherent(device) const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device coherent(device) bfloat* QY [[buffer(6)]],
+                 device coherent(device) const Q27HeadCaches* caches [[buffer(11)]], device coherent(device) const int* meta [[buffer(12)]],
+                 device coherent(device) const int* nodes [[buffer(13)]], device coherent(device) const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
                  uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
   q27_head_norm_rope_rows_direct<true, false, true>(Q, K, QW, KW, positions, a, QY, nullptr, group, sg, lane, nullptr, caches, meta,
@@ -286,16 +286,16 @@ kernel void q27_head_norm_rope_packed_cached(device const bfloat* Q [[buffer(0)]
 // counted q and k|v projections (q27_head_norm_rope_held): the head's norm gains, the lane's rope cosine and sine (the
 // row's position comes from the host), and (DEC, k heads) the row's key and value cache rows from the plan's nodes and
 // meta and the caches table. The rows' own words (Q, K, V) are read behind the wait.
-struct Q27RopeHeld { float wa[4], wb[4]; float c, s; device bfloat* key; device bfloat* value; };
+struct Q27RopeHeld { float wa[4], wb[4]; float c, s; device coherent(device) bfloat* key; device coherent(device) bfloat* value; };
 template <bool DEC>
-inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat* KW, device const int* positions, constant HeadRope& a,
+inline void q27_head_norm_rope_held(device coherent(device) const bfloat* QW, device coherent(device) const bfloat* KW, device coherent(device) const int* positions, constant HeadRope& a,
                                     uint2 group, uint sg, uint lane, thread Q27RopeHeld& h,
-                                    device const Q27HeadCaches* caches = nullptr, device const int* meta = nullptr,
-                                    device const int* nodes = nullptr) {
+                                    device coherent(device) const Q27HeadCaches* caches = nullptr, device coherent(device) const int* meta = nullptr,
+                                    device coherent(device) const int* nodes = nullptr) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
-  device const bfloat* w = query ? QW : KW;
+  device coherent(device) const bfloat* w = query ? QW : KW;
   for (uint j = 0; j != 4; ++j) h.wa[j] = float(w[4 * lane + j]);
   for (uint j = 0; j != 4; ++j) h.wb[j] = float(w[128 + 4 * lane + j]);
   const uint pairs = a.rotary / 2;
@@ -317,17 +317,17 @@ inline void q27_head_norm_rope_held(device const bfloat* QW, device const bfloat
   }
 }
 template <bool PACK, bool DEC>
-inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat* K, constant HeadRope& a, device bfloat* QY,
-                                    device bfloat* KY, uint2 group, uint sg, uint lane, thread const Q27RopeHeld& h,
-                                    device bfloat* QA = nullptr, device const bfloat* V = nullptr, uint v_stride = 0) {
+inline void q27_head_norm_rope_rows(device coherent(device) const bfloat* Q, device coherent(device) const bfloat* K, constant HeadRope& a, device coherent(device) bfloat* QY,
+                                    device coherent(device) bfloat* KY, uint2 group, uint sg, uint lane, thread const Q27RopeHeld& h,
+                                    device coherent(device) bfloat* QA = nullptr, device coherent(device) const bfloat* V = nullptr, uint v_stride = 0) {
   const uint head = group.x * 4 + sg, row = group.y;
   if (head >= a.heads + a.kv_heads) return;
   const bool query = head < a.heads;
-  device const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
+  device coherent(device) const bfloat* x = query ? Q + (row * a.heads + head) * a.stride : K + row * a.key_stride + (head - a.heads) * a.width;
   const uint g = PACK ? a.heads / a.kv_heads : 0, kv_head = PACK ? head / g : 0;
-  device bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
+  device coherent(device) bfloat* y = !query ? KY + (row * a.kv_heads + head - a.heads) * a.width
                             : QY + (PACK ? kv_head * a.packed_rows + row * g + head - kv_head * g : row * a.heads + head) * a.width;
-  const bfloat4 xa = *(device const bfloat4*)(x + 4 * lane), xb = *(device const bfloat4*)(x + 128 + 4 * lane);
+  const bfloat4 xa = *(device coherent(device) const bfloat4*)(x + 4 * lane), xb = *(device coherent(device) const bfloat4*)(x + 128 + 4 * lane);
   float sa = 0.0f, sb = 0.0f;
   for (uint j = 0; j != 4; ++j) {
     const float value = float(xa[j]);
@@ -363,35 +363,35 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
     ya[j] = bfloat(value);
     yb[j] = bfloat(nb[j]);
   }
-  *(device bfloat4*)(y + 4 * lane) = ya;
-  *(device bfloat4*)(y + 128 + 4 * lane) = yb;
+  *(device coherent(device) bfloat4*)(y + 4 * lane) = ya;
+  *(device coherent(device) bfloat4*)(y + 128 + 4 * lane) = yb;
   if (PACK && query && row == 0 && head == kv_head * g)
     for (uint r = a.rows * g; r < a.packed_rows; ++r) {
-      device bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
-      *(device bfloat4*)(pad + 4 * lane) = ya;
-      *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+      device coherent(device) bfloat* pad = QY + (kv_head * a.packed_rows + r) * a.width;
+      *(device coherent(device) bfloat4*)(pad + 4 * lane) = ya;
+      *(device coherent(device) bfloat4*)(pad + 128 + 4 * lane) = yb;
     }
   if (DEC && query) {
     const uint gq = a.heads / a.kv_heads, hq = head / gq;
-    device bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
-    *(device bfloat4*)(packed + 4 * lane) = ya;
-    *(device bfloat4*)(packed + 128 + 4 * lane) = yb;
+    device coherent(device) bfloat* packed = QA + (hq * a.packed_rows + row * gq + head - hq * gq) * a.width;
+    *(device coherent(device) bfloat4*)(packed + 4 * lane) = ya;
+    *(device coherent(device) bfloat4*)(packed + 128 + 4 * lane) = yb;
     if (row == 0 && head == hq * gq)
       for (uint r = a.rows * gq; r < a.packed_rows; ++r) {
-        device bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
-        *(device bfloat4*)(pad + 4 * lane) = ya;
-        *(device bfloat4*)(pad + 128 + 4 * lane) = yb;
+        device coherent(device) bfloat* pad = QA + (hq * a.packed_rows + r) * a.width;
+        *(device coherent(device) bfloat4*)(pad + 4 * lane) = ya;
+        *(device coherent(device) bfloat4*)(pad + 128 + 4 * lane) = yb;
       }
   }
   if (DEC && !query) {
     const uint hk = head - a.heads;
-    device bfloat* key = h.key;
-    *(device bfloat4*)(key + 4 * lane) = ya;
-    *(device bfloat4*)(key + 128 + 4 * lane) = yb;
-    device bfloat* value = h.value;
-    device const bfloat* source = V + row * v_stride + hk * a.width;
-    *(device bfloat4*)(value + 4 * lane) = *(device const bfloat4*)(source + 4 * lane);
-    *(device bfloat4*)(value + 128 + 4 * lane) = *(device const bfloat4*)(source + 128 + 4 * lane);
+    device coherent(device) bfloat* key = h.key;
+    *(device coherent(device) bfloat4*)(key + 4 * lane) = ya;
+    *(device coherent(device) bfloat4*)(key + 128 + 4 * lane) = yb;
+    device coherent(device) bfloat* value = h.value;
+    device coherent(device) const bfloat* source = V + row * v_stride + hk * a.width;
+    *(device coherent(device) bfloat4*)(value + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 4 * lane);
+    *(device coherent(device) bfloat4*)(value + 128 + 4 * lane) = *(device coherent(device) const bfloat4*)(source + 128 + 4 * lane);
   }
 }
 
@@ -399,9 +399,9 @@ inline void q27_head_norm_rope_rows(device const bfloat* Q, device const bfloat*
 // count their threadgroups on NC[0] past a device fence; each group reads them once the count reaches wait_for (bounded),
 // past its own fence, and the last group leaves both words zero for the next pair (as tf_delta_gdn_pre_rows does)
 #define Q27_HEAD_NORM_ROPE(NAME, PACK) \
-kernel void NAME(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* QW [[buffer(2)]], \
-                 device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
-                 device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
+kernel void NAME(device coherent(device) const bfloat* Q [[buffer(0)]], device coherent(device) const bfloat* K [[buffer(1)]], device coherent(device) const bfloat* QW [[buffer(2)]], \
+                 device coherent(device) const bfloat* KW [[buffer(3)]], device coherent(device) const int* positions [[buffer(4)]], constant HeadRope& a [[buffer(5)]], \
+                 device coherent(device) bfloat* QY [[buffer(6)]], device coherent(device) bfloat* KY [[buffer(7)]], device atomic_uint* NC [[buffer(8)]], \
                  constant uint& wait_for [[buffer(9)]], uint2 group [[threadgroup_position_in_grid]], \
                  uint2 groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
@@ -428,12 +428,12 @@ Q27_HEAD_NORM_ROPE(q27_head_norm_rope_packed_held, true)
 // keys and values in their cache slots, so no q27_attn_pack_a or q27_attn_append follows. It waits on its counted
 // projections as q27_head_norm_rope does; count_out above 0: every group counts itself on PC[0] once stored, for the
 // prefix that shares its barrier interval.
-kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]],
-                 device const bfloat* QW [[buffer(2)]], device const bfloat* KW [[buffer(3)]], device const int* positions [[buffer(4)]],
-                 constant HeadRope& a [[buffer(5)]], device bfloat* QY [[buffer(6)]], device bfloat* KY [[buffer(7)]],
-                 device atomic_uint* NC [[buffer(8)]], constant uint& wait_for [[buffer(9)]], device bfloat* QA [[buffer(10)]],
-                 device const Q27HeadCaches* caches [[buffer(11)]], device const int* meta [[buffer(12)]],
-                 device const int* nodes [[buffer(13)]], device const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
+kernel void q27_head_norm_rope_decoded(device coherent(device) const bfloat* Q [[buffer(0)]], device coherent(device) const bfloat* K [[buffer(1)]],
+                 device coherent(device) const bfloat* QW [[buffer(2)]], device coherent(device) const bfloat* KW [[buffer(3)]], device coherent(device) const int* positions [[buffer(4)]],
+                 constant HeadRope& a [[buffer(5)]], device coherent(device) bfloat* QY [[buffer(6)]], device coherent(device) bfloat* KY [[buffer(7)]],
+                 device atomic_uint* NC [[buffer(8)]], constant uint& wait_for [[buffer(9)]], device coherent(device) bfloat* QA [[buffer(10)]],
+                 device coherent(device) const Q27HeadCaches* caches [[buffer(11)]], device coherent(device) const int* meta [[buffer(12)]],
+                 device coherent(device) const int* nodes [[buffer(13)]], device coherent(device) const bfloat* V [[buffer(14)]], constant uint& v_stride [[buffer(15)]],
                  device atomic_uint* PC [[buffer(16)]], constant uint& count_out [[buffer(17)]],
                  uint2 group [[threadgroup_position_in_grid]], uint2 groups [[threadgroups_per_grid]],
                  uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -464,8 +464,8 @@ kernel void q27_head_norm_rope_decoded(device const bfloat* Q [[buffer(0)]], dev
 struct Element { uint width, heads, rows, activation; };
 
 // SiLU(gate) times up reads stacked [gate|up] rows with one final native activation rounding.
-kernel void q27_mlp(device const uchar* GU [[buffer(0)]], constant Element& a [[buffer(1)]],
-                    device uchar* OUT [[buffer(2)]], uint2 at [[thread_position_in_grid]]) {
+kernel void q27_mlp(device coherent(device) const uchar* GU [[buffer(0)]], constant Element& a [[buffer(1)]],
+                    device coherent(device) uchar* OUT [[buffer(2)]], uint2 at [[thread_position_in_grid]]) {
   if (at.x >= a.width || at.y >= a.rows) return;
   const float gate = q27_read(GU, at.y * 2 * a.width + at.x, a.activation);
   const float up = q27_read(GU, at.y * 2 * a.width + a.width + at.x, a.activation);
@@ -473,8 +473,8 @@ kernel void q27_mlp(device const uchar* GU [[buffer(0)]], constant Element& a [[
 }
 
 // Attention uses the native-rounded sigmoid before multiplying its output, matching the Metal row family.
-kernel void q27_gate(device const uchar* O [[buffer(0)]], device const uchar* QG [[buffer(1)]],
-                     constant Element& a [[buffer(2)]], device uchar* OUT [[buffer(3)]],
+kernel void q27_gate(device coherent(device) const uchar* O [[buffer(0)]], device coherent(device) const uchar* QG [[buffer(1)]],
+                     constant Element& a [[buffer(2)]], device coherent(device) uchar* OUT [[buffer(3)]],
                      uint3 at [[thread_position_in_grid]]) {
   if (at.x >= a.width || at.y >= a.heads || at.z >= a.rows) return;
   const uint index = (at.z * a.heads + at.y) * a.width + at.x;
@@ -486,9 +486,9 @@ kernel void q27_gate(device const uchar* O [[buffer(0)]], device const uchar* QG
 struct Post { uint width, heads, rows, stride, offset, activation, gain; float eps; };
 
 // GDN post-norm retains the rounded normalized result before the fp32 SiLU product, as row_glue.gdn_post.
-kernel void q27_gdn_post(device const uchar* REC [[buffer(0)]], device const uchar* Z [[buffer(1)]],
-                         device const uchar* W [[buffer(2)]], constant Post& a [[buffer(3)]],
-                         device uchar* OUT [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+kernel void q27_gdn_post(device coherent(device) const uchar* REC [[buffer(0)]], device coherent(device) const uchar* Z [[buffer(1)]],
+                         device coherent(device) const uchar* W [[buffer(2)]], constant Post& a [[buffer(3)]],
+                         device coherent(device) uchar* OUT [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint head = group.y, row = group.z, per = a.width / 32;
   float values[16], square = 0.0f;

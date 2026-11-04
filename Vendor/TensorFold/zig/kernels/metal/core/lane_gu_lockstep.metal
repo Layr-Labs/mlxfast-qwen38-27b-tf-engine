@@ -1,6 +1,6 @@
 // K64 lockstep G/U scheduler for the guarded decoded indexed GU path. Same two SGs, original split chains and register activation.
 [[max_total_threads_per_threadgroup(64)]]
-kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],
+kernel void tf_lane_lockstep(const device coherent(device) bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device coherent(device) bfloat* Y [[buffer(4)]],const device coherent(device) float* XS [[buffer(5)]],device coherent(device) float* HS [[buffer(6)]],
 #if defined(TF_GU_COUNT)
  device atomic_uint* GC [[buffer(7)]],
 #endif
@@ -83,7 +83,7 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
 
  // Literal original two-SG register-local SwiGLU/HS epilogue; only C is named U.
  threadgroup bfloat hb[8*64];
- if(mb<M){const int c0=ks*32+nb;device bfloat* yr=Y+(size_t)mb*(TF_N/2)+int(tg.x)*64+c0;threadgroup bfloat* hr=hb+mb*64+c0;
+ if(mb<M){const int c0=ks*32+nb;device coherent(device) bfloat* yr=Y+(size_t)mb*(TF_N/2)+int(tg.x)*64+c0;threadgroup bfloat* hr=hb+mb*64+c0;
   for(int i=0;i<16;i++){if(!TF_LIVE(i))continue;const int c=16*(i>>3)+(i&3);const float gf=float(bfloat(G[i]));const bfloat h=bfloat(gf/(1.0f+metal::exp(-gf))*float(bfloat(U[i])));yr[c]=h;hr[c]=h;}
  }
  threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -4,14 +4,14 @@ using namespace metal;
 typedef bfloat bfloat16_t;
 typedef half float16_t;
 [[kernel]] void custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float(
-  const device bfloat16_t* H [[buffer(0)]],
-  const device bfloat16_t* R [[buffer(1)]],
+  const device coherent(device) bfloat16_t* H [[buffer(0)]],
+  const device coherent(device) bfloat16_t* R [[buffer(1)]],
   const device bfloat16_t* Wt [[buffer(2)]],
   const constant float* eps [[buffer(3)]],
   const device int32_t* dims [[buffer(4)]],
-  device bfloat16_t* HO [[buffer(5)]],
-  device bfloat16_t* XO [[buffer(6)]],
-  device float* XS [[buffer(7)]],
+  device coherent(device) bfloat16_t* HO [[buffer(5)]],
+  device coherent(device) bfloat16_t* XO [[buffer(6)]],
+  device coherent(device) float* XS [[buffer(7)]],
   device atomic_uint* NC [[buffer(8)]],
   constant uint& wait_for [[buffer(9)]],
   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
@@ -40,7 +40,7 @@ Q27_SPECIALIZE
   // this barrier interval, so their words are requested before the wait below; only R's follow it.
   bfloat4 h4[E / 4], r4[E / 4], w4[E / 4];
   for (int j = 0; j < E / 8; j++) {
-    const uint4 hw = ((const device uint4*)(H + base))[j];
+    const uint4 hw = ((const device coherent(device) uint4*)(H + base))[j];
     h4[2 * j] = as_type<bfloat4>(hw.xy);
     h4[2 * j + 1] = as_type<bfloat4>(hw.zw);
   }
@@ -66,7 +66,7 @@ Q27_SPECIALIZE
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   for (int j = 0; j < E / 8; j++) {
-    const uint4 rw = ((const device uint4*)(R + base))[j];
+    const uint4 rw = ((const device coherent(device) uint4*)(R + base))[j];
     r4[2 * j] = as_type<bfloat4>(rw.xy);
     r4[2 * j + 1] = as_type<bfloat4>(rw.zw);
   }
@@ -79,7 +79,7 @@ Q27_SPECIALIZE
     hv[i] = float(h);
     ss = fma(hv[i], hv[i], ss);
   }
-  for (int j = 0; j < E / 8; j++) ((device uint4*)(HO + base))[j] = uint4(as_type<uint2>(o4[2 * j]), as_type<uint2>(o4[2 * j + 1]));
+  for (int j = 0; j < E / 8; j++) ((device coherent(device) uint4*)(HO + base))[j] = uint4(as_type<uint2>(o4[2 * j]), as_type<uint2>(o4[2 * j + 1]));
   ss = simd_sum(ss);
   if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -93,7 +93,7 @@ Q27_SPECIALIZE
     x4[i / 4][i % 4] = x;
     xv[i] = float(x);
   }
-  for (int j = 0; j < E / 8; j++) ((device uint4*)(XO + base))[j] = uint4(as_type<uint2>(x4[2 * j]), as_type<uint2>(x4[2 * j + 1]));
+  for (int j = 0; j < E / 8; j++) ((device coherent(device) uint4*)(XO + base))[j] = uint4(as_type<uint2>(x4[2 * j]), as_type<uint2>(x4[2 * j + 1]));
   // a group's 64 values summed in order from zero, as the lane projection's sums are: its four threads take turns
   float gs = 0.0f;
   for (uint turn = 0; turn < 4; turn++) {

@@ -58,7 +58,7 @@ inline tf_raw tf_lane_fetch(const device uint* W, const device uint4* SB, int ti
   return raw;
 }
 
-inline float tf_lane_xsum(const device bfloat* X, int m, int g, int M) {
+inline float tf_lane_xsum(const device coherent(device) bfloat* X, int m, int g, int M) {
   float acc = 0.0f;
   if (m < M) for (int i = 0; i < GS; i++) acc += float(X[(size_t)m * TF_K + g * GS + i]);
   return acc;
@@ -160,10 +160,10 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
         }                                                                                                      \
   }
 
-[[kernel]] void tf_lane(const device bfloat* X [[buffer(0)]], const device uint* W [[buffer(1)]],
-    const device bfloat* SBt [[buffer(2)]], const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]],
+[[kernel]] void tf_lane(const device coherent(device) bfloat* X [[buffer(0)]], const device uint* W [[buffer(1)]],
+    const device bfloat* SBt [[buffer(2)]], const device int* mdims [[buffer(3)]], device coherent(device) TF_OUT* Y [[buffer(4)]],
 #if TF_PRECOMPUTE_SUMS
-    const device float* XS [[buffer(5)]],
+    const device coherent(device) float* XS [[buffer(5)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]],
     uint tgx [[threadgroup_position_in_grid]]) {
@@ -225,7 +225,7 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
 }
 
 #if TF_PRECOMPUTE_SUMS
-kernel void tf_lane_sums(const device bfloat* X [[buffer(0)]],constant int& rows [[buffer(1)]],device float* XS [[buffer(2)]],constant int& stride [[buffer(3)]],uint index [[thread_position_in_grid]]) {
+kernel void tf_lane_sums(const device coherent(device) bfloat* X [[buffer(0)]],constant int& rows [[buffer(1)]],device coherent(device) float* XS [[buffer(2)]],constant int& stride [[buffer(3)]],uint index [[thread_position_in_grid]]) {
   const int row=int(index)%stride,group=int(index)/stride;
   if(group>=KG)return;
   XS[index]=tf_lane_xsum(X,row,group,rows);
@@ -233,9 +233,9 @@ kernel void tf_lane_sums(const device bfloat* X [[buffer(0)]],constant int& rows
 #endif
 
 #if TF_BITS == 4
-kernel void tf_lane_pair(const device bfloat* X [[buffer(0)]],const device uint* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device TF_OUT* Y [[buffer(4)]],
+kernel void tf_lane_pair(const device coherent(device) bfloat* X [[buffer(0)]],const device uint* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device coherent(device) TF_OUT* Y [[buffer(4)]],
 #if TF_PRECOMPUTE_SUMS
-const device float* XS [[buffer(5)]],
+const device coherent(device) float* XS [[buffer(5)]],
 #endif
 uint group_id [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint thread_id [[thread_position_in_threadgroup]],uint tile_id [[threadgroup_position_in_grid]]) {
   const uint sg=group_id/2,tip=thread_id-sg*64;
@@ -324,7 +324,7 @@ inline uint4 tf_look12b(const device uint* tab, uint3 ix) {
 #define TF_PART 16
 #endif
 
-inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device float* XS, int g, int n, int m, int stride) {
+inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv, const device coherent(device) float* XS, int g, int n, int m, int stride) {
 #if defined(TF_ROWS8)
   return {wl[(size_t)g * TF_TB * TF_RW], TF_BITS == 2 ? uint4(0) : wl[(size_t)g * TF_TB * TF_RW + 32], sbv[((size_t)g * TF_N + n) / 4], sbv[((size_t)g * TF_N + n + 16) / 4], XS[g * stride + m], 0.0f};
 #else
@@ -359,10 +359,10 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
-[[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
-    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+[[kernel]] void tf_lane_reg(const device coherent(device) bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device coherent(device) TF_OUT* Y [[buffer(4)]], const device coherent(device) float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
-    device float* HS [[buffer(6)]],
+    device coherent(device) float* HS [[buffer(6)]],
 #elif defined(TF_COUNT)
     device atomic_uint* TC [[buffer(6)]],
 #endif
@@ -449,8 +449,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // multiples of 4), without the per-group 64-bit index arithmetic
   const device uint4* cp = wl + (size_t)first * TF_TB * TF_RW;
   const device uint4* sp = sbv + ((size_t)first * TF_N + n0 + nb) / 4;
-  const device float* xp = XS + first * stride + mb;
-  const device bfloat* xv = X + (size_t)first * GS;
+  const device coherent(device) float* xp = XS + first * stride + mb;
+  const device coherent(device) bfloat* xv = X + (size_t)first * GS;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = TF_BITS == 2 ? uint4(0) : cp[32]; }
   for (int g = first; g < last; g++) {
@@ -581,12 +581,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i];
 #if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
+#ifndef TF_TGPAD1
+#define TF_TGPAD1 0
 #endif
-#if TF_TGPAD > 0
-  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
+#if TF_TGPAD1 > 0
+  // the parallel prompt launches' threadgroup-memory reserve for the serial ones too; the use never runs (0: none)
+  threadgroup float tgpad1[TF_TGPAD1 / 4];
   if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
 #endif
 #endif
@@ -644,7 +644,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   threadgroup bfloat hb[8 * 64];
   if (mb < M) {
     const int c0 = ks * 32 + nb;
-    device TF_OUT* yr = Y + (size_t)mb * (TF_N / 2) + int(tg.x) * 64 + c0;
+    device coherent(device) TF_OUT* yr = Y + (size_t)mb * (TF_N / 2) + int(tg.x) * 64 + c0;
     threadgroup bfloat* hr = hb + mb * 64 + c0;
     for (int i = 0; i < 16; i++) {
       if (!TF_LIVE(i)) continue;
@@ -666,7 +666,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_ROWS8)
   // a live word's row is mb, and N is whole tiles, so one row test and one pointer cover the lane's eight stores
   if (ks == 0 && mb < M) {
-    device TF_OUT* yr = Y + (size_t)mb * TF_YS + TF_YCOL(tg.x, n0) + nb;
+    device coherent(device) TF_OUT* yr = Y + (size_t)mb * TF_YS + TF_YCOL(tg.x, n0) + nb;
     for (int i = 0; i < 16; i++) if (TF_LIVE(i)) yr[16 * (i >> 3) + (i & 3)] = static_cast<TF_OUT>(C[i]);
   }
 #else
@@ -799,12 +799,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
 [[max_total_threads_per_threadgroup(32 * TF_SK)]]
 #endif
-[[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
-    const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+[[kernel]] void tf_lane_reg(const device coherent(device) bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+    const device int* mdims [[buffer(3)]], device coherent(device) TF_OUT* Y [[buffer(4)]], const device coherent(device) float* XS [[buffer(5)]],
 #if defined(TF_SWIGLU)
-    device float* HS [[buffer(6)]],
+    device coherent(device) float* HS [[buffer(6)]],
 #elif defined(TF_RESID)
-    const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
+    const device coherent(device) bfloat* H [[buffer(6)]], device coherent(device) bfloat* RO [[buffer(7)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
@@ -859,8 +859,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
-  const device float* xp = XS + first * stride + mb;
-  const device bfloat* xv = X + (size_t)first * GS;
+  const device coherent(device) float* xp = XS + first * stride + mb;
+  const device coherent(device) bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
     const float x0 = xp[0], x1 = xp[8];
@@ -950,7 +950,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_RESID)
           // the residual stream's next rows: the output word as the store rounds it, added to the hidden word as
           // q27_norm_xs adds them (h + r, rounded to bf16); the norm then reads these rows alone
-          const vec<bfloat, 4> h = *(const device vec<bfloat, 4>*)(H + (size_t)m * TF_YS + n);
+          const vec<bfloat, 4> h = *(const device coherent(device) vec<bfloat, 4>*)(H + (size_t)m * TF_YS + n);
           vec<bfloat, 4> r;
           TF_UNROLL
           for (int j = 0; j < 4; j++) r[j] = bfloat(float(h[j]) + float(static_cast<bfloat>(C[t][4 * q + j])));

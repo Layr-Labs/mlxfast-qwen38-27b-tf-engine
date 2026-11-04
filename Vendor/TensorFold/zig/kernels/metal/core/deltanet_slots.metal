@@ -2,20 +2,20 @@
 struct TfDeltaSlotStep { uint row; int read_slot; int write_slot; };
 // SLOTS register slots: a chain needs one, a tree its peak of live branch states; fewer slots, fewer selects a node.
 template <uint SLOTS>
-kernel void tf_delta_gdn_tree_slots(device const bfloat* query [[buffer(0)]],
-                         device const bfloat* key [[buffer(1)]],
-                         device const bfloat* value [[buffer(2)]],
-                         device const float* decay [[buffer(3)]],
-                         device const bfloat* mixing [[buffer(4)]],
-                         device const float* committed [[buffer(5)]],
-                         device const int* parents [[buffer(6)]],
-                         device const TfDeltaSegment* segments [[buffer(7)]],
+kernel void tf_delta_gdn_tree_slots(device coherent(device) const bfloat* query [[buffer(0)]],
+                         device coherent(device) const bfloat* key [[buffer(1)]],
+                         device coherent(device) const bfloat* value [[buffer(2)]],
+                         device coherent(device) const float* decay [[buffer(3)]],
+                         device coherent(device) const bfloat* mixing [[buffer(4)]],
+                         device coherent(device) const float* committed [[buffer(5)]],
+                         device coherent(device) const int* parents [[buffer(6)]],
+                         device coherent(device) const TfDeltaSegment* segments [[buffer(7)]],
                          constant TfDeltaParams& p [[buffer(8)]],
-                         device bfloat* output [[buffer(9)]],
-                         device float* snapshots [[buffer(10)]],
-                         device const TfDeltaSlotStep* steps [[buffer(11)]],
-                         device float* advanced [[buffer(12)]],
-                         device float* before [[buffer(13)]],
+                         device coherent(device) bfloat* output [[buffer(9)]],
+                         device coherent(device) float* snapshots [[buffer(10)]],
+                         device coherent(device) const TfDeltaSlotStep* steps [[buffer(11)]],
+                         device coherent(device) float* advanced [[buffer(12)]],
+                         device coherent(device) float* before [[buffer(13)]],
                          uint3 position [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -49,15 +49,15 @@ kernel void tf_delta_gdn_tree_slots(device const bfloat* query [[buffer(0)]],
 }
 // One live state (a chain) for two adjacent value columns a simdgroup: each column's update and read are tree_slots<1>'s,
 // in the same lanes and order; the row's key, query, decay and mixing serve both columns.
-inline void tf_delta_tree_node2(thread float4& s0, thread float4& s1, device const bfloat* query, device const bfloat* key,
-                                device const bfloat* value, device const float* decay, device const bfloat* mixing,
-                                constant TfDeltaParams& p, device bfloat* output, uint row, uint head, uint key_head,
+inline void tf_delta_tree_node2(thread float4& s0, thread float4& s1, device coherent(device) const bfloat* query, device coherent(device) const bfloat* key,
+                                device coherent(device) const bfloat* value, device coherent(device) const float* decay, device coherent(device) const bfloat* mixing,
+                                constant TfDeltaParams& p, device coherent(device) bfloat* output, uint row, uint head, uint key_head,
                                 uint dimension, uint lane) {
   float a[4] = {s0[0], s0[1], s0[2], s0[3]};
   float b[4] = {s1[0], s1[1], s1[2], s1[3]};
   const uint at = row * p.nv + head;
-  device const bfloat* k = key + (row * p.nk + key_head) * p.dk;
-  device const bfloat* q = query + (row * p.nk + key_head) * p.dk;
+  device coherent(device) const bfloat* k = key + (row * p.nk + key_head) * p.dk;
+  device coherent(device) const bfloat* q = query + (row * p.nk + key_head) * p.dk;
   tf_delta_delta_update(a, k, decay[at], float(value[at * p.dv + dimension]), float(mixing[at]), lane, 4);
   tf_delta_delta_update(b, k, decay[at], float(value[at * p.dv + dimension + 1]), float(mixing[at]), lane, 4);
   const float ra = tf_delta_delta_read(a, q, lane, 4);
@@ -69,20 +69,20 @@ inline void tf_delta_tree_node2(thread float4& s0, thread float4& s1, device con
   s0 = float4(a[0], a[1], a[2], a[3]);
   s1 = float4(b[0], b[1], b[2], b[3]);
 }
-kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
-                         device const bfloat* key [[buffer(1)]],
-                         device const bfloat* value [[buffer(2)]],
-                         device const float* decay [[buffer(3)]],
-                         device const bfloat* mixing [[buffer(4)]],
-                         device const float* committed [[buffer(5)]],
-                         device const int* parents [[buffer(6)]],
-                         device const TfDeltaSegment* segments [[buffer(7)]],
+kernel void tf_delta_gdn_tree_pair(device coherent(device) const bfloat* query [[buffer(0)]],
+                         device coherent(device) const bfloat* key [[buffer(1)]],
+                         device coherent(device) const bfloat* value [[buffer(2)]],
+                         device coherent(device) const float* decay [[buffer(3)]],
+                         device coherent(device) const bfloat* mixing [[buffer(4)]],
+                         device coherent(device) const float* committed [[buffer(5)]],
+                         device coherent(device) const int* parents [[buffer(6)]],
+                         device coherent(device) const TfDeltaSegment* segments [[buffer(7)]],
                          constant TfDeltaParams& p [[buffer(8)]],
-                         device bfloat* output [[buffer(9)]],
-                         device float* snapshots [[buffer(10)]],
-                         device const TfDeltaSlotStep* steps [[buffer(11)]],
-                         device float* advanced [[buffer(12)]],
-                         device float* before [[buffer(13)]],
+                         device coherent(device) bfloat* output [[buffer(9)]],
+                         device coherent(device) float* snapshots [[buffer(10)]],
+                         device coherent(device) const TfDeltaSlotStep* steps [[buffer(11)]],
+                         device coherent(device) float* advanced [[buffer(12)]],
+                         device coherent(device) float* before [[buffer(13)]],
                          uint3 position [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const uint segment_index = position.z / p.nv, head = position.z % p.nv;
@@ -122,7 +122,7 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
       advanced[at + p.dk] = last1[part];
     }
 }
-#define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device const bfloat*, device const bfloat*, device const bfloat*, device const float*, device const bfloat*, device const float*, device const int*, device const TfDeltaSegment*, constant TfDeltaParams&, device bfloat*, device float*, device const TfDeltaSlotStep*, device float*, device float*, uint3, uint);
+#define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device coherent(device) const bfloat*, device coherent(device) const bfloat*, device coherent(device) const bfloat*, device coherent(device) const float*, device coherent(device) const bfloat*, device coherent(device) const float*, device coherent(device) const int*, device coherent(device) const TfDeltaSegment*, constant TfDeltaParams&, device coherent(device) bfloat*, device coherent(device) float*, device coherent(device) const TfDeltaSlotStep*, device coherent(device) float*, device coherent(device) float*, uint3, uint);
 TF_TREE_SLOTS(1)
 TF_TREE_SLOTS(2)
 TF_TREE_SLOTS(4)
@@ -181,11 +181,11 @@ inline float2 tf_delta_delta_read_words2(thread const float* a, thread const flo
 // and both value words are loaded and converted once; each column then runs tf_delta_tree_node's update and read in the
 // same lanes and order. Returns both columns' outputs: the caller stores them once node 0's children have loaded their
 // rows, so no device store (which the compiler must assume may alias those rows) stands between their loads and node 0's.
-inline float2 tf_delta_star_node(thread float4& s0, thread float4& s1, device const bfloat* query, device const bfloat* key,
-                                 device const bfloat* value, device const float* decay, device const bfloat* mixing,
+inline float2 tf_delta_star_node(thread float4& s0, thread float4& s1, device coherent(device) const bfloat* query, device coherent(device) const bfloat* key,
+                                 device coherent(device) const bfloat* value, device coherent(device) const float* decay, device coherent(device) const bfloat* mixing,
                                  uint kq, uint at, uint vo) {
-  device const bfloat* k = key + kq;
-  device const bfloat* q = query + kq;
+  device coherent(device) const bfloat* k = key + kq;
+  device coherent(device) const bfloat* q = query + kq;
   float kf[4], qf[4];
   for (uint part = 0; part < 4; ++part) {
     kf[part] = float(k[part]);
@@ -208,15 +208,15 @@ inline float2 tf_delta_star_node(thread float4& s0, thread float4& s1, device co
 // last row's stores (device stores the compiler must assume may alias them). The unroll is load-bearing: W = 4 without
 // it ran slower than W = 1.
 template <uint W>
-inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
-                                   device const bfloat* value, device const float* decay, device const bfloat* mixing,
-                                   device bfloat* output, thread uint& kq, thread uint& at, thread uint& vo, uint kq_step,
+inline void tf_delta_star_children(float4 r0, float4 r1, device coherent(device) const bfloat* query, device coherent(device) const bfloat* key,
+                                   device coherent(device) const bfloat* value, device coherent(device) const float* decay, device coherent(device) const bfloat* mixing,
+                                   device coherent(device) bfloat* output, thread uint& kq, thread uint& at, thread uint& vo, uint kq_step,
                                    uint at_step, uint vo_step, uint lane) {
   float kf[W][4], qf[W][4], forget[W], mix[W], incoming0[W], incoming1[W];
   uint out[W];
   _Pragma("clang loop unroll(full)") for (uint w = 0; w < W; ++w) {
-    device const bfloat* k = key + kq;
-    device const bfloat* q = query + kq;
+    device coherent(device) const bfloat* k = key + kq;
+    device coherent(device) const bfloat* q = query + kq;
     for (uint part = 0; part < 4; ++part) {
       kf[w][part] = float(k[part]);
       qf[w][part] = float(q[part]);
@@ -247,9 +247,9 @@ inline void tf_delta_star_children(float4 r0, float4 r1, device const bfloat* qu
 }
 // A star's node 0 (the row at kq, at, vo) and every child of it (the next rows - 1 rows), three at a time: each child
 // once, from node 0's states; node 0's outputs are stored last.
-inline void tf_delta_star_rows(float4 r0, float4 r1, device const bfloat* query, device const bfloat* key,
-                               device const bfloat* value, device const float* decay, device const bfloat* mixing,
-                               device bfloat* output, uint rows, uint kq, uint at, uint vo, uint kq_step, uint at_step,
+inline void tf_delta_star_rows(float4 r0, float4 r1, device coherent(device) const bfloat* query, device coherent(device) const bfloat* key,
+                               device coherent(device) const bfloat* value, device coherent(device) const float* decay, device coherent(device) const bfloat* mixing,
+                               device coherent(device) bfloat* output, uint rows, uint kq, uint at, uint vo, uint kq_step, uint at_step,
                                uint vo_step, uint lane) {
   const float2 node = tf_delta_star_node(r0, r1, query, key, value, decay, mixing, kq, at, vo);
   uint c = 1, ckq = kq + kq_step, cat = at + at_step, cvo = vo + vo_step;
@@ -280,15 +280,15 @@ inline void tf_delta_gdn_star_wait(device atomic_uint* PC, uint wait_prep, uint3
 // is that kernel's; the star needs no slot steps, no parent selects and no kept states. Node 0's children are independent
 // (each from node 0's states), so they run three at a time (tf_delta_star_rows).
 // Verify rounds only (no advance): no state is written.
-kernel void tf_delta_gdn_star_pair(device const bfloat* query [[buffer(0)]],
-                                   device const bfloat* key [[buffer(1)]],
-                                   device const bfloat* value [[buffer(2)]],
-                                   device const float* decay [[buffer(3)]],
-                                   device const bfloat* mixing [[buffer(4)]],
-                                   device const float* committed [[buffer(5)]],
-                                   device const TfDeltaSegment* segments [[buffer(7)]],
+kernel void tf_delta_gdn_star_pair(device coherent(device) const bfloat* query [[buffer(0)]],
+                                   device coherent(device) const bfloat* key [[buffer(1)]],
+                                   device coherent(device) const bfloat* value [[buffer(2)]],
+                                   device coherent(device) const float* decay [[buffer(3)]],
+                                   device coherent(device) const bfloat* mixing [[buffer(4)]],
+                                   device coherent(device) const float* committed [[buffer(5)]],
+                                   device coherent(device) const TfDeltaSegment* segments [[buffer(7)]],
                                    constant TfDeltaParams& p [[buffer(8)]],
-                                   device bfloat* output [[buffer(9)]],
+                                   device coherent(device) bfloat* output [[buffer(9)]],
                                    device atomic_uint* SC [[buffer(10)]],
                                    constant uint& count_out [[buffer(11)]],
                                    device atomic_uint* PC [[buffer(17)]],
@@ -326,12 +326,12 @@ struct TfDeltaPending { uint rows, persist; };
 // tf_delta_delta_update_words on the key words in registers: tf_delta_delta_update's statements on the same words (the
 // same products, fused multiply-adds, in-order lane sums and simd_sum).
 template <uint N>
-inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device const bfloat* key, device const bfloat* value,
-                                       device const float* decay, device const bfloat* mixing, thread uint& kq,
+inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device coherent(device) const bfloat* key, device coherent(device) const bfloat* value,
+                                       device coherent(device) const float* decay, device coherent(device) const bfloat* mixing, thread uint& kq,
                                        thread uint& at, thread uint& vo, uint kq_step, uint at_step, uint vo_step) {
   float kf[N][4], forget[N], mix[N], incoming0[N], incoming1[N];
   _Pragma("clang loop unroll(full)") for (uint i = 0; i < N; ++i) {
-    device const bfloat* k = key + kq;
+    device coherent(device) const bfloat* k = key + kq;
     for (uint part = 0; part < 4; ++part) kf[i][part] = float(k[part]);
     forget[i] = decay[at];
     mix[i] = float(mixing[at]);
@@ -352,21 +352,21 @@ inline void tf_delta_star_pending_rows(thread float* a, thread float* b, device 
 // pending.persist writes them back over the committed words each lane read (its simdgroup's own two columns, two float4
 // words a lane: the pool's state spans start 16-byte aligned and dk = 128), before node 0 and so before the threadgroup
 // counts itself.
-kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
-                                      device const bfloat* key [[buffer(1)]],
-                                      device const bfloat* value [[buffer(2)]],
-                                      device const float* decay [[buffer(3)]],
-                                      device const bfloat* mixing [[buffer(4)]],
-                                      device float* committed [[buffer(5)]],
-                                      device const TfDeltaSegment* segments [[buffer(7)]],
+kernel void tf_delta_gdn_star_pending(device coherent(device) const bfloat* query [[buffer(0)]],
+                                      device coherent(device) const bfloat* key [[buffer(1)]],
+                                      device coherent(device) const bfloat* value [[buffer(2)]],
+                                      device coherent(device) const float* decay [[buffer(3)]],
+                                      device coherent(device) const bfloat* mixing [[buffer(4)]],
+                                      device coherent(device) float* committed [[buffer(5)]],
+                                      device coherent(device) const TfDeltaSegment* segments [[buffer(7)]],
                                       constant TfDeltaParams& p [[buffer(8)]],
-                                      device bfloat* output [[buffer(9)]],
+                                      device coherent(device) bfloat* output [[buffer(9)]],
                                       device atomic_uint* SC [[buffer(10)]],
                                       constant uint& count_out [[buffer(11)]],
-                                      device const bfloat* pending_key [[buffer(12)]],
-                                      device const bfloat* pending_value [[buffer(13)]],
-                                      device const float* pending_decay [[buffer(14)]],
-                                      device const bfloat* pending_mixing [[buffer(15)]],
+                                      device coherent(device) const bfloat* pending_key [[buffer(12)]],
+                                      device coherent(device) const bfloat* pending_value [[buffer(13)]],
+                                      device coherent(device) const float* pending_decay [[buffer(14)]],
+                                      device coherent(device) const bfloat* pending_mixing [[buffer(15)]],
                                       constant TfDeltaPending& pending [[buffer(16)]],
                                       device atomic_uint* PC [[buffer(17)]],
                                       constant uint& wait_prep [[buffer(18)]],
@@ -390,8 +390,8 @@ kernel void tf_delta_gdn_star_pending(device const bfloat* query [[buffer(0)]],
   else if (row + 2 == pending.rows) tf_delta_star_pending_rows<2>(a, b, pending_key, pending_value, pending_decay, pending_mixing, pkq, pat, pvo, kq_step, at_step, vo_step);
   else if (row + 1 == pending.rows) tf_delta_star_pending_rows<1>(a, b, pending_key, pending_value, pending_decay, pending_mixing, pkq, pat, pvo, kq_step, at_step, vo_step);
   if (pending.persist != 0u) {
-    *(device float4*)(committed + base + column) = float4(a[0], a[1], a[2], a[3]);
-    *(device float4*)(committed + base + column + p.dk) = float4(b[0], b[1], b[2], b[3]);
+    *(device coherent(device) float4*)(committed + base + column) = float4(a[0], a[1], a[2], a[3]);
+    *(device coherent(device) float4*)(committed + base + column + p.dk) = float4(b[0], b[1], b[2], b[3]);
   }
   float4 r0 = float4(a[0], a[1], a[2], a[3]), r1 = float4(b[0], b[1], b[2], b[3]);
   const uint kq = (span.first * p.nk + key_head) * p.dk + lane * 4, at = span.first * p.nv + head, vo = at * p.dv + d0;

@@ -35,9 +35,9 @@ inline void q27_count(device atomic_uint* NC, ushort tid) {
 // wait_for above 0: the counted decoded preprocess (q27_head_norm_rope_decoded) shares this launch's barrier interval and
 // every group waits on WC[0] before it reads the packed query or the round's cached keys.
 template <int SG, int PARTS = 2>
-kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
-    constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* tile_stream [[buffer(4)]],
-    device float* PO [[buffer(5)]], device float* PM [[buffer(6)]], device float* PL [[buffer(7)]], device const int* nodes [[buffer(8)]],
+kernel void q27_attn_prefix(device coherent(device) const bfloat* Qp [[buffer(0)]], device coherent(device) const Q27AttnReadPtrs* caches [[buffer(1)]],
+    constant float* scale [[buffer(2)]], device coherent(device) const int* meta [[buffer(3)]], device coherent(device) const int* tile_stream [[buffer(4)]],
+    device coherent(device) float* PO [[buffer(5)]], device coherent(device) float* PM [[buffer(6)]], device coherent(device) float* PL [[buffer(7)]], device coherent(device) const int* nodes [[buffer(8)]],
     device atomic_uint* PC [[buffer(9)]], constant uint& count_out [[buffer(10)]],
     device atomic_uint* WC [[buffer(11)]], constant uint& wait_for [[buffer(12)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -69,11 +69,11 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   // a pair past the plan's tiles or chunks computes nothing; with count_out every group still reaches its count
   if (tile < SGA && int(c) < meta[MG + st * MS + 1]) {
   // each row's chunk c is its own chunk's (its one-row step's); padding rows take the last row's and mask every key
-  const device int* own = nodes + NW * meta[MG + st * MS + 6];
+  const device coherent(device) int* own = nodes + NW * meta[MG + st * MS + 6];
   const int ck0 = own[NW * (min(q0, G * NQ - 1) / G) + 2], ck1 = own[NW * (min(q1, G * NQ - 1) / G) + 2];
   const int wa = simd_min(min(ck0, ck1)), wb = simd_max(max(ck0, ck1));
-  const device bfloat* Kb = caches[st].keys;
-  const device bfloat* Vb = caches[st].values;
+  const device coherent(device) bfloat* Kb = caches[st].keys;
+  const device coherent(device) bfloat* Vb = caches[st].values;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)Qp + (int64_t)hk * RP * D, dextents<int32_t, 2>(D, RP));
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tK((device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7], dextents<int32_t, 2>(D, L), array<int32_t, 2>({1, D}));
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV((device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8], dextents<int32_t, 2>(D, L), array<int32_t, 2>({1, D}));
@@ -132,8 +132,8 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   // rows past the stream's last query row are padding that nothing reads
   for (int q = 0; q < OE / 4; q++) {
     if ((q & 1) ? q1 >= G * NQ : q0 >= G * NQ) continue;
-    device float* dst = PO + (base + tile * 16 + fm + (q & 1) * 8) * D + (part * OD) + (q >> 1) * 16 + fn;
-    *(device float4*)dst = float4(O[4 * q], O[4 * q + 1], O[4 * q + 2], O[4 * q + 3]);
+    device coherent(device) float* dst = PO + (base + tile * 16 + fm + (q & 1) * 8) * D + (part * OD) + (q >> 1) * 16 + fn;
+    *(device coherent(device) float4*)dst = float4(O[4 * q], O[4 * q + 1], O[4 * q + 2], O[4 * q + 3]);
   }
   if (part == 0 && (lane & 9) == 0) {
     if (q0 < G * NQ) { PM[base + r0] = m0; PL[base + r0] = l0; }
@@ -142,7 +142,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const 
   }
   if (count_out != 0u) q27_count(PC, tid);
 }
-#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+#define Q27_PREFIX(SG) template [[host_name("q27_attn_prefix_" #SG)]] kernel void q27_attn_prefix<SG>(device coherent(device) const bfloat*, device coherent(device) const Q27AttnReadPtrs*, constant float*, device coherent(device) const int*, device coherent(device) const int*, device coherent(device) float*, device coherent(device) float*, device coherent(device) float*, device coherent(device) const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 Q27_PREFIX(1)
 Q27_PREFIX(2)
 Q27_PREFIX(3)
@@ -159,26 +159,26 @@ Q27_PREFIX(13)
 Q27_PREFIX(14)
 Q27_PREFIX(15)
 Q27_PREFIX(16)
-template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device coherent(device) const bfloat*, device coherent(device) const Q27AttnReadPtrs*, constant float*, device coherent(device) const int*, device coherent(device) const int*, device coherent(device) float*, device coherent(device) float*, device coherent(device) float*, device coherent(device) const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 
 // One staged K or V block of a tail tile, 128 threads: this thread's slots kv[128 j] (j < 8) take rows q0 + STEP j of the
 // cache at `src` (the thread's column; rows D apart). Rows before P come from the cache through a pointer stepped STEP rows a
 // slot, rows in [P, nmax) are the node's own (row P + path[row - P]), later rows are zero: each slot holds the 16 bytes the
 // per-slot select (row < P, row < nmax) gave it, without a row division, compare chain or 64-bit row product of its own.
 template <int STEP>
-inline void q27_stage(threadgroup vec<bfloat, 8>* kv, const device bfloat* src, int q0, int P, int nmax, const threadgroup int* path) {
+inline void q27_stage(threadgroup vec<bfloat, 8>* kv, const device coherent(device) bfloat* src, int q0, int P, int nmax, const threadgroup int* path) {
   const int context = min(int(uint(max(P - q0 + STEP - 1, 0)) / STEP), 8), own = min(int(uint(max(nmax - q0 + STEP - 1, 0)) / STEP), 8);
-  const device vec<bfloat, 8>* row = (const device vec<bfloat, 8>*)(src + (int64_t)q0 * D);
+  const device coherent(device) vec<bfloat, 8>* row = (const device coherent(device) vec<bfloat, 8>*)(src + (int64_t)q0 * D);
   int j = 0;
   for (; j < context; ++j, row += STEP * D / 8) kv[128 * j] = *row;
-  for (; j < own; ++j) kv[128 * j] = *(const device vec<bfloat, 8>*)(src + (int64_t)(P + path[q0 + STEP * j - P]) * D);
+  for (; j < own; ++j) kv[128 * j] = *(const device coherent(device) vec<bfloat, 8>*)(src + (int64_t)(P + path[q0 + STEP * j - P]) * D);
   for (; j < 8; ++j) kv[128 * j] = vec<bfloat, 8>(0);
 }
 
-kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
-    constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
-    device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
-    device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
+kernel void q27_attn_tail(device coherent(device) const bfloat* QB [[buffer(0)]], device coherent(device) const Q27AttnReadPtrs* caches [[buffer(1)]],
+    constant float* scale [[buffer(2)]], device coherent(device) const int* meta [[buffer(3)]], device coherent(device) const int* paths [[buffer(4)]], device coherent(device) const int* nodes [[buffer(5)]],
+    device coherent(device) const float* POA [[buffer(6)]], device coherent(device) const float* PMA [[buffer(7)]], device coherent(device) const float* PLA [[buffer(8)]],
+    device coherent(device) float* PO [[buffer(9)]], device coherent(device) float* PM [[buffer(10)]], device coherent(device) float* PL [[buffer(11)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort tid [[thread_index_in_threadgroup]]) {
   // four simdgroups load each K and V tile; simdgroup 0 alone does the arithmetic, in the one-simdgroup order
@@ -192,8 +192,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   if (int(cb) >= meta[MG + st * MS + 5]) return;
   const int la = meta[MG + st * MS + 3] * 16 + (int(node) - meta[MG + st * MS + 6]) * G;
   const int depth = nodes[NW * node];
-  const device bfloat* Kb = caches[st].keys;
-  const device bfloat* Vb = caches[st].values;
+  const device coherent(device) bfloat* Kb = caches[st].keys;
+  const device coherent(device) bfloat* Vb = caches[st].values;
   const int nmax = P + depth + 1;
   const short qid = lane >> 2;
   const short fm = (qid & 4) | ((lane >> 1) & 3);
@@ -206,8 +206,8 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   threadgroup int path[MAXD];
   // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
   if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
-  const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
-  const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
+  const device coherent(device) bfloat* kbase = (const device coherent(device) bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
+  const device coherent(device) bfloat* vbase = (const device coherent(device) bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -293,9 +293,9 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
   if (sg != 0) return;
   const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
   for (int q = 0; q < 16; q++) {
-    device float* dst = PO + (base + fm + (q & 1) * 8) * D + (q >> 1) * 16 + fn;
-    *(device float4*)dst = float4(Olo[4 * q], Olo[4 * q + 1], Olo[4 * q + 2], Olo[4 * q + 3]);
-    *(device float4*)(dst + 128) = float4(Ohi[4 * q], Ohi[4 * q + 1], Ohi[4 * q + 2], Ohi[4 * q + 3]);
+    device coherent(device) float* dst = PO + (base + fm + (q & 1) * 8) * D + (q >> 1) * 16 + fn;
+    *(device coherent(device) float4*)dst = float4(Olo[4 * q], Olo[4 * q + 1], Olo[4 * q + 2], Olo[4 * q + 3]);
+    *(device coherent(device) float4*)(dst + 128) = float4(Ohi[4 * q], Ohi[4 * q + 1], Ohi[4 * q + 2], Ohi[4 * q + 3]);
   }
   if ((lane & 9) == 0) {
     PM[base + r0] = m0; PL[base + r0] = l0;
@@ -307,11 +307,11 @@ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q2
 // wait_for above 0: the counted split tail shares this launch's barrier interval (it waited on the counted prefix before it
 // counted itself), so a group reads both partials once the tail's count on NC[0] reaches wait_for. The plan words come
 // first: nothing in the barrier interval writes them.
-kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const float* PMA [[buffer(1)]], device const float* PLA [[buffer(2)]],
-    device const float* POB [[buffer(3)]], device const float* PMB [[buffer(4)]], device const float* PLB [[buffer(5)]],
-    device const int* meta [[buffer(6)]], device const int* nodes [[buffer(7)]], device bfloat* OUT [[buffer(8)]],
-    device const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
-    device float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
+kernel void q27_attn_merge(device coherent(device) const float* POA [[buffer(0)]], device coherent(device) const float* PMA [[buffer(1)]], device coherent(device) const float* PLA [[buffer(2)]],
+    device coherent(device) const float* POB [[buffer(3)]], device coherent(device) const float* PMB [[buffer(4)]], device coherent(device) const float* PLB [[buffer(5)]],
+    device coherent(device) const int* meta [[buffer(6)]], device coherent(device) const int* nodes [[buffer(7)]], device coherent(device) bfloat* OUT [[buffer(8)]],
+    device coherent(device) const bfloat* QG [[buffer(9)]], constant uint& gated [[buffer(10)]],
+    device coherent(device) float* XS [[buffer(11)]], constant uint& sums_stride [[buffer(12)]],
     device atomic_uint* NC [[buffer(13)]], constant uint& wait_for [[buffer(14)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     ushort tid [[thread_index_in_threadgroup]], uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
@@ -335,8 +335,8 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
       const int64_t row = ((int64_t)hk * CA + min(c0 + j, CT - 1)) * RPA + ra;
       mcs[j] = PMA[row];
       lcs[j] = PLA[row];
-      lo[j] = *(device const float4*)(POA + row * D + lane * DP);
-      hi[j] = *(device const float4*)(POA + row * D + lane * DP + 4);
+      lo[j] = *(device coherent(device) const float4*)(POA + row * D + lane * DP);
+      hi[j] = *(device coherent(device) const float4*)(POA + row * D + lane * DP + 4);
     }
     for (int j = 0; j < MB; j++) {
       if (c0 + j >= CT) break;
@@ -389,10 +389,10 @@ kernel void q27_attn_merge(device const float* POA [[buffer(0)]], device const f
 // A group's plan words, its first key tile's K and V staging and its scores read nothing the prefix writes (the round's own
 // rows were appended behind an earlier barrier), so they come before the wait; the partial and the softmax come after it.
 [[max_total_threads_per_threadgroup(128)]]
-kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
-    constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
-    device const float* POA [[buffer(6)]], device const float* PMA [[buffer(7)]], device const float* PLA [[buffer(8)]],
-    device float* PO [[buffer(9)]], device float* PM [[buffer(10)]], device float* PL [[buffer(11)]],
+kernel void q27_attn_tail_split(device coherent(device) const bfloat* QB [[buffer(0)]], device coherent(device) const Q27AttnReadPtrs* caches [[buffer(1)]],
+    constant float* scale [[buffer(2)]], device coherent(device) const int* meta [[buffer(3)]], device coherent(device) const int* paths [[buffer(4)]], device coherent(device) const int* nodes [[buffer(5)]],
+    device coherent(device) const float* POA [[buffer(6)]], device coherent(device) const float* PMA [[buffer(7)]], device coherent(device) const float* PLA [[buffer(8)]],
+    device coherent(device) float* PO [[buffer(9)]], device coherent(device) float* PM [[buffer(10)]], device coherent(device) float* PL [[buffer(11)]],
     device atomic_uint* WC [[buffer(12)]], constant uint& wait_for [[buffer(13)]],
     device atomic_uint* TC [[buffer(14)]], constant uint& count_out [[buffer(15)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -415,8 +415,8 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   }
   const int la = meta[MG + st * MS + 3] * 16 + (int(node) - meta[MG + st * MS + 6]) * G;
   const int depth = nodes[NW * node];
-  const device bfloat* Kb = caches[st].keys;
-  const device bfloat* Vb = caches[st].values;
+  const device coherent(device) bfloat* Kb = caches[st].keys;
+  const device coherent(device) bfloat* Vb = caches[st].values;
   const int nmax = P + depth + 1;
   const short qid = lane >> 2;
   const short fm = (qid & 4) | ((lane >> 1) & 3);
@@ -429,8 +429,8 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   threadgroup int path[MAXD];
   // the node's path (its own keys' rows past P; depth < MAXD), read by the staging behind the first tile's barrier
   if (int(tid) <= depth) path[tid] = paths[node * MAXD + tid];
-  const device bfloat* kbase = (const device bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
-  const device bfloat* vbase = (const device bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
+  const device coherent(device) bfloat* kbase = (const device coherent(device) bfloat*)Kb + (int64_t)hk * meta[MG + st * MS + 7];
+  const device coherent(device) bfloat* vbase = (const device coherent(device) bfloat*)Vb + (int64_t)hk * meta[MG + st * MS + 8];
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ((device bfloat*)QB + ((int64_t)hk * W + node) * 16 * D, dextents<int32_t, 2>(D, 16));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tK32(KV, dextents<int32_t, 2>(D, 32));
   tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tVh(KV, dextents<int32_t, 2>(128, TK));
@@ -529,8 +529,8 @@ kernel void q27_attn_tail_split(device const bfloat* QB [[buffer(0)]], device co
   if (sg == 0) {
     const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
     for (int q = 0; q < 16; q++) {
-      device float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
-      *(device float4*)dst = (q & 1) ? float4(0.0f) : float4(saved[4 * (q >> 1)], saved[4 * (q >> 1) + 1], saved[4 * (q >> 1) + 2], saved[4 * (q >> 1) + 3]);
+      device coherent(device) float* dst = PO + (base + fm + (q & 1) * 8) * D + (hi ? 128 : 0) + (q >> 1) * 16 + fn;
+      *(device coherent(device) float4*)dst = (q & 1) ? float4(0.0f) : float4(saved[4 * (q >> 1)], saved[4 * (q >> 1) + 1], saved[4 * (q >> 1) + 2], saved[4 * (q >> 1) + 3]);
     }
     if (!hi && (lane & 9) == 0) {
       PM[base + r0] = m0; PL[base + r0] = l0;
