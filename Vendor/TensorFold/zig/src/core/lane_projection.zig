@@ -186,6 +186,8 @@ pub const Layout = struct {
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
     prompt_sr: bool = false,
+    /// Prompt register launch maps its 8x8 tile/row-block grid through a linear Morton walk.
+    morton_prompt: bool = false,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
@@ -236,6 +238,7 @@ pub const Layout = struct {
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
         if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
+        if (l.morton_prompt and (!l.prompt_sr or l.swiglu or l.residual or l.rows8 or l.ranges.len != 0 or l.groups != null)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
@@ -346,6 +349,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
+    if (l.morton_prompt) try text.appendSlice(a, "#define TF_MORTON_PROMPT 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
     if (l.m8) try text.appendSlice(a, "#define TF_M8 1\n");
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
@@ -491,6 +495,8 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    /// Built with Layout.morton_prompt: prompt rows only, eight 16-row blocks at a time.
+    morton_prompt: bool = false,
     /// Built with Layout.rows8: launches take at most 8 rows.
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
@@ -531,7 +537,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .morton_prompt = l.morton_prompt, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -739,7 +745,12 @@ pub const Projection = struct {
             e.setBuffer(y.buf, y.off, 7);
         }
         if (counter) |c| e.setBuffer(c.buf, c.off, 6); // TF_COUNT: the norm's wait word
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        if (p.morton_prompt and blocks == 8) {
+            // One 8x8 Morton tile panel per 64 linear groups; pad only the final N panel.
+            e.dispatchGroups(mtl.Size.of(((p.tile_count + 7) / 8) * 64, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        } else {
+            e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        }
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
@@ -790,6 +801,19 @@ test "serial SK2 keeps logical split and is off by default" {
     try l.validate();
     l.sk = 2;
     l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "prompt Morton scheduling requires the full prompt reg layout" {
+    var l = Layout{ .n = 1024, .k = 512, .format = .{ .bits = 4, .group = 64 }, .reg = true, .precompute_sums = true, .prompt_sr = true, .reg_lean = true, .morton_prompt = true };
+    try l.validate();
+    const text = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_MORTON_PROMPT 1\n") != null);
+    l.rows8 = true;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.rows8 = false;
+    l.swiglu = true;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 

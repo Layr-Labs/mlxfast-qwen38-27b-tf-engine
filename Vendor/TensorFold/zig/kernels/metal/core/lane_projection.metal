@@ -15,6 +15,11 @@ using namespace mpp::tensor_ops;
 #ifndef TF_YS
 #define TF_YS TF_N
 #endif
+#if defined(TF_PROMPT_TN)
+#define TF_LANE_TILE_COUNT (TF_N / 32 / TF_PROMPT_TN)
+#else
+#define TF_LANE_TILE_COUNT (TF_N / 32)
+#endif
 // Output rows lie TF_YS elements apart, so a member of a fused stack writes its columns of the fused rows.
 #define TF_ODD_WORDS (TF_GROUP * TF_BITS / 32 % 2)
 
@@ -372,8 +377,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_WAIT)
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
 #endif
-    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+#if defined(TF_MORTON_PROMPT)
+  const uint linear = tg.x, panel = linear / 64u, code = linear % 64u;
+  const uint local_x = ((code >> 1) & 1u) | (((code >> 3) & 1u) << 1) | (((code >> 5) & 1u) << 2);
+  const uint local_y = (code & 1u) | (((code >> 2) & 1u) << 1) | (((code >> 4) & 1u) << 2);
+  const uint tile_id = panel * 8u + local_x, block_id = local_y;
+  if (tile_id >= TF_LANE_TILE_COUNT) return;
+  const int r0 = int(block_id) * 16, rows = mdims[0] - r0;
+#else
+  const uint tile_id = tg.x;
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+#endif
   if (rows <= 0) return;
 #if defined(TF_TILE_LIST)
   if (tg.x >= TL[0]) {
@@ -394,7 +409,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #elif defined(TF_SWIGLU)
   const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1], tile = 2 * int(tg.x) + (ks & 1) + (ks >> 1) * (TF_N / 64), n0 = tile * NT;
 #else
-  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1], tile = TF_TILE_OF(tg.x), n0 = tile * NT;
+  const int lane = int(lanei), ks = int(sgi), M = min(rows, TF_DM), stride = mdims[1], tile = TF_TILE_OF(tile_id), n0 = tile * NT;
 #endif
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(TF_DM, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
