@@ -25,10 +25,10 @@ pub const Shape = struct {
 };
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 /// Rows a tf_shared_lane_attention_split_kv threadgroup takes (its TF_SPLIT_ROWS) and its threads: a simdgroup a query
-/// head of one KV head and row.
+/// head of one KV head and row, eight simdgroups a threadgroup where the KV head has fewer than eight query heads.
 fn kvRows(s: Shape) usize {
     const g = s.query_heads / s.kv_heads;
-    return if (g >= 16) 1 else 16 / g;
+    return if (g >= 8) 1 else 8 / g;
 }
 fn kvThreads(s: Shape) usize {
     return s.query_heads / s.kv_heads * kvRows(s) * 32;

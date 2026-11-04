@@ -163,7 +163,7 @@ inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D 
 // at a time in threadgroup memory. A simdgroup then takes a stage's keys TF_SPLIT_TILE at a time: a tile's K and V rows
 // and mask bytes load first, then each unmasked key's arithmetic in key order, tf_split_key's on the same bfloat words,
 // into the same partials; rows past args.rows load and barrier but write nothing.
-#define TF_SPLIT_ROWS (TF_G >= 16 ? 1 : 16 / TF_G)
+#define TF_SPLIT_ROWS (TF_G >= 8 ? 1 : 8 / TF_G)
 #define TF_STAGE 16
 // One staged key: tf_split_key's arithmetic on its K and V words already in registers.
 inline void tf_split_staged(thread float (&q)[TF_D / 32], thread float (&out)[TF_D / 32], thread float& maximum,
