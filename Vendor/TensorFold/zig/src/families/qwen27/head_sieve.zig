@@ -19,6 +19,21 @@ const sources = @import("qwen_runtime_sources");
 
 const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
 
+// Group consecutive bindings without changing their buffer, offset or slot.
+fn bindHeadRefs(e: mtl.ComputeEncoder, comptime n: usize, refs: [n]projection.Ref, first: usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (0..n) |i| {
+            buffers[i] = refs[i].buffer;
+            offsets[i] = refs[i].offset;
+        }
+        e.setBuffers(n, buffers, offsets, first);
+    } else {
+        inline for (0..n) |i| e.setBuffer(refs[i].buffer, refs[i].offset, first + i);
+    }
+}
+
 pub const HeadSieve = struct {
     /// Rows a sieved verify takes: the tile-list launch's decoded rows.
     pub const rows_max = 8;
@@ -94,7 +109,7 @@ pub const HeadSieve = struct {
             made[count] = try mtl.Pipeline.init(m.device, lib, name, false);
             count += 1;
         }
-        // the scan runs a SIMD group a tile; top runs a 256-thread threadgroup (a SIMD group a row), pick 1024 threads
+        // scan runs eight SIMD groups (one tile each) per 256-thread group; top takes 256 threads, pick 1024 threads
         // the 8-row scan is a second library: a toolchain that rejects the descriptor leaves it null and the sieve stays
         // on the 16-row scan
         var scan8: ?mtl.Pipeline = null;
@@ -109,10 +124,16 @@ pub const HeadSieve = struct {
                 scan8 = mtl.Pipeline.init(m.device, l8, "tf_head_sieve_scan", false) catch null;
             }
         }
-        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        if (made[2].simdWidth() != 32 or made[2].maxThreads() < 256 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        if (scan8) |p| {
+            if (p.simdWidth() != 32 or p.maxThreads() < 256) {
+                p.deinit();
+                scan8 = null;
+            }
+        }
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
-        try m.kernels.prepareTiles(head, head.n);
+        try m.kernels.prepareTilesReuse(head, head.n);
         var at: usize = 0;
         const take = struct {
             fn f(p: *usize, bytes: usize) usize {
@@ -188,10 +209,7 @@ pub const HeadSieve = struct {
         e.setPipeline(s.prep);
         e.setBuffer(x.buffer, x.offset, 0);
         e.setValue(@as(i32, @intCast(rows)), 1);
-        e.setBuffer(s.scratch, s.o_xq, 2);
-        e.setBuffer(s.scratch, s.o_list, 3);
-        e.setBuffer(s.scratch, s.o_args, 4);
-        e.setBuffer(s.scratch, s.o_bk, 5);
+        bindHeadRefs(e, 4, .{ s.ref(s.o_xq), s.ref(s.o_list), s.ref(s.o_args), s.ref(s.o_bk) }, 2);
         e.dispatchThreads(mtl.Size.of(@max(@as(usize, s.groups) * sums_stride, @as(usize, s.blocks) * rows_max), 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
         // 2: every tile's best a + k s and best a, a row each, through the 2-bit copy. The 8-row scan is used once it
@@ -199,37 +217,22 @@ pub const HeadSieve = struct {
         // differs) the 16-row scan feeds top/select/pick, and the 8-row scan runs into o_hm8 for the proof.
         if (s.use8 and s.scan8 != null) {
             e.setPipeline(s.scan8.?);
-            e.setBuffer(x.buffer, x.offset, 0);
-            e.setBuffer(s.words, 0, 1);
-            e.setBuffer(meta.buffer, meta.offset, 2);
+            bindHeadRefs(e, 3, .{ x, .{ .buffer = s.words }, meta }, 0);
             e.setValue([2]i32{ @intCast(rows), sums_stride }, 3);
-            e.setBuffer(s.scratch, s.o_hm, 4);
-            e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
-            e.setBuffer(s.scratch, s.o_xq, 6);
-            e.setBuffer(s.scratch, s.o_bk, 7);
-            e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
+            bindHeadRefs(e, 4, .{ s.ref(s.o_hm), xs.ref, s.ref(s.o_xq), s.ref(s.o_bk) }, 4);
+            e.dispatchGroups(mtl.Size.of(s.tiles / 8, 1, 1), mtl.Size.of(256, 1, 1));
         } else {
             e.setPipeline(s.scan);
-            e.setBuffer(x.buffer, x.offset, 0);
-            e.setBuffer(s.words, 0, 1);
-            e.setBuffer(meta.buffer, meta.offset, 2);
+            bindHeadRefs(e, 3, .{ x, .{ .buffer = s.words }, meta }, 0);
             e.setValue([2]i32{ @intCast(rows), sums_stride }, 3);
-            e.setBuffer(s.scratch, s.o_hm, 4);
-            e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
-            e.setBuffer(s.scratch, s.o_xq, 6);
-            e.setBuffer(s.scratch, s.o_bk, 7);
-            e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
+            bindHeadRefs(e, 4, .{ s.ref(s.o_hm), xs.ref, s.ref(s.o_xq), s.ref(s.o_bk) }, 4);
+            e.dispatchGroups(mtl.Size.of(s.tiles / 8, 1, 1), mtl.Size.of(256, 1, 1));
             if (!s.checked8 and s.scan8 != null and !s.probe8) {
                 e.setPipeline(s.scan8.?);
-                e.setBuffer(x.buffer, x.offset, 0);
-                e.setBuffer(s.words, 0, 1);
-                e.setBuffer(meta.buffer, meta.offset, 2);
+                bindHeadRefs(e, 3, .{ x, .{ .buffer = s.words }, meta }, 0);
                 e.setValue([2]i32{ @intCast(rows), sums_stride }, 3);
-                e.setBuffer(s.scratch, s.o_hm8, 4);
-                e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
-                e.setBuffer(s.scratch, s.o_xq, 6);
-                e.setBuffer(s.scratch, s.o_bk8, 7);
-                e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
+                bindHeadRefs(e, 4, .{ s.ref(s.o_hm8), xs.ref, s.ref(s.o_xq), s.ref(s.o_bk8) }, 4);
+                e.dispatchGroups(mtl.Size.of(s.tiles / 8, 1, 1), mtl.Size.of(256, 1, 1));
                 s.probe8 = true;
             }
         }
@@ -238,8 +241,7 @@ pub const HeadSieve = struct {
         e.setPipeline(s.top);
         e.setBuffer(s.scratch, s.o_hm, 0);
         e.setValue(@as(i32, @intCast(rows)), 1);
-        e.setBuffer(s.scratch, s.o_first, 2);
-        e.setBuffer(s.scratch, s.o_bk, 3);
+        bindHeadRefs(e, 2, .{ s.ref(s.o_first), s.ref(s.o_bk) }, 2);
         e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
         // 4: the first tiles exactly, the head's own tile-list launch (slot r: row r's first tile). Beside it, behind the
@@ -251,24 +253,18 @@ pub const HeadSieve = struct {
         e.barrier();
         // 5: the rows' thresholds, and every tile some row's bound reaches
         e.setPipeline(s.select);
-        e.setBuffer(s.scratch, s.o_hm, 0);
-        e.setBuffer(s.scratch, s.o_y1, 1);
-        e.setBuffer(s.scratch, s.o_first, 2);
+        bindHeadRefs(e, 3, .{ s.ref(s.o_hm), s.ref(s.o_y1), s.ref(s.o_first) }, 0);
         e.setValue(@as(i32, @intCast(rows)), 3);
-        e.setBuffer(s.scratch, s.o_list, 4);
-        e.setBuffer(s.scratch, s.o_args, 5);
+        bindHeadRefs(e, 2, .{ s.ref(s.o_list), s.ref(s.o_args) }, 4);
         e.dispatchGroups(mtl.Size.of((s.tiles + 255) / 256, 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
-        // 6: the listed tiles exactly, as many threadgroups as tiles listed, rows the vocabulary apart in the logits buffer;
-        // beside it, the listed tiles' lines requested at once, as in 4
-        m.kernels.warmTiles(e, s.head, s.ref(s.o_list), s.tiles) catch {};
-        try m.kernels.quantTilesIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args));
+        // 6: evaluate the listed tiles exactly. Reused first tiles copy their prior BF16 results;
+        // skip the speculative list-wide warm so it does not read their weight lines again.
+        try m.kernels.quantTilesReuseIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args), s.ref(s.o_first), s.ref(s.o_y1), first_stride);
         e.barrier();
         // 7: each row's token from those words
         e.setPipeline(s.pick);
-        e.setBuffer(logits.buffer, logits.offset, 0);
-        e.setBuffer(s.scratch, s.o_list, 1);
-        e.setBuffer(picks, 0, 2);
+        bindHeadRefs(e, 3, .{ logits, s.ref(s.o_list), .{ .buffer = picks } }, 0);
         e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(1024, 1, 1));
     }
 

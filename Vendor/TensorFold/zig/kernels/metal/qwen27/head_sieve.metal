@@ -93,13 +93,18 @@ inline uint tf_sieve_key(float v) {
 // metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
 // it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row], and
 // that best a (when finite) into its block's key BK[(tile / TBLK) * 8 + row] (atomic max of tf_sieve_key).
-// dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
-[[max_total_threads_per_threadgroup(32)]]
+// dims: rows, the sums' stride (16). Grid TILES / 8 threadgroups of 256; eight SIMD groups each scan one tile.
+[[max_total_threads_per_threadgroup(256)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
-    device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
-  const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
-  if (tile >= TILES || M <= 0) return;
+    device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y;
+  // Host fits() requires TF_N divisible by 256, so every group has eight valid tiles.
+  // This check is uniform across all 256 threads before the threadgroup barrier.
+  if (M <= 0 || (TILES % 8) != 0 || tg >= uint(TILES / 8)) return;
+  const int tile = int(tg) * 8 + int(sg), n0 = tile * NT;
+  threadgroup uint tile_keys[8 * 8];
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(TF_SIEVE_M, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroup> op;
@@ -198,11 +203,22 @@ inline uint tf_sieve_key(float v) {
   hi = fmax(hi, simd_shuffle_xor(hi, 8));
   mid = fmax(mid, simd_shuffle_xor(mid, 1));
   mid = fmax(mid, simd_shuffle_xor(mid, 8));
-  if ((lane & 9) == 0 && mb < M) {
-    HM[(size_t)tile * 16 + mb] = hi;
-    HM[(size_t)tile * 16 + 8 + mb] = mid;
-    // top never takes a tile whose best a is -inf, so neither does a block key
-    if (mid > -INFINITY) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + mb, tf_sieve_key(mid), memory_order_relaxed);
+  if ((lane & 9) == 0) {
+    uint k = 0u;
+    if (mb < M) {
+      HM[(size_t)tile * 16 + mb] = hi;
+      HM[(size_t)tile * 16 + 8 + mb] = mid;
+      // top never takes a tile whose best a is -inf, so neither does a block key.
+      if (mid > -INFINITY) k = tf_sieve_key(mid);
+    }
+    tile_keys[sg * 8u + uint(mb)] = k;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // TBLK=256 is a multiple of eight, so all eight tiles share a block.
+  if (sg == 0u && lane < 8 && lane < M) {
+    uint best = 0u;
+    for (uint i = 0; i < 8u; i++) best = max(best, tile_keys[i * 8u + uint(lane)]);
+    if (best != 0u) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + lane, best, memory_order_relaxed);
   }
 }
 
