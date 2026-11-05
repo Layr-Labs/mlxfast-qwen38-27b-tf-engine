@@ -26,13 +26,18 @@ pub const Hook = struct {
     uploaded: bool = false,
     /// A staggered prompt's second segment's own copies of the pool's every-layer scratch (gdn_pool_gpu.Own).
     own: ?pool_gpu.Own = null,
+    /// The plan's metadata words and the projections' [rows, stride] words (null: the frame's): a first command buffer
+    /// committed ahead reads its own.
+    metadata: ?pool_gpu.Metadata = null,
+    dims: ?@import("projection.zig").Ref = null,
 
     pub fn forward(ptr: *anyopaque, e: metal.ComputeEncoder, block: usize, weight: Weights.Gdn, frame: *Frame, rows: u32) !void {
         const hook: *Hook = @ptrCast(@alignCast(ptr));
         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
         const layer = hook.linear_index[block];
         const sums = @import("forward.zig").sums(frame, .sums, rows);
-        var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt) };
+        const dims = hook.dims orelse frame.get(.dims);
+        var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt), .dims = dims };
         // decoded verify rows: qkv and zba count their threadgroups past a device fence and the prepare that reads them waits
         // on that count in the same barrier interval (Kernels.quantCounted, Round.prepareRowsAfter), as the record's norms
         // wait on their projections; both are counted or neither, so the shared counter always returns to zero
@@ -42,8 +47,8 @@ pub const Hook = struct {
             const b = (try hook.quant.quantCounted(e, weight.zba, frame.get(.input), sums, frame.get(.mixed), rows)) orelse return error.BadGdnHook;
             after = .{ .counter = hook.quant.count_words.?, .wait = a + b };
         } else {
-            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
-            if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
+            try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, dims, try hook.pool.projected(layer), rows);
+            if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, dims, frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, dims, frame.get(.mixed), rows);
             e.barrier();
         }
         const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
@@ -56,7 +61,8 @@ pub const Hook = struct {
         const xs = frame.get(.sums);
         frame.mixer_sums = false;
         gated.sums = .{ .span = .{ .buffer = xs.buffer, .offset = xs.offset, .bytes = xs.buffer.length() - xs.offset }, .stride = sums.stride, .written = &frame.mixer_sums };
-        if (hook.accepted_chain) try hook.pool.forwardChain(layer, devicePlan(hook.plan.*, frame), gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, devicePlan(hook.plan.*, frame), gated, e, beside, after, hook.deferred, hook.uploaded);
+        const plan: pool_gpu.DevicePlan = if (hook.metadata) |m| .{ .host = hook.plan.*, .metadata = m } else devicePlan(hook.plan.*, frame);
+        if (hook.accepted_chain) try hook.pool.forwardChain(layer, plan, gated, e, hook.quant.prompt, beside) else try hook.pool.forwardAfter(layer, plan, gated, e, beside, after, hook.deferred, hook.uploaded);
     }
 
     pub fn commit(hook: *Hook, e: metal.ComputeEncoder, block: usize, frame: *Frame) !void {
@@ -84,15 +90,16 @@ const Late = struct {
     sums: @import("quant_gpu.zig").Sums,
     rows: u32,
     tiles: u32,
+    dims: @import("projection.zig").Ref,
     fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
         const z: *Late = @ptrCast(@alignCast(ptr));
-        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.frame.get(.dims), z.frame.get(.mixed), z.rows, .{ 0, z.tiles });
+        try z.quant.quantRange(e, z.zba, z.frame.get(.input), z.sums, z.dims, z.frame.get(.mixed), z.rows, .{ 0, z.tiles });
     }
 };
 
 /// z's 32-column tiles for a prompt pass whose zba takes ranged launches, z ending on a tile boundary before b and a; 0
 /// keeps one launch (decoded rows: their short scan already keeps the GPU busy).
-fn zTiles(zba: Linear, frame: *Frame, prompt: bool) u32 {
+pub fn zTiles(zba: Linear, frame: *Frame, prompt: bool) u32 {
     const width: u32 = @intCast(frame.config.gdnValueDim());
     if (!prompt or !Quant.ranged(zba) or width % 32 != 0 or zba.n % 32 != 0 or zba.n <= width) return 0;
     return width / 32;
