@@ -426,7 +426,28 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
   uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
 #endif
+#if TF_PF == 2
+  // two-ahead: mw holds the group after next's codes, so each iteration's codes load one iteration earlier; the spare
+  // index pair the same. Each iteration shifts the spare pair in and loads two groups ahead, as tf_lane's TF_PF == 2
+  // double buffer does: same values, same order, load timing only.
+  uint4 mw0 = nw0, mw1 = nw1;
+#if defined(TF_SBI12)
+  uint3 mi = ni;
+#elif defined(TF_SBI)
+  uint2 mi0 = ni0, mi1 = ni1;
+#endif
+#if TF_GN > 1
+  mw0 = wl[(size_t)(TF_G0 + 1) * TF_TB * TF_RW]; mw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)(TF_G0 + 1) * TF_TB * TF_RW + 32];
+#if defined(TF_SBI12)
+  mi = ixs[(size_t)(TF_G0 + 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
+  mi0 = ixs[(size_t)(TF_G0 + 1) * (TF_N / 4)]; mi1 = ixs[(size_t)(TF_G0 + 1) * (TF_N / 4) + 4];
+#endif
+#endif
+  const device uint4* mp = wl + (size_t)(TF_GN > 1 ? TF_G0 + 1 : TF_G0) * TF_TB * TF_RW;
+#else
   const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
+#endif
 #endif
 #if defined(TF_SERIAL_SK2)
   float C0[16];
@@ -473,7 +494,28 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint2 ni0 = 0, ni1 = 0;
   if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
 #endif
+#if TF_PF == 2
+  // two-ahead: mw holds the group after next's codes, so each iteration's codes load one iteration earlier; the spare
+  // index pair the same. Each iteration shifts the spare pair in and loads two groups ahead, as tf_lane's TF_PF == 2
+  // double buffer does: same values, same order, load timing only.
+  uint4 mw0 = nw0, mw1 = nw1;
+#if defined(TF_SBI12)
+  uint3 mi = ni;
+#elif defined(TF_SBI)
+  uint2 mi0 = ni0, mi1 = ni1;
+#endif
+  if (first + 1 < end) {
+    mw0 = wl[(size_t)(first + 1) * TF_TB * TF_RW]; mw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)(first + 1) * TF_TB * TF_RW + 32];
+#if defined(TF_SBI12)
+    mi = ixs[(size_t)(first + 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
+    mi0 = ixs[(size_t)(first + 1) * (TF_N / 4)]; mi1 = ixs[(size_t)(first + 1) * (TF_N / 4) + 4];
+#endif
+  }
+  const device uint4* mp = wl + (size_t)(first + 1 < end ? first + 1 : first) * TF_TB * TF_RW;
+#else
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
+#endif
 #endif
 #if defined(TF_WAIT)
   // X and XS come from a producer in this launch's barrier interval, whose threadgroups count themselves on WC[0] past a
@@ -530,11 +572,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
 #else
+#if TF_PF == 2
+    { const int stay = int(g + 2 >= end); mp += (1 - stay) * TF_TB * TF_RW; nw0 = mw0; nw1 = mw1; mw0 = mp[0]; mw1 = TF_BITS == 2 ? uint4(0) : mp[32]; }
+#if defined(TF_SBI12)
+    ni = mi; mi = ixs[(size_t)min(g + 2, end - 1) * (TF_N / 8)];
+#elif defined(TF_SBI)
+    ni0 = mi0; ni1 = mi1; { const size_t gi = (size_t)min(g + 2, end - 1) * (TF_N / 4); mi0 = ixs[gi]; mi1 = ixs[gi + 4]; }
+#endif
+#else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
     { const size_t gi = (size_t)min(g + 1, end - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+#endif
 #endif
 #endif
 #else
