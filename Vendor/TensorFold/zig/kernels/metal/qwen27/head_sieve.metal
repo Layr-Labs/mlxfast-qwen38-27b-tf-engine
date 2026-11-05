@@ -39,7 +39,8 @@ kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4
   const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
   const size_t wide = ((size_t)(tile / TF_TB) * KG + g) * TF_TB + tile % TF_TB;
   const uint4 w0 = W[wide * 64 + lane], w1 = W[wide * 64 + 32 + lane];
-  W2[t] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
+  // The internal copy is group-major so adjacent tile scans read nearby blocks.
+  W2[(size_t(g) * TILES + tile) * 32 + lane] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
 }
 
 // Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
@@ -49,9 +50,11 @@ kernel void tf_head_sieve_prep(const device bfloat* X [[buffer(0)]], constant in
     device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], device uint* BK [[buffer(5)]], uint t [[thread_position_in_grid]]) {
   if (t == 0) {
     list[0] = 0;
-    args[0] = 0;
+    // One harmless spare group keeps the indirect launch nonzero even if all hits are reused.
+    args[0] = 1;
     args[1] = 1;
     args[2] = 1;
+    args[3] = 0; // selected first-tile slots, recorded by select
   }
   if (t < uint(BLOCKS * 8)) BK[t] = 0;
   if (t >= uint(KG * 16)) return;
@@ -117,7 +120,7 @@ inline uint tf_sieve_key(float v) {
   // each group's words by 32-bit offsets that advance a fixed step a group from the tile's first group: the codes (wo),
   // the metadata (io), the row sums (xo, qo) and the rows' group columns (xv), the same words as the products
   // tile * KG * 32 + g * 32, g * TF_N, g * stride, g * 16 and g * GS index (all below 2^32 for the heads fits() takes)
-  uint wo = uint(tile) * uint(KG * 32) + uint(lane);
+  uint wo = uint(tile) * 32u + uint(lane); // group-major internal copy
   uint4 nw = W[wo];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
@@ -161,7 +164,7 @@ inline uint tf_sieve_key(float v) {
     // the next group's codes and indices under this one's tensor op (the last group reloads its own, unread)
     {
       const uint step = uint(g + 1 < KG);
-      wo += step * 32u;
+      wo += step * uint(TILES * 32);
       nw = W[wo];
 #if defined(TF_SBI12)
       io += step * uint(TF_N / 8);
@@ -265,6 +268,18 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
   bool hit = false;
   if (t < uint(TILES))
     for (int r = 0; r < 8; r++) hit = hit || (r < rows && HM[(size_t)t * 16 + r] >= thr[r]);
+  // The first projection already has every live row of each first tile. Record only first tiles
+  // that the original predicate actually selected; arbitrary nonfinite bounds can exclude one.
+  uint first_slot = 8u;
+  if (hit) {
+    for (uint i = 0; i < uint(rows); i++) {
+      if (first[1 + i] == t) { first_slot = i; break; }
+    }
+  }
+  if (first_slot < 8u) {
+    atomic_fetch_or_explicit(args + 3, 1u << first_slot, memory_order_relaxed);
+    hit = false;
+  }
   const uint n = simd_sum(uint(hit)), at = simd_prefix_exclusive_sum(uint(hit));
   uint base = 0;
   if (lane == 0 && n != 0) {
@@ -280,6 +295,7 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
 // mask (1 NaN, 2 +inf, 4 -inf) of the words read, as tf_round_bf16_argmax picks a full row. A threadgroup of 1024 a row.
 [[max_total_threads_per_threadgroup(1024)]]
 [[kernel]] void tf_head_sieve_pick(const device ushort* Y [[buffer(0)]], const device uint* list [[buffer(1)]], device uint2* picks [[buffer(2)]],
+    const device uint* first [[buffer(3)]], const device ushort* Y1 [[buffer(4)]], const device uint* args [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float bv[32];
@@ -290,6 +306,18 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
   for (uint cell = tid; cell < cells; cell += 1024) {
     const float value = as_type<float>(uint(Y[(size_t)row * TF_N + cell]) << 16);
     const uint token = list[1 + cell / 32] * 32 + cell % 32;
+    if (!isfinite(value)) mask |= isnan(value) ? 1u : value > 0 ? 2u : 4u;
+    else if (id == 0xffffffffu || value > best || (value == best && token < id)) {
+      best = value;
+      id = token;
+    }
+  }
+  // First tiles removed from list are read from the earlier exact output, one slot per chosen tile.
+  const uint slot = tid / 32;
+  if (slot < min(first[0], 8u) && (args[3] & (1u << slot)) != 0u) {
+    const uint column = tid % 32;
+    const float value = as_type<float>(uint(Y1[(size_t)row * 256 + slot * 32 + column]) << 16);
+    const uint token = first[1 + slot] * 32 + column;
     if (!isfinite(value)) mask |= isnan(value) ? 1u : value > 0 ? 2u : 4u;
     else if (id == 0xffffffffu || value > best || (value == best && token < id)) {
       best = value;

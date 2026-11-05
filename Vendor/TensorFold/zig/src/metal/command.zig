@@ -138,6 +138,15 @@ pub const ComputeEncoder = struct {
         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
     }
 
+    /// Bind a contiguous group in one Metal call; the arrays are read during the call.
+    pub fn setBuffers(self: ComputeEncoder, comptime n: usize, buffers: [n]Buffer, offsets: [n]usize, first: usize) void {
+        if (comptime n != 0) {
+            var ids: [n]Id = undefined;
+            inline for (0..n) |i| ids[i] = buffers[i].id;
+            objc.msg(void, self.id, "setBuffers:offsets:withRange:", .{ ids[0..].ptr, offsets[0..].ptr, types.Range{ .location = first, .length = n } });
+        }
+    }
+
     /// Small constants copied into the command stream (at most 4 KB).
     pub fn setBytes(self: ComputeEncoder, bytes: []const u8, index: usize) void {
         objc.msg(void, self.id, "setBytes:length:atIndex:", .{ bytes.ptr, bytes.len, index });
