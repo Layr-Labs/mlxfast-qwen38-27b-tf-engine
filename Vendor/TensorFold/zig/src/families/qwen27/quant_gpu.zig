@@ -5,6 +5,7 @@ const lane = @import("core").lane_projection;
 const row = @import("core").row_projection;
 const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
+const native_gu = @import("native_gu.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
@@ -171,6 +172,12 @@ pub const Kernels = struct {
     gu_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
+    native_gu_pipe: ?mtl.Pipeline = null,
+    native_gu_status: @import("native_gu_startup_policy.zig").Status = .off,
+    native_gu_startup_cohorts: u16 = 0,
+    /// CPU-only diagnostics, inspectable outside a phase; never used to select work.
+    native_gu_calls: u64 = 0,
+    native_gu_dispatches: u64 = 0,
     warm_sink: ?mtl.Buffer = null,
     /// Code bytes warm reads ahead of a decoded out projection (warm_mb MiB), set on first use.
     warm_bytes: ?usize = null,
@@ -208,12 +215,66 @@ pub const Kernels = struct {
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
+        if (k.native_gu_pipe) |p| p.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
         if (k.warm_tiles_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+    }
+
+    /// Eager model-load preparation only: no first-use compile or GPU repack in a prompt phase.
+    pub fn prepareNativeGU(k: *Kernels) !void {
+        if (k.native_gu_pipe != null or !k.device.tensorUnits()) return;
+        k.native_gu_status = .unavailable;
+        const text = "#define TF_NATIVE_GU_M32_PROTOTYPE 1\n" ++ sources.native_gu_m32;
+        const library = try mtl.Library.fromSource(k.device, text, mtl.CompileOptions.mlx());
+        defer library.deinit();
+        const pipe = try mtl.Pipeline.init(k.device, library, "tf_native_gu_m32_prototype", false);
+        errdefer pipe.deinit();
+        if (pipe.simdWidth() != 32 or pipe.maxThreads() < 128) return error.UnsupportedPipelineShape;
+        k.native_gu_pipe = pipe;
+        k.native_gu_status = .off;
+    }
+
+    fn nativeRefFits(ref: Ref, bytes: usize) bool {
+        return ref.offset <= ref.buffer.length() and bytes <= ref.buffer.length() - ref.offset;
+    }
+
+    fn nativeGateUpPrompt(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) bool {
+        const dispatches = k.encodeNativeStartup(e, p, x, xs, out, out_sums, rows) catch return false;
+        k.native_gu_dispatches +|= dispatches;
+        k.native_gu_calls +|= 1;
+        return true;
+    }
+
+    pub fn encodeNativeStartup(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !u64 {
+        const words = p.native_gu orelse return error.NativeGuShape;
+        const pipe = k.native_gu_pipe orelse return error.NativeGuShape;
+        if (!native_gu.route(true, k.device.tensorUnits(), rows, p.n, p.k, p.bits, p.group, p.tile, p.runs.len, p.raw != null)) return error.NativeGuShape;
+        if (xs.stride < rows or !nativeRefFits(words, native_gu.bytes) or !nativeRefFits(p.pairs, @as(usize, p.n) * (p.k / 64) * 4) or
+            !nativeRefFits(x, @as(usize, rows) * p.k * 2) or !nativeRefFits(xs.ref, (@as(usize, p.k / 64 - 1) * xs.stride + rows) * 4) or
+            !nativeRefFits(out, @as(usize, rows) * native_gu.columns * 2) or !nativeRefFits(out_sums, (@as(usize, native_gu.columns / 64 - 1) * xs.stride + rows) * 4)) return error.NativeGuShape;
+        var dispatches: u64 = 0;
+        var first: u32 = 0;
+        while (first < rows) : (first += lane.reg_rows) {
+            const chunk = native_gu.chunk(first, rows);
+            const params = native_gu.promptParams(chunk.rows, xs.stride);
+            e.setPipeline(pipe);
+            e.setBuffer(x.buffer, x.offset + chunk.x, 0);
+            e.setBuffer(words.buffer, words.offset, 1);
+            e.setBuffer(words.buffer, words.offset + native_gu.up_word_offset, 2);
+            e.setBuffer(p.pairs.buffer, p.pairs.offset, 3);
+            e.setBuffer(p.pairs.buffer, p.pairs.offset + native_gu.up_pair_offset, 4);
+            e.setBuffer(xs.ref.buffer, xs.ref.offset + chunk.sums, 5);
+            e.setBuffer(out.buffer, out.offset + chunk.y, 6);
+            e.setBuffer(out_sums.buffer, out_sums.offset + chunk.sums, 7);
+            e.setValue(params, 8);
+            e.dispatchGroups(mtl.Size.of(params.tiles, (chunk.rows + 31) / 32, 1), mtl.Size.of(128, 1, 1));
+            dispatches += 1;
+        }
+        return dispatches;
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -285,21 +346,7 @@ pub const Kernels = struct {
         return true;
     }
 
-    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch, two
-    /// tiles a SIMD group (the gate pair, then the up pair) where the code batches allow.
-    fn gateUpActivatedPrompt(
-        k: *Kernels,
-        input_encoder: mtl.ComputeEncoder,
-        p: projection.Linear,
-        x: Ref,
-        xs: Sums,
-        out: Ref,
-        out_sums: Ref,
-        rows: u32,
-    ) !bool {
-        if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
-        if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
+    fn originalPromptGuLane(k: *Kernels, p: projection.Linear) !lane.Projection {
         const key = Key{
             .kind = .projection,
             .n = p.n,
@@ -312,9 +359,6 @@ pub const Kernels = struct {
             .batch = p.batch,
             .swiglu = true,
         };
-        var span = profile.begin(k.profiler, input_encoder, .dense);
-        span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
-        errdefer span.cancel();
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
@@ -334,6 +378,71 @@ pub const Kernels = struct {
             });
             k.joined(entry.value_ptr);
         }
+        return entry.value_ptr.*;
+    }
+
+    /// Original selection survives every optional preparation, qualification and timing failure.
+    pub fn qualifyNativeGU(k: *Kernels, queue: mtl.Queue, layers: anytype, target: bool) void {
+        if (k.native_gu_pipe == null) return;
+        const policy = @import("native_gu_startup_policy.zig");
+        const calibration = @import("native_gu_startup.zig");
+        k.native_gu_startup_cohorts = 0;
+        var decision: policy.Decision = .{ .status = .shape };
+        if (target and k.device.tensorUnits() and layers.len == 64) attempt: {
+            var matrices: [64]projection.Linear = undefined;
+            for (layers, &matrices) |layer, *p| {
+                p.* = layer.gu;
+                if (!calibration.eligible(p.*)) break :attempt;
+            }
+            decision.status = .unavailable;
+            const baseline = k.originalPromptGuLane(matrices[0]) catch break :attempt;
+            decision = calibration.run(k, queue, baseline, &matrices, &k.native_gu_startup_cohorts) catch |err| .{ .status = switch (err) {
+                error.NativeGuIdentity => .identity,
+                error.NativeGuGuard, error.NativeGuNonfinite => .guard,
+                error.NativeGuSums => .sums,
+                error.NativeGuGpu => .gpu,
+                error.NativeGuTime => .time,
+                error.NativeGuBudget => .budget,
+                else => .unavailable,
+            } };
+        }
+        k.native_gu_status = decision.status;
+        if (!decision.native) {
+            k.native_gu_pipe.?.deinit();
+            k.native_gu_pipe = null;
+        }
+        // Diagnostics stay in these CPU fields; no timing or selection text enters the protocol.
+    }
+
+    /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch, two
+    /// tiles a SIMD group (the gate pair, then the up pair) where the code batches allow.
+    fn gateUpActivatedPrompt(
+        k: *Kernels,
+        input_encoder: mtl.ComputeEncoder,
+        p: projection.Linear,
+        x: Ref,
+        xs: Sums,
+        out: Ref,
+        out_sums: Ref,
+        rows: u32,
+    ) !bool {
+        if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
+        if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
+        if (k.native_gu_pipe != null and p.native_gu != null) {
+            var native_span = profile.begin(k.profiler, input_encoder, .dense);
+            native_span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
+            errdefer native_span.cancel();
+            if (k.nativeGateUpPrompt(native_span.encoder, p, x, xs, out, out_sums, rows)) {
+                try native_span.end();
+                return true;
+            }
+            native_span.cancel();
+        }
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
+        errdefer span.cancel();
+        const program = try k.originalPromptGuLane(p);
         const half = p.n / 2;
         var first: u32 = 0;
         while (first < rows) : (first += lane.reg_rows) {
@@ -345,7 +454,7 @@ pub const Kernels = struct {
             const xsr = lane.Sums{ .ref = .{ .buf = xs.ref.buffer, .off = xs_off }, .stride = xs.stride };
             const hr = lane.Ref{ .buf = out.buffer, .off = out.offset + @as(usize, first) * half * 2 };
             const hsr = lane.Ref{ .buf = out_sums.buffer, .off = out_sums.offset + @as(usize, first) * 4 };
-            try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
+            try program.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
         }
         try span.end();
         return true;
@@ -513,7 +622,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }

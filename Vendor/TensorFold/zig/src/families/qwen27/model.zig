@@ -78,12 +78,22 @@ pub const Model = struct {
         errdefer m.checkpoint.deinit();
         const files = try core.checkpoint_host.shardFiles(a, io, dir);
         defer core.checkpoint_host.freeShardFiles(a, files);
-        // projections stay in the files until load repacks them: the weights live once, in their lane layouts
+        // Base projections stay in the files until load repacks them; enabled native GU adds one canonical sidecar.
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
-        m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
-        errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        // Cached once at load. Pipeline failure disables packing before any sidecar is made.
+        const native_policy = @import("native_gu.zig");
+        const native_text = if (platform.c.getenv("TF_Q27_NATIVE_GU")) |v| std.mem.span(v) else null;
+        var native_enabled = native_policy.enabled(native_text, platform.c.getenv("TF_Q27_NATIVE_GU_DISABLE") != null) and m.device.tensorUnits();
+        if (native_enabled) m.kernels.prepareNativeGU() catch |err| {
+            std.log.warn("qwen27: optional native prompt GU pipeline unavailable ({s}); original projection retained", .{@errorName(err)});
+            native_enabled = false;
+        };
+        m.weights = try wts.loadWithOptions(a, m.device, &m.checkpoint, c, &ws, .{ .native_gu = native_enabled });
+        errdefer m.weights.deinit();
+        m.kernels.qualifyNativeGU(m.queue, m.weights.layers, m.widths_tag == 0);
+        if (m.kernels.native_gu_pipe == null) m.weights.releaseNativeGU();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
