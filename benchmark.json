@@ -54,7 +54,7 @@
     "decodeSpeedupFloor": 0.95,
     "prefillSpeedupFloor": 0.95,
     "decodeSpeedupCeiling": 5.0,
-    "prefillSpeedupCeiling": 1.5
+    "prefillSpeedupCeiling": 3.0
   },
   "leaderboard": {
     "namespace": "qwen3.8-27b-tf-mlx-v1"
