@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const frags = @import("frags.zig");
+const m8_abi = @import("lane_m8_abi.zig");
 
 pub const weight_layout = "u32[ceil(N/32)][K/group][32][group*bits/32], low-bit-first codes, columns past N zero";
 pub const reg_layout = "u32[N/32][K/64][2][32 lanes][4] 4-bit codes, regBlock order";
@@ -319,12 +320,12 @@ pub const Layout = struct {
 };
 
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
-fn lockstepGu(l:Layout)bool{
-    return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
-        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
-        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
-        l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
-        l.ranges.len==0 and l.y_stride==null and !l.residual;
+fn lockstepGu(l: Layout) bool {
+    return l.n == 34816 and l.k == 5120 and l.format.bits == 4 and l.format.group == 64 and
+        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk == 2 and
+        l.indexed and !l.prompt_sr and l.prompt_tn == 1 and l.tile_batch == 8 and
+        l.pf == 1 and l.precompute_sums and l.output == .bf16 and l.groups == null and
+        l.ranges.len == 0 and l.y_stride == null and !l.residual;
 }
 
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
@@ -361,7 +362,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if (lockstepGu(l)) try text.appendSlice(a, ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
 }
 
@@ -493,6 +494,14 @@ pub const Projection = struct {
     reg: bool = false,
     /// Built with Layout.rows8: launches take at most 8 rows.
     rows8: bool = false,
+    /// Retained layout identity for load-time paired kernel qualification.
+    m8: bool = false,
+    /// Q4 M8 needs a load-time right-input ABI probe before the kernel may touch its raw tensor slots.
+    m8_abi_required: bool = false,
+    /// Owned configuration/report storage, initialized to probe mode and activated only after host validation.
+    m8_abi_buffer: ?mtl.Buffer = null,
+    /// Set only after the same compiled M8 pipeline's metadata-only probe has passed and its map was activated.
+    m8_abi_ready: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
     swiglu: bool = false,
     /// A swiglu launch's threads a group: four one-tile SIMD groups, or two two-tile ones (Layout.prompt_tn 2).
@@ -520,24 +529,118 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        const p = try mtl.Pipeline.init(device, lib, if (lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
         if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
+        var m8_abi_buffer: ?mtl.Buffer = null;
+        errdefer if (sums_pipe) |pipe| pipe.deinit();
+        errdefer if (sums_buffer) |buffer| buffer.deinit();
+        errdefer if (m8_abi_buffer) |buffer| buffer.deinit();
         if (l.precompute_sums) {
             sums_pipe = try mtl.Pipeline.init(device, lib, "tf_lane_sums", false);
-            errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        const m8_abi_required = needsM8ABI(l);
+        if (m8_abi_required) {
+            const words = try m8_abi.configWords(physical_sk);
+            m8_abi_buffer = try device.buffer(words * @sizeOf(u32), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            try m8_abi.initialize(m8_abi_buffer.?.slice(u32, words), physical_sk);
+        }
+        var result = Projection{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .m8 = l.m8, .m8_abi_required = m8_abi_required, .m8_abi_buffer = m8_abi_buffer, .m8_abi_ready = !m8_abi_required, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        if (m8_abi_required) {
+            const queue = try device.queue();
+            defer queue.deinit();
+            try result.prepareM8ABI(device, queue);
+        }
+        return result;
     }
 
     pub fn deinit(p: Projection) void {
         p.pipe.deinit();
         if (p.sums_pipe) |pipe| pipe.deinit();
         if (p.sums_buffer) |buffer| buffer.deinit();
+        if (p.m8_abi_buffer) |buffer| buffer.deinit();
+    }
+
+    /// Metadata-only probe of this exact compiled Q4 M8 pipeline, completed by init before returning
+    /// a projection for numerical qualification or counted dispatch.
+    pub fn prepareM8ABI(p: *Projection, device: mtl.Device, queue: mtl.Queue) !void {
+        if (!p.m8_abi_required) return;
+        if (p.m8_abi_ready) return;
+        if (!p.m8 or !p.reg or !p.rows8 or p.output_bytes != 2 or p.sk == 0)
+            return error.UnsupportedM8ABI;
+        const config = p.m8_abi_buffer orelse return error.UnsupportedM8ABI;
+        errdefer p.m8_abi_ready = false;
+
+        const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+        const dims = try device.buffer(8, options);
+        defer dims.deinit();
+        const x = try device.buffer(8 * p.k * 2, options);
+        defer x.deinit();
+        // Probe mode forms the first tile's lane pointers but must return before reading any RHS word.
+        const w = try device.buffer(p.weight_bytes, options);
+        defer w.deinit();
+        const sb = try device.buffer(p.metadata_bytes, options);
+        defer sb.deinit();
+        const y = try device.buffer(8 * p.y_stride * p.output_bytes, options);
+        defer y.deinit();
+        const xs = try device.buffer(p.group_count * 16 * @sizeOf(f32), options);
+        defer xs.deinit();
+        const tc: ?mtl.Buffer = if (p.count) try device.buffer(8, options) else null;
+        defer if (tc) |buffer| buffer.deinit();
+        const wc = try device.buffer(8, options);
+        defer wc.deinit();
+        @memcpy(dims.contents()[0..8], std.mem.asBytes(&[2]i32{ 8, 16 }));
+        @memset(x.contents()[0 .. 8 * p.k * 2], 0);
+        @memset(w.contents()[0..p.weight_bytes], 0);
+        @memset(sb.contents()[0..p.metadata_bytes], 0);
+        @memset(y.contents()[0 .. 8 * p.y_stride * p.output_bytes], 0xA5);
+        @memset(xs.contents()[0 .. p.group_count * 16 * @sizeOf(f32)], 0);
+        if (tc) |buffer| @memset(buffer.contents()[0..8], 0);
+        @memset(wc.contents()[0..8], 0);
+        wc.slice(u32, 2)[0] = 1; // a broken early return cannot enter a long wait loop
+
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        var encoder_closed = false;
+        defer if (!encoder_closed) e.end();
+        e.setPipeline(p.pipe);
+        e.setBuffer(x, 0, 0);
+        e.setBuffer(w, 0, 1);
+        e.setBuffer(sb, 0, 2);
+        e.setBuffer(dims, 0, 3);
+        e.setBuffer(y, 0, 4);
+        e.setBuffer(xs, 0, 5);
+        if (tc) |buffer| e.setBuffer(buffer, 0, 6);
+        if (p.wait) {
+            e.setBuffer(wc, 0, 9);
+            e.setValue(@as(u32, 1), 10);
+        }
+        e.setBuffer(config, 0, 11);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        e.end();
+        encoder_closed = true;
+        cb.commit();
+        cb.wait();
+        if (cb.status() != .completed) return error.UnsupportedM8ABI;
+        if (tc) |buffer| if (buffer.slice(u32, 2)[0] != 0 or buffer.slice(u32, 2)[1] != 0) return error.UnsupportedM8ABI;
+        if (p.wait and (wc.slice(u32, 2)[0] != 1 or wc.slice(u32, 2)[1] != 0)) return error.UnsupportedM8ABI;
+        for (y.contents()[0 .. 8 * p.y_stride * p.output_bytes]) |byte| if (byte != 0xA5) return error.UnsupportedM8ABI;
+        const words = config.slice(u32, m8_abi.configWords(p.sk) catch return error.UnsupportedM8ABI);
+        _ = m8_abi.validate(words, p.sk) catch |err| {
+            const rec = words[m8_abi.records_base..][0..10];
+            std.log.info("M8 ABI probe rejected ({s}): rhs_capacity={d}/{d} rhs_bytes={d}/{d} destination_capacity={d}/{d} destination_bytes={d}/{d}", .{
+                @errorName(err), rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8], rec[9],
+            });
+            return err;
+        };
+        try m8_abi.activate(words, p.sk);
+        p.m8_abi_ready = true;
     }
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
@@ -709,6 +812,8 @@ pub const Projection = struct {
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
+        if (p.m8_abi_required and (!p.m8_abi_ready or p.m8_abi_buffer == null)) return error.UnsupportedM8ABI;
+        if (p.m8_abi_required and p.m8_abi_buffer.?.slice(u32, 1)[0] != m8_abi.mode_run) return error.UnsupportedM8ABI;
         if (p.tile_list) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
@@ -739,6 +844,7 @@ pub const Projection = struct {
             e.setBuffer(y.buf, y.off, 7);
         }
         if (counter) |c| e.setBuffer(c.buf, c.off, 6); // TF_COUNT: the norm's wait word
+        if (p.m8_abi_required) e.setBuffer(p.m8_abi_buffer.?, 0, 11);
         e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
@@ -746,6 +852,36 @@ pub const Projection = struct {
 
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
+
+fn needsM8ABI(l: Layout) bool {
+    return l.m8 and l.format.bits == 4;
+}
+
+test "only Q4 M8 layouts require a qualified RHS ABI" {
+    try std.testing.expect(needsM8ABI(.{ .n = 32, .k = 64, .format = .{ .bits = 4, .group = 64 }, .m8 = true }));
+    try std.testing.expect(!needsM8ABI(.{ .n = 32, .k = 64, .format = .{ .bits = 2, .group = 64 }, .m8 = true }));
+    try std.testing.expect(!needsM8ABI(.{ .n = 32, .k = 64, .format = .{ .bits = 4, .group = 64 }, .m8 = false }));
+}
+
+test "Q4 M8 encode fails before touching an unprobed encoder" {
+    const p = Projection{
+        .pipe = undefined,
+        .n = 32,
+        .k = 64,
+        .group_count = 1,
+        .weight_bytes = 0,
+        .metadata_bytes = 0,
+        .output_bytes = 2,
+        .y_stride = 32,
+        .tile_count = 1,
+        .sk = 4,
+        .rows8 = true,
+        .m8 = true,
+        .m8_abi_required = true,
+        .m8_abi_ready = false,
+    };
+    try std.testing.expectError(error.UnsupportedM8ABI, p.encodeImpl(undefined, undefined, undefined, undefined, null, undefined, 1, null, null, null));
+}
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };

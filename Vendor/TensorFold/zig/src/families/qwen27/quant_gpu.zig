@@ -75,6 +75,8 @@ const Key = struct {
     sbi: bool = false,
     sbi12: bool = false,
     resid: bool = false,
+    /// Qualified target DOWN M8 pipeline; distinct from ordinary rows8/M16 entries.
+    m8: bool = false,
     count: bool = false,
     wait: bool = false,
     tiles: u32 = 0,
@@ -163,6 +165,13 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    target_down_m8_qualified: u32 = 0,
+    target_down_m8_rejected: u32 = 0,
+    target_down_m8_dispatches: u64 = 0,
+    /// Model.load sets this only when the M8 optimization is admitted; target DOWN must not silently fall back to M16.
+    target_down_m8_required: bool = false,
+    target_down_m8_calibration_failed: bool = false,
+    target_down_m8_probe_error_logged: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -196,6 +205,9 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.setResident(null);
+        if (k.target_down_m8_qualified != 0 or k.target_down_m8_rejected != 0 or k.target_down_m8_dispatches != 0) {
+            std.log.info("qwen27: target-down M8 qualified={d} rejected={d} encoded_dispatches={d}", .{ k.target_down_m8_qualified, k.target_down_m8_rejected, k.target_down_m8_dispatches });
+        }
         if (k.row_pipelines) |*pipelines| pipelines.deinit();
         if (k.simd) |*pipelines| pipelines.deinit();
         if (k.simd_bits) |*pipelines| pipelines.deinit();
@@ -513,7 +525,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -700,10 +713,259 @@ pub const Kernels = struct {
     /// once a threadgroup too, but only parallel split-K launches wait.
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .m8 = wait and p.m8_qualified and (p.m8_row_mask & (@as(u8, 1) << @as(u3, @intCast(rows - 1)))) != 0 and targetDownM8Shape(p), .count = true, .wait = wait };
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
+    }
+
+    test "qualified M8 stays on counted target DOWN rows 1 through 8 with distinct wait keys" {
+        var k = Kernels{ .allocator = std.testing.allocator, .device = undefined };
+        var p = projection.Linear{
+            .words = undefined,
+            .pairs = undefined,
+            .n = 5120,
+            .k = 17408,
+            .tile = 32,
+            .slices = 4,
+            .m8_qualified = false,
+        };
+        try std.testing.expect(targetDownM8Shape(p));
+        for (1..9) |rows| {
+            p.m8_qualified = false;
+            const unqualified = countedKey(&k, p, @intCast(rows), false).?;
+            try std.testing.expect(!unqualified.m8);
+            p.m8_qualified = true;
+            p.m8_row_mask = 0xFF;
+            const no_wait = countedKey(&k, p, @intCast(rows), false).?;
+            const wait = countedKey(&k, p, @intCast(rows), true).?;
+            try std.testing.expect(!no_wait.m8 and wait.m8);
+            try std.testing.expect(!std.meta.eql(no_wait, wait));
+            p.m8_row_mask = 0;
+            try std.testing.expect(!countedKey(&k, p, @intCast(rows), true).?.m8);
+            p.m8_row_mask = @as(u8, 1) << @as(u3, @intCast(rows - 1));
+            try std.testing.expect(countedKey(&k, p, @intCast(rows), true).?.m8);
+        }
+        try std.testing.expect(countedKey(&k, p, 9, false) == null);
+        k.prompt = true;
+        try std.testing.expect(countedKey(&k, p, 1, false) == null);
+        k.prompt = false;
+        p.m8_qualified = true;
+        p.n = 34816;
+        try std.testing.expect(!targetDownM8Shape(p));
+        try std.testing.expect(!countedKey(&k, p, 1, false).?.m8);
+    }
+
+    fn targetDownM8Shape(p: projection.Linear) bool {
+        return p.n == 5120 and p.k == 17408 and p.bits == 4 and p.group == 64 and p.tile == 32 and p.slices >= 2 and p.runs.len == 0 and p.raw == null;
+    }
+
+    /// Called during model load for each real target DOWN weight. Any probe failure keeps the M16 key.
+    pub fn qualifyTargetDownM8(k: *Kernels, queue: mtl.Queue, p: *projection.Linear) bool {
+        p.m8_qualified = false;
+        p.m8_row_mask = 0;
+        if (!targetDownM8Shape(p.*)) return false;
+        const qualified = k.probeTargetDownM8(queue, p.*) catch |err| blk: {
+            if (!k.target_down_m8_probe_error_logged) {
+                k.target_down_m8_probe_error_logged = true;
+                std.log.warn("qwen27: target-down M8 numeric qualification failed for {d}x{d} Q4/G{d}: {s}", .{ p.n, p.k, p.group, @errorName(err) });
+            }
+            break :blk false;
+        };
+        p.m8_qualified = qualified;
+        if (qualified) k.target_down_m8_qualified += 1 else k.target_down_m8_rejected += 1;
+        return qualified;
+    }
+
+    /// All real DOWN matrices run in each calibration cohort before any request can select M8.
+    pub fn calibrateTargetDownM8(k: *Kernels, queue: mtl.Queue, down: []const projection.Linear) u8 {
+        const calibration = @import("decode_m8_calibration.zig");
+        k.target_down_m8_calibration_failed = false;
+        if (down.len != calibration.matrices) {
+            k.target_down_m8_calibration_failed = true;
+            return 0;
+        }
+        var programs: [calibration.matrices]calibration.Program = undefined;
+        for (down, 0..) |p, i| {
+            if (!p.m8_qualified or !targetDownM8Shape(p)) {
+                k.target_down_m8_calibration_failed = true;
+                return 0;
+            }
+            var baseline_key = countedKey(k, p, 8, true) orelse {
+                k.target_down_m8_calibration_failed = true;
+                return 0;
+            };
+            baseline_key.m8 = false;
+            var candidate_key = baseline_key;
+            candidate_key.m8 = true;
+            // Copy borrowed handles before another insertion can grow the pipeline map.
+            const baseline = (countedProjection(k, p, baseline_key) catch {
+                k.target_down_m8_calibration_failed = true;
+                return 0;
+            }).*;
+            const candidate = (countedProjection(k, p, candidate_key) catch {
+                k.target_down_m8_calibration_failed = true;
+                return 0;
+            }).*;
+            programs[i] = .{
+                .layer = i,
+                .baseline = baseline,
+                .candidate = candidate,
+                .words = .{ .buf = p.words.buffer, .off = p.words.offset },
+                .metadata = metadata(p, p.index != null),
+            };
+        }
+        var row_mask: u8 = 0;
+        for (1..9) |live_rows| {
+            const evidence = calibration.run(k.device, queue, &programs, @intCast(live_rows)) catch |err| {
+                k.target_down_m8_calibration_failed = true;
+                std.log.info("qwen27: target-down M8 rows={d} kept M16 ({s})", .{ live_rows, @errorName(err) });
+                continue;
+            };
+            const decision = evidence.decision;
+            std.log.info("qwen27: target-down M8 rows={d} adopted={} relative={d:.6} saved={d:.9} positive={d} null={d:.6}", .{
+                live_rows, decision.use_m8, decision.median_relative_gain, decision.median_saving_seconds, decision.positive_pairs, decision.max_null_relative,
+            });
+            if (decision.use_m8) row_mask |= @as(u8, 1) << @as(u3, @intCast(live_rows - 1));
+        }
+        return row_mask;
+    }
+
+    /// A shared constructor keeps qualification and production on the same complete counted/wait cache key.
+    fn countedProjection(k: *Kernels, p: projection.Linear, key: Key) !*lane.Projection {
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = key.slices,
+                .precompute_sums = true,
+                .reg = true,
+                .tile_batch = key.batch,
+                .rows8 = true,
+                .reg_lean = true,
+                .indexed = key.sbi,
+                .indexed12 = key.sbi12,
+                .m8 = key.m8,
+                .count = true,
+                .wait = key.wait,
+                .serial_sk2 = key.serialSk2(),
+            });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr;
+    }
+
+    fn probeTargetDownM8(k: *Kernels, queue: mtl.Queue, p: projection.Linear) !bool {
+        @setFloatMode(.strict);
+        const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+        const rows_max: usize = 8;
+        const sums_stride: usize = 16;
+        const groups: usize = p.k / 64;
+        const prefix_bytes: usize = 64;
+        const suffix_bytes: usize = 64;
+        const x_buf = try k.device.buffer(rows_max * p.k * 2, options);
+        defer x_buf.deinit();
+        const xs_buf = try k.device.buffer(groups * sums_stride * 4, options);
+        defer xs_buf.deinit();
+        const y_size = prefix_bytes + rows_max * p.n * 2 + suffix_bytes;
+        const y16 = try k.device.buffer(y_size, options);
+        defer y16.deinit();
+        const y8 = try k.device.buffer(y_size, options);
+        defer y8.deinit();
+        const tc16 = try k.device.buffer(8, options);
+        defer tc16.deinit();
+        const tc8 = try k.device.buffer(8, options);
+        defer tc8.deinit();
+        const wc16 = try k.device.buffer(8, options);
+        defer wc16.deinit();
+        const wc8 = try k.device.buffer(8, options);
+        defer wc8.deinit();
+
+        var base_count = countedKey(k, p, 1, false) orelse return error.M8ProbeCountKeyUnavailable;
+        base_count.m8 = false;
+        var test_count = base_count;
+        test_count.m8 = true;
+        var base_wait = countedKey(k, p, 1, true) orelse return error.M8ProbeWaitKeyUnavailable;
+        base_wait.m8 = false;
+        var test_wait = base_wait;
+        test_wait.m8 = true;
+        // Copy each handle before another getOrPut can rehash the map and invalidate its value pointer.
+        const p16 = (try countedProjection(k, p, base_count)).*;
+        const p8 = (try countedProjection(k, p, test_count)).*;
+        const p16w = (try countedProjection(k, p, base_wait)).*;
+        const p8w = (try countedProjection(k, p, test_wait)).*;
+        const xref = lane.Ref{ .buf = x_buf, .off = 0 };
+        const sums = lane.Sums{ .ref = .{ .buf = xs_buf, .off = 0 }, .stride = sums_stride };
+        const wref = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+        const sbref = metadata(p, p.index != null);
+        const yrefs = [_]lane.Ref{ .{ .buf = y16, .off = prefix_bytes }, .{ .buf = y8, .off = prefix_bytes } };
+        var state: u32 = 0;
+        for ([_]u32{ 0x9E3779B9, 0xA511E9B3 }) |seed| {
+            state = seed;
+            const xv = x_buf.slice(u16, rows_max * p.k);
+            const sv = xs_buf.slice(f32, groups * sums_stride);
+            @memset(sv, 0);
+            for (0..rows_max) |r| for (0..p.k) |c| {
+                state = state *% 1664525 +% 1013904223;
+                const f = (@as(f32, @floatFromInt(state >> 8)) / 16777216.0) * 4.0 - 2.0;
+                xv[r * p.k + c] = @truncate(@as(u32, @bitCast(f)) >> 16);
+            };
+            for (0..groups) |g| for (0..rows_max) |r| {
+                var group_sum: f32 = 0;
+                for (0..64) |i| group_sum += @as(f32, @bitCast(@as(u32, xv[r * p.k + g * 64 + i]) << 16));
+                sv[g * sums_stride + r] = group_sum;
+            };
+            for (1..rows_max + 1) |rows| {
+                const used = rows * p.n * 2;
+                const variants = [_]struct { proj: lane.Projection, yi: usize, wait: bool, expected: u8 }{
+                    .{ .proj = p16, .yi = 0, .wait = false, .expected = 0xA5 },
+                    .{ .proj = p8, .yi = 1, .wait = false, .expected = 0x5A },
+                    .{ .proj = p16w, .yi = 0, .wait = true, .expected = 0xA5 },
+                    .{ .proj = p8w, .yi = 1, .wait = true, .expected = 0x5A },
+                };
+                for (variants, 0..) |v, variant_index| {
+                    const yb = if (v.yi == 0) y16 else y8;
+                    const tc = if (v.yi == 0) tc16 else tc8;
+                    const wc = if (v.yi == 0) wc16 else wc8;
+                    @memset(yb.contents()[0..y_size], v.expected);
+                    @memset(yb.contents()[prefix_bytes .. y_size - suffix_bytes], 0xFF);
+                    @memset(tc.contents()[0..8], 0);
+                    @memset(wc.contents()[0..8], 0);
+                    if (v.wait) wc.slice(u32, 2)[0] = 1;
+                    const pool = mtl.objc.Pool.push();
+                    defer pool.pop();
+                    const cb = queue.commandBuffer();
+                    const e = cb.compute(.serial);
+                    var encoder_closed = false;
+                    defer if (!encoder_closed) e.end();
+                    if (v.wait) {
+                        try v.proj.encodeCountedAfter(e, xref, wref, sbref, sums, yrefs[v.yi], @intCast(rows), .{ .buf = tc, .off = 0 }, .{ .buf = wc, .off = 0 }, 1);
+                    } else {
+                        try v.proj.encodeCounted(e, xref, wref, sbref, sums, yrefs[v.yi], @intCast(rows), .{ .buf = tc, .off = 0 });
+                    }
+                    e.end();
+                    encoder_closed = true;
+                    cb.commit();
+                    cb.wait();
+                    if (cb.status() != .completed) return error.M8ProbeCommandFailed;
+                    if (tc.slice(u32, 2)[0] != @as(u32, @intCast(v.proj.tile_count)) or tc.slice(u32, 2)[1] != 0) return error.M8ProbeCountMismatch;
+                    if (v.wait and (wc.slice(u32, 2)[0] != 0 or wc.slice(u32, 2)[1] != 0)) return error.M8ProbeWaitMismatch;
+                    const live_start = prefix_bytes;
+                    const live_end = live_start + used;
+                    for (yb.slice(u16, y_size / 2)[live_start / 2 .. live_end / 2]) |word| if ((word & 0x7f80) == 0x7f80) return error.M8ProbeNonfiniteOutput;
+                    for (yb.contents()[0..prefix_bytes]) |byte| if (byte != v.expected) return error.M8ProbePrefixOverwrite;
+                    for (yb.contents()[live_end .. y_size - suffix_bytes]) |byte| if (byte != 0xFF) return error.M8ProbePaddingOverwrite;
+                    for (yb.contents()[y_size - suffix_bytes .. y_size]) |byte| if (byte != v.expected) return error.M8ProbeSuffixOverwrite;
+                    if (variant_index == 1 or variant_index == 3) {
+                        if (!std.mem.eql(u8, y16.contents()[live_start..live_end], y8.contents()[live_start..live_end])) return error.M8ProbeOutputMismatch;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
@@ -817,22 +1079,18 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .serial_sk2 = key.serialSk2() });
-            k.joined(entry.value_ptr);
-        }
+        const entry = try k.countedProjection(p, key);
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? });
+        try entry.encodeCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? });
         try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        if (key.m8) k.target_down_m8_dispatches += 1;
+        return @intCast(entry.tile_count);
     }
 
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        const key = try k.targetDownM8CallKey(p, rows);
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -842,27 +1100,27 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
-            k.joined(entry.value_ptr);
-        }
+        const entry = try k.countedProjection(p, key);
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+        try entry.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
         try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        if (key.m8) k.target_down_m8_dispatches += 1;
+        return @intCast(entry.tile_count);
+    }
+
+    /// Resolve and enforce the exact target DOWN row-stratum selected at model load. Kept pure for direct host tests.
+    fn targetDownM8CallKey(k: *const Kernels, p: projection.Linear, rows: u32) !Key {
+        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        if (k.target_down_m8_required and targetDownM8Shape(p) and !key.m8) return error.TargetDownM8NotSelected;
+        return key;
     }
 
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
     /// rows and their group sums are stored, when `down` takes the counted launch that waits on them in the same barrier
     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
-        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
-        if (k.countedKey(down, rows, true) == null) return null;
+        if (!try k.gateUpCountedEligible(p, down, rows)) return null;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
-        if (!key.serialSk2()) return null;
         if (k.gu_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -880,6 +1138,30 @@ pub const Kernels = struct {
         const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
         try span.end();
         return n;
+    }
+
+    /// Preserve the legacy optional fast path unless this model admitted target DOWN M8. In that mode, a normal decoded
+    /// target call must reach the exact counted-wait kernel with a calibrated M8 row key; otherwise fail before touching
+    /// buffers or the caller's encoder instead of silently taking the M16 fallback.
+    fn gateUpCountedEligible(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) !bool {
+        const required_target = k.target_down_m8_required and !k.prompt and rows > 0 and rows <= 8 and targetDownM8Shape(down);
+        if (k.prompt or rows == 0 or rows > 8) return false;
+        const gate_eligible = p.runs.len == 0 and p.raw == null and p.tile == 32 and p.bits == 4 and p.group == 64 and p.n == 34816 and p.k == 5120 and p.batch == 8 and p.index != null;
+        if (!gate_eligible) {
+            if (required_target) return error.TargetDownM8GateUpUnavailable;
+            return false;
+        }
+        const down_key = k.countedKey(down, rows, true) orelse {
+            if (required_target) return error.TargetDownM8GateUpUnavailable;
+            return false;
+        };
+        if (required_target and !down_key.m8) return error.TargetDownM8NotSelected;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
+        if (!key.serialSk2()) {
+            if (required_target) return error.TargetDownM8GateUpUnavailable;
+            return false;
+        }
+        return true;
     }
 
     /// Prompt rows [base, base + 128) into the Neural Engine's fp16 input planes [hidden][128].
@@ -931,6 +1213,72 @@ pub const Kernels = struct {
         try span.end();
     }
 };
+
+test "target DOWN M8 admission selector: selected, unselected, non-target, disabled and invalid rows" {
+    var k = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_down_m8_required = true };
+    var p = projection.Linear{
+        .words = undefined,
+        .pairs = undefined,
+        .n = 5120,
+        .k = 17408,
+        .tile = 32,
+        .slices = 4,
+        .m8_qualified = true,
+        .m8_row_mask = 0b0000_0010,
+    };
+    try std.testing.expect((try k.targetDownM8CallKey(p, 2)).m8);
+    try std.testing.expectError(error.TargetDownM8NotSelected, k.targetDownM8CallKey(p, 1));
+    try std.testing.expectError(error.TargetDownM8NotSelected, k.targetDownM8CallKey(p, 8));
+    p.n = 34816;
+    try std.testing.expect(!(try k.targetDownM8CallKey(p, 1)).m8);
+    p.n = 5120;
+    k.target_down_m8_required = false;
+    try std.testing.expect(!(try k.targetDownM8CallKey(p, 1)).m8);
+    k.target_down_m8_required = true;
+    try std.testing.expectError(error.BadCoreProjectionRows, k.targetDownM8CallKey(p, 0));
+    try std.testing.expectError(error.BadCoreProjectionRows, k.targetDownM8CallKey(p, 9));
+}
+
+test "target DOWN M8 required gate/up entry rejects fallback before encoder access" {
+    var k = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_down_m8_required = true };
+    const down = projection.Linear{
+        .words = undefined,
+        .pairs = undefined,
+        .n = 5120,
+        .k = 17408,
+        .tile = 32,
+        .slices = 4,
+        .m8_qualified = true,
+        .m8_row_mask = 0,
+    };
+    var gate = projection.Linear{
+        .words = undefined,
+        .pairs = undefined,
+        .index = .{ .buffer = undefined },
+        .n = 34816,
+        .k = 5120,
+        .tile = 32,
+        .slices = 2,
+        .batch = 8,
+    };
+    try std.testing.expectError(error.TargetDownM8NotSelected, k.gateUpCounted(undefined, gate, down, undefined, undefined, undefined, undefined, 2));
+    try std.testing.expectError(error.TargetDownM8NotSelected, k.quantCountedAfter(undefined, down, undefined, undefined, undefined, 2, 1));
+    gate.n = 0;
+    try std.testing.expectError(error.TargetDownM8GateUpUnavailable, k.gateUpCounted(undefined, gate, down, undefined, undefined, undefined, undefined, 2));
+    gate.n = 34816;
+    gate.slices = 1;
+    var selected_down = down;
+    selected_down.m8_row_mask = 1 << 1;
+    try std.testing.expectError(error.TargetDownM8GateUpUnavailable, k.gateUpCounted(undefined, gate, selected_down, undefined, undefined, undefined, undefined, 2));
+    gate.slices = 2;
+    k.target_down_m8_required = false;
+    gate.n = 0;
+    try std.testing.expect((try k.gateUpCounted(undefined, gate, down, undefined, undefined, undefined, undefined, 2)) == null);
+    k.target_down_m8_required = true;
+    k.prompt = true;
+    gate.n = 34816;
+    try std.testing.expect((try k.gateUpCounted(undefined, gate, down, undefined, undefined, undefined, undefined, 2)) == null);
+}
 
 /// The metadata a reg launch binds: decoded rows' indexed copy where its key takes it, else the pairs.
 fn metadata(p: projection.Linear, indexed: bool) lane.Ref {
