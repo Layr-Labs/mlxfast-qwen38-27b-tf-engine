@@ -808,7 +808,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr int TN = TF_PROMPT_TN;
+#if defined(TF_PROMPT_MR2)
+  const int r0 = int(tg.y) * 32, rows = mdims[0] - r0;
+#else
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
+#endif
   if (rows <= 0) return;
   X += (size_t)r0 * TF_K;
 #if defined(TF_SWIGLU)
@@ -853,16 +857,75 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   const device uint4* sp = (const device uint4*)SB + ((size_t)first * TF_N + tile0 * NT + nb) / 4;
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
+#if defined(TF_PROMPT_MR2)
+  float C[2][16];
+  TF_UNROLL
+  for (int h = 0; h < 2; h++) {
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) C[h][i] = 0.0f;
+  }
+#else
   float C[TN][16];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
+#endif
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = first; g < last; g++) {
+#if defined(TF_PROMPT_MR2)
+    const float x0 = xp[0], x1 = xp[8], y0 = xp[16], y1 = xp[24];
+    xp += stride;
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, 16), xstr));
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+    const uint4 q0 = sp[0], q1 = sp[4];
+    sp += TF_N / 4;
+    const uint4 cur0 = nw0, cur1 = nw1;
+    thread half2* b2l = (thread half2*)&cbl[0];
+    thread half2* b2h = (thread half2*)&cbh[0];
+    TF_UNROLL
+    for (int w = 0; w < 8; w++) {
+      const uint word = w < 4 ? cur0[w] : cur1[w - 4];
+      thread half2* b2 = (w & 1) ? b2h : b2l;
+      const int e = 2 * (w >> 1);
+      b2[e] = as_type<half2>(word & 0x000F000Fu);
+      b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
+      b2[e + 8] = as_type<half2>((word >> 8) & 0x000F000Fu);
+      b2[e + 9] = as_type<half2>((word >> 12) & 0x000F000Fu);
+    }
+    cp += g + 1 < last ? TF_TB * 64 : 0;
+    nw0 = cp[0]; nw1 = cp[32];
+    opm.run(xl0, cbl, P);
+    opa.run(xl1, cbh, P);
+    TF_UNROLL
+    for (int j = 0; j < 4; j++) {
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+      C[0][j] = fma(s0, P[j], fma(b0, x0, C[0][j]));
+      C[0][4 + j] = fma(s0, P[4 + j], fma(b0, x1, C[0][4 + j]));
+      C[0][8 + j] = fma(s1, P[8 + j], fma(b1, x0, C[0][8 + j]));
+      C[0][12 + j] = fma(s1, P[12 + j], fma(b1, x1, C[0][12 + j]));
+    }
+    x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)(xv + (size_t)16 * TF_K), dextents<int32_t, 2>(GS, 16), xstr));
+    TF_UNROLL
+    for (int i = 0; i < 16; i++) { xl0[i] = x64[i]; xl1[i] = x64[16 + i]; }
+    xv += GS;
+    opm.run(xl0, cbl, P);
+    opa.run(xl1, cbh, P);
+    TF_UNROLL
+    for (int j = 0; j < 4; j++) {
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+      C[1][j] = fma(s0, P[j], fma(b0, y0, C[1][j]));
+      C[1][4 + j] = fma(s0, P[4 + j], fma(b0, y1, C[1][4 + j]));
+      C[1][8 + j] = fma(s1, P[8 + j], fma(b1, y0, C[1][8 + j]));
+      C[1][12 + j] = fma(s1, P[12 + j], fma(b1, y1, C[1][12 + j]));
+    }
+#else
     const float x0 = xp[0], x1 = xp[8];
     xp += stride;
     x64.load(tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>((device bfloat*)xv, dextents<int32_t, 2>(GS, M), xstr));
@@ -874,6 +937,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if TF_PROMPT_TN == 4
     TF_TN_TILE(2)
     TF_TN_TILE(3)
+#endif
 #endif
   }
 #if defined(TF_SWIGLU)
@@ -907,7 +971,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
+#if defined(TF_PROMPT_MR2)
+  threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * 32 * 32];
+#else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
+#endif
 #ifndef TF_TGPAD
 #define TF_TGPAD 8192
 #endif
@@ -917,6 +985,43 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   threadgroup float tgpad[TF_TGPAD / 4];
   if (mdims[0] == -12345) { tgpad[lane] = C[0][0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0][0] = tgpad[lane ^ 1]; }
 #endif
+#if defined(TF_PROMPT_MR2)
+  if (TF_SK > 1) {
+    if (ks > 0) {
+      TF_UNROLL
+      for (int i = 0; i < 16; i++) {
+        part[((ks - 1) * 32 + i) * 32 + lane] = C[0][i];
+        part[((ks - 1) * 32 + 16 + i) * 32 + lane] = C[1][i];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+      for (int s2 = 1; s2 < TF_SK; s2++) {
+        TF_UNROLL
+        for (int i = 0; i < 16; i++) {
+          C[0][i] += part[((s2 - 1) * 32 + i) * 32 + lane];
+          C[1][i] += part[((s2 - 1) * 32 + 16 + i) * 32 + lane];
+        }
+      }
+    }
+  }
+  static_assert(TF_N % 4 == 0 && TF_YS % 4 == 0, "a lane's quads are whole and aligned");
+  if (ks == 0) {
+    for (int h = 0; h < 2; h++) {
+      TF_UNROLL
+      for (int q = 0; q < 4; q++) {
+        const int m = 16 * h + mb + 8 * (q & 1), n = tile0 * NT + nb + 16 * (q >> 1);
+        if (m < rows && n < TF_N) {
+          const vec<bfloat, 4> hrow = *(const device vec<bfloat, 4>*)(H + (size_t)m * TF_YS + n);
+          vec<bfloat, 4> r;
+          TF_UNROLL
+          for (int j = 0; j < 4; j++) r[j] = bfloat(float(hrow[j]) + float(static_cast<bfloat>(C[h][4 * q + j])));
+          *(device vec<bfloat, 4>*)(RO + (size_t)m * TF_YS + n) = r;
+        }
+      }
+    }
+  }
+#else
   if (TF_SK > 1) {
     if (ks > 0) {
       TF_UNROLL
@@ -965,6 +1070,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       }
     }
   }
+#endif
 #endif
 }
 #endif

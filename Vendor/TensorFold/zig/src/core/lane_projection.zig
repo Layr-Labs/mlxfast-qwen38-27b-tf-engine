@@ -203,6 +203,8 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Prompt residual DOWN only: one N tile covers two sequential M16 input blocks with shared unpacked W.
+    prompt_mr2: bool = false,
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
@@ -250,7 +252,10 @@ pub const Layout = struct {
         if (l.swiglu and l.prompt_tn != 1 and (l.prompt_tn != 2 or l.sk != 1 or (l.n / 64) % l.tile_batch != 0)) return error.InvalidSchedule;
         if (l.prompt_tn != 1 and (!l.prompt_sr or l.serial_sk2 or
             (l.prompt_tn != 2 and l.prompt_tn != 4) or l.tile_batch % l.prompt_tn != 0 or !l.tilesInGroups(l.prompt_tn))) return error.InvalidSchedule;
-        if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
+        if (l.residual and ((l.prompt_tn == 1 and !l.prompt_mr2) or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
+        if (l.prompt_mr2 and (!l.residual or l.prompt_tn != 1 or l.n != 5120 or l.k != 17408 or l.sk != 2 or
+            l.format.bits != 4 or l.format.group != 64 or !l.prompt_sr or l.serial_sk2 or l.rows8 or l.indexed or
+            l.count or l.wait or l.tile_list or l.ranges.len != 0)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
@@ -297,7 +302,8 @@ pub const Layout = struct {
     }
 
     pub fn threadgroupBytes(l: Layout) usize {
-        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
+        const rows: usize = if (l.prompt_mr2) 32 else 16;
+        return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * rows * 32 * @sizeOf(f32);
     }
 
     pub fn weightWords(l: Layout) usize {
@@ -319,12 +325,12 @@ pub const Layout = struct {
 };
 
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
-fn lockstepGu(l:Layout)bool{
-    return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
-        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
-        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
-        l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
-        l.ranges.len==0 and l.y_stride==null and !l.residual;
+fn lockstepGu(l: Layout) bool {
+    return l.n == 34816 and l.k == 5120 and l.format.bits == 4 and l.format.group == 64 and
+        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk == 2 and
+        l.indexed and !l.prompt_sr and l.prompt_tn == 1 and l.tile_batch == 8 and
+        l.pf == 1 and l.precompute_sums and l.output == .bf16 and l.groups == null and
+        l.ranges.len == 0 and l.y_stride == null and !l.residual;
 }
 
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
@@ -351,7 +357,8 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.reg_lean) try text.appendSlice(a, "#define TF_REG_LEAN 1\n");
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
-    if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.prompt_tn != 1 or l.prompt_mr2) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.prompt_mr2) try text.appendSlice(a, "#define TF_PROMPT_MR2 1\n");
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
@@ -361,7 +368,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if (lockstepGu(l)) try text.appendSlice(a, ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
 }
 
@@ -499,6 +506,8 @@ pub const Projection = struct {
     swiglu_threads: usize = 128,
     /// Built with Layout.residual: encodeResid only.
     residual: bool = false,
+    /// Built with Layout.prompt_mr2: dispatches two M16 input blocks per threadgroup.
+    prompt_mr2: bool = false,
     /// Built with Layout.count: encodeCounted only.
     count: bool = false,
     /// Built with Layout.gu_count: encodeSwigluCounted only.
@@ -520,7 +529,7 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        const p = try mtl.Pipeline.init(device, lib, if (lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
         if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
@@ -531,7 +540,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .prompt_mr2 = l.prompt_mr2, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 or l.prompt_mr2 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -568,7 +577,7 @@ pub const Projection = struct {
     /// q27_norm_xs forms the residual stream; no output rows are stored. `sums` null: the projection's own sums pass.
     pub fn encodeResid(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: ?Sums, h: Ref, ro: Ref, rows: u32) !void {
         if (!p.residual) return error.InvalidSchedule;
-        if (rows == 0 or rows > reg_rows) return error.InvalidRows;
+        if (rows == 0 or rows > reg_rows or (p.prompt_mr2 and rows % 32 != 0)) return error.InvalidRows;
         if (sums) |s| {
             if (s.stride < rows) return error.InvalidRows;
             try checkRef(s.ref, ((p.group_count - 1) * @as(usize, s.stride) + rows) * 4, 4);
@@ -711,8 +720,8 @@ pub const Projection = struct {
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
         if (p.tile_list) return error.InvalidSchedule;
         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
-        const blocks = (rows + 15) / 16;
-        const stride: u32 = if (given) |g| g.stride else 16 * blocks;
+        const blocks = if (p.prompt_mr2) (rows + 31) / 32 else (rows + 15) / 16;
+        const stride: u32 = if (given) |g| g.stride else 16 * (if (p.prompt_mr2) (rows + 15) / 16 else blocks);
         try checkRef(x, rows * p.k * 2, 2);
         try checkRef(w, p.weight_bytes, if (p.reg) 16 else 8);
         try checkRef(sb, p.metadata_bytes, 16);
@@ -747,6 +756,11 @@ pub const Projection = struct {
 /// Rows one reg encode takes, as 16-row blocks on the grid's y (a prompt chunk's rows in one weight read).
 pub const reg_rows = 128;
 
+/// MR2 is legal only for the Q27 residual DOWN shape and an aligned existing prompt chunk.
+pub fn promptDownMr2Eligible(enabled: bool, n: u32, k: u32, sk: u32, bits: u8, group: u32, rows: u32) bool {
+    return enabled and n == 5120 and k == 17408 and sk == 2 and bits == 4 and group == 64 and rows != 0 and rows % 32 == 0 and rows <= reg_rows;
+}
+
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
@@ -766,6 +780,43 @@ test "rows8 is off by default, needs the reg kernel and only adds its define" {
     l.reg = false;
     l.serial_sk2 = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "MR2 residual DOWN layout keeps M16 TN2 threadgroup storage while changing the row grid" {
+    const base = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = 8, .reg_lean = true, .prompt_tn = 2, .residual = true };
+    var mr2 = base;
+    mr2.prompt_tn = 1;
+    mr2.prompt_mr2 = true;
+    try base.validate();
+    try mr2.validate();
+    try std.testing.expectEqual(@as(usize, 8192), base.threadgroupBytes());
+    try std.testing.expectEqual(base.threadgroupBytes(), mr2.threadgroupBytes());
+    const base_source = try source(std.testing.allocator, base);
+    defer std.testing.allocator.free(base_source);
+    const mr2_source = try source(std.testing.allocator, mr2);
+    defer std.testing.allocator.free(mr2_source);
+    try std.testing.expect(std.mem.indexOf(u8, base_source, "#define TF_PROMPT_MR2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mr2_source, "#define TF_PROMPT_MR2 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mr2_source, "#define TF_PROMPT_TN 1\n") != null);
+    mr2.k = 6144;
+    try std.testing.expectError(error.InvalidSchedule, mr2.validate());
+    mr2 = base;
+    mr2.prompt_tn = 1;
+    mr2.prompt_mr2 = true;
+    mr2.sk = 4;
+    try std.testing.expectError(error.InvalidSchedule, mr2.validate());
+}
+
+test "MR2 selector rejects disabled, wrong-shape, wrong-split and odd-tail chunks" {
+    try std.testing.expect(promptDownMr2Eligible(true, 5120, 17408, 2, 4, 64, 32));
+    try std.testing.expect(promptDownMr2Eligible(true, 5120, 17408, 2, 4, 64, 128));
+    try std.testing.expect(!promptDownMr2Eligible(false, 5120, 17408, 2, 4, 64, 32));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 17408, 2, 4, 64, 31));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 17408, 2, 4, 64, 0));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 17408, 1, 4, 64, 32));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 6144, 2, 4, 64, 32));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 17408, 2, 2, 64, 32));
+    try std.testing.expect(!promptDownMr2Eligible(true, 5120, 17408, 2, 4, 64, 160));
 }
 
 test "serial SK2 keeps logical split and is off by default" {

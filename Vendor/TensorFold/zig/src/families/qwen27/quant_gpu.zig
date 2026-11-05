@@ -75,6 +75,7 @@ const Key = struct {
     sbi: bool = false,
     sbi12: bool = false,
     resid: bool = false,
+    mr2: bool = false,
     count: bool = false,
     wait: bool = false,
     tiles: u32 = 0,
@@ -163,6 +164,10 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    /// The MR2 prompt DOWN candidate defaults on; setting TF_Q27_PROMPT_DOWN_MR2_DISABLE selects the exact base path.
+    prompt_down_mr2_enabled: bool = false,
+    /// Count successful aligned MR2 dispatches so local validation can prove the branch engaged.
+    prompt_down_mr2_dispatches: u64 = 0,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -358,27 +363,32 @@ pub const Kernels = struct {
         if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
         if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
         const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
-        const tn = promptTiles(key, p.n, 0);
-        if (tn == 1 or key.serialSk2()) return false;
+        const base_key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        const base_tn = promptTiles(base_key, p.n, 0);
+        if (base_tn == 1 or base_key.serialSk2()) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = sk, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
-            k.joined(entry.value_ptr);
-        }
         var first: u32 = 0;
         while (first < rows) : (first += lane.reg_rows) {
             const n = @min(rows - first, lane.reg_rows);
+            const mr2 = lane.promptDownMr2Eligible(k.prompt_down_mr2_enabled, p.n, p.k, sk, p.bits, p.group, n);
+            const tn: usize = if (mr2) 1 else base_tn;
+            var key = base_key;
+            key.mr2 = mr2;
+            const entry = try k.lanes.getOrPut(k.allocator, key);
+            if (!entry.found_existing) {
+                errdefer _ = k.lanes.remove(key);
+                entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true, .prompt_mr2 = mr2 });
+                k.joined(entry.value_ptr);
+            }
             const xr = lane.Ref{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 };
             const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
             const hr = lane.Ref{ .buf = hidden.buffer, .off = hidden.offset + @as(usize, first) * p.n * 2 };
             const rr = lane.Ref{ .buf = residual.buffer, .off = residual.offset + @as(usize, first) * p.n * 2 };
             const sr: ?lane.Sums = if (xs) |g| .{ .ref = .{ .buf = g.ref.buffer, .off = g.ref.offset + @as(usize, first) * 4 }, .stride = g.stride } else null;
             try entry.value_ptr.encodeResid(span.encoder, xr, w, metadata(p, false), sr, hr, rr, n);
+            if (mr2) k.prompt_down_mr2_dispatches += 1;
         }
         try span.end();
         return true;
@@ -513,7 +523,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }

@@ -82,7 +82,7 @@ pub const Model = struct {
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
         m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
         errdefer m.weights.deinit();
-        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
+        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits(), .prompt_down_mr2_enabled = platform.c.getenv("TF_Q27_PROMPT_DOWN_MR2_DISABLE") == null };
         errdefer m.kernels.deinit();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
