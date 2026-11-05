@@ -1,11 +1,8 @@
-// The greedy verify head's sieve (head_sieve.zig): a 2-bit copy of the vocabulary head's codes (code >> 2, the same
-// scales and biases) gives each (row, column) an approximate logit a and the spread s of the dropped bits' term (the
-// square root of 1.25 times the sum over groups of scale^2 times the group's sum of squares: 1.25 is the variance of a
-// uniform 2-bit residual about its middle 1.5). Each row's first tile (the 32-column tile of its best a) is recomputed
-// exactly by the head's own tile-list launch; the row's threshold is the lower of that tile's exact best and its best a,
-// and every tile whose a + k s reaches some row's threshold is recomputed the same way. Each row's token is the best of
-// those exact words: the highest bf16 logit, ties to the lowest id, tf_round_bf16_argmax's rule. A row's true best u
-// escapes only if its dropped bits' term exceeds both k s_u and that of the first tile's best-a column by k s_u.
+// The greedy verify head's sieve (head_sieve.zig): the current 2-bit scan and kappa 6 estimate.
+// Each row's four highest approximate-logit tiles are rescored by the exact Q4 head. Their best exact
+// BF16 word is a lower bound on the row's true best and supplies the listing threshold. Every first
+// tile is included explicitly, plus every tile whose estimated upper logit reaches that threshold.
+// Statistical pruning remains heuristic; an omitted winning tile cannot be recovered by exact rescoring.
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
@@ -25,7 +22,8 @@ using namespace mpp::tensor_ops;
 #endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
-// top's first pass: each block of TBLK tiles' highest best a a row, as tf_sieve_key's order (BK[block * 8 + row])
+constant constexpr int FIRSTS = 4, FIRST_STRIDE = 8 * FIRSTS * 32;
+// Block-key scratch retained by the scan interface; four-first top reads HM directly.
 constant constexpr int TBLK = 256, BLOCKS = (TILES + TBLK - 1) / TBLK;
 constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at most, relative to its size
 constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, generously
@@ -91,8 +89,7 @@ inline uint tf_sieve_key(float v) {
 // The sieve: a 32-column tile a threadgroup (one SIMD group), every group of the 2-bit copy through tf_lane_reg's
 // decoded-row loop (rows8, one K split, codes as fp16 subnormals in the tensor op's right input, the head's own
 // metadata words), with a = 4 s * (codes >> 2 product) + (b + 1.5 s) * row sum and s^2 * the row's sum of squares beside
-// it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row], and
-// that best a (when finite) into its block's key BK[(tile / TBLK) * 8 + row] (atomic max of tf_sieve_key).
+// it. Each (tile, row)'s best a + k s + slack into HM[tile * 16 + row] and its best a into HM[tile * 16 + 8 + row].
 // dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
 [[max_total_threads_per_threadgroup(32)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
@@ -201,70 +198,100 @@ inline uint tf_sieve_key(float v) {
   if ((lane & 9) == 0 && mb < M) {
     HM[(size_t)tile * 16 + mb] = hi;
     HM[(size_t)tile * 16 + 8 + mb] = mid;
-    // top never takes a tile whose best a is -inf, so neither does a block key
-    if (mid > -INFINITY) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + mb, tf_sieve_key(mid), memory_order_relaxed);
+    // Four-first top reads HM directly; no block-key atomic is needed.
   }
 }
 
-// Each row's first tile: the tile of its highest best a (ties: the lower tile; none finite: tile 0) into
-// first[1 + row], with first[0] = rows (the tile list the head's tile-list launch reads). Row r's SIMD group takes the
-// highest of the scan's block keys (BK[block * 8 + r]; 0: no finite best a anywhere) and the lowest block holding it,
-// then that block's lowest tile whose best a has that key: equal keys are equal values, so this is the tile a pass over
-// every tile in order keeps. One threadgroup of 256 (SIMD group r: row r).
-[[max_total_threads_per_threadgroup(256)]]
+// Each row's first tiles: its FIRSTS tiles of highest best a, in (best a down, tile up) order (ties: the lower tile
+// first; past the row's finite values, tile 0), row r's f-th at first[1 + r * FIRSTS + f], with first[0] = rows *
+// FIRSTS (the tile list the head's tile-list launch reads). Pass f takes, per row, the best tile after pass f - 1's in
+// that order. One threadgroup of 1024.
+[[max_total_threads_per_threadgroup(1024)]]
 [[kernel]] void tf_head_sieve_top(const device float* HM [[buffer(0)]], constant int& rows [[buffer(1)]], device uint* first [[buffer(2)]],
-    const device uint* BK [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]]) {
-  const int r = int(sg);
-  if (tid == 0) first[0] = uint(rows);
-  if (r >= rows || r >= 8) return;
-  uint best = 0;
-  for (uint b = lane; b < uint(BLOCKS); b += 32) best = max(best, BK[b * 8 + r]);
-  const uint m = simd_max(best);
-  if (m == 0u) {
-    if (lane == 0) first[1 + r] = 0u;
-    return;
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float bv[32][8];
+  threadgroup uint bt[32][8];
+  threadgroup float pv[8];
+  threadgroup uint pt[8];
+  for (int f = 0; f < FIRSTS; f++) {
+    float best[8];
+    uint at[8];
+    float lv[8];
+    uint lt[8];
+    for (int r = 0; r < 8; r++) {
+      best[r] = -INFINITY;
+      at[r] = 0xffffffffu;
+      lv[r] = f == 0 ? 0.0f : pv[r];
+      lt[r] = f == 0 ? 0u : pt[r];
+    }
+    // each thread's tiles in increasing order: a later equal value never displaces an earlier tile
+    for (uint t = tid; t < uint(TILES); t += 1024)
+      for (int r = 0; r < 8; r++) {
+        const float v = HM[(size_t)t * 16 + 8 + r];
+        const bool after = f == 0 || v < lv[r] || (v == lv[r] && t > lt[r]);
+        if (r < rows && after && v > best[r]) {
+          best[r] = v;
+          at[r] = t;
+        }
+      }
+    for (int r = 0; r < 8; r++) {
+      const float m = simd_max(best[r]);
+      const uint t = simd_min(best[r] == m ? at[r] : 0xffffffffu);
+      if (lane == 0) {
+        bv[sg][r] = m;
+        bt[sg][r] = t;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8) {
+      float m = bv[0][tid];
+      uint t = bt[0][tid];
+      for (int s = 1; s < 32; s++) {
+        const float o = bv[s][tid];
+        const uint ot = bt[s][tid];
+        if (o > m || (o == m && ot < t)) {
+          m = o;
+          t = ot;
+        }
+      }
+      if (tid < uint(rows)) first[1 + tid * FIRSTS + f] = t == 0xffffffffu ? 0u : t;
+      // a row with no finite value left keeps finding none: -inf is after nothing
+      pv[tid] = t == 0xffffffffu ? -INFINITY : m;
+      pt[tid] = t == 0xffffffffu ? 0xffffffffu : t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  uint at = 0xffffffffu;
-  for (uint b = lane; b < uint(BLOCKS); b += 32)
-    if (BK[b * 8 + r] == m) at = min(at, b);
-  const uint b0 = simd_min(at);
-  // each lane's tiles of the block in increasing order: the first with key m is its lowest
-  uint t = 0xffffffffu;
-  for (uint i = lane; i < uint(TBLK); i += 32) {
-    const uint tl = b0 * TBLK + i;
-    if (t == 0xffffffffu && tl < uint(TILES) && tf_sieve_key(HM[(size_t)tl * 16 + 8 + r]) == m) t = tl;
-  }
-  t = simd_min(t);
-  if (lane == 0) first[1 + r] = t;
+  if (tid == 0) first[0] = uint(rows * FIRSTS);
 }
 
-// Each row's threshold: the lower of its first tile's exact best (Y1: the tile-list launch's words, row r's first
-// tile at slot r of rows 256 apart; a bound of the row's top logit from below) and that tile's best a; then every tile
-// some row's best a + k s + slack reaches into list (list[0] its count, then the tiles in any order), counted on the
-// indirect dispatch's first word as well. A row's first tile always lands (its best a + k s is its best a or more).
-// Grid TILES / 256 threadgroups of 256.
+// Each row's threshold: the best exact word of its first tiles (Y1: the tile-list launch's words, row r's f-th first
+// tile at slot r * FIRSTS + f of rows FIRST_STRIDE apart; a bound of the row's top logit from below); then every first
+// tile and every tile some row's best a + k s + slack reaches into list (list[0] its count, then the tiles in any
+// order), counted on the indirect dispatch's first word as well. Grid TILES / 256 threadgroups of 256.
 kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const device ushort* Y1 [[buffer(1)]], const device uint* first [[buffer(2)]],
     constant int& rows [[buffer(3)]], device atomic_uint* list [[buffer(4)]], device atomic_uint* args [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint group [[threadgroup_position_in_grid]]) {
   threadgroup float thr[8];
   if (tid < 8) {
     float e = -INFINITY;
-    if (int(tid) < rows) {
-      const device ushort* y = Y1 + tid * 256 + tid * 32;
-      for (int c = 0; c < 32; c++) {
-        const float v = as_type<float>(uint(y[c]) << 16);
-        if (v > e) e = v;
+    if (int(tid) < rows)
+      for (int f = 0; f < FIRSTS; f++) {
+        const device ushort* y = Y1 + tid * FIRST_STRIDE + (tid * FIRSTS + f) * 32;
+        for (int c = 0; c < 32; c++) {
+          const float v = as_type<float>(uint(y[c]) << 16);
+          if (v > e) e = v;
+        }
       }
-      e = fmin(e, HM[(size_t)first[1 + tid] * 16 + 8 + tid]);
-    }
     thr[tid] = e;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint t = group * 256 + tid;
   bool hit = false;
-  if (t < uint(TILES))
+  if (t < uint(TILES)) {
     for (int r = 0; r < 8; r++) hit = hit || (r < rows && HM[(size_t)t * 16 + r] >= thr[r]);
+    const uint firsts = first[0];
+    for (uint j = 0; j < firsts; j++) hit = hit || first[1 + j] == t;
+  }
   const uint n = simd_sum(uint(hit)), at = simd_prefix_exclusive_sum(uint(hit));
   uint base = 0;
   if (lane == 0 && n != 0) {

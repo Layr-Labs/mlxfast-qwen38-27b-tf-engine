@@ -1,15 +1,12 @@
-//! The greedy verify head's sieve (kernels/metal/qwen27/head_sieve.metal), the CUDA head_sieve's method on the reg lane
-//! layout: a 2-bit copy of the vocabulary head's codes (code >> 2, the same metadata words) built when a drafter binds;
-//! a greedy verify of at most 8 rows then streams it in place of the 4-bit words (half the head's code bytes), recomputes
-//! each row's first tile (the 32-column tile of its best approximate logit) with the head's own tile-list launch
-//! (Kernels.quantTiles: each word the one the full launch writes), and then, in one indirect tile-list launch, only the
-//! tiles whose approximate logit plus kappa spreads of the dropped bits' term reaches the lower of that tile's exact best
-//! and its best approximate logit. Each row's token is the best of those exact words, the full head's tie rule: the
-//! full head's token whenever the best id's dropped bits' term exceeds both kappa spreads and the first tile's best-a
-//! id's by less than kappa spreads. Statistical (kappa spreads), not a certified bound, as on the CUDA track.
+//! The greedy verify head's sieve (kernels/metal/qwen27/head_sieve.metal), on the reg lane layout: a 2-bit
+//! copy of the vocabulary head's codes (code >> 2, the same metadata words) built when a drafter binds.
+//! A greedy verify of at most 8 rows streams one half of the head's code bytes and recomputes each row's
+//! four highest approximate-logit tiles with the head's own exact tile-list launch. Their best exact logit
+//! supplies the threshold for a second exact launch over every tile whose approximate logit plus kappa
+//! spreads reaches it, including all first tiles. Picks use the full head's bf16 tie rule.
+//! Statistical (kappa = 6 spreads), not a certified bound: exact rescoring cannot recover a skipped winner.
 //! No logits row is written: the round's picks go straight to the matcher, and Runner.head_token stands in for the
 //! accepted row's logits that tree_commit's keep_head would have left in row 0.
-//! kappa is 6.
 const std = @import("std");
 const mtl = @import("metal");
 const projection = @import("projection.zig");
@@ -22,10 +19,11 @@ const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
 pub const HeadSieve = struct {
     /// Rows a sieved verify takes: the tile-list launch's decoded rows.
     pub const rows_max = 8;
-    /// The first tiles' rows: a slot (32 columns) a row, rows_max slots.
-    const first_stride = rows_max * 32;
+    /// Four first tiles per row, stored in rows_max * firsts slots.
+    const firsts = 4;
+    const first_stride = rows_max * firsts * 32;
     const sums_stride = 16; // quant.padded(rows) for rows_max rows at most
-    /// Tiles a block key covers (head_sieve.metal's TBLK): the scan keeps each block's highest best a a row for top.
+    /// Tiles a block key covers (head_sieve.metal's TBLK); retained for the existing kernel bindings.
     const block_tiles = 256;
 
     pack: mtl.Pipeline,
@@ -47,7 +45,7 @@ pub const HeadSieve = struct {
     o_xq: usize,
     o_hm: usize,
     o_hm8: usize,
-    /// The block keys top reads (o_bk, cleared by prep each round) and the ones the 8-row proof scan writes (never read).
+    /// Block-key scratch retained by the existing kernel bindings; four-first top reads HM directly.
     o_bk: usize,
     o_bk8: usize,
     o_first: usize,
@@ -94,7 +92,7 @@ pub const HeadSieve = struct {
             made[count] = try mtl.Pipeline.init(m.device, lib, name, false);
             count += 1;
         }
-        // the scan runs a SIMD group a tile; top runs a 256-thread threadgroup (a SIMD group a row), pick 1024 threads
+        // the scan runs a SIMD group a tile; top runs a 1024-thread threadgroup, pick 1024 threads
         // the 8-row scan is a second library: a toolchain that rejects the descriptor leaves it null and the sieve stays
         // on the 16-row scan
         var scan8: ?mtl.Pipeline = null;
@@ -109,7 +107,7 @@ pub const HeadSieve = struct {
                 scan8 = mtl.Pipeline.init(m.device, l8, "tf_head_sieve_scan", false) catch null;
             }
         }
-        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 1024 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
         try m.kernels.prepareTiles(head, head.n);
@@ -127,7 +125,7 @@ pub const HeadSieve = struct {
         const blocks: u32 = (tiles + block_tiles - 1) / block_tiles;
         const o_bk = take(&at, @as(usize, blocks) * rows_max * 4);
         const o_bk8 = take(&at, @as(usize, blocks) * rows_max * 4);
-        const o_first = take(&at, (1 + rows_max) * 4);
+        const o_first = take(&at, (1 + rows_max * firsts) * 4);
         const o_y1 = take(&at, rows_max * first_stride * 2);
         const o_list = take(&at, (1 + @as(usize, tiles)) * 4);
         const o_args = take(&at, 4 * 4);
@@ -234,20 +232,20 @@ pub const HeadSieve = struct {
             }
         }
         e.barrier();
-        // 3: each row's first tile, from the scan's block keys
+        // 3: each row's four highest approximate-logit tiles
         e.setPipeline(s.top);
         e.setBuffer(s.scratch, s.o_hm, 0);
         e.setValue(@as(i32, @intCast(rows)), 1);
         e.setBuffer(s.scratch, s.o_first, 2);
         e.setBuffer(s.scratch, s.o_bk, 3);
-        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(256, 1, 1));
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(1024, 1, 1));
         e.barrier();
-        // 4: the first tiles exactly, the head's own tile-list launch (slot r: row r's first tile). Beside it, behind the
+        // 4: the first tiles exactly, the head's own tile-list launch (slot r * firsts + f). Beside it, behind the
         // barrier that orders the list: its tiles' lines requested at once (Kernels.warmTiles), so its one SIMD group a
         // row finds them in the caches as it walks their K groups. Nothing it writes is read; one that fails to encode
         // only loses its prefetch (the launch below sets its own pipeline and bindings).
-        m.kernels.warmTiles(e, s.head, s.ref(s.o_first), rows) catch {};
-        try m.kernels.quantTiles(e, s.head, x, xs, s.ref(s.o_first), s.ref(s.o_y1), rows, rows, first_stride);
+        m.kernels.warmTiles(e, s.head, s.ref(s.o_first), rows * firsts) catch {};
+        try m.kernels.quantTiles(e, s.head, x, xs, s.ref(s.o_first), s.ref(s.o_y1), rows, rows * firsts, first_stride);
         e.barrier();
         // 5: the rows' thresholds, and every tile some row's bound reaches
         e.setPipeline(s.select);
