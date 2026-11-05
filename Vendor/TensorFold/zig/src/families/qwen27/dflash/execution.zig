@@ -164,7 +164,7 @@ pub fn appendBlockPrepare(ops: op.Ops, g: *const w.Graph, preparation: op.Prepar
     const stack = try encodeAppendOrStack(ops, g, preparation, taps, positions, frame, transaction, block);
     try ops.vtable.context_stage(ops.ptr, transaction, frame, next);
     const output = try encodeStreams(ops, g, preparation, &.{.{ .context = next, .anchor = anchor }}, frame, block, &.{}, stack);
-    const picks = try lattice_begin(ops.ptr, frame, output.head, g.config);
+    const picks = try lattice_begin(ops.ptr, frame, output.head, output.projected, g.config);
     return .{ .frame = frame, .transaction = transaction, .head = output.head, .projected = output.projected, .picks = picks };
 }
 
