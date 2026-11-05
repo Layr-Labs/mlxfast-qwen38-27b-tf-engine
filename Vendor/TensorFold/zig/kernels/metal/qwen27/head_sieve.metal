@@ -67,17 +67,23 @@ kernel void tf_head_sieve_prep(const device bfloat* X [[buffer(0)]], constant in
   XQ[t] = acc;
 }
 
+// Immutable coefficients retain the same f32 operations as the scan, calculated once on the GPU.
 #if defined(TF_SBI)
-inline uint4 tf_sieve_look(const device uint* tab, uint2 ix) {
-  return uint4(tab[ix.x & 0xFFFFu], tab[ix.x >> 16], tab[ix.y & 0xFFFFu], tab[ix.y >> 16]);
+kernel void tf_head_sieve_coefficients(const device uint* pairs [[buffer(0)]], device float4* coefficients [[buffer(1)]],
+    uint i [[thread_position_in_grid]]) {
+  if (i >= uint(TF_SBI)) return;
+  const vec<bfloat, 2> pair = as_type<vec<bfloat, 2>>(pairs[i]);
+  const float scale = float(pair.x), bias = float(pair.y);
+  const float t = scale * (1.0f / 16777216.0f);
+  coefficients[i] = float4(4.0f * scale, fma(1.5f, t, bias), t * t, 0.0f);
 }
 #endif
 #if defined(TF_SBI12)
-inline uint4 tf_sieve_look12a(const device uint* tab, uint3 ix) {
-  return uint4(tab[ix.x & 0xFFFu], tab[(ix.x >> 12) & 0xFFFu], tab[(ix.x >> 24) | ((ix.y & 0xFu) << 8)], tab[(ix.y >> 4) & 0xFFFu]);
+inline uint4 tf_sieve_indices12a(uint3 ix) {
+  return uint4(ix.x & 0xFFFu, (ix.x >> 12) & 0xFFFu, (ix.x >> 24) | ((ix.y & 0xFu) << 8), (ix.y >> 4) & 0xFFFu);
 }
-inline uint4 tf_sieve_look12b(const device uint* tab, uint3 ix) {
-  return uint4(tab[(ix.y >> 16) & 0xFFFu], tab[(ix.y >> 28) | ((ix.z & 0xFFu) << 4)], tab[(ix.z >> 8) & 0xFFFu], tab[ix.z >> 20]);
+inline uint4 tf_sieve_indices12b(uint3 ix) {
+  return uint4((ix.y >> 16) & 0xFFFu, (ix.y >> 28) | ((ix.z & 0xFFu) << 4), (ix.z >> 8) & 0xFFFu, ix.z >> 20);
 }
 #endif
 
@@ -97,7 +103,7 @@ inline uint tf_sieve_key(float v) {
 [[max_total_threads_per_threadgroup(32)]]
 [[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
-    device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
+    device atomic_uint* BK [[buffer(7)]], const device float4* coefficients [[buffer(8)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
   const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
@@ -138,9 +144,9 @@ inline uint tf_sieve_key(float v) {
   const array<int32_t, 2> xstr = {1, TF_K};
   for (int g = 0; g < KG; g++) {
 #if defined(TF_SBI12)
-    const uint4 q0 = tf_sieve_look12a(tab, ni), q1 = tf_sieve_look12b(tab, ni);
+    const uint4 q0 = tf_sieve_indices12a(ni), q1 = tf_sieve_indices12b(ni);
 #elif defined(TF_SBI)
-    const uint4 q0 = uint4(tab[ni0.x], tab[ni0.y], tab[ni0.z], tab[ni0.w]), q1 = uint4(tab[ni1.x], tab[ni1.y], tab[ni1.z], tab[ni1.w]);
+    const uint4 q0 = uint4(ni0), q1 = uint4(ni1);
 #else
     const uint4 q0 = sbv[io], q1 = sbv[io + 4];
     io += uint(TF_N / 4);
@@ -176,6 +182,13 @@ inline uint tf_sieve_key(float v) {
     xv += uint(GS);
     op.run(x, cb, P);
     for (int j = 0; j < 4; j++) {
+#if defined(TF_SBI)
+      const float4 v0 = coefficients[q0[j]], v1 = coefficients[q1[j]];
+      C[j] = fma(v0.x, P[j], fma(v0.y, x0, C[j]));
+      C[4 + j] = fma(v1.x, P[8 + j], fma(v1.y, x0, C[4 + j]));
+      V[j] = fma(v0.z, xq, V[j]);
+      V[4 + j] = fma(v1.z, xq, V[4 + j]);
+#else
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[j]), v1 = as_type<vec<bfloat, 2>>(q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
       const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
@@ -184,6 +197,7 @@ inline uint tf_sieve_key(float v) {
       C[4 + j] = fma(4.0f * s1, P[8 + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
       V[j] = fma(t0 * t0, xq, V[j]);
       V[4 + j] = fma(t1 * t1, xq, V[4 + j]);
+#endif
     }
   }
   // fmax drops a NaN operand: a row of NaN logits keeps -inf here, its first tile 0 and every tile listed
