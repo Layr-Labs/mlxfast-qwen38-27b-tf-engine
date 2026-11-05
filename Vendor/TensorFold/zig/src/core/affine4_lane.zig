@@ -15,9 +15,8 @@ pub const Adapter = struct {
     /// `small` built with Layout.count: the same launch, each threadgroup adding one to a counter word once its rows are
     /// stored, so a launch that reads them can share its barrier interval (lane.Projection.encodeCounted).
     small_count: ?lane.Projection = null,
-    /// 2-bit reg adapters' rows8 build on an 8-row tensor op (Layout.m8), taken in place of `small` only after its words
-    /// equal `small`'s on the GPU at init (agrees8): the 16-row op spends 16 rows of tensor work a code on these
-    /// tensor-bound launches of 1 to 8 rows.
+    /// Selected 2-bit and q4 down adapters' rows8 build on an 8-row tensor op (Layout.m8), taken in place of `small`
+    /// only after its words equal `small`'s on the GPU at init (agrees8).
     small8: ?lane.Projection = null,
     /// Reg adapters' prompt build on the same words and the (folded) pairs: launches of more than 16 rows (a prompt's
     /// absorb) take the target's prompt loop (prompt_sr: pointer-stepped codes, pairs and sums), the same words out.
@@ -75,12 +74,27 @@ pub const Adapter = struct {
         errdefer if (small) |s| s.deinit();
         errdefer if (small_count) |s| s.deinit();
         var small8: ?lane.Projection = null;
-        if (layout.reg and prepared.nibbles) if (small) |s| {
+        // The stock drafter's q4 down projection is 5120 x 17408. Restrict extra probes to this shape;
+        // other q4 adapters and all existing 2-bit behavior retain their previous paths.
+        const q4_down = !prepared.nibbles and prepared.bits == 4 and prepared.n == 5120 and prepared.k == 17408;
+        if (layout.reg and (prepared.nibbles or q4_down)) if (small) |s| {
             var l8 = layout;
             l8.rows8 = true;
             l8.m8 = true;
             if (lane.Projection.init(a, device, l8)) |p8| {
-                if (agrees8(device, s, p8, words, if (index) |ix| ix else metadata, layout.k) catch false) small8 = p8 else p8.deinit();
+                if (agrees8(device, s, p8, words, if (index) |ix| ix else metadata, layout.k) catch false) {
+                    small8 = p8;
+                    // Keep counted and uncounted outputs on the same verified descriptor when a counted
+                    // m8 build is supported; otherwise leave the existing counted pipeline untouched.
+                    if (q4_down and small_count != null) {
+                        var lc = l8;
+                        lc.count = true;
+                        if (lane.Projection.init(a, device, lc)) |count8| {
+                            small_count.?.deinit();
+                            small_count = count8;
+                        } else |_| {}
+                    }
+                } else p8.deinit();
             } else |_| {}
         };
         errdefer if (small8) |s| s.deinit();
