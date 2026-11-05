@@ -132,6 +132,13 @@ jobs:
           tools/test-submission-security.sh | tee "${RUNNER_TEMP}/submission-security.log"
           grep -Eq 'submission-security: ([2-9][0-9]{2}|[1-9][0-9]{3,}) distinct cases, 0 failures' "${RUNNER_TEMP}/submission-security.log"
 
+      - name: TEMPORARY sandboxed-build trace
+        run: |
+          set +e
+          bash -x tools/test-sandboxed-build.sh > "${RUNNER_TEMP}/trace.log" 2>&1
+          echo "rc=$?"
+          grep -v 'system agent passed' "${RUNNER_TEMP}/trace.log" | tail -n 60
+
       - name: Real Seatbelt containment
         run: |
           tools/test-orphan-guard.sh
