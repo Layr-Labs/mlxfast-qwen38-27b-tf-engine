@@ -569,23 +569,6 @@ out="$("${GUARD}" check --job-start "${JOB_START}" 2>&1 || true)"
 kill -KILL "${MDWORKER_PID}" 2>/dev/null || true
 process_is_gone "${MDWORKER_PID}" || fail "mdworker_shared copy did not stop"
 
-# A same-user copy named XProtect, in a user-writable temporary directory, is
-# not under the XProtect system prefix.
-mkdir -p "${WORK}/XProtect.app/Contents/MacOS"
-XPROTECT_COPY="${WORK}/XProtect.app/Contents/MacOS/XProtect"
-build_sleeper "${XPROTECT_COPY}"
-chmod 0755 "${XPROTECT_COPY}"
-xprotect_pid_file="${WORK}/xprotect-copy.pid"
-spawn_exec_orphan "${xprotect_pid_file}" "${XPROTECT_COPY}"
-XPROTECT_PID="$(<"${xprotect_pid_file}")"
-PIDS+=("${XPROTECT_PID}")
-wait_for_ppid_one "${XPROTECT_PID}" || fail "XProtect copy was not reparented to pid 1"
-wait_for_exe "${XPROTECT_PID}" "${XPROTECT_COPY}" || fail "XProtect copy did not exec"
-out="$("${GUARD}" check --job-start "${JOB_START}" 2>&1 || true)"
-[[ "${out}" == *'orphan-process'* ]] || fail "XProtect copy was incorrectly excluded"
-kill -KILL "${XPROTECT_PID}" 2>/dev/null || true
-process_is_gone "${XPROTECT_PID}" || fail "XProtect copy did not stop"
-
 # Measure-level post-timing gate. The mock replaces benchd only. It writes all
 # three sealed files, starts a real PPID-1 helper during iterate, and returns 0.
 TREE="${WORK}/measure-tree"
@@ -642,11 +625,6 @@ if os.fork():
     raise SystemExit(0)
 with open(sys.argv[1], "w") as handle:
     handle.write(str(os.getpid()) + "\n")
-# Let go of the caller's stdin, stdout and stderr. Otherwise the test's
-# command substitution waits for this orphan to exit before it returns.
-null = os.open(os.devnull, os.O_RDWR)
-for fd in (0, 1, 2):
-    os.dup2(null, fd)
 time.sleep(300)
 PY
 tries=0

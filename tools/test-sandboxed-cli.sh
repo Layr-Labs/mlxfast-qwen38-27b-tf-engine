@@ -6,8 +6,6 @@ if [[ "$(uname -s)" == Darwin ]] && ! /usr/bin/sandbox-exec -p '(version 1) (all
   exit 0
 fi
 fail() { printf 'test-sandboxed-cli.sh: FAIL: %s\n' "$*" >&2; exit 1; }
-# shellcheck source=tools/lib/official-run-test-env.sh
-. "${ROOT}/tools/lib/official-run-test-env.sh"
 WORK="$(mktemp -d)"
 # Match the resolved path that the profile's exact process-exec rule uses.
 WORK="$(cd -- "${WORK}" && pwd -P)"
@@ -101,18 +99,6 @@ int main(int c, char **v) {
 }
 MOCK
 /usr/bin/cc -o "${WORK}/worker" "${WORK}/worker.c"
-# On a self-hosted runner that is not a ranked box, assert the official
-# refusal once, then run the local cases as local calls
-# (tools/lib/official-run-test-env.sh). The refused call may create the
-# official work root; remove it again so the work-root cases below still run.
-official_root_existed=0
-[[ ! -e "${OFFICIAL_ROOT}" && ! -L "${OFFICIAL_ROOT}" ]] || official_root_existed=1
-official_refusal_then_local 'sandboxed-cli.sh: FAIL: profile' -- \
-  env TMPDIR=/tmp MLXFAST_ENGINE_BIN="${WORK}/worker" "${ROOT}/tools/sandboxed-cli.sh" self-test \
-  || fail "official refusal without the ranked-box variables changed"
-if [[ "${official_root_existed}" == 0 && -d "${OFFICIAL_ROOT}" && ! -L "${OFFICIAL_ROOT}" ]]; then
-  rmdir "${OFFICIAL_ROOT}" || fail "the refused call left files in the official work root"
-fi
 [[ "$(TMPDIR=/tmp MLXFAST_ENGINE_BIN="${WORK}/worker" "${ROOT}/tools/sandboxed-cli.sh" self-test)" == 'sandboxed-cli.sh: PASS: self-test' ]] \
   || fail "self-test profile or environment differs"
 [[ "$(RUNNER_TEMP="${SHORT_TMP}" MOCK_DIRTY_TMP=1 MLXFAST_ENGINE_BIN="${WORK}/worker" "${ROOT}/tools/sandboxed-cli.sh" self-test)" == 'sandboxed-cli.sh: PASS: self-test' ]] \

@@ -23,7 +23,6 @@ jobs:
     with:
       lanes: |
         lint linux_arm64 ubuntu-latest
-        macos-security macos_arm64 macos-15
 
   lint:
     name: Hosted security and syntax
@@ -114,8 +113,10 @@ jobs:
 
   macos-security:
     name: macOS Seatbelt and offline tests
-    needs: [route, lint]
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['macos-security'] }}
+    # Not routed. On any self-hosted runner, the Seatbelt scripts take the
+    # ranked Mac's official path, so this job stays on GitHub-hosted macOS.
+    needs: lint
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

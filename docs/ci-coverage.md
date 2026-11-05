@@ -3,8 +3,7 @@
 ## Result
 
 CI uses offline tests and JSON validation. The `macos-security` job in
-`.github/workflows/ci.yml` runs every test below on macOS: `macos-15`, or a
-Darkbloom macOS Sandbox (see "Runner routing").
+`.github/workflows/ci.yml` runs every test below on `macos-15`.
 
 1. `tools/test-author-prompts.sh` checks prompt authoring with synthetic tokenizer data.
 2. `tools/test-bench-worker-staging.sh` checks sandboxed worker staging and self-test.
@@ -52,7 +51,11 @@ with no token permissions and no checkout. Each routed job runs on
 | Lane | Darkbloom profile | Fallback |
 |---|---|---|
 | `lint` | `linux_arm64` | `ubuntu-latest` |
-| `macos-security` | `macos_arm64` | `macos-15` |
+
+`macos-security` is not routed. It always runs on GitHub-hosted `macos-15`.
+On a self-hosted runner, the Seatbelt scripts take the ranked Mac's official
+path (`RUNNER_ENVIRONMENT=self-hosted`), so the job cannot run as plain CI
+there.
 
 Routing is off unless the repository variable `DARKBLOOM_ROUTING` is exactly
 `on`. While it is off, and for pull requests from forks, every job keeps its

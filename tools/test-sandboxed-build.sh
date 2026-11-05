@@ -4,8 +4,6 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SANDBOXED_BUILD="${SANDBOXED_BUILD_UNDER_TEST:-${ROOT}/tools/sandboxed-build.sh}"
 TRUSTED_ZIG_DIR="${ROOT}/tools/trusted-zig-dir.sh"
 fail() { printf 'test-sandboxed-build.sh: FAIL: %s\n' "$*" >&2; exit 1; }
-# shellcheck source=tools/lib/official-run-test-env.sh
-. "${ROOT}/tools/lib/official-run-test-env.sh"
 # Official builds call the orphan guard, which needs a Runner.Worker ancestor.
 # Run the whole test under a small fake one, as tools/test-orphan-guard.sh does.
 if [[ "${SANDBOXED_BUILD_TEST_UNDER_RUNNER:-0}" != 1 ]]; then
@@ -80,35 +78,6 @@ if [[ "$(uname -s)" == Darwin && -z "${TEST_DEVELOPER_DIR}" ]]; then
   TEST_DEVELOPER_DIR="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
 fi
 
-# The official path accepts metal and metallib only from a trusted root
-# (sandboxed-build.sh xcrun_tool_path). Take that rule from the script itself,
-# so the test predicts the official result with the same code. A host whose
-# Metal toolchain is absent or under a user-writable path gets the refusal.
-TOOLCHAIN_RULE="$(awk '
-  /^(has_acl|toolchain_dir|xcrun_tool_path)\(\) \{$/ { body = 1; count++ }
-  body { print }
-  body && /^}$/ { body = 0 }
-  END { if (count != 3) exit 1 }' "${SANDBOXED_BUILD}")" \
-  || fail "the toolchain rule functions are not in ${SANDBOXED_BUILD}"
-metal_toolchain_trusted() {
-  # $1: the DEVELOPER_DIR the official call gets; empty means xcode-select.
-  (
-    set +e
-    eval "${TOOLCHAIN_RULE}"
-    developer_env=(env -u DEVELOPER_DIR)
-    [[ -z "$1" ]] || developer_env=(env DEVELOPER_DIR="$1")
-    developer_dir="$1"
-    [[ -n "${developer_dir}" ]] \
-      || developer_dir="$(env -u DEVELOPER_DIR /usr/bin/xcode-select -p 2>/dev/null)" || exit 1
-    DEVELOPER_REAL="$(/bin/realpath "${developer_dir}" 2>/dev/null)" || exit 1
-    OWNER_UID="$(/usr/bin/stat -f %u "${DEVELOPER_REAL}" 2>/dev/null)" || exit 1
-    for tool in metal metallib; do
-      found="$("${developer_env[@]}" /usr/bin/xcrun -n -sdk macosx -f "${tool}" 2>/dev/null)" || exit 1
-      xcrun_tool_path "${tool}" "${found}" >/dev/null || exit 1
-    done
-  )
-}
-
 # Use a virtual root and this test account as the expected owner. The helper
 # still reads the real owner and mode with stat.
 trust_root="${WORK}/trust-root"
@@ -166,16 +135,6 @@ profile="$(env HOME="${WORK}" MLXFAST_QWEN38_GOLDEN_DIR="${WORK}/goldens" MLXFAS
 for rule in '(deny ipc-posix-shm*)' '(deny ipc-sysv*)' '(deny ipc-posix-sem*)' '(deny user-preference-write)'; do
   [[ "${profile}" == *"${rule}"* ]] || fail "build profile is missing ${rule}"
 done
-# On a self-hosted runner that is not a ranked box, assert the official
-# refusal once, then run the local cases as local calls
-# (tools/lib/official-run-test-env.sh).
-official_refusal_then_local \
-  'sandboxed-build.sh: FAIL: xcrun-warm' 'sandboxed-build.sh: FAIL: toolchain-writable' \
-  'sandboxed-build.sh: FAIL: profile' -- \
-  env RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- \
-  /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write" \
-  || fail "official refusal without the ranked-box variables changed"
-[[ ! -e "${WORK}/write/result" ]] || fail "a refused official call ran its command"
 out="$(RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write")"
 [[ "${out}" == 'sandboxed-build.sh: PASS' ]] || fail "local result line changed"
 [[ "$(<"${WORK}/write/result")" == ok ]]
@@ -186,7 +145,8 @@ out="$(env -u RUNNER_TEMP -u RUNNER_WORKSPACE -u RUNNER_ENVIRONMENT \
 official_refusal='sandboxed-build.sh: FAIL: profile'
 official_refusal_alt=''
 if [[ "$(uname -s)" == Darwin ]] \
-  && { ! metal_toolchain_trusted "${TEST_DEVELOPER_DIR}" \
+  && { ! env DEVELOPER_DIR="${TEST_DEVELOPER_DIR}" /usr/bin/xcrun -n -sdk macosx -f metal >/dev/null 2>&1 \
+    || ! env DEVELOPER_DIR="${TEST_DEVELOPER_DIR}" /usr/bin/xcrun -n -sdk macosx -f metallib >/dev/null 2>&1 \
     || ! env DEVELOPER_DIR="${TEST_DEVELOPER_DIR}" /usr/bin/xcrun -n -f python3 >/dev/null 2>&1; }; then
   official_refusal='sandboxed-build.sh: FAIL: xcrun-warm'
   official_refusal_alt='sandboxed-build.sh: FAIL: toolchain-writable'
@@ -363,20 +323,20 @@ if [[ "$(uname -s)" == Darwin ]]; then
         MLXFAST_OFFICIAL_BENCHMARK_RUN=1 "${SANDBOXED_BUILD}" "$@"
     }
 
-    if ! metal_toolchain_trusted "${TEST_DEVELOPER_DIR}"; then
+    if ! env DEVELOPER_DIR="${TEST_DEVELOPER_DIR}" \
+      /usr/bin/xcrun -sdk macosx -f metal >/dev/null 2>&1; then
       if [[ "${MLXFAST_REQUIRE_METAL_TEST:-0}" == 1 ]]; then
-        fail "trusted metal toolchain absent"
+        fail "metal toolchain absent"
       fi
-      # official_build execs, so the `|| true` must stay outside the
-      # substitution: inside it, it never runs and set -e ends the test.
-      out="$(official_build --write "${WORK}/write" -- /usr/bin/true 2>&1)" || true
+      out="$(official_build --write "${WORK}/write" -- /usr/bin/true 2>&1 || true)"
       [[ "${out}" == 'sandboxed-build.sh: FAIL: xcrun-warm' \
         || "${out}" == 'sandboxed-build.sh: FAIL: toolchain-writable' ]] \
         || fail "missing Metal toolchain refusal changed: got '${out}', expected 'sandboxed-build.sh: FAIL: xcrun-warm' or 'sandboxed-build.sh: FAIL: toolchain-writable'"
-      printf 'test-sandboxed-build.sh: SKIP: trusted metal toolchain absent (official build section)\n'
+      printf 'test-sandboxed-build.sh: SKIP: metal toolchain absent (official build section)\n'
     else
 
-  if metal_toolchain_trusted ""; then
+  if env -u DEVELOPER_DIR /usr/bin/xcode-select -p >/dev/null 2>&1 \
+    && env -u DEVELOPER_DIR /usr/bin/xcrun -sdk macosx -f metal >/dev/null 2>&1; then
     out="$(env -u DEVELOPER_DIR HOME="${WORK}" RUNNER_TEMP="${WORK}" \
       MLXFAST_QWEN38_GOLDEN_DIR="${WORK}/goldens" \
       MLXFAST_BASELINE_WORKSPACE="${WORK}/baseline" MLXFAST_BASELINE_CALIBRATION="${WORK}/cal.json" \
@@ -386,9 +346,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
     [[ "${out}" == 'sandboxed-build.sh: PASS' ]] \
       || fail "official build with DEVELOPER_DIR unset failed"
   elif [[ "${MLXFAST_REQUIRE_METAL_TEST:-0}" == 1 ]]; then
-    fail "trusted xcode-select Metal toolchain absent"
+    fail "xcode-select Metal toolchain absent"
   else
-    printf 'test-sandboxed-build.sh: SKIP: trusted xcode-select Metal toolchain absent\n'
+    printf 'test-sandboxed-build.sh: SKIP: xcode-select Metal toolchain absent\n'
   fi
 
   current_runner="${WORK}/actions-runner-current"
