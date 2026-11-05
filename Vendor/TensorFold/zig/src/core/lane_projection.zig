@@ -222,6 +222,8 @@ pub const Layout = struct {
     /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
     /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
     m8: bool = false,
+    /// Scalar C slots for the Qwen27 counted target DOWN rows8 decode specialization only.
+    target_down_scalar_c: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
@@ -238,6 +240,10 @@ pub const Layout = struct {
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
+        if (l.target_down_scalar_c and (l.n != 5120 or l.k != 17408 or l.format.bits != 4 or l.format.group != 64 or
+            l.sk != 4 or l.tile_batch != 8 or !l.reg or !l.reg_lean or !l.rows8 or !l.count or !l.wait or
+            l.serial_sk2 or l.prompt_sr or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null or
+            l.ranges.len != 0 or l.output != .bf16 or !l.precompute_sums or l.m8)) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
@@ -356,11 +362,12 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
+    if (l.target_down_scalar_c) try text.appendSlice(a, "#define TF_Q27_TARGET_DOWN_CSCALAR 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
-    try text.appendSlice(a, ks.core_lane_projection);
+    try text.appendSlice(a, if (l.target_down_scalar_c) ks.core_target_down_cscalar else ks.core_lane_projection);
     if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
 }
@@ -791,6 +798,41 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "target DOWN scalar C is only emitted for the counted waiting Q4 decode layout" {
+    var l = Layout{
+        .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4,
+        .precompute_sums = true, .reg = true, .tile_batch = 8, .rows8 = true,
+        .reg_lean = true, .indexed = true, .indexed12 = true, .count = true, .wait = true,
+        .target_down_scalar_c = true,
+    };
+    const text = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_Q27_TARGET_DOWN_CSCALAR 1\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, ks.core_target_down_cscalar));
+    inline for (.{
+        .{ "sk", @as(usize, 2) },
+        .{ "tile_batch", @as(usize, 1) },
+        .{ "wait", false },
+        .{ "count", false },
+        .{ "rows8", false },
+        .{ "reg_lean", false },
+        .{ "swiglu", true },
+        .{ "prompt_sr", true },
+        .{ "serial_sk2", true },
+        .{ "n", @as(usize, 34816) },
+    }) |change| {
+        var bad = l;
+        @field(bad, change[0]) = change[1];
+        try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    }
+    l.target_down_scalar_c = false;
+    try l.validate();
+    const plain = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_Q27_TARGET_DOWN_CSCALAR") == null);
+    try std.testing.expect(std.mem.endsWith(u8, plain, ks.core_lane_projection));
 }
 
 test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {

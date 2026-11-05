@@ -77,6 +77,7 @@ const Key = struct {
     resid: bool = false,
     count: bool = false,
     wait: bool = false,
+    scalar_c: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
     /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
@@ -109,6 +110,56 @@ test "wide decode SK2 keeps row and phase boundaries distinct" {
     }
     try std.testing.expect(wideDecodeSk2(12288, 5120, 8, false));
     for ([_]u32{ 5120, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
+}
+
+test "explicit C scalarization selector is target DOWN only and cache-separated" {
+    const base = projection.Linear{
+        .words = undefined, .pairs = undefined, .n = 5120, .k = 17408, .tile = 32,
+        .slices = 4, .batch = 8,
+    };
+    try std.testing.expect(Kernels.targetDownScalarCShape(base, 1));
+    try std.testing.expect(Kernels.targetDownScalarCShape(base, 8));
+    for ([_]u32{ 0, 9, 16 }) |rows| try std.testing.expect(!Kernels.targetDownScalarCShape(base, rows));
+    inline for (.{
+        .{ "n", @as(u32, 34816) },
+        .{ "k", @as(u32, 5120) },
+        .{ "tile", @as(u32, 64) },
+        .{ "slices", @as(u32, 2) },
+        .{ "batch", @as(u32, 1) },
+        .{ "bits", @as(u8, 2) },
+        .{ "group", @as(u32, 128) },
+    }) |change| {
+        var excluded = base;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expect(!Kernels.targetDownScalarCShape(excluded, 8));
+    }
+    var raw = base;
+    raw.raw = .{ .w = undefined, .scales = undefined, .biases = undefined, .n = 5120, .k = 17408 };
+    try std.testing.expect(!Kernels.targetDownScalarCShape(raw, 8));
+    var enabled = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_down_scalar_c_disabled = false };
+    const selected = enabled.countedAfterKey(base, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selected.scalar_c);
+    try std.testing.expect(enabled.countedAfterKey(base, 9) == null);
+    try std.testing.expect(enabled.countedAfterKey(base, 0) == null);
+    enabled.prompt = true;
+    try std.testing.expect(enabled.countedAfterKey(base, 8) == null);
+    enabled.prompt = false;
+    var non_target = base;
+    non_target.n = 10240;
+    try std.testing.expect(!enabled.countedAfterKey(non_target, 8).?.scalar_c);
+    var disabled = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_down_scalar_c_disabled = true };
+    const baseline_key = disabled.countedAfterKey(base, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!baseline_key.scalar_c);
+    const normal = Key{ .kind = .projection, .n = 5120, .k = 17408, .slices = 4, .bits = 4, .group = 64, .rows8 = true, .lean = true, .batch = 8, .count = true, .wait = true };
+    var scalar = normal;
+    scalar.scalar_c = true;
+    var cache = std.AutoHashMap(Key, bool).init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.put(normal, false);
+    try cache.put(scalar, true);
+    try std.testing.expectEqual(@as(u32, 2), cache.count());
+    try std.testing.expect(!cache.get(normal).?);
+    try std.testing.expect(cache.get(scalar).?);
 }
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
@@ -180,6 +231,10 @@ pub const Kernels = struct {
     warm_tiles_sink: ?mtl.Buffer = null,
     /// team-m5-08w: the 16-byte input norm failed to build on this chip (logged once): the record's kernel runs instead.
     input_words_failed: bool = false,
+    /// Cached presence check for the target DOWN explicit-accumulator kill switch.
+    target_down_scalar_c_disabled: ?bool = null,
+    /// Successful dispatches through the target decoded DOWN scalar-accumulator specialization.
+    target_down_scalar_c_dispatches: std.atomic.Value(u64) = .init(0),
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -195,6 +250,8 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        const scalar_c_dispatches = k.target_down_scalar_c_dispatches.load(.monotonic);
+        if (scalar_c_dispatches != 0) std.log.info("qwen27: target decoded DOWN scalar-C dispatches={d}", .{scalar_c_dispatches});
         k.setResident(null);
         if (k.row_pipelines) |*pipelines| pipelines.deinit();
         if (k.simd) |*pipelines| pipelines.deinit();
@@ -706,6 +763,24 @@ pub const Kernels = struct {
         return key;
     }
 
+    fn targetDownScalarCShape(p: projection.Linear, rows: u32) bool {
+        return rows > 0 and rows <= 8 and p.n == 5120 and p.k == 17408 and p.bits == 4 and p.group == 64 and
+            p.tile == 32 and p.slices == 4 and p.batch == 8 and p.runs.len == 0 and p.raw == null;
+    }
+
+    fn targetDownScalarCEnabled(k: *Kernels) bool {
+        if (k.target_down_scalar_c_disabled) |disabled| return !disabled;
+        const disabled = std.c.getenv("TF_Q27_TARGET_DOWN_CSCALAR_DISABLE") != null;
+        k.target_down_scalar_c_disabled = disabled;
+        return !disabled;
+    }
+
+    fn countedAfterKey(k: *Kernels, p: projection.Linear, rows: u32) ?Key {
+        var key = k.countedKey(p, rows, true) orelse return null;
+        if (targetDownScalarCShape(p, rows) and k.targetDownScalarCEnabled()) key.scalar_c = true;
+        return key;
+    }
+
     /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
     /// and padding included) and of all its decoded metadata (the indexed table and indices, else the pairs), with no
     /// barrier. Encoded inside a latency-bound barrier interval (a star scan, an attention prefix), it moves those lines
@@ -832,7 +907,7 @@ pub const Kernels = struct {
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        const key = k.countedAfterKey(p, rows) orelse return error.BadCoreProjectionRows;
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -845,12 +920,13 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true, .target_down_scalar_c = key.scalar_c });
             k.joined(entry.value_ptr);
         }
         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
         try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
         try span.end();
+        if (key.scalar_c) _ = k.target_down_scalar_c_dispatches.fetchAdd(1, .monotonic);
         return @intCast(entry.value_ptr.tile_count);
     }
 
