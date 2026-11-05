@@ -203,6 +203,8 @@ pub const Layout = struct {
     y_stride: ?usize = null,
     /// Prompt-row reg launches: 2 or 4 adjacent tiles of one code batch in a SIMD group, sharing each group's activation registers.
     prompt_tn: usize = 1,
+    /// Prompt GU full-128-row threadgroup permutation; 0 keeps the original walk.
+    prompt_gu_walk: u8 = 0,
     /// Two-tile prompt launches of a 5120-wide output projection: store the residual stream's next rows (hidden + output,
     /// rounded as q27_norm_xs rounds them) instead of the output rows (encodeResid).
     residual: bool = false,
@@ -225,6 +227,8 @@ pub const Layout = struct {
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
+        if (l.prompt_gu_walk != 0 and l.prompt_gu_walk != 2 and l.prompt_gu_walk != 4 and l.prompt_gu_walk != 22) return error.UnsupportedPromptWalk;
+        if (l.prompt_gu_walk != 0 and !(l.n == 34816 and l.k == 5120 and l.format.bits == 4 and l.format.group == 64 and l.sk == 1 and l.reg and l.prompt_sr and l.swiglu and l.prompt_tn == 2 and l.tile_batch == 8 and !l.rows8 and !l.indexed and !l.residual and !l.gu_count and !l.wait)) return error.UnsupportedPromptWalk;
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
         if (l.reg and (l.cooperative or (l.format.bits != 4 and !l.regTwo()) or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
@@ -352,6 +356,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.tile_batch != 1) try text.print(a, "#define TF_TB {d}\n", .{l.tile_batch});
     if (l.swiglu) try text.appendSlice(a, "#define TF_SWIGLU 1\n");
     if (l.prompt_tn != 1) try text.print(a, "#define TF_PROMPT_TN {d}\n", .{l.prompt_tn});
+    if (l.prompt_gu_walk != 0) try text.print(a, "#define TF_PROMPT_GU_WALK {d}\n", .{l.prompt_gu_walk});
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");

@@ -82,10 +82,11 @@ pub const Model = struct {
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
         m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
         errdefer m.weights.deinit();
-        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
+        m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits(), .prompt_gu_walk_disabled = platform.c.getenv("TF_Q27_PROMPT_GU_WALK_DISABLE") != null };
         errdefer m.kernels.deinit();
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
+        if (m.widths_tag == 0) m.kernels.preparePromptGuWalk(m.queue, m.weights.layers);
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
         m.frame = try Frame.init(m.device, c, @max(rows, promptRows(if (later) 0 else m.device.generation())));
         errdefer m.frame.deinit();
