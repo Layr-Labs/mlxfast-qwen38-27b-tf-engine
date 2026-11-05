@@ -581,12 +581,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i];
 #if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
+#ifndef TF_TGPAD1
+#define TF_TGPAD1 0
 #endif
-#if TF_TGPAD > 0
-  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
+#if TF_TGPAD1 > 0
+  // the parallel prompt launches' threadgroup-memory reserve for the serial ones too; the use never runs (0: none)
+  threadgroup float tgpad1[TF_TGPAD1 / 4];
   if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
 #endif
 #endif
@@ -909,7 +909,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
 #ifndef TF_TGPAD
-#define TF_TGPAD 8192
+// four K slices (the z columns beside the scan): no reserve beside their 12 KB part array
+#define TF_TGPAD (TF_SK == 4 ? 0 : 8192)
 #endif
 #if TF_TGPAD > 0
   // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs

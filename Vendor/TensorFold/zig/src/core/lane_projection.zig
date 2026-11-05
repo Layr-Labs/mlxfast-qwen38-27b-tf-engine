@@ -180,8 +180,8 @@ pub const Layout = struct {
     cooperative: bool = false,
     /// 4-bit g64 codes in reg_layout, unpacked into tensor-op registers; every word equals the cooperative kernel's.
     reg: bool = false,
-    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or eight on
-    /// one-tile prompt rows.
+    /// Run the logical reg chains in one SIMD group, adding each to the sum so far: two, four on decoded rows, or four or
+    /// eight on one-tile prompt rows.
     serial_sk2: bool = false,
     /// Prompt-row reg launches (prompt SwiGLU included): the lean loop addresses its words by pointers that advance a fixed
     /// step a group.
@@ -234,7 +234,7 @@ pub const Layout = struct {
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
-        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and (l.sk != 8 or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
+        if (l.serial_sk2 and (!l.reg or (l.sk != 2 and (l.sk != 4 or !l.rows8) and ((l.sk != 4 and l.sk != 8) or !l.prompt_sr or l.prompt_tn != 1)))) return error.InvalidSchedule;
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
@@ -476,6 +476,21 @@ fn overlap(a: []const u8, b: []const u8) bool {
 
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 
+/// Bind only consecutive buffer slots. Test facades without batching keep the same order.
+fn bindRefs(e: mtl.ComputeEncoder, comptime n: usize, refs: [n]Ref, first: usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (0..n) |i| {
+            buffers[i] = refs[i].buf;
+            offsets[i] = refs[i].off;
+        }
+        e.setBuffers(n, buffers, offsets, first);
+    } else {
+        inline for (0..n) |i| e.setBuffer(refs[i].buf, refs[i].off, first + i);
+    }
+}
+
 pub const Projection = struct {
     pipe: mtl.Pipeline,
     n: usize,
@@ -636,13 +651,9 @@ pub const Projection = struct {
         const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
         try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
-        e.setBuffer(h.buf, h.off, 4);
-        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
-        e.setBuffer(hs.buf, hs.off, 6);
+        bindRefs(e, 3, .{ h, sums.ref, hs }, 4);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
@@ -699,12 +710,9 @@ pub const Projection = struct {
         try checkRef(list, (@as(usize, slots) + 1) * 4, 4);
         try checkRef(y, ((rows - 1) * p.y_stride + @as(usize, slots) * 32) * 2, 2);
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
-        e.setBuffer(y.buf, y.off, 4);
-        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        bindRefs(e, 2, .{ y, sums.ref }, 4);
         e.setBuffer(list.buf, list.off, 7);
     }
 
@@ -727,9 +735,7 @@ pub const Projection = struct {
             e.barrier();
         };
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         if (dims) |d| e.setBuffer(d.buf, d.off, 3) else e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
@@ -788,6 +794,12 @@ test "serial SK2 keeps logical split and is off by default" {
     l.prompt_sr = true;
     l.reg_lean = true;
     try l.validate();
+    // four chains: one-tile prompt rows too
+    l.sk = 4;
+    try l.validate();
+    l.prompt_sr = false;
+    l.reg_lean = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
