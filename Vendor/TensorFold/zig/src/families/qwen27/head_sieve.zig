@@ -208,6 +208,9 @@ pub const HeadSieve = struct {
             e.setBuffer(s.scratch, s.o_xq, 6);
             e.setBuffer(s.scratch, s.o_bk, 7);
             e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
+            // s23 probe: the same scan again behind a barrier (idempotent: same HM words, atomic max of the same keys)
+            e.barrier();
+            e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
         } else {
             e.setPipeline(s.scan);
             e.setBuffer(x.buffer, x.offset, 0);
