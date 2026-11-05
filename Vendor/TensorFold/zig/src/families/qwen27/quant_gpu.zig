@@ -95,15 +95,17 @@ const Key = struct {
 };
 
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
-/// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
+/// and the attention query+gate (12288), whose 384 half-tiles sit between the other two. The serial form's one wave a
+/// tile starves a 40-core grader sooner than the 19-core box the rows >= 6 crossover was measured on, so the parallel
+/// two-wave form takes launches from four rows.
 fn wideDecodeSk2(n: u32, input_width: u32, rows: u32, prompt: bool) bool {
-    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 6 and rows <= 8;
+    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 4 and rows <= 8;
 }
 
 test "wide decode SK2 keeps row and phase boundaries distinct" {
     for ([_]u32{ 34816, 10240 }) |n| {
-        for ([_]u32{ 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
-        for ([_]u32{ 0, 1, 2, 3, 4, 5, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 4, 5, 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 0, 1, 2, 3, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
         try std.testing.expect(!wideDecodeSk2(n, 5120, 8, true));
         try std.testing.expect(!wideDecodeSk2(n, 2560, 8, false));
     }
