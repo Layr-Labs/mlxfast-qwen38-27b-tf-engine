@@ -21,7 +21,13 @@ PROC_PIDTBSDINFO_SIZE = 136
 PROC_PIDCOALITIONINFO = 20
 PROC_PIDCOALITIONINFO_SIZE = 40
 PROC_PIDPATHINFO_MAXSIZE = 4096
-SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/")
+# /Library/Apple/System/Library/CoreServices/ holds XProtect, which macOS keeps
+# on the data volume under SIP. launchd starts it as a per-user agent at any
+# time, during a job too. The same root-owned, non-writable tree check as for
+# the other prefixes applies (trusted_system_path). Ruled 2026-11-05.
+SYSTEM_PREFIXES = (
+    "/System/", "/usr/libexec/", "/usr/sbin/",
+    "/Library/Apple/System/Library/CoreServices/")
 CRYPTEX_WRITABLE_PARENTS = {
     "/System/Volumes/Preboot/Cryptexes",
     "/System/Volumes/Preboot/Cryptexes/Incoming",
@@ -849,6 +855,47 @@ def recheck_self_test():
             first_call_count = len(stat_calls)
     if len(stat_calls) != first_call_count:
         raise GuardError("trusted system path cache was not reused")
+
+    # XProtect: passes under its root-owned, non-writable tree, and only there.
+    xprotect = ("/Library/Apple/System/Library/CoreServices/XProtect.app"
+                "/Contents/MacOS/XProtect")
+    xprotect_copy = "/tmp/XProtect.app/Contents/MacOS/XProtect"
+    library_apple_other = "/Library/Apple/usr/libexec/agent"
+    regular_files.update({xprotect, xprotect_copy, library_apple_other})
+    writable_dir = "/Library/Apple/System/Library/CoreServices/XProtect.app"
+
+    def writable_xprotect_stat(path):
+        if path == writable_dir:
+            return FakeStat(stat.S_IFDIR | 0o777)
+        return fake_root_stat(path)
+
+    def user_xprotect_stat(path):
+        info = fake_root_stat(path)
+        if path == xprotect:
+            info.st_uid = os.getuid() or 501
+        return info
+
+    if orphaned(
+            dict(selected, path=xprotect), job_coalition_value,
+            coalition_reader=outside_coalition, stat_reader=fake_root_stat,
+            acl_reader=lambda _path: False, log_pass=False):
+        raise GuardError("root-owned XProtect was flagged")
+    for label, path, reader in (
+            ("XProtect copy in /tmp", xprotect_copy, fake_root_stat),
+            ("XProtect under a writable directory", xprotect,
+             writable_xprotect_stat),
+            ("XProtect not owned by root", xprotect, user_xprotect_stat),
+            ("other /Library/Apple path", library_apple_other, fake_root_stat)):
+        if not orphaned(
+                dict(selected, path=path), job_coalition_value,
+                coalition_reader=outside_coalition, stat_reader=reader,
+                acl_reader=lambda _path: False, log_pass=False):
+            raise GuardError(f"{label} was not flagged")
+    if not orphaned(
+            dict(selected, path=xprotect), job_coalition_value,
+            coalition_reader=outside_coalition, stat_reader=fake_root_stat,
+            acl_reader=lambda path: path == writable_dir, log_pass=False):
+        raise GuardError("XProtect under a directory with an ACL was not flagged")
 
     cryptex_root = "/System/Volumes/Preboot/Cryptexes"
     cryptex_child = f"{cryptex_root}/OS"
