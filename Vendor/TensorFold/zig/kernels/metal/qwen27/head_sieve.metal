@@ -39,7 +39,8 @@ kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4
   const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
   const size_t wide = ((size_t)(tile / TF_TB) * KG + g) * TF_TB + tile % TF_TB;
   const uint4 w0 = W[wide * 64 + lane], w1 = W[wide * 64 + 32 + lane];
-  W2[t] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
+  // The internal copy is group-major so adjacent tile scans read nearby blocks.
+  W2[(size_t(g) * TILES + tile) * 32 + lane] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
 }
 
 // Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
@@ -117,7 +118,7 @@ inline uint tf_sieve_key(float v) {
   // each group's words by 32-bit offsets that advance a fixed step a group from the tile's first group: the codes (wo),
   // the metadata (io), the row sums (xo, qo) and the rows' group columns (xv), the same words as the products
   // tile * KG * 32 + g * 32, g * TF_N, g * stride, g * 16 and g * GS index (all below 2^32 for the heads fits() takes)
-  uint wo = uint(tile) * uint(KG * 32) + uint(lane);
+  uint wo = uint(tile) * 32u + uint(lane); // group-major internal copy
   uint4 nw = W[wo];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
@@ -161,7 +162,7 @@ inline uint tf_sieve_key(float v) {
     // the next group's codes and indices under this one's tensor op (the last group reloads its own, unread)
     {
       const uint step = uint(g + 1 < KG);
-      wo += step * 32u;
+      wo += step * uint(TILES * 32);
       nw = W[wo];
 #if defined(TF_SBI12)
       io += step * uint(TF_N / 8);
