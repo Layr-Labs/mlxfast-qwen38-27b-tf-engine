@@ -7,6 +7,15 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+
+/// Batch adjacent warm buffer slots when supported; test encoders retain the same bindings.
+fn bindWarm(e: mtl.ComputeEncoder, comptime n: usize, buffers: [n]mtl.Buffer, offsets: [n]usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        e.setBuffers(n, buffers, offsets, 0);
+    } else {
+        inline for (0..n) |i| e.setBuffer(buffers[i], offsets[i], i);
+    }
+}
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
 const warm_mb = 10;
@@ -746,8 +755,7 @@ pub const Kernels = struct {
         // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
         const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
         e.setPipeline(k.warm_pipe.?);
-        e.setBuffer(words.buffer, words.offset, 0);
-        e.setBuffer(meta.buffer, meta.offset, 1);
+        bindWarm(e, 2, .{ words.buffer, meta.buffer }, .{ words.offset, meta.offset });
         e.setValue(lines, 2);
         e.setBuffer(k.warm_sink.?, 0, 3);
         e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
@@ -788,9 +796,7 @@ pub const Kernels = struct {
         const args = [11]u32{ groups, p.batch, 32 * 64 / 2, (p.n + 31) / 32, slots, @intCast(code_bytes), @intCast(form[0]), @intCast(form[1]), @intCast(form[2]), @intCast(meta_bytes), @intCast(@min(form[3], meta_bytes)) };
         const threads = @max(@as(usize, slots) * groups, form[3] / 128);
         e.setPipeline(pipe);
-        e.setBuffer(p.words.buffer, p.words.offset, 0);
-        e.setBuffer(meta.buf, meta.off, 1);
-        e.setBuffer(list.buffer, list.offset, 2);
+        bindWarm(e, 3, .{ p.words.buffer, meta.buf, list.buffer }, .{ p.words.offset, meta.off, list.offset });
         e.setValue(args, 3);
         e.setBuffer(k.warm_tiles_sink.?, 0, 4);
         e.dispatchGroups(mtl.Size.of(std.math.clamp((threads + 255) / 256, 1, warm_groups), 1, 1), mtl.Size.of(256, 1, 1));
