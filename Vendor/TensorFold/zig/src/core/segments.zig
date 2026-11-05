@@ -69,6 +69,46 @@ pub fn prepareFirst(queue: mtl.Queue, mode: mtl.DispatchType, lead: ?Lead) void 
 
 /// A command buffer made ahead that no pass took, ended and committed with what it holds (at most its lead): it then
 /// neither holds a queue slot nor leaves its lead undone.
+/// The next polled single-lane pass's first command buffer, encoded and committed now, ahead of the host's encode of the
+/// rest: its encoder waits on `fences` (each updated by work committed on `queue` before it), `encode` fills it, its end
+/// updates the polled lane's kept fence, and the pass's next command buffer is made ahead (as prepareFirst makes one)
+/// waiting on that fence, so the rest of the pass runs behind it. The committed buffer is returned retained: its owner
+/// checks it once the pass ran. Null (nothing committed) when no polled pass has kept a fence on `queue` yet.
+pub fn commitFirst(queue: mtl.Queue, mode: mtl.DispatchType, fences: []const mtl.objc.Id, encode: Lead) !?mtl.CommandBuffer {
+    const kept = poll_fence orelse return null;
+    if (kept.queue != queue.id) return null;
+    flushFirst();
+    const cb = queue.commandBuffer().retain();
+    const enc = cb.compute(mode);
+    for (fences) |f| mtl.objc.msg(void, enc.id, "waitForFence:", .{f});
+    encode.encode(encode.ptr, enc) catch |err| {
+        // its waits are met by work already committed: sent as encoded, it ends, and its owner fails the pass
+        enc.end();
+        cb.commit();
+        cb.wait();
+        cb.release();
+        return err;
+    };
+    kept.fence.update(enc);
+    enc.end();
+    cb.commit();
+    const rest = queue.commandBuffer().retain();
+    const rest_enc = rest.compute(mode);
+    _ = mtl.objc.retain(rest_enc.id);
+    kept.fence.wait(rest_enc);
+    first_ahead = .{ .cb = rest, .enc = rest_enc, .queue = queue.id, .mode = mode };
+    return cb;
+}
+
+/// A command buffer of the pass that just ran, retained by the caller (commitFirst's): waited for and checked with the
+/// pass's own at the next pass's start (checkUnchecked). False: no room, and the caller checks it itself.
+pub fn addUnchecked(cb: mtl.CommandBuffer) bool {
+    if (n_unchecked == unchecked.len) return false;
+    unchecked[n_unchecked] = cb;
+    n_unchecked += 1;
+    return true;
+}
+
 pub fn flushFirst() void {
     const ahead = first_ahead orelse return;
     first_ahead = null;
@@ -223,6 +263,9 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
+            // a family's last periodic commit (commitsUntil, 0: none): past it the rest of the pass goes in one buffer
+            const until: usize = if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "commitsUntil")) x.fam.commitsUntil() else 0;
+            if (until != 0 and i + 1 > until) return;
             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
             // host encodes the next chunk's layers
             if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3) and !(x.first == 0 and i == 0)) return;
@@ -251,6 +294,8 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
     for (lanes[0..n]) |l| l.cb.commit();
     // work the family queues behind the last chunk before the host waits on it (a round's keep)
     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
+    // a family that declares laneDue and laneDone takes each segment but the last as it ends, while the later ones run
+    const ended: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "laneDone")) endedLanes(fam, lanes[0..n]) else {};
     if (signalled) {
         const ev = poll_event.?;
         while (ev.value() < poll_value and lanes[0].cb.status() != .@"error") std.atomic.spinLoopHint();
@@ -262,6 +307,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             unchecked[n_unchecked] = lanes[0].cb.retain();
             n_unchecked += 1;
             try queued;
+            try ended;
             return 0;
         }
     }
@@ -288,7 +334,22 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         gpu = if (n_done > 0) gpu + l.cb.gpuSeconds() else @max(gpu, l.cb.gpuSeconds());
     }
     try queued;
+    try ended;
     return gpu;
+}
+
+/// Every command buffer of the pass is committed. Segment k's last one is waited for, then the family's laneDone(k) runs,
+/// for each segment but the last in order while laneDue says so. Each wait returns: segment 0 waits on no event, and
+/// segment k only on segment k-1's signals, which its command buffers (committed, and waited for just before) carry. A
+/// segment that failed ends the walk; the pass's own waits report it.
+fn endedLanes(fam: anytype, lanes: []const Lane) !void {
+    if (lanes.len < 2) return;
+    for (lanes[0 .. lanes.len - 1], 0..) |l, k| {
+        if (!fam.laneDue(k)) return;
+        l.cb.wait();
+        if (l.cb.failure() != null) return;
+        try fam.laneDone(k);
+    }
 }
 
 test {
