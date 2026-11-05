@@ -269,6 +269,9 @@ pub const HeadSieve = struct {
         e.setBuffer(logits.buffer, logits.offset, 0);
         e.setBuffer(s.scratch, s.o_list, 1);
         e.setBuffer(picks, 0, 2);
+        e.setBuffer(s.scratch, s.o_first, 3);
+        e.setBuffer(s.scratch, s.o_y1, 4);
+        e.setBuffer(s.scratch, s.o_args, 5);
         e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(1024, 1, 1));
     }
 
@@ -294,6 +297,6 @@ pub const HeadSieve = struct {
         s.listed_max = @max(s.listed_max, n);
         if (s.rounds != s.next_log) return;
         s.next_log *= 2;
-        std.log.info("qwen27: head sieve: rounds={d} listed tiles avg={d} max={d} of {d}", .{ s.rounds, s.listed / s.rounds, s.listed_max, s.tiles });
+        std.log.info("qwen27: head sieve: rounds={d} non-reused listed tiles avg={d} max={d} of {d}", .{ s.rounds, s.listed / s.rounds, s.listed_max, s.tiles });
     }
 };
