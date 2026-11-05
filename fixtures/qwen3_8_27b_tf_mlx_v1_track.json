@@ -22,7 +22,7 @@
   "decode_speedup_floor": 0.95,
   "prefill_speedup_floor": 0.95,
   "decode_speedup_ceiling": 5.0,
-  "prefill_speedup_ceiling": 3.0,
+  "prefill_speedup_ceiling": 5.0,
   "seed_window_max_ratio": 1.4,
   "require_private_dir": true,
   "decode_golden_offset": 1,

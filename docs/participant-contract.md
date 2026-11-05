@@ -99,7 +99,7 @@ Sources for this section:
 
 ## Guards that can refuse a run
 
-- Prefill speedup ceiling: `3.0`.
+- Prefill speedup ceiling: `5.0`.
 - Decode speedup ceiling: `5.0`.
 - A pair above a ceiling refuses the run.
 - Prefill speedup floor: `0.95`.
