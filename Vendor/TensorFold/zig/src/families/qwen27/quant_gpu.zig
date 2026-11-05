@@ -954,14 +954,20 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
 
-/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
-/// split-K 5120-wide projections (MLP down, attention output) and for the 5120-deep inputs (attention query+gate, GDN qkv,
-/// the GDN z columns that run beside the scan, MLP gate/up), one elsewhere. A two-tile launch runs its K splits as SIMD
-/// groups of one threadgroup, so the query+gate's prompt rows leave the serial split-K kernel for it.
+/// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: four for the
+/// 5120-deep inputs (attention query+gate, GDN qkv, the GDN z columns that run beside the scan, MLP gate/up) where four
+/// sit in one code batch in whole quads, two for the split-K 5120-wide projections (MLP down, attention output), one
+/// elsewhere. A multi-tile launch runs its K splits as SIMD groups of one threadgroup, so the query+gate's prompt rows
+/// leave the serial split-K kernel for it.
 fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (!key.prompt_sr or skip != 0 or key.batch % 2 != 0) return 1; // a SIMD group's tiles share one code batch
     // the launch's tiles in whole pairs: a range's first tile and length, or every tile
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
-    if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
+    if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) {
+        if (key.batch % 4 != 0) return 2;
+        // four tiles where the launch splits into whole quads, else the pair form
+        if (key.range[1] != 0) return if (key.range[0] % 4 != 0 or key.range[1] % 4 != 0) 2 else 4;
+        return if ((n + 31) / 32 % 4 != 0) 2 else 4;
+    }
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
 }
