@@ -4,6 +4,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SANDBOXED_BUILD="${SANDBOXED_BUILD_UNDER_TEST:-${ROOT}/tools/sandboxed-build.sh}"
 TRUSTED_ZIG_DIR="${ROOT}/tools/trusted-zig-dir.sh"
 fail() { printf 'test-sandboxed-build.sh: FAIL: %s\n' "$*" >&2; exit 1; }
+# shellcheck source=tools/lib/official-run-test-env.sh
+. "${ROOT}/tools/lib/official-run-test-env.sh"
 # Official builds call the orphan guard, which needs a Runner.Worker ancestor.
 # Run the whole test under a small fake one, as tools/test-orphan-guard.sh does.
 if [[ "${SANDBOXED_BUILD_TEST_UNDER_RUNNER:-0}" != 1 ]]; then
@@ -164,21 +166,16 @@ profile="$(env HOME="${WORK}" MLXFAST_QWEN38_GOLDEN_DIR="${WORK}/goldens" MLXFAS
 for rule in '(deny ipc-posix-shm*)' '(deny ipc-sysv*)' '(deny ipc-posix-sem*)' '(deny user-preference-write)'; do
   [[ "${profile}" == *"${rule}"* ]] || fail "build profile is missing ${rule}"
 done
-# The caller's runner environment makes every call below without
-# MLXFAST_OFFICIAL_BENCHMARK_RUN=1 take the official path on a self-hosted
-# runner. When that path refuses this host's Metal toolchain (outside the
-# trusted roots), assert the refusal once, then run the local cases as local
-# calls. The official cases below set the official run themselves.
-if [[ "$(uname -s)" == Darwin \
-    && ( "${RUNNER_ENVIRONMENT:-}" == self-hosted || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == 1 ) ]] \
-  && ! metal_toolchain_trusted "${DEVELOPER_DIR:-}"; then
-  out="$(RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write" 2>&1 || true)"
-  [[ "${out}" == 'sandboxed-build.sh: FAIL: xcrun-warm' \
-    || "${out}" == 'sandboxed-build.sh: FAIL: toolchain-writable' ]] \
-    || fail "untrusted Metal toolchain refusal changed: got '${out}'"
-  [[ ! -e "${WORK}/write/result" ]] || fail "the refused official call ran its command"
-  unset RUNNER_ENVIRONMENT MLXFAST_OFFICIAL_BENCHMARK_RUN
-fi
+# On a self-hosted runner that is not a ranked box, assert the official
+# refusal once, then run the local cases as local calls
+# (tools/lib/official-run-test-env.sh).
+official_refusal_then_local \
+  'sandboxed-build.sh: FAIL: xcrun-warm' 'sandboxed-build.sh: FAIL: toolchain-writable' \
+  'sandboxed-build.sh: FAIL: profile' -- \
+  env RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- \
+  /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write" \
+  || fail "official refusal without the ranked-box variables changed"
+[[ ! -e "${WORK}/write/result" ]] || fail "a refused official call ran its command"
 out="$(RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write")"
 [[ "${out}" == 'sandboxed-build.sh: PASS' ]] || fail "local result line changed"
 [[ "$(<"${WORK}/write/result")" == ok ]]
