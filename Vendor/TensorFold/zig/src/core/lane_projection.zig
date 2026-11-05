@@ -212,6 +212,8 @@ pub const Layout = struct {
     /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
     /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
     gu_count: bool = false,
+    /// Count the decoded GU's four contiguous output quarters separately; a waiting down's K splits read one each.
+    gu_parts: usize = 1,
     /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
     /// same barrier interval (encodeCountedAfter).
     wait: bool = false,
@@ -253,6 +255,8 @@ pub const Layout = struct {
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
+        if (l.gu_parts != 1 and (l.gu_parts != 4 or
+            !(l.gu_count or (l.wait and l.n == 5120 and l.k == 17408 and l.sk == 4)))) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
@@ -327,6 +331,38 @@ fn lockstepGu(l:Layout)bool{
         l.ranges.len==0 and l.y_stride==null and !l.residual;
 }
 
+test "partitioned GU readiness rejects unmatched down splits and shapes" {
+    const good = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4,
+        .precompute_sums = true, .reg = true, .tile_batch = 8, .rows8 = true, .reg_lean = true,
+        .count = true, .wait = true, .gu_parts = 4 };
+    try good.validate();
+    inline for (.{ .{ "gu_parts", @as(usize, 0) }, .{ "gu_parts", @as(usize, 2) },
+        .{ "sk", @as(usize, 2) }, .{ "sk", @as(usize, 8) }, .{ "n", @as(usize, 10240) },
+        .{ "k", @as(usize, 5120) }, .{ "wait", false } }) |change| {
+        var bad = good;
+        @field(bad, change[0]) = change[1];
+        try std.testing.expectError(error.InvalidSchedule, bad.validate());
+    }
+    var producer = good;
+    producer.n = 34816;
+    producer.k = 5120;
+    producer.sk = 2;
+    producer.serial_sk2 = true;
+    producer.swiglu = true;
+    producer.indexed = true;
+    producer.count = false;
+    producer.wait = false;
+    producer.gu_count = true;
+    try producer.validate();
+    producer.n = 17408;
+    try std.testing.expectError(error.InvalidSchedule, producer.validate());
+    // Each admitted down split consumes exactly its GU producers' contiguous 64-column output groups.
+    for (0..4) |split| {
+        try std.testing.expectEqual(split * 68, split * good.k / 64 / good.sk);
+        try std.testing.expectEqual((split + 1) * 68, (split + 1) * good.k / 64 / good.sk);
+    }
+}
+
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
     const g = l.groupCut();
@@ -355,6 +391,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
+    if (l.gu_parts != 1) try text.print(a, "#define TF_GU_PARTS {d}\n", .{l.gu_parts});
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
@@ -503,6 +540,7 @@ pub const Projection = struct {
     count: bool = false,
     /// Built with Layout.gu_count: encodeSwigluCounted only.
     gu_count: bool = false,
+    gu_parts: usize = 1,
     /// Built with Layout.wait: encodeCountedAfter only.
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
@@ -531,7 +569,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .gu_parts = l.gu_parts, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -595,14 +633,15 @@ pub const Projection = struct {
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, dims);
     }
 
-    /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
-    /// this launch leaves zero) reaches `wait_for`: the producer of `x` and `sums` shares this launch's barrier interval.
+    /// encodeCounted waiting on GU in this launch's barrier interval. `waited` holds gu_parts producer counts and an
+    /// arrival word, left zero before the final TC count. `wait_for` is the total producer count over all parts.
     pub fn encodeCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !void {
         if (!p.count or !p.wait or wait_for == 0) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        try checkRef(waited, 8, 4);
+        try checkRef(waited, (p.gu_parts + 1) * 4, 4);
+        if (wait_for % p.gu_parts != 0) return error.InvalidSchedule;
         e.setBuffer(waited.buf, waited.off, 9);
         e.setValue(wait_for, 10);
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
@@ -615,11 +654,11 @@ pub const Projection = struct {
         return p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, null);
     }
 
-    /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
-    /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
+    /// encodeSwiglu on a Layout.gu_count build: each threadgroup counts its fenced stores in its output partition.
+    /// `counter` has gu_parts count words and an arrival word, cleared by the waiting down; returns total threadgroups.
     pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
         if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
-        try checkRef(counter, 8, 4);
+        try checkRef(counter, (p.gu_parts + 1) * 4, 4);
         try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
         return @intCast(p.n / 128);
     }
