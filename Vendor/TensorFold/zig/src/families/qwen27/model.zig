@@ -84,6 +84,22 @@ pub const Model = struct {
         errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        // Complete qualification and paired full-weight calibration before request frames exist.
+        if (m.device.tensorUnits() and platform.c.getenv("TF_Q27_TARGET_M8_DISABLE") == null) {
+            for (m.weights.layers) |*layer| _ = m.kernels.qualifyTargetDownM8(m.queue, &layer.down);
+            const calibration = @import("decode_m8_calibration.zig");
+            var down: [calibration.matrices]@import("projection.zig").Linear = undefined;
+            var row_mask: u8 = 0;
+            if (m.weights.layers.len == down.len) {
+                for (m.weights.layers, &down) |layer, *p| p.* = layer.down;
+                row_mask = m.kernels.calibrateTargetDownM8(m.queue, &down);
+            }
+            for (m.weights.layers) |*layer| {
+                layer.down.m8_row_mask = row_mask;
+                if (row_mask == 0) layer.down.m8_qualified = false;
+            }
+            std.log.info("qwen27: target-down M8 ready qualified={d} rejected={d} row_mask={d}", .{ m.kernels.target_down_m8_qualified, m.kernels.target_down_m8_rejected, row_mask });
+        }
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.

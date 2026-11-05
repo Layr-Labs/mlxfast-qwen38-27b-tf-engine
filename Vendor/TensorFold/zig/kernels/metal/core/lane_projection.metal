@@ -350,6 +350,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
 #define TF_CHAIN_WALK 1
 #endif
+#if defined(TF_M8) && TF_BITS == 4
+// M8 ABI query output is header/map-free: record-only writes at fixed offsets.
+#define TF_M8_SAVE_SLOTS(REC, OFF, T, LIM) do { \
+  const uint cap = (T).get_capacity(); \
+  M8A[(REC) + (OFF)] = cap; \
+  for (uint qi = 0; qi < (LIM); qi++) { \
+    const uint qo = (REC) + (OFF) + 1 + 3 * qi; \
+    if (qi < cap && (T).is_valid_element(ushort(qi))) { \
+      const auto qc = (T).get_multidimensional_index(ushort(qi)); \
+      M8A[qo] = 1u; M8A[qo + 1] = uint(qc[0]); M8A[qo + 2] = uint(qc[1]); \
+    } else { \
+      M8A[qo] = 0u; M8A[qo + 1] = 0xffffffffu; M8A[qo + 2] = 0xffffffffu; \
+    } \
+  } \
+} while (0)
+#endif
 #if defined(TF_GU_TURNS)
 [[max_total_threads_per_threadgroup(64)]]
 #elif defined(TF_SWIGLU)
@@ -361,6 +377,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #endif
 [[kernel]] void tf_lane_reg(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     const device int* mdims [[buffer(3)]], device TF_OUT* Y [[buffer(4)]], const device float* XS [[buffer(5)]],
+#if defined(TF_M8) && TF_BITS == 4
+    device uint* M8A [[buffer(11)]],
+#endif
 #if defined(TF_SWIGLU)
     device float* HS [[buffer(6)]],
 #elif defined(TF_COUNT)
@@ -403,6 +422,32 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto a0 = a.slice(0, 0);
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+#if defined(TF_M8) && TF_BITS == 4
+  const uint m8_mode = M8A[0];
+  if (m8_mode == 1u) {
+    constexpr auto desc16 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc16, execution_simdgroup> op16;
+    auto cb16 = op16.template get_right_input_cooperative_tensor<bfloat, half, float>();
+    auto P16 = op16.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb16)>, float>();
+    using LB8 = typename mpp::tensor_ops::__mutmul2d_detail::__cooperative_tensor_layout<decltype(cb)>::layout;
+    using LB16 = typename mpp::tensor_ops::__mutmul2d_detail::__cooperative_tensor_layout<decltype(cb16)>::layout;
+    using LP8 = typename mpp::tensor_ops::__mutmul2d_detail::__cooperative_tensor_layout<decltype(P)>::layout;
+    using LP16 = typename mpp::tensor_ops::__mutmul2d_detail::__cooperative_tensor_layout<decltype(P16)>::layout;
+    const uint rec = 36u + (uint(sgi) * 32u + uint(lane)) * 494u;
+    M8A[rec] = uint(sgi); M8A[rec + 1] = uint(lane);
+    M8A[rec + 2] = cb.get_capacity(); M8A[rec + 3] = cb16.get_capacity();
+    M8A[rec + 4] = uint(LB8::thread_storage_size()); M8A[rec + 5] = uint(LB16::thread_storage_size());
+    M8A[rec + 6] = P.get_capacity(); M8A[rec + 7] = P16.get_capacity();
+    M8A[rec + 8] = uint(LP8::thread_storage_size()); M8A[rec + 9] = uint(LP16::thread_storage_size());
+    TF_M8_SAVE_SLOTS(rec, 10u, cb, 64u);
+    TF_M8_SAVE_SLOTS(rec, 203u, cb16, 64u);
+    TF_M8_SAVE_SLOTS(rec, 396u, P, 16u);
+    TF_M8_SAVE_SLOTS(rec, 445u, P16, 16u);
+    return;
+  }
+  const uint m8_lane_modes = M8A[4u + uint(lane)];
+  const float m8_poison = as_type<float>(0x7fc00000u);
+#endif
   thread half2* b2 = (thread half2*)&cb[0];
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
@@ -552,6 +597,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     auto x = a.slice(g * GS, 0);
 #endif
     op.run(x, cb, P);
+#if defined(TF_M8) && TF_BITS == 4
+#define TF_M8_ACCUM_SLOT(J) do { \
+  const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[J]), v1 = as_type<vec<bfloat, 2>>(cur.q1[J]); \
+  const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+  const float p0 = P[J]; \
+  const uint high_mode = (m8_lane_modes >> (2u * (J))) & 3u; \
+  float p1 = m8_poison; \
+  if (high_mode == 0u) p1 = 0.0f; \
+  else if (high_mode == 1u) p1 = P[4 + (J)]; \
+  else if (high_mode == 2u) p1 = P[8 + (J)]; \
+  C[J] = fma(s0, p0, fma(b0, cur.x0, C[J])); \
+  C[8 + (J)] = fma(s1, p1, fma(b1, cur.x0, C[8 + (J)])); \
+} while (0)
+    TF_M8_ACCUM_SLOT(0); TF_M8_ACCUM_SLOT(1); TF_M8_ACCUM_SLOT(2); TF_M8_ACCUM_SLOT(3);
+#undef TF_M8_ACCUM_SLOT
+#else
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
@@ -564,6 +625,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
 #endif
     }
+#endif
   }
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
     // the K splits' reduction order, in registers: ((c0 + c1) + c2) + c3
