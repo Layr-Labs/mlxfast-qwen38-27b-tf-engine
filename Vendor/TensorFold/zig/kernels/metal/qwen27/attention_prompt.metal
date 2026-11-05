@@ -55,7 +55,7 @@ template <bool EDGE>
 inline void q27_prompt_step(thread Q27PromptRun& r, int kt, int kend, const device bfloat* q, const device bfloat* k, const device bfloat* v,
     threadgroup float (*xs)[32][16], ushort sg, ushort lane, short fm, short fn, short h, int n0, int n1, float scale2) {
   q27f8 s0 = 0.0f, s1 = 0.0f;
-  _Pragma("clang loop unroll_count(4)") // whole unrolling hoists every K load ahead of the products and runs slower
+  _Pragma("clang loop unroll(full)") // whole unrolling hoists every K load ahead of the products; pre-M5 read slower, retest on M5
   for (int d = 0; d < 8; d++) q27_mma_s(s0, s1, q27_frag<false>(q + d * 16, PD, fm, fn, 0, 16), q27_frag<EDGE>(k + kt * PD + d * 16, PD, fm, fn, kt, kend), q27_frag<EDGE>(k + (kt + 16) * PD + d * 16, PD, fm, fn, kt + 16, kend));
   _Pragma("clang loop unroll(full)")
   for (int i = 0; i < 8; i++) { xs[sg][lane][i] = s0[i]; xs[sg][lane][8 + i] = s1[i]; }
