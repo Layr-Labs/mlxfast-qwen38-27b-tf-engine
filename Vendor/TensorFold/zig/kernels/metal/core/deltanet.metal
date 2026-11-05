@@ -189,13 +189,14 @@ inline void tf_delta_gdn_pre_rows4_direct(device const bfloat* projection, devic
 
 // tf_delta_gdn_pre_rows4_direct for a prompt chain's rows, whose row r takes taps r .. r + 3 (one window; the host checks
 // it, gdn_plan.Plan.chain): a simdgroup's rows share their taps, so it loads each tap once, count + 3 loads for its count
-// rows where the window lookups made 4 count, and reads one slot word. Every row's arithmetic is
+// rows where the window lookups made 4 count, and reads one slot word: 32 rows a group, up to 8 a simdgroup (11 tap loads
+// and one weight load for 8 rows, where two 4-row simdgroups took 14 and two). Every row's arithmetic is
 // tf_delta_gdn_pre_rows4_direct's, in its order, on the same words.
 inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
     device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  const uint head = group.y, base = group.z * 32, in_group = metal::min(32u, p.rows - base), per = (in_group + 3) / 4;
   if (sg * per >= in_group) return;
   const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
@@ -207,13 +208,13 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
   // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
-  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
+  bfloat4 taps[11];
+  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 11; ++s) {
     const uint source = first + s;
     taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
   }
-  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 8; ++i) {
     if (i < count) {
       const uint row = first + i;
       float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1040,6 +1041,7 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
                          uint t [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float parked[8 * 65]; // One padded row for each of eight ordered sums.
   const uint row = group.z * 4 + sg, head = group.y;
   // the norm gains (the same dv words for every head and row) come from nothing in this barrier interval, so they are read
   // before the wait below; the scan's rows and z (the zba projection's, written in this interval too) are read after it
@@ -1061,33 +1063,38 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (row >= p.rows || p.dv != 128) return;
-  const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
-  const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
-  float values[4];
-  float square = 0.0f;
-  for (uint part = 0; part < 4; ++part) {
-    values[part] = float(x[part]);
-    square += values[part] * values[part];
-  }
-  square = simd_sum(square);
-  const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
-  bfloat4 y;
-  for (uint part = 0; part < 4; ++part) {
-    const float normalized = float(bfloat(gain[part] * (values[part] * inverse)));
-    const float z = float(z4[part]);
-    y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
-  }
-  *(device bfloat4*)(output + at) = y;
-  if (sums_stride != 0) {
-    simdgroup_barrier(mem_flags::mem_device);
-    if ((lane & 15) == 0) {
-      const int width = int(p.nv * p.dv), g = int((head * p.dv + lane * 4) / 64);
-      float acc = 0.0f;
-      for (int i = 0; i < 64; i++) acc += float(output[(size_t)row * width + g * 64 + i]);
-      sums[g * int(sums_stride) + int(row)] = acc;
+  if (p.dv != 128) return;
+  if (row < p.rows) {
+    const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+    const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
+    float values[4];
+    float square = 0.0f;
+    for (uint part = 0; part < 4; ++part) {
+      values[part] = float(x[part]);
+      square += values[part] * values[part];
     }
+    square = simd_sum(square);
+    const float inverse = metal::rsqrt(square / float(p.dv) + p.eps);
+    bfloat4 y;
+    for (uint part = 0; part < 4; ++part) {
+      const float normalized = float(bfloat(gain[part] * (values[part] * inverse)));
+      const float z = float(z4[part]);
+      y[part] = bfloat(z / (1.0f + metal::exp(-z)) * normalized);
+    }
+    *(device bfloat4*)(output + at) = y;
+    if (sums_stride != 0)
+      for (uint part = 0; part < 4; ++part)
+        parked[(sg * 2 + lane / 16) * 65 + (lane & 15) * 4 + part] = float(y[part]);
   }
+  if (sums_stride == 0) return;
+  // Inactive row SIMD groups also reach this barrier in a partial final group.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0 || lane >= 8) return;
+  const uint sum_row = group.z * 4 + lane / 2;
+  if (sum_row >= p.rows) return;
+  float acc = 0.0f;
+  for (uint i = 0; i < 64; ++i) acc += parked[lane * 65 + i];
+  sums[(head * 2 + (lane & 1)) * sums_stride + sum_row] = acc;
 }
 
 // tf_delta_gdn_post_rows for a prompt chain's rows: 16 rows of a head a group of 128, 4 a simdgroup, each row's words
