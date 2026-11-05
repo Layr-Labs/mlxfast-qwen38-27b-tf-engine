@@ -126,6 +126,23 @@ jobs:
       - name: Seatbelt is available
         run: test -x /usr/bin/sandbox-exec
 
+      - name: TEMPORARY xcrun diagnostic
+        run: |
+          echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-} TMPDIR=${TMPDIR:-}"
+          echo "DARWIN_USER_TEMP_DIR=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
+          echo "xcode-select=$(/usr/bin/xcode-select -p 2>&1) DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+          for t in "-sdk macosx -f metal" "-sdk macosx -f metallib" "-f python3"; do
+            # shellcheck disable=SC2086
+            out="$(/usr/bin/xcrun -n ${t} 2>&1)"; echo "xcrun -n ${t}: rc=$? ${out}"
+          done
+          for d in "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" "${TMPDIR:-/nonexistent}"; do
+            ls -la "${d%/}/xcrun_db" 2>&1 || true
+          done
+          /usr/bin/xcrun -sdk macosx -f metal >/dev/null 2>&1; echo "cached lookup rc=$?"
+          for d in "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" "${TMPDIR:-/nonexistent}"; do
+            ls -la "${d%/}/xcrun_db" 2>&1 || true
+          done
+
       - name: Submission-security suite did not shrink
         run: |
           set -euo pipefail
