@@ -403,6 +403,54 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   auto a0 = a.slice(0, 0);
   auto cb = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
   auto P = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+#if defined(TF_M8) && TF_BITS == 4
+  // The old M16 descriptor is a coordinate oracle only; it never runs. Accept only the two known slot relations.
+  constexpr auto desc16 = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc16, execution_simdgroup> op16;
+  auto cb16 = op16.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto P16 = op16.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cb16)>, float>();
+  bool m8_slots_ok = P.get_capacity() >= 8 && P16.get_capacity() >= 12;
+  uint m8_high_pad = 0, m8_high_compact = 0, m8_high_legacy = 0;
+#define TF_M8_CHECK_SLOT(J) do { \
+  if (!P16.is_valid_element(ushort(J)) || !P.is_valid_element(ushort(J))) { \
+    m8_slots_ok = false; \
+  } else { \
+    const auto old_lo = P16.get_multidimensional_index(ushort(J)); \
+    const auto new_lo = P.get_multidimensional_index(ushort(J)); \
+    if (old_lo[0] != new_lo[0] || old_lo[1] != new_lo[1]) m8_slots_ok = false; \
+  } \
+  if (!P16.is_valid_element(ushort(8 + (J)))) { \
+    m8_slots_ok = false; \
+  } else { \
+    const auto old_hi = P16.get_multidimensional_index(ushort(8 + (J))); \
+    if (old_hi[1] >= 8) { \
+      m8_high_pad |= 1u << (J); \
+    } else { \
+      bool mapped = false; \
+      if (P.is_valid_element(ushort(4 + (J)))) { \
+        const auto new_hi = P.get_multidimensional_index(ushort(4 + (J))); \
+        if (old_hi[0] == new_hi[0] && old_hi[1] == new_hi[1]) { \
+          m8_high_compact |= 1u << (J); \
+          mapped = true; \
+        } \
+      } \
+      if (!mapped && P.get_capacity() >= 12 && P.is_valid_element(ushort(8 + (J)))) { \
+        const auto new_hi_legacy = P.get_multidimensional_index(ushort(8 + (J))); \
+        if (old_hi[0] == new_hi_legacy[0] && old_hi[1] == new_hi_legacy[1]) { \
+          m8_high_legacy |= 1u << (J); \
+          mapped = true; \
+        } \
+      } \
+      if (!mapped) m8_slots_ok = false; \
+    } \
+  } \
+} while (0)
+  if (m8_slots_ok) {
+    TF_M8_CHECK_SLOT(0); TF_M8_CHECK_SLOT(1); TF_M8_CHECK_SLOT(2); TF_M8_CHECK_SLOT(3);
+  }
+#undef TF_M8_CHECK_SLOT
+  const float m8_poison = as_type<float>(0x7fc00000u);
+#endif
   thread half2* b2 = (thread half2*)&cb[0];
   const device uint4* sbv = (const device uint4*)SB;
   const half2 bias = half2(1024.0h);
@@ -552,6 +600,20 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     auto x = a.slice(g * GS, 0);
 #endif
     op.run(x, cb, P);
+#if defined(TF_M8) && TF_BITS == 4
+#define TF_M8_ACCUM_SLOT(J) do { \
+  const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[J]), v1 = as_type<vec<bfloat, 2>>(cur.q1[J]); \
+  const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+  const float p0 = m8_slots_ok ? P[J] : m8_poison; \
+  const float p1 = !m8_slots_ok ? m8_poison : ((m8_high_pad & (1u << (J))) ? 0.0f : \
+    ((m8_high_compact & (1u << (J))) ? P[4 + (J)] : \
+      ((m8_high_legacy & (1u << (J))) ? P[8 + (J)] : m8_poison))); \
+  C[J] = fma(s0, p0, fma(b0, cur.x0, C[J])); \
+  C[8 + (J)] = fma(s1, p1, fma(b1, cur.x0, C[8 + (J)])); \
+} while (0)
+    TF_M8_ACCUM_SLOT(0); TF_M8_ACCUM_SLOT(1); TF_M8_ACCUM_SLOT(2); TF_M8_ACCUM_SLOT(3);
+#undef TF_M8_ACCUM_SLOT
+#else
     for (int j = 0; j < 4; j++) {
       const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(cur.q0[j]), v1 = as_type<vec<bfloat, 2>>(cur.q1[j]);
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
@@ -564,6 +626,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       C[12 + j] = fma(s1, P[12 + j], fma(b1, cur.x1, C[12 + j]));
 #endif
     }
+#endif
   }
 #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8)
     // the K splits' reduction order, in registers: ((c0 + c1) + c2) + c3
