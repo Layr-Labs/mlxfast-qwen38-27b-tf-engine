@@ -5,6 +5,7 @@ const lane = @import("core").lane_projection;
 const row = @import("core").row_projection;
 const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
+const dense_gu = @import("dense_prompt_gu.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
@@ -53,6 +54,24 @@ const warm_source =
 ;
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
+
+fn densePrefix(prompt: bool, p: projection.Linear, rows: u32, skip: u32, cut: [2]u32, range: [2]u32) u32 {
+    if (!prompt or rows < 128 or rows > @import("gpu_frame.zig").max_rows) return 0;
+    if (p.n != 34816 or p.k != 5120 or p.tile != 32 or p.bits != 4 or p.group != 64 or p.runs.len != 0) return 0;
+    if (skip != 0 or cut[0] != 0 or cut[1] != 0 or range[0] != 0 or range[1] != 0) return 0;
+    const weights = p.prompt_dense_gu orelse return 0;
+    if (weights.n != p.n or weights.k != p.k) return 0;
+    return rows / 128 * 128;
+}
+
+const DenseTail = struct { x: Ref, xs: ?Sums, y: Ref };
+fn denseTail(p: projection.Linear, x: Ref, xs: ?Sums, y: Ref, prefix: u32) DenseTail {
+    return .{
+        .x = .{ .buffer = x.buffer, .offset = x.offset + @as(usize, prefix) * p.k * 2 },
+        .xs = if (xs) |s| .{ .ref = .{ .buffer = s.ref.buffer, .offset = s.ref.offset + @as(usize, prefix) * 4 }, .stride = s.stride } else null,
+        .y = .{ .buffer = y.buffer, .offset = y.offset + @as(usize, prefix) * p.n * 2 },
+    };
+}
 
 const Key = struct {
     kind: Kind,
@@ -163,6 +182,10 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    dense_prompt_gu: ?dense_gu.Program = null,
+    dense_gu_calls: u64 = 0,
+    dense_gu_rows: u64 = 0,
+    dense_gu_seen: u64 = 0,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -196,6 +219,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.setResident(null);
+        if (k.dense_prompt_gu) |*program| program.deinit();
         if (k.row_pipelines) |*pipelines| pipelines.deinit();
         if (k.simd) |*pipelines| pipelines.deinit();
         if (k.simd_bits) |*pipelines| pipelines.deinit();
@@ -297,6 +321,8 @@ pub const Kernels = struct {
         out_sums: Ref,
         rows: u32,
     ) !bool {
+        // Dense coefficients produce the ordinary G/U rows; the existing mlp stage consumes them.
+        if (densePrefix(k.prompt, p, rows, 0, .{ 0, 0 }, .{ 0, 0 }) != 0) return false;
         if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
         if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
@@ -418,6 +444,30 @@ pub const Kernels = struct {
         if ((skip > 0 or cut[1] > 0 or range[1] > 0) and p.raw != null) return error.BadCoreProjectionRows;
         if (range[1] > 0 and (skip > 0 or cut[1] > 0 or range[0] + range[1] > (p.n + 31) / 32)) return error.BadCoreProjectionRows;
         if (skip > 0 and (p.raw != null or skip >= p.n / 64)) return error.BadCoreProjectionRows;
+        const prefix = densePrefix(k.prompt, p, rows, skip, cut, range);
+        if (prefix != 0) {
+            const program = k.dense_prompt_gu orelse return error.DensePromptGuNotReady;
+            const weights = p.prompt_dense_gu.?;
+            {
+                var dense_span = profile.begin(k.profiler, input_encoder, .dense);
+                dense_span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
+                errdefer dense_span.cancel();
+                try program.encode(dense_span.encoder, weights, x, y, prefix);
+                try dense_span.end();
+            }
+            k.dense_gu_calls += 1;
+            k.dense_gu_rows += prefix;
+            if (weights.layer < 64) {
+                const bit = @as(u64, 1) << @as(u6, @intCast(weights.layer));
+                if (k.dense_gu_seen & bit == 0) std.log.info("qwen27: dense prompt GU active layer={d}", .{weights.layer});
+                k.dense_gu_seen |= bit;
+            }
+            if (prefix < rows) {
+                const tail = denseTail(p, x, xs, y, prefix);
+                try k.quantOne(input_encoder, p, tail.x, tail.xs, dims, tail.y, rows - prefix, skip, cut, range);
+            }
+            return;
+        }
         if (p.raw) |raw| if (raw.bits != 4 and k.tiled(raw)) {
             if (rows == 0 or rows > 128 or p.tile != 32) return error.BadCoreProjectionRows;
             return k.strided(input_encoder, raw, x, y, rows, @intCast(raw.n));
@@ -428,7 +478,6 @@ pub const Kernels = struct {
         errdefer span.cancel();
         const e = span.encoder;
 
-        _ = dims;
         if (rows == 0 or rows > @import("gpu_frame.zig").max_rows or p.tile != 32) return error.BadCoreProjectionRows;
         if (p.raw) |raw| if (raw.bits == 4 and raw.group == 64 and raw.sum == .f32 and raw.n % 8 == 0) {
             const m = row.simd.Matrix{ .w = raw.w, .w_off = raw.w_off, .scales = raw.scales, .s_off = raw.s_off, .biases = raw.biases, .b_off = raw.b_off, .n = raw.n, .k = raw.k };
@@ -513,7 +562,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -964,4 +1014,42 @@ fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
+}
+
+test "dense prompt GU prefix preserves decode, shape, range and tail boundaries" {
+    var p = projection.Linear{ .words = undefined, .pairs = undefined, .n = 34816, .k = 5120, .tile = 32, .slices = 2, .prompt_dense_gu = .{ .high = undefined, .offsets = undefined, .indices = undefined, .residual = undefined, .count = 0, .n = 34816, .k = 5120, .layer = 57 } };
+    for ([_]u32{ 0, 1, 8, 16, 127, 2049 }) |rows| try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, rows, 0, .{ 0, 0 }, .{ 0, 0 }));
+    for ([_]u32{ 128, 129, 255, 256, 257, 512, 2048 }) |rows| {
+        const prefix = densePrefix(true, p, rows, 0, .{ 0, 0 }, .{ 0, 0 });
+        try std.testing.expectEqual(rows / 128 * 128, prefix);
+        try std.testing.expect(prefix <= rows and rows - prefix < 128);
+        try std.testing.expectEqual(@as(u32, 0), densePrefix(false, p, rows, 0, .{ 0, 0 }, .{ 0, 0 }));
+    }
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 1, .{ 0, 0 }, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 1, 0 }, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 0, 2 }, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 0, 0 }, .{ 1, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 0, 0 }, .{ 0, 32 }));
+    const good = p;
+    inline for (.{ .{ "n", @as(u32, 17408) }, .{ "k", @as(u32, 2560) }, .{ "tile", @as(u32, 16) }, .{ "bits", @as(u8, 8) }, .{ "group", @as(u32, 128) } }) |change| {
+        p = good;
+        @field(p, change[0]) = change[1];
+        try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 0, 0 }, .{ 0, 0 }));
+    }
+    p = good;
+    p.prompt_dense_gu = null;
+    try std.testing.expectEqual(@as(u32, 0), densePrefix(true, p, 128, 0, .{ 0, 0 }, .{ 0, 0 }));
+}
+
+test "dense prompt GU tail advances rows and preserves group-major sum stride" {
+    const p = projection.Linear{ .words = undefined, .pairs = undefined, .n = 34816, .k = 5120, .tile = 32, .slices = 2 };
+    const x = Ref{ .buffer = undefined, .offset = 32 };
+    const y = Ref{ .buffer = undefined, .offset = 64 };
+    const xs = Sums{ .ref = .{ .buffer = undefined, .offset = 128 }, .stride = 512 };
+    const tail = denseTail(p, x, xs, y, 128);
+    try std.testing.expectEqual(@as(usize, 32 + 128 * 5120 * 2), tail.x.offset);
+    try std.testing.expectEqual(@as(usize, 64 + 128 * 34816 * 2), tail.y.offset);
+    try std.testing.expectEqual(@as(usize, 128 + 128 * 4), tail.xs.?.ref.offset);
+    try std.testing.expectEqual(@as(u32, 512), tail.xs.?.stride);
+    try std.testing.expect(denseTail(p, x, null, y, 128).xs == null);
 }

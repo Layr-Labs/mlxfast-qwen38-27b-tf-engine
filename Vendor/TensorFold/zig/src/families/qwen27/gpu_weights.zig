@@ -1,4 +1,4 @@
-//! The Metal graph borrows native scalar tensors and owns only byte-preserving affine layouts.
+//! The Metal graph borrows native scalar tensors and owns affine layouts and optional dense coefficients.
 const std = @import("std");
 const mtl = @import("metal");
 const cp = @import("core").checkpoint_metal;
@@ -9,7 +9,60 @@ const widths = @import("widths.zig");
 const Width = widths.Width;
 const Ref = projection.Ref;
 const Linear = projection.Linear;
+const dense_prompt_gu = @import("dense_prompt_gu.zig");
 pub const Tensor = cp.Tensor;
+
+/// Auxiliary coefficients use a bounded share of the device's advertised working set.
+pub fn defaultAuxBudget(max_working_set: u64) usize {
+    return if (max_working_set >= @as(u64, 64) << 30) @as(usize, 8) << 30 else @as(usize, 7) << 28;
+}
+
+pub const LoadOptions = struct {
+    dense_prompt_gu: bool = false,
+    max_aux_bytes: usize = 7 << 28,
+};
+
+const dense_n: usize = 34816;
+const dense_k: usize = 5120;
+// CSR keeps one dummy u16 index and f32 residual even when its count is zero.
+const dense_min_bytes: usize = dense_n * dense_k * @sizeOf(u16) + (dense_n + 1) * @sizeOf(u32) + @sizeOf(u16) + @sizeOf(f32);
+const DenseBudget = struct {
+    limit: usize,
+    used: usize = 0,
+
+    fn remaining(b: DenseBudget) usize {
+        return b.limit -| b.used;
+    }
+};
+
+fn denseLayerEligible(layer: usize, total: usize, hidden: usize, intermediate: usize, gate: Width, up: Width) bool {
+    return layer < total -| 1 and hidden == dense_k and intermediate == dense_n / 2 and
+        widths.isUniform(gate) and widths.isUniform(up);
+}
+
+/// Keep the last minimum-budget-eligible layers; callers mark terminal/mixed layers false first.
+fn selectDenseLayers(eligible: []bool, max_aux_bytes: usize) void {
+    var count = max_aux_bytes / dense_min_bytes;
+    var i = eligible.len;
+    while (i > 0) {
+        i -= 1;
+        const take = eligible[i] and count > 0;
+        eligible[i] = take;
+        if (take) count -= 1;
+    }
+}
+
+/// All size/budget checks precede the four infallible ownership transfers.
+fn admitDense(owned: anytype, budget: *DenseBudget, w: anytype) !bool {
+    const buffers = .{ w.high, w.offsets, w.indices, w.residual };
+    var actual: usize = 0;
+    inline for (buffers) |buffer| actual = try std.math.add(usize, actual, buffer.length());
+    if (actual > budget.remaining()) return false;
+    std.debug.assert(owned.capacity - owned.items.len >= 4);
+    inline for (buffers) |buffer| owned.appendAssumeCapacity(buffer);
+    budget.used += actual;
+    return true;
+}
 
 pub const Gdn = struct { qkv: Linear, zba: Linear, out: Linear, conv: Tensor, a_log: Tensor, dt: Tensor, norm: Tensor };
 pub const Attention = struct { q: Linear, kv: Linear, out: Linear, q_norm: Tensor, k_norm: Tensor };
@@ -26,6 +79,13 @@ pub const Weights = struct {
     head_decode: Linear,
     owned: std.ArrayList(mtl.Buffer) = .empty,
     runs: std.ArrayList([]projection.Run) = .empty,
+    /// These buffers are already included in `owned` and its residency/memory inventory.
+    dense_prompt_gu_bytes: usize = 0,
+
+    pub fn hasDensePromptGu(w: *const Weights) bool {
+        for (w.layers) |l| if (l.gu.prompt_dense_gu != null) return true;
+        return false;
+    }
 
     pub fn deinit(w: *Weights) void {
         for (w.owned.items) |b| b.deinit();
@@ -69,6 +129,8 @@ const Builder = struct {
     stage: *cp.Stage,
     runs: *std.ArrayList([]projection.Run),
     widths: *const widths.Widths,
+    dense_layers: []const bool = &.{},
+    dense_budget: ?*DenseBudget = null,
 
     fn get(b: Builder, suffix: []const u8) !Tensor {
         const name = try std.mem.concat(b.allocator, u8, &.{ b.prefix, suffix });
@@ -99,6 +161,15 @@ const Builder = struct {
 
     /// The same matrix prepared with `forced` adjacent tiles interleaved (see projection.prepareForced).
     fn linearForced(b: Builder, parts: []const Part, k: usize, forced: ?u32) !Linear {
+        return b.linearWithDense(parts, k, forced, null);
+    }
+
+    fn linearGu(b: Builder, parts: []const Part, k: usize, layer_index: usize) !Linear {
+        const selected = layer_index < b.dense_layers.len and b.dense_layers[layer_index];
+        return b.linearWithDense(parts, k, null, if (selected) @as(u32, @intCast(layer_index)) else null);
+    }
+
+    fn linearWithDense(b: Builder, parts: []const Part, k: usize, forced: ?u32, dense_layer: ?u32) !Linear {
         var arena = std.heap.ArenaAllocator.init(b.allocator);
         defer arena.deinit();
         const names = try arena.allocator().alloc([]const u8, parts.len * 3);
@@ -119,7 +190,25 @@ const Builder = struct {
                 .group = p.w.group,
             };
         }
-        return b.stackForced(triples[0..parts.len], forced);
+        var result = try b.stackForced(triples[0..parts.len], forced);
+        if (dense_layer) |layer_index| {
+            const budget = b.dense_budget orelse return error.MissingDenseBudget;
+            if (budget.remaining() < dense_min_bytes) return result;
+            // Capacity is secured before prepare owns any of its four buffers.
+            try b.owned.ensureUnusedCapacity(b.allocator, 4);
+            const weights = try dense_prompt_gu.prepare(b.allocator, b.device, triples[0..parts.len], layer_index);
+            var transferred = false;
+            defer if (!transferred) dense_prompt_gu.deinitWeights(weights);
+            const before = budget.used;
+            if (try admitDense(b.owned, budget, weights)) {
+                result.prompt_dense_gu = weights;
+                transferred = true;
+                std.log.info("qwen27: dense prompt GU layer={d} aux_bytes={d} residual_count={d}", .{ layer_index, budget.used - before, weights.count });
+            } else {
+                std.log.info("qwen27: dense prompt GU layer={d} rejected by remaining auxiliary budget", .{layer_index});
+            }
+        }
+        return result;
     }
 
     /// Fused members of one width take one matrix as before; a mixed stack becomes one matrix a member.
@@ -180,7 +269,7 @@ const Builder = struct {
                 .k_norm = try b.tensor(try Name.full(a, prefix, "self_attn.k_norm.weight"), .bf16, &.{c.head_dim}),
             } },
         };
-        const gu = try b.linear(&.{ .{ .module = try Name.full(a, prefix, "mlp.gate_proj"), .n = c.intermediate, .w = w[@backingInt(M.gate)] }, .{ .module = try Name.full(a, prefix, "mlp.up_proj"), .n = c.intermediate, .w = w[@backingInt(M.up)] } }, c.hidden);
+        const gu = try b.linearGu(&.{ .{ .module = try Name.full(a, prefix, "mlp.gate_proj"), .n = c.intermediate, .w = w[@backingInt(M.gate)] }, .{ .module = try Name.full(a, prefix, "mlp.up_proj"), .n = c.intermediate, .w = w[@backingInt(M.up)] } }, c.hidden, i);
         const down = try b.linear(&.{.{ .module = try Name.full(a, prefix, "mlp.down_proj"), .n = c.hidden, .w = w[@backingInt(M.down)] }}, c.intermediate);
         return .{ .norm = try b.tensor(try Name.full(a, prefix, "input_layernorm.weight"), .bf16, &.{c.hidden}), .post_norm = try b.tensor(try Name.full(a, prefix, "post_attention_layernorm.weight"), .bf16, &.{c.hidden}), .gu = gu, .down = down, .mixer = mixer };
     }
@@ -195,6 +284,10 @@ fn checked(t: Tensor, dtype: cp.DType, shape: []const usize) !Tensor {
 
 /// The graph from `checkpoint`, whose `repacked` tensors stay in their files: each Linear is staged, repacked, dropped.
 pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const cp.Checkpoint, c: Config, ws: *const widths.Widths) !Weights {
+    return loadWithOptions(allocator, device, checkpoint, c, ws, .{});
+}
+
+pub fn loadWithOptions(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const cp.Checkpoint, c: Config, ws: *const widths.Widths, options: LoadOptions) !Weights {
     const prefix: []const u8 = if (checkpoint.has("language_model.model.embed_tokens.weight")) "language_model." else if (checkpoint.has("model.embed_tokens.weight")) "" else return error.MissingTextNamespace;
     if (checkpoint.has("language_model.model.embed_tokens.weight") and checkpoint.has("model.embed_tokens.weight")) return error.AmbiguousTextNamespace;
     var owned: std.ArrayList(mtl.Buffer) = .empty;
@@ -211,7 +304,17 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     errdefer allocator.free(layers);
     var stage = cp.Stage{ .device = device };
     defer stage.deinit();
-    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws };
+    const selected: []bool = if (options.dense_prompt_gu) try allocator.alloc(bool, c.layers) else &.{};
+    defer if (options.dense_prompt_gu) allocator.free(selected);
+    if (options.dense_prompt_gu) {
+        for (selected, 0..) |*take, i| {
+            const w = ws.layers[i];
+            take.* = denseLayerEligible(i, c.layers, c.hidden, c.intermediate, w[@backingInt(widths.Member.gate)], w[@backingInt(widths.Member.up)]);
+        }
+        selectDenseLayers(selected, options.max_aux_bytes);
+    }
+    var dense_budget = DenseBudget{ .limit = options.max_aux_bytes };
+    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws, .dense_layers = selected, .dense_budget = &dense_budget };
     for (layers, 0..) |*l, i| l.* = try b.layer(c, i);
     const embed = try b.quant("model.embed_tokens", c.vocab, c.hidden, ws.embed);
     const norm = try b.tensor("model.norm.weight", .bf16, &.{c.hidden});
@@ -224,7 +327,7 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     var extra: ?Linear = null;
     if (batched_head) extra = head_decode;
     if (device.tensorUnits()) try laneOrder(allocator, device, layers, head, extra);
-    return .{ .allocator = allocator, .layers = layers, .embed = embed, .norm = norm, .head = head, .head_decode = head_decode, .owned = owned, .runs = runs };
+    return .{ .allocator = allocator, .layers = layers, .embed = embed, .norm = norm, .head = head, .head_decode = head_decode, .owned = owned, .runs = runs, .dense_prompt_gu_bytes = dense_budget.used };
 }
 
 /// Tensor-unit projections leave load in lane_projection.reg_layout, the order quant_gpu's reg kernel reads.
@@ -264,4 +367,102 @@ test "repacked names the modules the graph reads only through owned copies" {
     try std.testing.expect(!repacked("language_model.model.layers.3.self_attn.q_norm.weight", 2));
     try std.testing.expect(!repacked("language_model.model.norm.weight", 2));
     try std.testing.expect(!repacked("language_model.model.layers.0.linear_attn.A_log", 2));
+}
+
+test "dense prompt GU chooses the last budget eligible nonterminal layers" {
+    try std.testing.expectEqual(@as(usize, 356655114), dense_min_bytes);
+    try std.testing.expect(!(LoadOptions{}).dense_prompt_gu);
+    try std.testing.expectEqual(@as(usize, 7 << 28), (LoadOptions{}).max_aux_bytes);
+    var selected: [64]bool = undefined;
+    for (&selected, 0..) |*take, i| take.* = denseLayerEligible(i, 64, 5120, 17408, widths.uniform, widths.uniform);
+    selectDenseLayers(&selected, (LoadOptions{}).max_aux_bytes);
+    for (selected, 0..) |take, i| try std.testing.expectEqual(i >= 58 and i <= 62, take);
+    try std.testing.expect(!denseLayerEligible(63, 64, 5120, 17408, widths.uniform, widths.uniform));
+    try std.testing.expect(!denseLayerEligible(62, 64, 2560, 17408, widths.uniform, widths.uniform));
+    try std.testing.expect(!denseLayerEligible(62, 64, 5120, 17408, .{ .bits = 2, .group = 64 }, widths.uniform));
+    try std.testing.expect(!denseLayerEligible(62, 64, 5120, 17408, widths.uniform, .{ .bits = 4, .group = 128 }));
+    for (&selected, 0..) |*take, i| take.* = i < 63 and i != 60;
+    selectDenseLayers(&selected, (LoadOptions{}).max_aux_bytes);
+    for (selected, 0..) |take, i| try std.testing.expectEqual(i >= 57 and i <= 62 and i != 60, take);
+    @memset(&selected, true);
+    selectDenseLayers(&selected, dense_min_bytes - 1);
+    for (selected) |take| try std.testing.expect(!take);
+}
+
+test "dense prompt GU actual buffer budget rejects atomically then transfers exactly four" {
+    const Buffer = struct {
+        id: u32,
+        size: usize,
+        fn length(b: @This()) usize { return b.size; }
+    };
+    const prepared = .{
+        .high = Buffer{ .id = 1, .size = 80 },
+        .offsets = Buffer{ .id = 2, .size = 8 },
+        .indices = Buffer{ .id = 3, .size = 2 },
+        .residual = Buffer{ .id = 4, .size = 4 },
+    };
+    var owned: std.ArrayList(Buffer) = .empty;
+    defer owned.deinit(std.testing.allocator);
+    try owned.ensureUnusedCapacity(std.testing.allocator, 4);
+    var budget = DenseBudget{ .limit = 93 };
+    try std.testing.expect(!try admitDense(&owned, &budget, prepared));
+    try std.testing.expectEqual(@as(usize, 0), owned.items.len);
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    budget.limit = 94;
+    try std.testing.expect(try admitDense(&owned, &budget, prepared));
+    try std.testing.expectEqual(@as(usize, 4), owned.items.len);
+    try std.testing.expectEqual(@as(usize, 94), budget.used);
+    for (owned.items, 1..) |buffer, id| try std.testing.expectEqual(@as(u32, @intCast(id)), buffer.id);
+    try std.testing.expect(!try admitDense(&owned, &budget, prepared));
+    try std.testing.expectEqual(@as(usize, 4), owned.items.len);
+    try std.testing.expectEqual(@as(usize, 94), budget.used);
+}
+
+test "dense prompt GU actual byte sum overflow transfers no ownership" {
+    const Buffer = struct {
+        size: usize,
+        fn length(b: @This()) usize { return b.size; }
+    };
+    const prepared = .{
+        .high = Buffer{ .size = std.math.maxInt(usize) },
+        .offsets = Buffer{ .size = 1 },
+        .indices = Buffer{ .size = 2 },
+        .residual = Buffer{ .size = 4 },
+    };
+    var owned: std.ArrayList(Buffer) = .empty;
+    defer owned.deinit(std.testing.allocator);
+    try owned.ensureUnusedCapacity(std.testing.allocator, 4);
+    var budget = DenseBudget{ .limit = std.math.maxInt(usize) };
+    try std.testing.expectError(error.Overflow, admitDense(&owned, &budget, prepared));
+    try std.testing.expectEqual(@as(usize, 0), owned.items.len);
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+}
+
+test "dense auxiliary default budget follows working set boundaries and remains capped" {
+    const low: usize = 7 << 28;
+    const high: usize = 8 << 30;
+    const threshold: u64 = @as(u64, 64) << 30;
+    try std.testing.expectEqual(low, defaultAuxBudget(0));
+    try std.testing.expectEqual(low, defaultAuxBudget(@as(u64, 36) << 30));
+    try std.testing.expectEqual(low, defaultAuxBudget(threshold - 1));
+    try std.testing.expectEqual(high, defaultAuxBudget(threshold));
+    try std.testing.expectEqual(high, defaultAuxBudget(threshold + 1));
+    try std.testing.expectEqual(high, defaultAuxBudget(@as(u64, 128) << 30));
+    try std.testing.expectEqual(high, defaultAuxBudget(std.math.maxInt(u64)));
+    try std.testing.expectEqual(low, (LoadOptions{}).max_aux_bytes);
+}
+
+test "working set budget chooses five or twenty four eligible sidecars" {
+    var selected: [64]bool = undefined;
+    for ([_]u64{ @as(u64, 36) << 30, @as(u64, 64) << 30, std.math.maxInt(u64) }) |working_set| {
+        for (&selected, 0..) |*take, i| take.* = denseLayerEligible(i, 64, 5120, 17408, widths.uniform, widths.uniform);
+        selectDenseLayers(&selected, defaultAuxBudget(working_set));
+        const first: usize = if (working_set < @as(u64, 64) << 30) 58 else 39;
+        var count: usize = 0;
+        for (selected, 0..) |take, i| {
+            try std.testing.expectEqual(i >= first and i <= 62, take);
+            if (take) count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (first == 58) 5 else 24), count);
+    }
 }
