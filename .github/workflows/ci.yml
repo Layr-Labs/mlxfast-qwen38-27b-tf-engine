@@ -135,9 +135,10 @@ jobs:
       - name: TEMPORARY sandboxed-build trace
         run: |
           set +e
-          env SHELLOPTS=xtrace bash tools/test-sandboxed-build.sh > "${RUNNER_TEMP}/trace.log" 2>&1
+          printf '%s\n' 'trap '"'"'echo "ERRTRAP ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND:0:200}" >&2'"'"' ERR' > "${RUNNER_TEMP}/errtrap.sh"
+          env BASH_ENV="${RUNNER_TEMP}/errtrap.sh" bash tools/test-sandboxed-build.sh > "${RUNNER_TEMP}/trace.log" 2>&1
           echo "rc=$?"
-          grep -v "system agent passed" "${RUNNER_TEMP}/trace.log" | tail -n 120
+          grep -E 'ERRTRAP .*test-sandboxed-build|FAIL' "${RUNNER_TEMP}/trace.log" | tail -n 20
 
       - name: Real Seatbelt containment
         run: |
