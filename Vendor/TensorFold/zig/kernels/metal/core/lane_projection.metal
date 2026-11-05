@@ -807,6 +807,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const device bfloat* H [[buffer(6)]], device bfloat* RO [[buffer(7)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+#ifndef TF_PROMPT_GU_WALK
+#define TF_PROMPT_GU_WALK 0
+#endif
+#if defined(TF_SWIGLU) && TF_PROMPT_TN == 2 && TF_SK == 1 && TF_N == 34816 && TF_K == 5120 && TF_BITS == 4 && TF_GROUP == 64
+  if (mdims[0] == 128) {
+#if TF_PROMPT_GU_WALK == 2 || TF_PROMPT_GU_WALK == 4 || TF_PROMPT_GU_WALK == 8
+    const uint linear = tg.y * 272 + tg.x;
+    const uint block = linear / (272 * TF_PROMPT_GU_WALK), rem = linear % (272 * TF_PROMPT_GU_WALK);
+    tg = uint2(rem / TF_PROMPT_GU_WALK, block * TF_PROMPT_GU_WALK + rem % TF_PROMPT_GU_WALK);
+#elif TF_PROMPT_GU_WALK == 22
+    const uint v = tg.y * 272 + tg.x, block = v >> 2;
+    const uint bx = block % 136, by = block / 136;
+    tg = uint2(2 * bx + (v & 1), 2 * by + ((v >> 1) & 1));
+#endif
+  }
+#endif
   constexpr int TN = TF_PROMPT_TN;
   const int r0 = int(tg.y) * 16, rows = mdims[0] - r0;
   if (rows <= 0) return;

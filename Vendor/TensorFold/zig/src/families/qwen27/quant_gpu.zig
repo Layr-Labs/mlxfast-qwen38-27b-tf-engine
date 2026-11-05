@@ -70,6 +70,7 @@ const Key = struct {
     rows8: bool = false,
     lean: bool = false,
     prompt_sr: bool = false,
+    prompt_gu_walk: u8 = 0,
     batch: u32 = 1,
     swiglu: bool = false,
     sbi: bool = false,
@@ -163,6 +164,10 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    /// Device-only startup decision, retained without synthetic activation content.
+    prompt_gu_walk: u8 = 0,
+    prompt_gu_walk_disabled: bool = false,
+    prompt_gu_walk_calls: u64 = 0,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -285,6 +290,68 @@ pub const Kernels = struct {
         return true;
     }
 
+    fn promptWalkChoice(k: *const Kernels, p: projection.Linear) u8 {
+        if (!k.prompt or k.prompt_gu_walk_disabled or !@import("prompt_gu_walk_calibration.zig").eligible(p)) return 0;
+        return k.prompt_gu_walk;
+    }
+
+    fn notePromptGuWalk(k: *Kernels, mode: u8, rows: u32) void {
+        if (mode != 0 and rows == lane.reg_rows) k.prompt_gu_walk_calls += 1;
+    }
+
+    fn promptGuKey(p: projection.Linear, mode: u8) Key {
+        return Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = 1, .bits = p.bits, .group = p.group, .lean = true, .prompt_sr = true, .batch = p.batch, .swiglu = true, .prompt_gu_walk = mode };
+    }
+
+    fn promptGuLane(k: *Kernels, p: projection.Linear, mode: u8) !lane.Projection {
+        const key = promptGuKey(p, mode);
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = 1,
+                .precompute_sums = true,
+                .reg = true,
+                .prompt_sr = true,
+                .tile_batch = p.batch,
+                .reg_lean = true,
+                .swiglu = true,
+                .prompt_tn = if (p.batch % 2 == 0 and (p.n / 64) % p.batch == 0) 2 else 1,
+                .prompt_gu_walk = mode,
+            });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr.*;
+    }
+
+    /// Called before frame allocation. All errors leave the original schedule selected.
+    pub fn preparePromptGuWalk(k: *Kernels, queue: mtl.Queue, layers: anytype) void {
+        k.prompt_gu_walk = 0;
+        if (k.prompt_gu_walk_disabled or !k.device.tensorUnits() or layers.len != 64) return;
+        const calibration = @import("prompt_gu_walk_calibration.zig");
+        const policy = @import("prompt_gu_walk_policy.zig");
+        var matrices: [64]projection.Linear = undefined;
+        for (layers, &matrices) |layer, *p| {
+            p.* = layer.gu;
+            if (!calibration.eligible(p.*)) return;
+        }
+        var programs: [policy.modes.len]lane.Projection = undefined;
+        for (policy.modes, &programs) |mode, *program| {
+            program.* = k.promptGuLane(matrices[0], mode) catch |err| {
+                std.log.info("qwen27: prompt GU walk fallback compile={s}", .{@errorName(err)});
+                return;
+            };
+        }
+        k.prompt_gu_walk = calibration.run(k.device, queue, programs, &matrices) catch |err| value: {
+            std.log.info("qwen27: prompt GU walk fallback calibration={s}", .{@errorName(err)});
+            break :value 0;
+        };
+        std.log.info("qwen27: prompt GU walk selected={d}", .{k.prompt_gu_walk});
+    }
+
     /// Prompt rows' fused gate/up and activation: one K split, 16-row blocks, up to `lane.reg_rows` rows a launch, two
     /// tiles a SIMD group (the gate pair, then the up pair) where the code batches allow.
     fn gateUpActivatedPrompt(
@@ -300,40 +367,11 @@ pub const Kernels = struct {
         if (rows == 0 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
         if (p.bits != 4 or p.group != 64 or p.n != 34816) return false;
         if ((projection.promptSplit(p.n, p.k) orelse p.slices) != 1) return false;
-        const key = Key{
-            .kind = .projection,
-            .n = p.n,
-            .k = p.k,
-            .slices = 1,
-            .bits = p.bits,
-            .group = p.group,
-            .lean = true,
-            .prompt_sr = true,
-            .batch = p.batch,
-            .swiglu = true,
-        };
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
-                .n = p.n,
-                .k = p.k,
-                .format = .{ .bits = p.bits, .group = p.group },
-                .sk = 1,
-                .precompute_sums = true,
-                .reg = true,
-                .prompt_sr = key.prompt_sr,
-                .tile_batch = key.batch,
-                .reg_lean = true,
-                .swiglu = true,
-                // two tiles a SIMD group where the gate and up pairs each sit inside one code batch
-                .prompt_tn = if (key.batch % 2 == 0 and (p.n / 64) % key.batch == 0) 2 else 1,
-            });
-            k.joined(entry.value_ptr);
-        }
+        const mode = k.promptWalkChoice(p);
+        const kernel = try k.promptGuLane(p, mode);
         const half = p.n / 2;
         var first: u32 = 0;
         while (first < rows) : (first += lane.reg_rows) {
@@ -345,7 +383,8 @@ pub const Kernels = struct {
             const xsr = lane.Sums{ .ref = .{ .buf = xs.ref.buffer, .off = xs_off }, .stride = xs.stride };
             const hr = lane.Ref{ .buf = out.buffer, .off = out.offset + @as(usize, first) * half * 2 };
             const hsr = lane.Ref{ .buf = out_sums.buffer, .off = out_sums.offset + @as(usize, first) * 4 };
-            try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
+            try kernel.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
+            k.notePromptGuWalk(mode, n);
         }
         try span.end();
         return true;
@@ -513,7 +552,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -964,4 +1004,45 @@ fn promptTiles(key: Key, n: u32, skip: u32) usize {
     if (if (key.range[1] != 0) key.range[0] % 2 != 0 or key.range[1] % 2 != 0 else (n + 31) / 32 % 2 != 0) return 1;
     if (key.k == 5120 and (n == 12288 or n == 10240 or n == 6240 or n == 34816)) return 2;
     return if (n == 5120 and key.slices == 2 and (key.k == 17408 or key.k == 6144)) 2 else 1;
+}
+
+test "prompt GU walk selector preserves phase shape and kill boundaries" {
+    _ = @import("prompt_gu_walk_policy.zig");
+    var kernels = Kernels{ .allocator = std.testing.allocator, .device = undefined, .prompt = true, .prompt_gu_walk = 4 };
+    const p = projection.Linear{ .words = undefined, .pairs = undefined, .n = 34816, .k = 5120, .tile = 32, .slices = 2, .batch = 8 };
+    try std.testing.expectEqual(@as(u8, 4), kernels.promptWalkChoice(p));
+    kernels.prompt = false;
+    try std.testing.expectEqual(@as(u8, 0), kernels.promptWalkChoice(p));
+    kernels.prompt = true;
+    kernels.prompt_gu_walk_disabled = true;
+    try std.testing.expectEqual(@as(u8, 0), kernels.promptWalkChoice(p));
+    kernels.prompt_gu_walk_disabled = false;
+    inline for (.{ .{ "n", @as(u32, 17408) }, .{ "k", @as(u32, 2560) }, .{ "tile", @as(u32, 16) }, .{ "batch", @as(u32, 1) }, .{ "bits", @as(u8, 8) }, .{ "group", @as(u32, 128) } }) |change| {
+        var excluded = p;
+        @field(excluded, change[0]) = change[1];
+        try std.testing.expectEqual(@as(u8, 0), kernels.promptWalkChoice(excluded));
+    }
+    var cache = std.AutoHashMap(Key, u8).init(std.testing.allocator);
+    defer cache.deinit();
+    for (@import("prompt_gu_walk_policy.zig").modes) |mode| {
+        const key = Kernels.promptGuKey(p, mode);
+        try cache.put(key, mode);
+    }
+    try std.testing.expectEqual(@as(u32, 5), cache.count());
+    kernels.notePromptGuWalk(4, 128);
+    kernels.notePromptGuWalk(0, 128);
+    kernels.notePromptGuWalk(4, 127);
+    try std.testing.expectEqual(@as(u64, 1), kernels.prompt_gu_walk_calls);
+}
+
+test "prompt GU walk emitted source uses actual selected mode" {
+    const a = std.testing.allocator;
+    for (@import("prompt_gu_walk_policy.zig").modes[1..]) |mode| {
+        const text = try lane.source(a, .{ .n = 34816, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 1, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = 8, .reg_lean = true, .swiglu = true, .prompt_tn = 2, .prompt_gu_walk = mode });
+        defer a.free(text);
+        const expected = try std.fmt.allocPrint(a, "#define TF_PROMPT_GU_WALK {d}\n", .{mode});
+        defer a.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, text, expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_PROMPT_TN 2\n") != null);
+    }
 }
