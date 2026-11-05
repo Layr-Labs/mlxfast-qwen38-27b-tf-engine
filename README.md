@@ -124,7 +124,7 @@ pair_score   = prefill_gain^0.25 * decode_gain^0.75
 ```
 
 The final score is the arithmetic mean of the two pair scores. The prefill
-speedup must be from `0.95` through `1.5`. The decode speedup must be from
+speedup must be from `0.95` through `3.0`. The decode speedup must be from
 `0.95` through `5.0`. A failed correctness, variance, or control-band check
 produces no score. The exact warm-up and measured windows are in
 `docs/participant-contract.md`.
