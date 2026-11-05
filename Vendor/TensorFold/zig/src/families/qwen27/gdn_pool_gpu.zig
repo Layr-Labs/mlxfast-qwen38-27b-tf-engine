@@ -113,9 +113,11 @@ pub const Pool = struct {
         errdefer for (buffers) |buffer| buffer.deinit();
         const kernels = try Kernels.init(device);
         // words 0-1: the star scan's count and its gate's arrivals; words 2-3 (gdn.star_words): the prepare's count and the
-        // star scan's arrivals
-        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
-        @memset(scan_words.contents()[0..16], 0);
+        // star scan's arrivals. Tensor-unit (M5) GPUs only: before the M5 a gate that waits on the scan's count in its
+        // barrier interval can read the scan's rows stale (DFlash verifies then pick wrong tokens on an M3), so there
+        // the star scan ends at a barrier instead (forwardStar without a counter)
+        const scan_words: ?metal.Buffer = if (device.tensorUnits()) try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked) else null;
+        if (scan_words) |b| @memset(b.contents()[0..16], 0);
         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
     }
 
@@ -258,7 +260,7 @@ pub const Pool = struct {
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
         // a prompt chain's rows (row r's taps r .. r + 3) load each tap once a simdgroup (tf_delta_gdn_pre_chain)
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepareRows(pre.encoder, if (prompt and plan.host.chain) pool.kernels.pre_chain else pool.kernels.pre_rows);
+        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else if (prompt and plan.host.chain) prepared.prepareChain(pre.encoder, pool.kernels.pre_chain) else prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
