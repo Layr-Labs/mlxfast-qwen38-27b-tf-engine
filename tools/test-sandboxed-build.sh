@@ -164,9 +164,11 @@ profile="$(env HOME="${WORK}" MLXFAST_QWEN38_GOLDEN_DIR="${WORK}/goldens" MLXFAS
 for rule in '(deny ipc-posix-shm*)' '(deny ipc-sysv*)' '(deny ipc-posix-sem*)' '(deny user-preference-write)'; do
   [[ "${profile}" == *"${rule}"* ]] || fail "build profile is missing ${rule}"
 done
-# This call keeps the caller's runner environment. On a self-hosted runner it
-# takes the official path, which refuses a Metal toolchain outside the trusted
-# roots; then the local result is checked with that environment removed.
+# The caller's runner environment makes every call below without
+# MLXFAST_OFFICIAL_BENCHMARK_RUN=1 take the official path on a self-hosted
+# runner. When that path refuses this host's Metal toolchain (outside the
+# trusted roots), assert the refusal once, then run the local cases as local
+# calls. The official cases below set the official run themselves.
 if [[ "$(uname -s)" == Darwin \
     && ( "${RUNNER_ENVIRONMENT:-}" == self-hosted || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == 1 ) ]] \
   && ! metal_toolchain_trusted "${DEVELOPER_DIR:-}"; then
@@ -175,11 +177,9 @@ if [[ "$(uname -s)" == Darwin \
     || "${out}" == 'sandboxed-build.sh: FAIL: toolchain-writable' ]] \
     || fail "untrusted Metal toolchain refusal changed: got '${out}'"
   [[ ! -e "${WORK}/write/result" ]] || fail "the refused official call ran its command"
-  out="$(env -u RUNNER_ENVIRONMENT -u MLXFAST_OFFICIAL_BENCHMARK_RUN RUNNER_TEMP="${WORK}" \
-    "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write")"
-else
-  out="$(RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write")"
+  unset RUNNER_ENVIRONMENT MLXFAST_OFFICIAL_BENCHMARK_RUN
 fi
+out="$(RUNNER_TEMP="${WORK}" "${SANDBOXED_BUILD}" --write "${WORK}/write" -- /bin/sh -c 'printf ok > "$1/result"' sh "${WORK}/write")"
 [[ "${out}" == 'sandboxed-build.sh: PASS' ]] || fail "local result line changed"
 [[ "$(<"${WORK}/write/result")" == ok ]]
 out="$(env -u RUNNER_TEMP -u RUNNER_WORKSPACE -u RUNNER_ENVIRONMENT \
