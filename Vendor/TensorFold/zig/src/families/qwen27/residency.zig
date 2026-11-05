@@ -54,6 +54,7 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
     for (b.head.owned.items) |buffer| fields.one(buffer, hook, joining);
     fields.one(b.args, hook, joining);
     fields.one(b.counts, hook, joining);
+    fields.one(b.proposal, hook, joining);
     if (b.head.plain) |*p| prepared(p, hook, joining);
     for (b.caches) |*c| fields.apply(c, hook, joining);
     var adapters = b.prepared.valueIterator();
