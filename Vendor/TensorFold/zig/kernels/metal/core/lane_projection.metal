@@ -369,6 +369,9 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_TILE_LIST)
     const device uint* TL [[buffer(7)]],
 #endif
+#if defined(TF_TILE_REUSE)
+    const device uint* FL [[buffer(8)]], const device ushort* FY [[buffer(9)]], constant uint& first_stride [[buffer(10)]],
+#endif
 #if defined(TF_WAIT)
     device atomic_uint* WC [[buffer(9)]], constant uint& wait_for [[buffer(10)]], uint2 tgs [[threadgroups_per_grid]],
 #endif
@@ -378,6 +381,18 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_TILE_LIST)
   if (tg.x >= TL[0]) {
     if (sgi == 0) for (int m = 0; m < min(rows, 8); m++) ((device ushort*)Y)[(size_t)m * TF_YS + tg.x * NT + lanei] = 0xFF7Fu;
+    return;
+  }
+#endif
+#if defined(TF_TILE_REUSE)
+  // The first pass computed every live row for each first tile. Reuse its exact bf16 words.
+  // first/list are published by prior dispatches; this test is uniform across the whole group.
+  const uint wanted = TL[1 + tg.x], first_count = min(min(FL[0], uint(rows)), 8u);
+  uint found = 0xffffffffu;
+  for (uint i = 0; i < first_count; i++) if (FL[1 + i] == wanted) { found = i; break; }
+  if (found != 0xffffffffu) {
+    if (sgi == 0) for (uint m = 0; m < min(uint(rows), 8u); m++)
+      ((device ushort*)Y)[(size_t)m * TF_YS + tg.x * NT + lanei] = FY[(size_t)m * first_stride + found * NT + lanei];
     return;
   }
 #endif
@@ -581,12 +596,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i];
 #if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
+#ifndef TF_TGPAD1
+#define TF_TGPAD1 0
 #endif
-#if TF_TGPAD > 0
-  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
+#if TF_TGPAD1 > 0
+  // the parallel prompt launches' threadgroup-memory reserve for the serial ones too; the use never runs (0: none)
+  threadgroup float tgpad1[TF_TGPAD1 / 4];
   if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
 #endif
 #endif
@@ -909,7 +924,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
   threadgroup float part[(TF_SK > 1 ? TF_SK - 1 : 1) * TN * 16 * 32];
 #ifndef TF_TGPAD
-#define TF_TGPAD 8192
+// four K slices (the z columns beside the scan): no reserve beside their 12 KB part array
+#define TF_TGPAD (TF_SK == 4 ? 0 : 8192)
 #endif
 #if TF_TGPAD > 0
   // fewer of these one-SIMD-group threadgroups a core: reserve TF_TGPAD bytes of threadgroup memory; the use below never runs
