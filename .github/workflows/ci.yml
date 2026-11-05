@@ -135,9 +135,9 @@ jobs:
       - name: TEMPORARY sandboxed-build trace
         run: |
           set +e
-          bash -x tools/test-sandboxed-build.sh > "${RUNNER_TEMP}/trace.log" 2>&1
+          SHELLOPTS=xtrace bash tools/test-sandboxed-build.sh > "${RUNNER_TEMP}/trace.log" 2>&1
           echo "rc=$?"
-          grep -v 'system agent passed' "${RUNNER_TEMP}/trace.log" | tail -n 60
+          grep -v "system agent passed" "${RUNNER_TEMP}/trace.log" | tail -n 120
 
       - name: Real Seatbelt containment
         run: |
