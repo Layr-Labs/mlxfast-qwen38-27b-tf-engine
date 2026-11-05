@@ -112,7 +112,7 @@ pub const HeadSieve = struct {
         if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
-        try m.kernels.prepareTiles(head, head.n);
+        try m.kernels.prepareTilesReuse(head, head.n);
         var at: usize = 0;
         const take = struct {
             fn f(p: *usize, bytes: usize) usize {
@@ -262,7 +262,7 @@ pub const HeadSieve = struct {
         // 6: the listed tiles exactly, as many threadgroups as tiles listed, rows the vocabulary apart in the logits buffer;
         // beside it, the listed tiles' lines requested at once, as in 4
         m.kernels.warmTiles(e, s.head, s.ref(s.o_list), s.tiles) catch {};
-        try m.kernels.quantTilesIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args));
+        try m.kernels.quantTilesReuseIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args), s.ref(s.o_first), s.ref(s.o_y1), first_stride);
         e.barrier();
         // 7: each row's token from those words
         e.setPipeline(s.pick);

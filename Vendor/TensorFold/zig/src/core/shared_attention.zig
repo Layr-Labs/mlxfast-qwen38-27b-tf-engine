@@ -24,6 +24,21 @@ pub const Shape = struct {
     }
 };
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
+
+/// Preserve consecutive slots and byte offsets; recording facades retain the individual calls.
+fn bindRefs(e: mtl.ComputeEncoder, comptime n: usize, refs: [n]Ref, first: usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (0..n) |i| {
+            buffers[i] = refs[i].buf;
+            offsets[i] = refs[i].off;
+        }
+        e.setBuffers(n, buffers, offsets, first);
+    } else {
+        inline for (0..n) |i| e.setBuffer(refs[i].buf, refs[i].off, first + i);
+    }
+}
 /// Rows a tf_shared_lane_attention_split_kv threadgroup takes (its TF_SPLIT_ROWS) and its threads: a simdgroup a query
 /// head of one KV head and row.
 fn kvRows(s: Shape) usize {
@@ -157,20 +172,31 @@ pub const Attention = struct {
 
     fn dispatchSplit(p: Attention, e: mtl.ComputeEncoder, rows: usize, keys: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref, xs: ?Sums, own: ?Own) void {
         e.setPipeline(p.split_kv orelse p.split);
-        for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
+        bindRefs(e, 4, .{ q, k, v, mask }, 0);
         bindArgs(e, args, 4);
         e.setBuffer(p.part, 0, 5);
         const kv_width: u32 = @intCast(p.shape.kv_heads * p.shape.head_dim);
         const o = own orelse Own{ .k = k, .v = v, .rows = 0, .k_stride = kv_width, .v_stride = kv_width };
-        e.setBuffer(o.k.buf, o.k.off, 6);
-        e.setBuffer(o.v.buf, o.v.off, 7);
+        bindRefs(e, 2, .{ o.k, o.v }, 6);
         e.setValue([3]u32{ o.rows, o.k_stride, o.v_stride }, 8);
         const chunks = chunksOf(keys, p.shape.split_chunk);
         if (p.split_kv != null) {
             const per = kvRows(p.shape);
             e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, (rows + per - 1) / per, chunks), mtl.Size.of(kvThreads(p.shape), 1, 1));
         } else e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunks), mtl.Size.of(32, 1, 1));
-        e.barrier();
+        if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+            // Include reads as well as writes: callers may use one arena buffer for
+            // different views, and a merge output can alias an earlier split input.
+            const args_buf = switch (args) {
+                .at => |r| r.buf,
+                .value => p.part,
+            };
+            const sums_buf = if (xs) |s| s.ref.buf else p.part;
+            e.barrierBuffers(&.{ p.part, q.buf, k.buf, v.buf, mask.buf, o.k.buf, o.v.buf, args_buf, out.buf, sums_buf });
+        } else {
+            // Host facades without the resource API retain their existing barrier.
+            e.barrier();
+        }
         e.setPipeline(if (xs != null) p.merge_xs else p.merge);
         e.setBuffer(p.part, 0, 0);
         bindArgs(e, args, 1);
@@ -197,7 +223,7 @@ pub const Attention = struct {
 
     fn dispatchAttend(p: Attention, e: mtl.ComputeEncoder, rows: usize, args: Bound, q: Ref, k: Ref, v: Ref, mask: Ref, out: Ref) void {
         e.setPipeline(p.attend);
-        for ([_]Ref{ q, k, v, mask }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
+        bindRefs(e, 4, .{ q, k, v, mask }, 0);
         bindArgs(e, args, 4);
         e.setBuffer(out.buf, out.off, 5);
         e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, 1), mtl.Size.of(32, 1, 1));
@@ -232,7 +258,7 @@ pub const Attention = struct {
         try disjoint(out, k);
         try disjoint(out, v);
         e.setPipeline(p.decode);
-        for ([_]Ref{ q, k, v }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
+        bindRefs(e, 3, .{ q, k, v }, 0);
         e.setValue(Args{ .rows = 1, .keys = @intCast(keys), .scale_bits = @bitCast(scale) }, 3);
         e.setBuffer(out.buf, out.off, 4);
         e.dispatchGroups(mtl.Size.of(p.shape.query_heads, 1, 1), mtl.Size.of(32, 1, 1));
@@ -251,7 +277,7 @@ pub const Attention = struct {
         try disjoint(y, positions);
         try disjoint(y, frequencies);
         e.setPipeline(p.rope);
-        for ([_]Ref{ x, positions, frequencies }, 0..) |r, i| e.setBuffer(r.buf, r.off, i);
+        bindRefs(e, 3, .{ x, positions, frequencies }, 0);
         e.setValue(Args{ .rows = @intCast(rows), .heads = @intCast(heads) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         e.dispatchThreads(mtl.Size.of(elements, 1, 1), mtl.Size.of(128, 1, 1));
@@ -324,15 +350,13 @@ pub const Attention = struct {
     fn dispatchAppend(p: Attention, e: mtl.ComputeEncoder, pipeline: mtl.Pipeline, count: usize, slots: union(enum) { host: []const u32, at: Ref }, args: Bound, k: Ref, v: Ref, cache_k: Ref, cache_v: Ref, strides: ?[2]u32) void {
         const width = p.shape.kv_heads * p.shape.head_dim;
         e.setPipeline(pipeline);
-        e.setBuffer(k.buf, k.off, 0);
-        e.setBuffer(v.buf, v.off, 1);
+        bindRefs(e, 2, .{ k, v }, 0);
         switch (slots) {
             .host => |s| e.setBytes(std.mem.sliceAsBytes(s), 2),
             .at => |r| e.setBuffer(r.buf, r.off, 2),
         }
         bindArgs(e, args, 3);
-        e.setBuffer(cache_k.buf, cache_k.off, 4);
-        e.setBuffer(cache_v.buf, cache_v.off, 5);
+        bindRefs(e, 2, .{ cache_k, cache_v }, 4);
         if (strides) |s| e.setValue(s, 6);
         e.dispatchThreads(mtl.Size.of(count * width, 1, 1), mtl.Size.of(128, 1, 1));
     }

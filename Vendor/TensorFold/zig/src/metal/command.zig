@@ -138,6 +138,15 @@ pub const ComputeEncoder = struct {
         objc.msg(void, self.id, "setBuffer:offset:atIndex:", .{ buffer.id, offset, index });
     }
 
+    /// Bind a contiguous group in one Metal call; the arrays are read during the call.
+    pub fn setBuffers(self: ComputeEncoder, comptime n: usize, buffers: [n]Buffer, offsets: [n]usize, first: usize) void {
+        if (comptime n != 0) {
+            var ids: [n]Id = undefined;
+            inline for (0..n) |i| ids[i] = buffers[i].id;
+            objc.msg(void, self.id, "setBuffers:offsets:withRange:", .{ ids[0..].ptr, offsets[0..].ptr, types.Range{ .location = first, .length = n } });
+        }
+    }
+
     /// Small constants copied into the command stream (at most 4 KB).
     pub fn setBytes(self: ComputeEncoder, bytes: []const u8, index: usize) void {
         objc.msg(void, self.id, "setBytes:length:atIndex:", .{ bytes.ptr, bytes.len, index });
@@ -169,6 +178,29 @@ pub const ComputeEncoder = struct {
     /// Later dispatches see every buffer write before this point (concurrent encoders).
     pub fn barrier(self: ComputeEncoder) void {
         objc.msg(void, self.id, "memoryBarrierWithScope:", .{types.BarrierScope.buffers});
+    }
+
+    /// Order whole resources across an internal dispatch boundary. Callers include every
+    /// input/output resource on either side, including aliases and GPU-written arguments.
+    /// This is not a byte-range barrier and does not clear an external hazard tracker.
+    pub fn barrierBuffers(self: ComputeEncoder, buffers: []const Buffer) void {
+        var ids: [16]Id = undefined;
+        if (buffers.len == 0 or buffers.len > ids.len) return self.barrier();
+        var count: usize = 0;
+        for (buffers) |buffer| {
+            var seen = false;
+            for (ids[0..count]) |id| {
+                if (id == buffer.id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                ids[count] = buffer.id;
+                count += 1;
+            }
+        }
+        objc.msg(void, self.id, "memoryBarrierWithResources:count:", .{ ids[0..count].ptr, count });
     }
 
     /// Declare a resource used through indirect commands or argument buffers.

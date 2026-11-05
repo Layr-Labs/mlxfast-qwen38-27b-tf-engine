@@ -78,9 +78,12 @@ const Key = struct {
     count: bool = false,
     wait: bool = false,
     tiles: u32 = 0,
+    tile_reuse: bool = false,
     parallel_sk2: bool = false,
-    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
-    /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
+    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8) and of the GDN z|b|a projection (6240 x 5120,
+    /// K split 4), whose b and a tiles' one-tile launch (gdn_hook) takes it: one SIMD group a tile runs the K chains in
+    /// turn (lane_projection.Layout.serial_sk2) instead of a SIMD group a chain in one threadgroup. Two-tile launches (z's)
+    /// keep their parallel K splits.
     serial: bool = false,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
@@ -457,7 +460,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.k == 5120 and ((p.n == 2048 and sk == 8) or (p.n == 6240 and sk == 4)) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -523,7 +526,7 @@ pub const Kernels = struct {
     /// slots past list[0] (of `slots`) get the lowest finite bf16.
     pub fn quantTiles(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32) !void {
         if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        const t = try k.tileList(p, stride);
+        const t = try k.tileList(p, stride, false);
         try t.encodeTiles(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots);
     }
 
@@ -531,24 +534,36 @@ pub const Kernels = struct {
     /// the list), the threadgroups of an indirect launch; `slots` bounds the count and the room `y` has a row.
     pub fn quantTilesIndirect(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32, args: Ref) !void {
         if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        const t = try k.tileList(p, stride);
+        const t = try k.tileList(p, stride, false);
         try t.encodeTilesIndirect(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots, .{ .buf = args.buffer, .off = args.offset });
+    }
+
+    /// Indirect tile list with exact first-tile outputs computed earlier in this same round.
+    pub fn quantTilesReuseIndirect(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32, args: Ref, first: Ref, values: Ref, first_stride: u32) !void {
+        if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
+        const t = try k.tileList(p, stride, true);
+        try t.encodeTilesReuseIndirect(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots, .{ .buf = args.buffer, .off = args.offset }, .{ .first = .{ .buf = first.buffer, .off = first.offset }, .values = .{ .buf = values.buffer, .off = values.offset }, .stride = first_stride });
+    }
+
+    /// Prepare the reuse variant independently of ordinary tile-list pipelines.
+    pub fn prepareTilesReuse(k: *Kernels, p: projection.Linear, stride: u32) !void {
+        _ = try k.tileList(p, stride, true);
     }
 
     /// Compiles at load the pipeline quantTiles of `p` at `stride` takes.
     pub fn prepareTiles(k: *Kernels, p: projection.Linear, stride: u32) !void {
-        _ = try k.tileList(p, stride);
+        _ = try k.tileList(p, stride, false);
     }
 
     /// The tile-list build of the decode-row pipeline `quant` of `p` takes for at most 8 rows (prepareDecode's key), so
     /// a listed tile's words are that launch's.
-    fn tileList(k: *Kernels, p: projection.Linear, stride: u32) !*lane.Projection {
+    fn tileList(k: *Kernels, p: projection.Linear, stride: u32, reuse: bool) !*lane.Projection {
         if (k.prompt or !ranged(p) or stride == 0 or stride % 32 != 0) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .tiles = stride };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .tiles = stride, .tile_reuse = reuse };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .output = .bf16, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .y_stride = stride, .tile_list = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .output = .bf16, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .y_stride = stride, .tile_list = true, .tile_reuse = key.tile_reuse });
             k.joined(entry.value_ptr);
         }
         return entry.value_ptr;
@@ -951,7 +966,18 @@ fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
     e.setBuffer(r.buffer, r.offset, index);
 }
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        const n = @typeInfo(@TypeOf(refs)).@"struct".field_types.len;
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (refs, 0..) |r, i| {
+            buffers[i] = r.buffer;
+            offsets[i] = r.offset;
+        }
+        e.setBuffers(n, buffers, offsets, 0);
+    } else {
+        inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    }
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the
