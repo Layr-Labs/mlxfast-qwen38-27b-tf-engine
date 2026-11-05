@@ -625,6 +625,11 @@ if os.fork():
     raise SystemExit(0)
 with open(sys.argv[1], "w") as handle:
     handle.write(str(os.getpid()) + "\n")
+# Let go of the caller's stdin, stdout and stderr. Otherwise the test's
+# command substitution waits for this orphan to exit before it returns.
+null = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(null, fd)
 time.sleep(300)
 PY
 tries=0
