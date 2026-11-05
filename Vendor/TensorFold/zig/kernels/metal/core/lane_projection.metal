@@ -530,12 +530,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     nw0 = cp[0];
     nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
 #else
-    { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
+    // The next code and metadata are unused on this split's final iteration.
+    if (g + 1 < end) {
+      wp += TF_TB * TF_RW;
+      nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32];
 #if defined(TF_SBI12)
-    ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
+      ni = ixs[(size_t)(g + 1) * (TF_N / 8)];
 #elif defined(TF_SBI)
-    { const size_t gi = (size_t)min(g + 1, end - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+      { const size_t gi = (size_t)(g + 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
 #endif
+    }
 #endif
 #else
     if (g + 1 < last) next = tf_reg_fetch(wl, sbv, XS, g + 1, n0 + nb, mb, stride);
