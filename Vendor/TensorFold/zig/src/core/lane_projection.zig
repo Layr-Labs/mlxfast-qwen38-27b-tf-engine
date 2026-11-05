@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const frags = @import("frags.zig");
+const native4_abi = @import("native4_abi.zig");
 
 pub const weight_layout = "u32[ceil(N/32)][K/group][32][group*bits/32], low-bit-first codes, columns past N zero";
 pub const reg_layout = "u32[N/32][K/64][2][32 lanes][4] 4-bit codes, regBlock order";
@@ -222,11 +223,13 @@ pub const Layout = struct {
     /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
     /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
     m8: bool = false,
+    /// Native BF16-by-U4 M8 decoded target projection; uses the dedicated raw-u4 shader and ABI records.
+    native4: bool = false,
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
-        if (l.reg and (l.cooperative or (l.format.bits != 4 and !l.regTwo()) or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
+        if (l.reg and (l.cooperative or (l.format.bits != 4 and !l.regTwo()) or l.format.group != 64 or (!l.precompute_sums and !l.native4))) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
         if (l.y_stride) |s| if ((s < l.n and !l.tile_list) or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.tile_list and (!l.reg or !l.rows8 or !l.reg_lean or l.swiglu or l.residual or l.count or l.prompt_sr or
@@ -238,6 +241,9 @@ pub const Layout = struct {
         if (l.prompt_sr and (!l.reg or !l.reg_lean or l.rows8)) return error.InvalidSchedule;
         if (l.rows8 and !l.reg) return error.InvalidSchedule;
         if (l.m8 and (!l.rows8 or l.swiglu or l.prompt_tn != 1)) return error.InvalidSchedule;
+        if (l.native4 and (!l.reg or !l.rows8 or !l.m8 or !l.count or !l.wait or l.swiglu or l.residual or
+            l.prompt_sr or l.prompt_tn != 1 or l.n != 5120 or l.k != 17408 or l.format.bits != 4 or
+            l.format.group != 64 or l.tile_batch != 8 or l.sk != 4 or l.indexed == false)) return error.InvalidSchedule;
         if (l.reg_lean and !l.reg) return error.InvalidSchedule;
         if (l.indexed and (!l.reg or !l.reg_lean or l.prompt_sr)) return error.InvalidSchedule;
         if (l.indexed12 and (!l.indexed or l.n % 32 != 0)) return error.InvalidSchedule;
@@ -319,16 +325,25 @@ pub const Layout = struct {
 };
 
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
-fn lockstepGu(l:Layout)bool{
-    return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
-        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
-        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
-        l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
-        l.ranges.len==0 and l.y_stride==null and !l.residual;
+fn lockstepGu(l: Layout) bool {
+    return l.n == 34816 and l.k == 5120 and l.format.bits == 4 and l.format.group == 64 and
+        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk == 2 and
+        l.indexed and !l.prompt_sr and l.prompt_tn == 1 and l.tile_batch == 8 and
+        l.pf == 1 and l.precompute_sums and l.output == .bf16 and l.groups == null and
+        l.ranges.len == 0 and l.y_stride == null and !l.residual;
 }
 
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try l.validate();
+    if (l.native4) {
+        var native: std.ArrayList(u8) = .empty;
+        errdefer native.deinit(a);
+        try native.print(a, "#define TF_N {d}\n#define TF_K {d}\n#define TF_SK {d}\n#define TF_TB {d}\n", .{ l.n, l.k, l.sk, l.tile_batch });
+        if (l.indexed) try native.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
+        if (l.indexed12) try native.appendSlice(a, "#define TF_SBI12 1\n");
+        try native.appendSlice(a, ks.core_native4_decode);
+        return try native.toOwnedSlice(a);
+    }
     const g = l.groupCut();
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(a);
@@ -361,8 +376,41 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if (lockstepGu(l)) try text.appendSlice(a, ks.core_lane_lockstep);
     return text.toOwnedSlice(a);
+}
+
+test "native4 layout is a dedicated exact Q4 target count-wait M8 specialization" {
+    const base = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 4, .reg = true, .tile_batch = 8, .rows8 = true, .m8 = true, .reg_lean = true, .count = true, .wait = true, .native4 = true };
+    try base.validate();
+    var excluded = base;
+    excluded.m8 = false;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    excluded = base;
+    excluded.count = false;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    excluded = base;
+    excluded.wait = false;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    excluded = base;
+    excluded.rows8 = false;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    excluded = base;
+    excluded.sk = 2;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    excluded = base;
+    excluded.tile_batch = 1;
+    try std.testing.expectError(error.InvalidSchedule, excluded.validate());
+    var indexed = base;
+    indexed.indexed = true;
+    indexed.indexed12 = true;
+    try indexed.validate();
+    const text = try source(std.testing.allocator, indexed);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SK 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_TB 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#define TF_SBI12 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "tf_lane_native4_decode") != null);
 }
 
 /// Exact byte copies of MLX affine W, S and B into the kernel's layouts (no dequantization); storage disjoint.
@@ -510,9 +558,23 @@ pub const Projection = struct {
     /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
     /// adjacent columns at a time, so those rows start four-word aligned.
     quads: bool = false,
+    native4: bool = false,
+    /// The per-(SIMD-group,lane) native-u4 query record, validated and activated before this projection is exposed.
+    native4_abi: ?mtl.Buffer = null,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
+        return initWithQueue(a, device, null, l);
+    }
+
+    /// Native-u4 uses its actual compiled M8 pipeline to query and freeze P lane coordinates during load.
+    pub fn initNative4(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, l: Layout) !Projection {
+        if (!l.native4) return error.InvalidSchedule;
+        return initWithQueue(a, device, queue, l);
+    }
+
+    fn initWithQueue(a: std.mem.Allocator, device: mtl.Device, query_queue: ?mtl.Queue, l: Layout) !Projection {
         try l.validate();
+        if (l.native4 and query_queue == null) return error.Native4NeedsQueue;
         if (!device.tensorUnits() and (l.format.bits != 6 or l.format.group != 32 or l.cooperative or l.reg or l.precompute_sums)) return error.TensorUnitsRequired;
         const text = try source(a, l);
         defer a.free(text);
@@ -520,24 +582,76 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
-        errdefer p.deinit();
+        const p = try mtl.Pipeline.init(device, lib, if (l.native4) "tf_lane_native4_decode" else if (lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        var own_pipe = true;
+        errdefer if (own_pipe) p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.native4) @as(usize, 32 * l.sk) else if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
+        var own_sums_pipe = true;
+        errdefer if (own_sums_pipe) if (sums_pipe) |pipe| pipe.deinit();
+        errdefer if (own_sums_pipe) if (sums_buffer) |buffer| buffer.deinit();
         if (l.precompute_sums) {
             sums_pipe = try mtl.Pipeline.init(device, lib, "tf_lane_sums", false);
-            errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        var result = Projection{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1, .native4 = l.native4 };
+        own_pipe = false;
+        own_sums_pipe = false;
+        if (l.native4) {
+            errdefer result.deinit();
+            try result.prepareNative4Abi(device, query_queue.?);
+        }
+        return result;
     }
 
     pub fn deinit(p: Projection) void {
         p.pipe.deinit();
         if (p.sums_pipe) |pipe| pipe.deinit();
         if (p.sums_buffer) |buffer| buffer.deinit();
+        if (p.native4_abi) |buffer| buffer.deinit();
+    }
+
+    fn prepareNative4Abi(p: *Projection, device: mtl.Device, queue: mtl.Queue) !void {
+        const words_count = try native4_abi.configWords(p.sk);
+        const cfg = try device.buffer(words_count * @sizeOf(u32), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer cfg.deinit();
+        try native4_abi.initialize(cfg.slice(u32, words_count), p.sk);
+        // The query shader returns before reading these bindings; legal tiny placeholders prove the ABI branch has no
+        // dependence on model weights, sums, output, wait state, or count state.
+        var dummies: [8]mtl.Buffer = undefined;
+        var made: usize = 0;
+        defer for (dummies[0..made]) |buffer| buffer.deinit();
+        while (made < dummies.len) : (made += 1) dummies[made] = try device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        const dims = [2]i32{ 8, 16 };
+        const waits = dummies[6].slice(u32, 2);
+        waits[0] = 1;
+        waits[1] = 0;
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(p.pipe);
+        e.setBuffer(dummies[0], 0, 0);
+        e.setBuffer(dummies[1], 0, 1);
+        e.setBuffer(dummies[2], 0, 2);
+        e.setValue(dims, 3);
+        e.setBuffer(dummies[3], 0, 4);
+        e.setBuffer(dummies[4], 0, 5);
+        e.setBuffer(dummies[5], 0, 6);
+        e.setBuffer(dummies[6], 0, 9);
+        e.setValue(@as(u32, 1), 10);
+        e.setBuffer(cfg, 0, 11);
+        // One query TG is sufficient to record all physical SIMD groups; repeating it across the production tile grid
+        // would race identical writes into the same ABI records.
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(32 * p.sk, 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.status() != .completed) return error.Native4AbiQueryGpu;
+        try native4_abi.activate(cfg.slice(u32, words_count), p.sk);
+        p.native4_abi = cfg;
     }
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
@@ -598,6 +712,7 @@ pub const Projection = struct {
     /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
     /// this launch leaves zero) reaches `wait_for`: the producer of `x` and `sums` shares this launch's barrier interval.
     pub fn encodeCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !void {
+        if (p.native4) return error.Native4NeedsDedicatedBinding;
         if (!p.count or !p.wait or wait_for == 0) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
@@ -606,6 +721,33 @@ pub const Projection = struct {
         e.setBuffer(waited.buf, waited.off, 9);
         e.setValue(wait_for, 10);
         return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
+    }
+
+    /// Native-u4 counted wait specialization. `abi` is the mode-0, validated M8 slot map produced during load.
+    pub fn encodeNative4CountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32, abi: Ref) !void {
+        if (!p.native4 or !p.count or !p.wait or wait_for == 0) return error.InvalidSchedule;
+        if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
+        try checkRef(x, rows * p.k * 2, 2);
+        try checkRef(w, p.weight_bytes, 16);
+        try checkRef(sb, p.metadata_bytes, 4);
+        try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * 2, 2);
+        try checkRef(counter, 8, 4);
+        try checkRef(waited, 8, 4);
+        try checkRef(abi, (@as(usize, 4) + p.sk * 32 * 36 + 8) * 4, 4);
+        if (abi.buf.slice(u32, abi.buf.length() / 4)[abi.off / 4] != native4_abi.mode_run) return error.Native4AbiNotReady;
+        e.setPipeline(p.pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setBuffer(w.buf, w.off, 1);
+        e.setBuffer(sb.buf, sb.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
+        e.setBuffer(y.buf, y.off, 4);
+        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        e.setBuffer(counter.buf, counter.off, 6);
+        e.setBuffer(waited.buf, waited.off, 9);
+        e.setValue(wait_for, 10);
+        e.setBuffer(abi.buf, abi.off, 11);
+        e.dispatchGroups(mtl.Size.of(160, 1, 1), mtl.Size.of(32 * p.sk, 1, 1));
     }
 
     /// A swiglu projection: `h` gets silu(gate) * up of the rows' bf16 gate/up words (N / 2 columns a row) and `hs` its

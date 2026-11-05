@@ -52,6 +52,7 @@ pub const gdn_prep_ref = @import("gdn_prep_ref.zig");
 pub const qk_ref = @import("qk_ref.zig");
 pub const moe_ref = @import("moe_ref.zig");
 pub const dense_ref = @import("dense_ref.zig");
+pub const native4_pack = @import("native4_pack.zig");
 
 pub const checkpoint_weights = @import("checkpoint_weights.zig");
 pub const kv_pool = @import("kv_pool.zig");

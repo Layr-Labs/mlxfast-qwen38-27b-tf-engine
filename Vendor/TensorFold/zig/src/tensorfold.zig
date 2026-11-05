@@ -87,6 +87,7 @@ test {
 }
 
 pub const lane_projection = @import("core/lane_projection.zig");
+pub const native4_pack = @import("core/native4_pack.zig");
 
 pub const recurrent_forks = @import("core/recurrent_forks.zig");
 
