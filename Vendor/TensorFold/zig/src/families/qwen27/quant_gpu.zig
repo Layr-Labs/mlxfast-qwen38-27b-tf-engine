@@ -7,6 +7,15 @@ const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
+
+/// Batch adjacent warm buffer slots when supported; test encoders retain the same bindings.
+fn bindWarm(e: mtl.ComputeEncoder, comptime n: usize, buffers: [n]mtl.Buffer, offsets: [n]usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        e.setBuffers(n, buffers, offsets, 0);
+    } else {
+        inline for (0..n) |i| e.setBuffer(buffers[i], offsets[i], i);
+    }
+}
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
 const warm_mb = 10;
@@ -97,17 +106,18 @@ const Key = struct {
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
 /// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
 fn wideDecodeSk2(n: u32, input_width: u32, rows: u32, prompt: bool) bool {
-    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 6 and rows <= 8;
+    return !prompt and input_width == 5120 and (n == 34816 or n == 10240 or n == 12288) and rows >= 5 and rows <= 8;
 }
 
 test "wide decode SK2 keeps row and phase boundaries distinct" {
     for ([_]u32{ 34816, 10240 }) |n| {
-        for ([_]u32{ 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
-        for ([_]u32{ 0, 1, 2, 3, 4, 5, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 5, 6, 7, 8 }) |rows| try std.testing.expect(wideDecodeSk2(n, 5120, rows, false));
+        for ([_]u32{ 0, 1, 2, 3, 4, 9, 16 }) |rows| try std.testing.expect(!wideDecodeSk2(n, 5120, rows, false));
         try std.testing.expect(!wideDecodeSk2(n, 5120, 8, true));
         try std.testing.expect(!wideDecodeSk2(n, 2560, 8, false));
     }
-    try std.testing.expect(wideDecodeSk2(12288, 5120, 8, false));
+    for ([_]u32{ 5, 6, 8 }) |rows| try std.testing.expect(wideDecodeSk2(12288, 5120, rows, false));
+    for ([_]u32{ 4, 9 }) |rows| try std.testing.expect(!wideDecodeSk2(12288, 5120, rows, false));
     for ([_]u32{ 5120, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
 }
 
@@ -746,8 +756,7 @@ pub const Kernels = struct {
         // four independent line loads a thread a pass keep enough lines in flight to stream at the bus's rate
         const groups: usize = std.math.clamp((lines[0] / 4 + 255) / 256, 1, warm_groups);
         e.setPipeline(k.warm_pipe.?);
-        e.setBuffer(words.buffer, words.offset, 0);
-        e.setBuffer(meta.buffer, meta.offset, 1);
+        bindWarm(e, 2, .{ words.buffer, meta.buffer }, .{ words.offset, meta.offset });
         e.setValue(lines, 2);
         e.setBuffer(k.warm_sink.?, 0, 3);
         e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
@@ -788,9 +797,7 @@ pub const Kernels = struct {
         const args = [11]u32{ groups, p.batch, 32 * 64 / 2, (p.n + 31) / 32, slots, @intCast(code_bytes), @intCast(form[0]), @intCast(form[1]), @intCast(form[2]), @intCast(meta_bytes), @intCast(@min(form[3], meta_bytes)) };
         const threads = @max(@as(usize, slots) * groups, form[3] / 128);
         e.setPipeline(pipe);
-        e.setBuffer(p.words.buffer, p.words.offset, 0);
-        e.setBuffer(meta.buf, meta.off, 1);
-        e.setBuffer(list.buffer, list.offset, 2);
+        bindWarm(e, 3, .{ p.words.buffer, meta.buf, list.buffer }, .{ p.words.offset, meta.off, list.offset });
         e.setValue(args, 3);
         e.setBuffer(k.warm_tiles_sink.?, 0, 4);
         e.dispatchGroups(mtl.Size.of(std.math.clamp((threads + 255) / 256, 1, warm_groups), 1, 1), mtl.Size.of(256, 1, 1));
