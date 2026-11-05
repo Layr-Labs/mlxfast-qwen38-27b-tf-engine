@@ -30,6 +30,8 @@ pub const Model = struct {
     share_pending: bool = false,
     /// widths.Widths.tag: 0 for a uniform 4-bit g64 checkpoint.
     widths_tag: u64 = 0,
+    /// Presence is cached once at load, before any dense coefficients or program are made.
+    dense_prompt_gu_disabled: bool = false,
 
     /// Immediate share loading for tools; `share_fits` null keeps their existing unrestricted behavior.
     pub fn load(a: std.mem.Allocator, io: std.Io, dir: []const u8, rows: u32, share_fits: ?*const fn (u64) bool) !*Model {
@@ -64,6 +66,7 @@ pub const Model = struct {
         m.allocator = a;
         m.config = c;
         m.widths_tag = ws.tag();
+        m.dense_prompt_gu_disabled = platform.c.getenv("TF_Q27_DENSE_PROMPT_GU_DISABLE") != null;
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
         if (!qualifiedGeneration(m.device.generation())) return error.QwenMetalQualificationRequired;
@@ -80,10 +83,12 @@ pub const Model = struct {
         defer core.checkpoint_host.freeShardFiles(a, files);
         // projections stay in the files until load repacks them: the weights live once, in their lane layouts
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
-        m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
+        m.weights = try wts.loadWithOptions(a, m.device, &m.checkpoint, c, &ws, .{ .dense_prompt_gu = !m.dense_prompt_gu_disabled, .max_aux_bytes = wts.defaultAuxBudget(m.device.maxWorkingSet()) });
         errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        if (m.weights.hasDensePromptGu()) m.kernels.dense_prompt_gu = try @import("dense_prompt_gu.zig").Program.init(a, m.device);
+        std.log.info("qwen27: dense prompt GU disabled={any} aux_bytes={d}", .{ m.dense_prompt_gu_disabled, m.weights.dense_prompt_gu_bytes });
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
