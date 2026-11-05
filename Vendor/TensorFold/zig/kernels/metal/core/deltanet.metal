@@ -863,8 +863,7 @@ inline float tf_delta_slot_sum(thread const float (&r)[4]) {
   kept += simd_shuffle_xor(kept, 4);
   return kept;
 }
-inline void tf_delta_bf16x16(device const bfloat* x, thread float (&f)[16]) {
-  const uint4 w0 = ((device const uint4*)x)[0], w1 = ((device const uint4*)x)[1];
+inline void tf_delta_unpack_bf16x16(uint4 w0, uint4 w1, thread float (&f)[16]) {
   const bfloat4 a0 = as_type<bfloat4>(w0.xy), a1 = as_type<bfloat4>(w0.zw), a2 = as_type<bfloat4>(w1.xy), a3 = as_type<bfloat4>(w1.zw);
   TF_UNROLL for (uint i = 0; i < 4; ++i) {
     f[i] = float(a0[i]);
@@ -873,6 +872,11 @@ inline void tf_delta_bf16x16(device const bfloat* x, thread float (&f)[16]) {
     f[12 + i] = float(a3[i]);
   }
 }
+inline void tf_delta_bf16x16(device const bfloat* x, thread float (&f)[16]) {
+  const uint4 w0 = ((device const uint4*)x)[0], w1 = ((device const uint4*)x)[1];
+  tf_delta_unpack_bf16x16(w0, w1, f);
+}
+
 inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
     device const bfloat* key,
     device const bfloat* value,
@@ -900,6 +904,10 @@ inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
   for (uint node = 0; node < span.rows; ++node) {
     float kf[16], qf[16], remembered[4], correction[4], result[4];
     TF_UNROLL for (uint c = 0; c < 4; ++c) { remembered[c] = 0.0f; result[c] = 0.0f; }
+    // Fetch the query's packed words before the independent decay/key work.
+    // Keep them packed until the update consumes them, limiting live registers.
+    const uint4 qw0 = ((device const uint4*)(query + kq))[0];
+    const uint4 qw1 = ((device const uint4*)(query + kq))[1];
     tf_delta_bf16x16(key + kq, kf);
     const float forget = decay[at];
     TF_UNROLL for (uint i = 0; i < 16; ++i)
@@ -913,7 +921,7 @@ inline void tf_delta_gdn_chain_wide_slots(device const bfloat* query,
     correction[1] = simd_shuffle_xor(own, 2);
     correction[2] = simd_shuffle_xor(own, 1);
     correction[3] = simd_shuffle_xor(own, 3);
-    tf_delta_bf16x16(query + kq, qf);
+    tf_delta_unpack_bf16x16(qw0, qw1, qf);
     TF_UNROLL for (uint i = 0; i < 16; ++i)
       TF_UNROLL for (uint c = 0; c < 4; ++c) {
         state[c][i] = state[c][i] + kf[i] * correction[c];
