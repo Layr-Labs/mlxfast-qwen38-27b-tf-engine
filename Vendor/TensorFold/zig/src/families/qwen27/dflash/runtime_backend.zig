@@ -196,6 +196,37 @@ pub const RoundArgs = extern struct {
     }
 };
 
+fn selectPipe(device: mtl.Device) !mtl.Pipeline {
+    const lib = try mtl.Library.fromSource(device, @import("qwen_runtime_sources").draft_select, mtl.CompileOptions.mlx());
+    defer lib.deinit();
+    const pipe = try mtl.Pipeline.init(device, lib, "tf_draft_select_fp32", false);
+    // one group of 512 threads: a SIMD group a candidate
+    if (pipe.maxThreads() < 512 or pipe.simdWidth() != 32) {
+        pipe.deinit();
+        return error.DraftSelectorThreads;
+    }
+    return pipe;
+}
+/// Bytes of Backend.proposal: tf_draft_select's words, then what the next verify's first command buffer reads beside
+/// its ids (Handoff).
+pub const proposal_bytes = 4096;
+/// Where a first command buffer committed ahead (decode_round.Runner.commitFirst) reads in Backend.proposal: the tree's
+/// ids (tf_draft_select's words 2..10: the anchor, the drafted tokens, the anchor again in the rows past them), its
+/// [rows, stride] words and its star plan's GDN metadata, each at its own 256 bytes.
+pub const Handoff = struct {
+    pub const ids = 8;
+    pub const dims = 1024;
+    const meta = 1280;
+    pub fn metadata(buf: mtl.Buffer) @import("../gdn_pool_gpu.zig").Metadata {
+        return .{ .parents = at(buf, 0), .windows = at(buf, 1), .row_slots = at(buf, 2), .segments = at(buf, 3), .keeps = at(buf, 4), .kept_rows = at(buf, 5), .slot_steps = at(buf, 6) };
+    }
+    fn at(buf: mtl.Buffer, field: usize) @import("../projection.zig").Ref {
+        return .{ .buffer = buf, .offset = meta + field * 256 };
+    }
+};
+/// tf_draft_select's parameters.
+pub const SelectParams = extern struct { vocab: u32, topk: u32, rank: u32, nodes: u32, children: u32, mapped: u32, map_width: u32, both: u32 = 0, floor: u64, edge: u64, tau: u64 };
+
 /// First in a frame encoded early (Model.prepareNext): waits for the verify's result and writes block 0 of `args`.
 pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
 
@@ -258,6 +289,11 @@ pub const Backend = struct {
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
+    /// The depth-one selector on the GPU (tf_draft_select): an early frame's last launch writes the next round's tree to
+    /// `proposal` from its top-k row, the anchor its lead picked and the drafter's codebooks (`codebooks`, once loaded).
+    select_pipe: ?mtl.Pipeline,
+    proposal: mtl.Buffer,
+    codebooks: ?[2]Ref = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -286,7 +322,20 @@ pub const Backend = struct {
         const args = try target.device.buffer(RoundArgs.blocks * @sizeOf(RoundArgs), options);
         errdefer args.deinit();
         const counts = try target.device.buffer(count_slots * 8, options);
-        return .{ .counts = counts, .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
+        errdefer counts.deinit();
+        // a selector that fails to build leaves every tree to the host
+        const select_pipe = selectPipe(target.device) catch |err| none: {
+            std.log.warn("draft selector stays on the host: {t}", .{err});
+            break :none null;
+        };
+        errdefer if (select_pipe) |pipe| pipe.deinit();
+        const proposal = try target.device.buffer(proposal_bytes, options);
+        @memset(proposal.slice(u8, proposal_bytes), 0);
+        // the first command buffer's rows: decode_round.Runner.first_rows, one 16-row group of the frame's sums
+        const dims = proposal.slice(i32, proposal_bytes / 4)[Handoff.dims / 4 ..][0..8];
+        dims[0] = 8;
+        dims[1] = 16;
+        return .{ .select_pipe = select_pipe, .proposal = proposal, .counts = counts, .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue, .bridge = frame_mod.Bridge.init(target.device) catch null }, .caches = caches, .args = args };
     }
     pub fn setResident(b: *Backend, hook: ?mtl.ResidencySet.Follow) void {
         @import("../residency.zig").setDraft(b, hook);
@@ -305,6 +354,8 @@ pub const Backend = struct {
         freeCaches(b.allocator, b.caches);
         b.args.deinit();
         b.counts.deinit();
+        if (b.select_pipe) |pipe| pipe.deinit();
+        b.proposal.deinit();
         b.head.deinit();
         b.topk.deinit();
         b.attention.deinit();
@@ -364,7 +415,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try draftSplit(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -379,7 +430,7 @@ pub const Backend = struct {
                     const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
                     try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
                 };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try draftSplit(shape[0], shape[1]), o);
                 try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
                 b.precise_count += 1;
             }
@@ -452,7 +503,7 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try draftSplit(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
@@ -596,3 +647,10 @@ pub const Backend = struct {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
     }
 };
+
+/// The drafter's K slices: projection.split's, at most 4. split() was tuned on an M5 Ultra, which runs the drafter's
+/// small GEMVs fastest with 8 slices; the ranked M5 Max has run every occupancy change the opposite way. Only the
+/// drafter's own partial sums move; the target verifies every token.
+fn draftSplit(n: usize, k: usize) !u32 {
+    return @min(try @import("../projection.zig").split(n, k), 4);
+}
