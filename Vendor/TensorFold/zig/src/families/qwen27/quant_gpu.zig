@@ -5,6 +5,8 @@ const lane = @import("core").lane_projection;
 const row = @import("core").row_projection;
 const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
+const half_projection = @import("core").half_projection;
+const expanded_down_plan = @import("core").expanded_down_plan;
 const profile = @import("core").gpu_profile;
 pub const Ref = projection.Ref;
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
@@ -143,7 +145,7 @@ test "serial SK2 guard and cache keys separate every excluded projection" {
     try std.testing.expectEqual(@as(?u32, 1), projection.promptSplit(34816, 5120));
 }
 /// input_words: q27_norm_input in 16-byte words (team-m5-08w), from the same template with Q27_NORM_WORDS defined.
-pub const Kind = enum { projection, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
+pub const Kind = enum { projection, half_down, xsum, norm, input_norm, mlp, mlp_wide, ane_input, mlp_ane, add_ane, input_words };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -180,6 +182,9 @@ pub const Kernels = struct {
     warm_tiles_sink: ?mtl.Buffer = null,
     /// team-m5-08w: the 16-byte input norm failed to build on this chip (logged once): the record's kernel runs instead.
     input_words_failed: bool = false,
+    /// Number of native-half DOWN launches actually encoded; useful for confirming the guarded path engaged.
+    native_half_down_encodes: std.atomic.Value(u64) = .init(0),
+    native_half_down_logged: std.atomic.Value(bool) = .init(false),
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
@@ -220,6 +225,7 @@ pub const Kernels = struct {
         if (k.cache.get(key)) |p| return p;
         const template = switch (key.kind) {
             .projection => unreachable,
+            .half_down => sources.half_projection,
             .xsum => sources.xsum,
             .norm => sources.norm_xs,
             .input_norm, .input_words => sources.norm_input,
@@ -230,6 +236,7 @@ pub const Kernels = struct {
         const mark = std.mem.indexOf(u8, template, "Q27_SPECIALIZE") orelse return error.BadKernelSource;
         const definitions = switch (key.kind) {
             .projection => unreachable,
+            .half_down => try std.fmt.allocPrint(k.allocator, "constant int TF_N={d};\nconstant int TF_K={d};", .{ key.n, key.k }),
             .xsum => try std.fmt.allocPrint(k.allocator, "constexpr int K={d}, GS=64;", .{key.k}),
             .norm, .input_norm => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};", .{key.k}),
             .input_words => try std.fmt.allocPrint(k.allocator, "constexpr int K={d};\n#define Q27_NORM_WORDS 1", .{key.k}),
@@ -243,6 +250,7 @@ pub const Kernels = struct {
         defer library.deinit();
         const name: [:0]const u8 = switch (key.kind) {
             .projection => unreachable,
+            .half_down => "tf_q27_half_down",
             .xsum => "custom_kernel_q27_xsum_bfloat16_t_int32_t_float",
             .norm => "custom_kernel_q27_norm_xs_bfloat16_t_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_bfloat16_t_float",
             .input_norm, .input_words => "custom_kernel_q27_norm_input_bfloat16_t_bfloat16_t_floatc_int32_t_bfloat16_t_float",
@@ -351,16 +359,98 @@ pub const Kernels = struct {
         return true;
     }
 
+    fn byteRangeFits(buffer: mtl.Buffer, offset: usize, count: usize, element_bytes: usize) bool {
+        const bytes = std.math.mul(usize, count, element_bytes) catch return false;
+        const length = buffer.length();
+        return expanded_down_plan.rangeFits(length, offset, bytes);
+    }
+
+    fn halfDownBuffersFit(p: projection.Linear, sidecar: half_projection.Sidecar, x: Ref, xs: Sums, hidden: Ref, residual: Ref, rows: u32, tail_rows: u32) bool {
+        if (rows == 0 or rows > @import("gpu_frame.zig").max_rows or xs.stride < rows) return false;
+        if (x.offset % @alignOf(u16) != 0 or hidden.offset % @alignOf(u16) != 0 or residual.offset % @alignOf(u16) != 0) return false;
+        const x_items = std.math.mul(usize, rows, p.k) catch return false;
+        const out_items = std.math.mul(usize, rows, p.n) catch return false;
+        if (!byteRangeFits(x.buffer, x.offset, x_items, @sizeOf(u16)) or
+            !byteRangeFits(hidden.buffer, hidden.offset, out_items, @sizeOf(u16)) or
+            !byteRangeFits(residual.buffer, residual.offset, out_items, @sizeOf(u16))) return false;
+
+        const high_items = std.math.mul(usize, sidecar.n, sidecar.k) catch return false;
+        const offset_items = @as(usize, sidecar.n) + 1;
+        const sparse_items = @max(@as(usize, sidecar.corrections), 1);
+        if (sidecar.high.offset % @alignOf(f16) != 0 or sidecar.offsets.offset % @alignOf(u32) != 0 or
+            sidecar.columns.offset % @alignOf(u16) != 0 or sidecar.deltas.offset % @alignOf(f32) != 0) return false;
+        if (!byteRangeFits(sidecar.high.buffer, sidecar.high.offset, high_items, @sizeOf(f16)) or
+            !byteRangeFits(sidecar.offsets.buffer, sidecar.offsets.offset, offset_items, @sizeOf(u32)) or
+            !byteRangeFits(sidecar.columns.buffer, sidecar.columns.offset, sparse_items, @sizeOf(u16)) or
+            !byteRangeFits(sidecar.deltas.buffer, sidecar.deltas.offset, sparse_items, @sizeOf(f32))) return false;
+
+        if (tail_rows > 0) {
+            if (xs.ref.offset % @alignOf(f32) != 0) return false;
+            const sum_items = std.math.mul(usize, p.k / 64, xs.stride) catch return false;
+            if (!byteRangeFits(xs.ref.buffer, xs.ref.offset, sum_items, @sizeOf(f32))) return false;
+        }
+        return true;
+    }
+
+    fn residualPromptKey(k: *Kernels, p: projection.Linear, rows: u32) ?Key {
+        if (!k.prompt or rows == 0 or rows > @import("gpu_frame.zig").max_rows or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return null;
+        const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        const tn = promptTiles(key, p.n, 0);
+        if (tn == 1 or key.serialSk2()) return null;
+        return key;
+    }
+
+    /// Exact-half plus sparse-correction DOWN for each complete 128-row prompt chunk; residual tails use the Q4 path.
+    /// Returns false without encoding when the shape or buffers fail preflight.
+    pub fn halfResid(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, sidecar: half_projection.Sidecar, x: Ref, xs: Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
+        if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
+        if (p.n != 5120 or p.k != 17408 or sidecar.n != p.n or sidecar.k != p.k) return false;
+        const plan = expanded_down_plan.plan(rows);
+        if (plan.native_chunks == 0) return false;
+        if (plan.tail_rows > 0 and k.residualPromptKey(p, plan.tail_rows) == null) return false;
+        if (!halfDownBuffersFit(p, sidecar, x, xs, hidden, residual, rows, plan.tail_rows)) return false;
+
+        const key = Key{ .kind = .half_down, .n = sidecar.n, .k = sidecar.k };
+        const pipeline = try k.get(key);
+        var span = profile.begin(k.profiler, input_encoder, .dense);
+        span.shape = .{ .n = p.n, .k = p.k, .sk = 1, .bits = 16 };
+        errdefer span.cancel();
+        const e = span.encoder;
+        e.setPipeline(pipeline);
+        for (0..plan.native_chunks) |chunk| {
+            const first: u32 = @intCast(chunk * expanded_down_plan.chunk_rows);
+            e.setBuffer(x.buffer, expanded_down_plan.rowByteOffset(x.offset, first, p.k), 0);
+            e.setBuffer(sidecar.high.buffer, sidecar.high.offset, 1);
+            e.setBuffer(hidden.buffer, expanded_down_plan.rowByteOffset(hidden.offset, first, p.n), 2);
+            e.setBuffer(sidecar.offsets.buffer, sidecar.offsets.offset, 3);
+            e.setBuffer(sidecar.columns.buffer, sidecar.columns.offset, 4);
+            e.setBuffer(sidecar.deltas.buffer, sidecar.deltas.offset, 5);
+            e.setBuffer(residual.buffer, expanded_down_plan.rowByteOffset(residual.offset, first, p.n), 6);
+            e.setValue(expanded_down_plan.chunk_rows, 7);
+            e.dispatchGroups(mtl.Size.of(160, expanded_down_plan.chunk_rows / 16, 1), mtl.Size.of(32, 1, 1));
+            expanded_down_plan.recordNativeEncode(&k.native_half_down_encodes);
+            if (!k.native_half_down_logged.swap(true, .acq_rel)) std.log.info("qwen27: exact-half prompt DOWN path engaged", .{});
+        }
+        try span.end();
+        if (plan.tail_rows > 0) {
+            const first = plan.nativeRows();
+            const tail_x = Ref{ .buffer = x.buffer, .offset = expanded_down_plan.rowByteOffset(x.offset, first, p.k) };
+            const tail_sums = Sums{ .ref = .{ .buffer = xs.ref.buffer, .offset = expanded_down_plan.sumsByteOffset(xs.ref.offset, first) }, .stride = xs.stride };
+            const tail_hidden = Ref{ .buffer = hidden.buffer, .offset = expanded_down_plan.rowByteOffset(hidden.offset, first, p.n) };
+            const tail_residual = Ref{ .buffer = residual.buffer, .offset = expanded_down_plan.rowByteOffset(residual.offset, first, p.n) };
+            if (!try k.quantResid(input_encoder, p, tail_x, tail_sums, tail_hidden, tail_residual, plan.tail_rows)) return error.BadCoreProjectionRows;
+        }
+        return true;
+    }
+
     /// Prompt rows of a two-tile 5120-wide output projection with the residual add in its store: `residual` gets `hidden`
     /// + the output rows, each word as q27_norm_xs forms it, and no output rows are written; the norm after it then reads
     /// `residual` alone. False (nothing encoded) where the launch has no two-tile prompt form: decoded rows among them.
     pub fn quantResid(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
-        if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
-        if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
-        const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        const key = k.residualPromptKey(p, rows) orelse return false;
+        const sk = key.slices;
         const tn = promptTiles(key, p.n, 0);
-        if (tn == 1 or key.serialSk2()) return false;
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = sk, .bits = p.bits };
         errdefer span.cancel();

@@ -6,6 +6,9 @@ const Config = @import("config.zig").Config;
 const projection = @import("projection.zig");
 const lane = @import("core").lane_projection;
 const widths = @import("widths.zig");
+const half_projection = @import("core").half_projection;
+const affine_half_sparse = @import("core").affine_half_sparse;
+const platform = @import("sys");
 const Width = widths.Width;
 const Ref = projection.Ref;
 const Linear = projection.Linear;
@@ -69,6 +72,8 @@ const Builder = struct {
     stage: *cp.Stage,
     runs: *std.ArrayList([]projection.Run),
     widths: *const widths.Widths,
+    expanded_down_enabled: bool,
+    expanded_down_counts: *ExpansionCounts,
 
     fn get(b: Builder, suffix: []const u8) !Tensor {
         const name = try std.mem.concat(b.allocator, u8, &.{ b.prefix, suffix });
@@ -94,11 +99,11 @@ const Builder = struct {
 
     /// `parts` (stacked in order, `n` rows of `k` each, at their widths) staged from the files and repacked.
     fn linear(b: Builder, parts: []const Part, k: usize) !Linear {
-        return b.linearForced(parts, k, null);
+        return b.linearForced(parts, k, null, false);
     }
 
     /// The same matrix prepared with `forced` adjacent tiles interleaved (see projection.prepareForced).
-    fn linearForced(b: Builder, parts: []const Part, k: usize, forced: ?u32) !Linear {
+    fn linearForced(b: Builder, parts: []const Part, k: usize, forced: ?u32, expand_down: bool) !Linear {
         var arena = std.heap.ArenaAllocator.init(b.allocator);
         defer arena.deinit();
         const names = try arena.allocator().alloc([]const u8, parts.len * 3);
@@ -119,7 +124,62 @@ const Builder = struct {
                 .group = p.w.group,
             };
         }
-        return b.stackForced(triples[0..parts.len], forced);
+        var prepared = try b.stackForced(triples[0..parts.len], forced);
+        if (expand_down and b.expanded_down_enabled and parts.len == 1 and parts[0].n == 5120 and k == 17408 and parts[0].w.bits == 4 and parts[0].w.group == 64) {
+            b.expanded_down_counts.attempted += 1;
+            prepared.expanded_down = b.prepareExpandedDown(triples[0]) catch |err| blk: {
+                std.log.warn("qwen27: expanded DOWN sidecar unavailable; retaining Q4 ({s})", .{@errorName(err)});
+                b.expanded_down_counts.failed += 1;
+                break :blk null;
+            };
+            if (prepared.expanded_down != null) b.expanded_down_counts.prepared += 1;
+        }
+        return prepared;
+    }
+
+    fn prepareExpandedDown(b: Builder, raw: projection.Triple) !?half_projection.Sidecar {
+        var matrix = try affine_half_sparse.convert(b.allocator, 5120, 17408, raw.weight.host(u32), raw.scales.host(u16), raw.biases.host(u16));
+        defer matrix.deinit();
+
+        const high_bytes = try std.math.mul(usize, matrix.high.len, @sizeOf(f16));
+        const offsets_bytes = try std.math.mul(usize, matrix.offsets.len, @sizeOf(u32));
+        const column_count = @max(matrix.columns.len, 1);
+        const delta_count = @max(matrix.deltas.len, 1);
+        const columns_bytes = try std.math.mul(usize, column_count, @sizeOf(u16));
+        const deltas_bytes = try std.math.mul(usize, delta_count, @sizeOf(f32));
+        var buffers: [4]?mtl.Buffer = .{ null, null, null, null };
+        errdefer for (&buffers) |*buffer| if (buffer.*) |owned| owned.deinit();
+
+        buffers[0] = try b.device.buffer(high_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        buffers[1] = try b.device.buffer(offsets_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        buffers[2] = try b.device.buffer(columns_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        buffers[3] = try b.device.buffer(deltas_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        @memcpy(buffers[0].?.contents()[0..high_bytes], std.mem.sliceAsBytes(matrix.high));
+        @memcpy(buffers[1].?.contents()[0..offsets_bytes], std.mem.sliceAsBytes(matrix.offsets));
+        if (matrix.columns.len != 0) {
+            @memcpy(buffers[2].?.contents()[0 .. matrix.columns.len * @sizeOf(u16)], std.mem.sliceAsBytes(matrix.columns));
+            @memcpy(buffers[3].?.contents()[0 .. matrix.deltas.len * @sizeOf(f32)], std.mem.sliceAsBytes(matrix.deltas));
+        } else {
+            @memset(buffers[2].?.contents()[0..columns_bytes], 0);
+            @memset(buffers[3].?.contents()[0..deltas_bytes], 0);
+        }
+
+        // Reserve once before transferring ownership so allocation failure cannot leave a partial owned prefix.
+        try b.owned.ensureUnusedCapacity(b.allocator, buffers.len);
+        const result = half_projection.Sidecar{
+            .high = .{ .buffer = buffers[0].? },
+            .offsets = .{ .buffer = buffers[1].? },
+            .columns = .{ .buffer = buffers[2].? },
+            .deltas = .{ .buffer = buffers[3].? },
+            .n = 5120,
+            .k = 17408,
+            .corrections = @intCast(matrix.deltas.len),
+        };
+        for (&buffers) |*buffer| {
+            b.owned.appendAssumeCapacity(buffer.*.?);
+            buffer.* = null;
+        }
+        return result;
     }
 
     /// Fused members of one width take one matrix as before; a mixed stack becomes one matrix a member.
@@ -181,12 +241,13 @@ const Builder = struct {
             } },
         };
         const gu = try b.linear(&.{ .{ .module = try Name.full(a, prefix, "mlp.gate_proj"), .n = c.intermediate, .w = w[@backingInt(M.gate)] }, .{ .module = try Name.full(a, prefix, "mlp.up_proj"), .n = c.intermediate, .w = w[@backingInt(M.up)] } }, c.hidden);
-        const down = try b.linear(&.{.{ .module = try Name.full(a, prefix, "mlp.down_proj"), .n = c.hidden, .w = w[@backingInt(M.down)] }}, c.intermediate);
+        const down = try b.linearForced(&.{.{ .module = try Name.full(a, prefix, "mlp.down_proj"), .n = c.hidden, .w = w[@backingInt(M.down)] }}, c.intermediate, null, i < 32);
         return .{ .norm = try b.tensor(try Name.full(a, prefix, "input_layernorm.weight"), .bf16, &.{c.hidden}), .post_norm = try b.tensor(try Name.full(a, prefix, "post_attention_layernorm.weight"), .bf16, &.{c.hidden}), .gu = gu, .down = down, .mixer = mixer };
     }
 };
 
 const Part = struct { module: []const u8, n: usize, w: Width };
+const ExpansionCounts = struct { attempted: u32 = 0, prepared: u32 = 0, failed: u32 = 0 };
 
 fn checked(t: Tensor, dtype: cp.DType, shape: []const usize) !Tensor {
     if (t.dtype != dtype or t.rank != shape.len or !std.mem.eql(usize, t.shape[0..t.rank], shape)) return error.BadNativeTensor;
@@ -211,8 +272,18 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     errdefer allocator.free(layers);
     var stage = cp.Stage{ .device = device };
     defer stage.deinit();
-    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws };
+    const expanded_down_disabled = platform.c.getenv("TF_Q27_EXPANDED_DOWN_DISABLE") != null;
+    const expanded_down_enabled = device.tensorUnits() and !expanded_down_disabled;
+    var expanded_down_counts: ExpansionCounts = .{};
+    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws, .expanded_down_enabled = expanded_down_enabled, .expanded_down_counts = &expanded_down_counts };
     for (layers, 0..) |*l, i| l.* = try b.layer(c, i);
+    if (expanded_down_enabled) {
+        std.log.info("qwen27: exact-half DOWN sidecars prepared={d} attempted={d} unavailable={d}", .{ expanded_down_counts.prepared, expanded_down_counts.attempted, expanded_down_counts.failed });
+    } else if (expanded_down_disabled) {
+        std.log.info("qwen27: exact-half DOWN sidecars disabled by TF_Q27_EXPANDED_DOWN_DISABLE", .{});
+    } else {
+        std.log.info("qwen27: exact-half DOWN sidecars disabled because tensor units are unavailable", .{});
+    }
     const embed = try b.quant("model.embed_tokens", c.vocab, c.hidden, ws.embed);
     const norm = try b.tensor("model.norm.weight", .bf16, &.{c.hidden});
     const head = try b.linear(&.{.{ .module = "lm_head", .n = c.vocab, .w = ws.head }}, c.hidden);
@@ -220,7 +291,7 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     // leaves unbatched. It takes its own copy with eight adjacent tiles interleaved, the order every other decode
     // shape reads, while `head` keeps the row order the drafter slices 98,592 of its rows in (runtime_head.zig).
     const batched_head = device.tensorUnits() and ws.head.bits == 4 and ws.head.group == 64 and c.vocab % 32 == 0;
-    const head_decode = if (batched_head) try b.linearForced(&.{.{ .module = "lm_head", .n = c.vocab, .w = ws.head }}, c.hidden, 8) else head;
+    const head_decode = if (batched_head) try b.linearForced(&.{.{ .module = "lm_head", .n = c.vocab, .w = ws.head }}, c.hidden, 8, false) else head;
     var extra: ?Linear = null;
     if (batched_head) extra = head_decode;
     if (device.tensorUnits()) try laneOrder(allocator, device, layers, head, extra);

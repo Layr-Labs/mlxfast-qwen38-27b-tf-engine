@@ -33,3 +33,8 @@ pub const bf16_topk_gpu = @import("bf16_topk_gpu");
 pub const tree_commit_gpu = @import("tree_commit_gpu");
 
 pub const tree_slots = @import("src/core/tree_slots.zig");
+
+/// GPU-resident exact-half affine projection sidecar metadata.
+pub const half_projection = @import("src/core/half_projection.zig");
+pub const expanded_down_plan = @import("src/core/expanded_down_plan.zig");
+pub const affine_half_sparse = @import("src/core/affine_half_sparse.zig");

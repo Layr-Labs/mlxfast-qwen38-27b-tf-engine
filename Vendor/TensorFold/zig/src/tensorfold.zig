@@ -114,3 +114,7 @@ pub const bf16_topk_gpu = @import("bf16_topk_gpu");
 pub const tree_commit_gpu = @import("tree_commit_gpu");
 
 pub const tree_slots = @import("core/tree_slots.zig");
+
+pub const half_projection = @import("core/half_projection.zig");
+pub const expanded_down_plan = @import("core/expanded_down_plan.zig");
+pub const affine_half_sparse = @import("core/affine_half_sparse.zig");
