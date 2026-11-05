@@ -189,13 +189,14 @@ inline void tf_delta_gdn_pre_rows4_direct(device const bfloat* projection, devic
 
 // tf_delta_gdn_pre_rows4_direct for a prompt chain's rows, whose row r takes taps r .. r + 3 (one window; the host checks
 // it, gdn_plan.Plan.chain): a simdgroup's rows share their taps, so it loads each tap once, count + 3 loads for its count
-// rows where the window lookups made 4 count, and reads one slot word. Every row's arithmetic is
+// rows where the window lookups made 4 count, and reads one slot word: 32 rows a group, up to 8 a simdgroup (11 tap loads
+// and one weight load for 8 rows, where two 4-row simdgroups took 14 and two). Every row's arithmetic is
 // tf_delta_gdn_pre_rows4_direct's, in its order, on the same words.
 inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device const bfloat* a, device const bfloat* b,
     device const bfloat* history, device const void* weights, device const void* decay_weight, device const void* time_bias,
     device const uint* row_slot, constant TfDeltaParams& p, device bfloat* query, device bfloat* key, device bfloat* value,
     device float* decay, device bfloat* mixing, uint3 group, uint sg, uint lane) {
-  const uint head = group.y, base = group.z * 16, in_group = metal::min(16u, p.rows - base), per = (in_group + 3) / 4;
+  const uint head = group.y, base = group.z * 32, in_group = metal::min(32u, p.rows - base), per = (in_group + 3) / 4;
   if (sg * per >= in_group) return;
   const uint first = base + sg * per, count = metal::min(per, in_group - sg * per);
   const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
@@ -207,13 +208,13 @@ inline void tf_delta_gdn_pre_chain4(device const bfloat* projection, device cons
     for (uint tap = 0; tap < 4; ++tap) weight[part][tap] = tf_delta_weight(weights, (channel + part) * p.taps + tap, p.weight_flags, 0);
   const uint slot = row_slot[first]; // one window: every row's slot
   // the simdgroup's taps (sources first .. first + count + 2), each loaded once; constant indices keep them in registers
-  bfloat4 taps[7];
-  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 7; ++s) {
+  bfloat4 taps[11];
+  _Pragma("clang loop unroll(full)") for (uint s = 0; s < 11; ++s) {
     const uint source = first + s;
     taps[s] = s >= count + 3 ? bfloat4(0) : source < keep ? *(device const bfloat4*)(history + (slot * keep + source) * channels + channel)
                                                          : *(device const bfloat4*)(projection + (source - keep) * channels + channel);
   }
-  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 4; ++i) {
+  _Pragma("clang loop unroll(full)") for (uint i = 0; i < 8; ++i) {
     if (i < count) {
       const uint row = first + i;
       float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1233,3 +1234,4 @@ kernel void tf_delta_gdn_clear4(device uint4* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = uint4(0u);
   if (at.x < conv_width) conv[row * conv_width + at.x] = uint4(0u);
 }
+#define GAUNTLET_REDRAW_4694152c_20261105T092938Z 1

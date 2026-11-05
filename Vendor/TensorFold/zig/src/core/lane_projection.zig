@@ -507,8 +507,8 @@ pub const Projection = struct {
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
-    /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
-    /// adjacent columns at a time, so those rows start four-word aligned.
+    /// Built with Layout.prompt_tn above 1, or as a one-tile prompt build without SwiGLU: a lane stores its output words
+    /// (and reads the residual's hidden words) four adjacent columns at a time, so those rows start four-word aligned.
     quads: bool = false,
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, l: Layout) !Projection {
@@ -531,7 +531,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 or (l.prompt_sr and !l.swiglu) };
     }
 
     pub fn deinit(p: Projection) void {
@@ -580,19 +580,11 @@ pub const Projection = struct {
     /// A counting projection (Layout.count): encodeSums whose threadgroups each add one to `counter` (a u32 word the
     /// waiting norm leaves zero) once their stores are past a device-scope fence; tile_count of them a launch.
     pub fn encodeCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref) !void {
-        return p.encodeCountedAt(e, x, w, sb, sums, y, rows, counter, null);
-    }
-
-    /// encodeCounted reading its [rows, stride] words at `dims` when given (encodeSumsAt's: an earlier dispatch wrote them,
-    /// at least one and at most `rows` rows): the launch is the one for `rows`, so every one of its tile_count
-    /// threadgroups still counts itself once.
-    pub fn encodeCountedAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, dims: ?Ref) !void {
         if (!p.count or p.wait) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        if (dims) |d| try checkRef(d, 8, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, dims);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
     }
 
     /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals

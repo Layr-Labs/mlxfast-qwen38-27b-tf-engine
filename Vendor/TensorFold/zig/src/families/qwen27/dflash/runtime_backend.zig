@@ -143,9 +143,8 @@ pub const Hazards = struct {
 /// verify's result picks one into block 0 on the GPU (tree_commit_gpu.select), and the frame's dispatches read it there.
 /// Each field starts its own 256 bytes, so every binding's offset is aligned.
 pub const RoundArgs = extern struct {
-    /// the block's rope positions, right behind the admitted taps, then the taps' own (the rows a stacked keys launch ropes
-    /// behind the block's)
-    positions: [4]u64 align(256),
+    /// the block's rope positions: right behind the admitted taps
+    positions: [2]u64 align(256),
     /// the block's tokens: the verify's last token (written on the GPU), then the mask
     ids: [2]u32 align(256),
     /// the K/V slots of the block's own rows, behind the admitted context in the ring
@@ -158,8 +157,6 @@ pub const RoundArgs = extern struct {
     dims: [2]i32 align(256),
     /// their group sums' rows
     count: i32 align(256),
-    /// the block's qkv launch with the admitted taps' rows behind its 2 (Ops.context_defer): [rows, sums stride]
-    stacked: [2]i32 align(256),
     /// the admitted taps' projections on simdgroup tiles (no tensor units): the fusion's and each K or V one's
     fusion: simd.Args align(256),
     kv: simd.Args align(256),
@@ -181,14 +178,13 @@ pub const RoundArgs = extern struct {
         const context_rows: u32 = @intCast(end - context.begin);
         const at: u32 = @intCast(context.begin % c.window);
         return .{
-            .positions = .{ end, end + 1, context.end, context.end + 1 },
+            .positions = .{ end, end + 1 },
             .ids = .{ c.mask, c.mask },
             .slots = .{ at + context_rows, at + context_rows + 1 },
             .attention = .{ .rows = 2, .keys = context_rows + 2, .mask_stride = keys, .scale_bits = @bitCast(@import("runtime_context.zig").scaleOf(c)) },
             .append = .{ .rows = rows },
             .dims = .{ @intCast(rows), 16 },
             .count = @intCast(rows),
-            .stacked = .{ @intCast(2 + rows), 16 },
             .fusion = .{ .k = @intCast(c.tapWidth()), .n = @intCast(c.hidden), .r = @intCast(rows) },
             .kv = .{ .k = @intCast(c.hidden), .n = @intCast(c.kvWidth()), .r = @intCast(rows) },
             .meta = .{ rows, 0, context_rows + 2, 0 },
@@ -200,9 +196,6 @@ pub const RoundArgs = extern struct {
 pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.ComputeEncoder, Ref) anyerror!void };
 
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
-/// An early frame's taps its block's layers append (Ops.context_defer): their rows, the ring slot of the first, and the
-/// layers whose keys and values are encoded so far.
-pub const Stacked = struct { rows: u32, slot: u32, layers: u32 = 0 };
 
 pub const Backend = struct {
     allocator: std.mem.Allocator,
@@ -224,8 +217,7 @@ pub const Backend = struct {
     appended_rows: u32 = 0,
     failed: bool = false,
     prepared: std.AutoHashMapUnmanaged(usize, core.affine4_lane.Adapter) = .empty,
-    /// `dims`: the [rows, stride] words a launch on them reads (a stacked block's: RoundArgs stacked), else its own rows.
-    input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums, dims: ?core.lane_projection.Ref = null } = null,
+    input_sums: ?struct { view: op.View, sums: core.lane_projection.Sums } = null,
     /// A conv with a residual held back for the norm that reads its output (one launch for both); the next launch of
     /// anything else encodes it first, on its own.
     held_conv: ?struct { x: op.View, p: op.Conv, y: op.View } = null,
@@ -236,10 +228,6 @@ pub const Backend = struct {
     simd: ?simd.Pipelines = null,
     stash: ?*Stash = null,
     fused_count: usize = 0,
-    /// Layers whose q, k and v are one fused launch (group_qkv).
-    qkv_layers: u32 = 0,
-    /// The current frame's deferred taps (Ops.context_defer).
-    stacked: ?Stacked = null,
     /// Linears drafted below 4 bits also keep a q4 copy under `key | precise_key` (and their fused groups under
     /// `(key | precise_key) + kind`); with `precise` a frame's projections read those copies.
     precise: bool = false,
@@ -364,7 +352,7 @@ pub const Backend = struct {
             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
         };
         if (order) |o| {
-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
+            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try draftSplit(shape[0], shape[1]), o);
             try @import("../residency.zig").putPrepared(b, key, adapter);
             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
             if (bits != 4) {
@@ -379,7 +367,7 @@ pub const Backend = struct {
                     const dup = core.affine4.Prepared{ .allocator = b.allocator, .n = q4.n, .k = q4.k, .words = try b.allocator.dupe(u32, q4.words), .scales = try b.allocator.dupe(u16, q4.scales), .biases = try b.allocator.dupe(u16, q4.biases), .bits = q4.bits, .group = q4.group, .nibbles = q4.nibbles };
                     try st.put(b.allocator, owned, .{ .prepared = dup, .key = key | precise_key });
                 };
-                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try @import("../projection.zig").split(shape[0], shape[1]), o);
+                const exact = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, q4, try draftSplit(shape[0], shape[1]), o);
                 try @import("../residency.zig").putPrepared(b, key | precise_key, exact);
                 b.precise_count += 1;
             }
@@ -452,16 +440,14 @@ pub const Backend = struct {
         }
         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
+        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try draftSplit(n, k), order);
         try @import("../residency.zig").putPrepared(b, key, adapter);
         b.fused_count += 1;
     }
     fn buildGroups(b: *Backend, order: ?core.lane_projection.RegOrder, st: *Stash) !void {
         for (0..b.config.layers) |layer| {
             try b.fuse(order, st, layer, "kv", 'k', group_kv);
-            const fused = b.fused_count;
             try b.fuse(order, st, layer, "qkv", 'q', group_qkv);
-            if (b.fused_count != fused) b.qkv_layers += 1;
             try b.fuse(order, st, layer, "gu", 'g', group_gu);
             // the q4 copies' gate/up group of a layer drafted below 4 bits (stashed as G and U)
             const before = b.fused_count;
@@ -596,3 +582,10 @@ pub const Backend = struct {
         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
     }
 };
+
+/// The drafter's K slices: projection.split's, at most 4. split() was tuned on an M5 Ultra, which runs the drafter's
+/// small GEMVs fastest with 8 slices; the ranked M5 Max has run every occupancy change the opposite way. Only the
+/// drafter's own partial sums move; the target verifies every token.
+fn draftSplit(n: usize, k: usize) !u32 {
+    return @min(try @import("../projection.zig").split(n, k), 4);
+}
