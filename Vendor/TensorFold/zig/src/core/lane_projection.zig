@@ -98,7 +98,7 @@ fn rankPairs(allocator: std.mem.Allocator, pair: []const u16, groups: usize, cap
 
 /// indexed_layout of packed pairs ([K/64][N][scale, bias]): rankPairs' words, then each group's u16 rank.
 /// Null (nothing kept) past sb_table distinct pairs.
-fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+pub fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
     const cap = sb_table;
     const ranked = (try rankPairs(allocator, pair, n * (k / 64), cap)) orelse return null;
     defer ranked.deinit(allocator);
