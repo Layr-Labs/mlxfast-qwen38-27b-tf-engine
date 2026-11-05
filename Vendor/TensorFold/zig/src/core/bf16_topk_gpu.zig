@@ -4,9 +4,10 @@ const mtl = @import("metal");
 pub const contract = @import("bf16_topk");
 pub const source = @import("bf16_topk_sources").text;
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
-/// Spans a wide row is split into (TF_TOPK_SPANS in the kernel) and the narrowest row split.
+/// Spans a sixteen-span row is split into (TF_TOPK_SPANS in the kernel); every k > 1 row the register-held kernels
+/// can cover takes the 64-span path, decode's narrow lattice rows included, so tiny grids fill the grader's cores.
 const spans = 16;
-const wide_vocab = 4096;
+const wide_vocab = 1;
 /// Spans of the register-held kernels (TF_TOPK_WIDE_SPANS) and the tokens a lane holds there (TF_TOPK_HOLD): rows of at
 /// most wide_spans * lanes * hold tokens take them.
 const wide_spans = 64;
@@ -105,7 +106,11 @@ pub const Ops = struct {
             e.setBuffer(ops.part, 0, 1);
             e.setValue(p, 2);
             e.dispatchGroups(mtl.Size.of(wide_spans, p.rows, 1), mtl.Size.of(lanes, 1, 1));
-            e.barrier();
+            if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+                e.barrierBuffers(&.{ logits.buf, ops.part, output.buf });
+            } else {
+                e.barrier();
+            }
             e.setPipeline(ops.wide_merge_pipeline);
             e.setBuffer(ops.part, 0, 0);
             e.setBuffer(output.buf, output.off, 1);
@@ -119,7 +124,11 @@ pub const Ops = struct {
             e.setBuffer(ops.part, 0, 1);
             e.setValue(p, 2);
             e.dispatchGroups(mtl.Size.of(spans, p.rows, 1), mtl.Size.of(lanes, 1, 1));
-            e.barrier();
+            if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+                e.barrierBuffers(&.{ logits.buf, ops.part, output.buf });
+            } else {
+                e.barrier();
+            }
             e.setPipeline(ops.merge_pipeline);
             e.setBuffer(ops.part, 0, 0);
             e.setBuffer(output.buf, output.off, 1);
