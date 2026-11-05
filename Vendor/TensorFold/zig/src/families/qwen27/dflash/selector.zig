@@ -5,7 +5,7 @@ const op = @import("operators.zig");
 pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
 /// `floor`: a node offers a child whose drafter probability (the head's softmax over its row's top-k) is below it only
 /// when that child is the node's best.
-pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
+pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.3, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
 /// Candidate count and maximum draft-parent path length are independent.
 pub const Policy = struct {
     nodes: usize,
