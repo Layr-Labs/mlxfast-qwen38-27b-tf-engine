@@ -119,6 +119,8 @@ pub const Frame = struct {
     part_count: usize = 0,
     ops: u32 = 0,
     residency: ?mtl.ResidencySet.Follow = null,
+    /// The pool's buffer lengths when it was last freed (remember): workspace sizes only, made again by refill.
+    kept: std.ArrayList(usize) = .empty,
     /// Bridges a proposal's frame to the verify behind it (finishBridged, endBridge); none if it failed to build.
     bridge: ?Bridge = null,
     /// Signalled behind a frame's last command: finish returns once the GPU reaches it, and the frame's command buffers
@@ -144,6 +146,7 @@ pub const Frame = struct {
         for (f.pool.items) |buffer| buffer.deinit();
         f.pool.deinit(f.allocator);
         f.entries.deinit(f.allocator);
+        f.kept.deinit(f.allocator);
     }
     pub fn cacheBytes(f: *const Frame) u64 {
         var bytes: u64 = 0;
@@ -153,6 +156,7 @@ pub const Frame = struct {
     /// Release idle reusable buffers. A live frame stays visible so phase close fails closed.
     pub fn drain(f: *Frame) u64 {
         if (f.active) return f.cacheBytes();
+        f.remember();
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
             buffer.deinit();
@@ -174,6 +178,32 @@ pub const Frame = struct {
             else => return false,
         };
         return true;
+    }
+    /// Before the pool is freed: its buffers' lengths, for refill. An empty pool keeps the lengths it had.
+    pub fn remember(f: *Frame) void {
+        if (f.pool.items.len == 0) return;
+        f.kept.clearRetainingCapacity();
+        f.kept.ensureTotalCapacity(f.allocator, f.pool.items.len) catch return;
+        for (f.pool.items) |buffer| f.kept.appendAssumeCapacity(buffer.length());
+    }
+    /// Whether refill has work: an idle, empty pool with lengths kept, its list's room taken here on the caller's thread.
+    pub fn refillDue(f: *Frame) bool {
+        if (f.active or f.pool.items.len != 0 or f.kept.items.len == 0) return false;
+        f.pool.ensureTotalCapacity(f.allocator, f.kept.items.len) catch return false;
+        return true;
+    }
+    /// After refillDue: the pool made again at the lengths remember kept, each buffer joining the residency set as
+    /// alloc's do: fresh zeroed buffers, no word of an earlier frame. Run on a helper thread while a prompt pass runs,
+    /// which never touches the frame (Generation.prefill), so the first frame behind the pass finds its scratch made and
+    /// wired instead of making it while the GPU waits. A failure stops early; alloc makes what is missing, as without this.
+    pub fn refill(f: *Frame) void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        for (f.kept.items) |bytes| {
+            const buffer = f.device.buffer(bytes, options) catch return;
+            f.pool.appendAssumeCapacity(buffer);
+            if (f.residency) |h| h.join(h.ctx, buffer);
+        }
     }
     /// Waits for and checks the command buffers a finished frame returned before they reported completion.
     pub fn checkUnchecked(f: *Frame) !void {
