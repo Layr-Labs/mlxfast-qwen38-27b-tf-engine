@@ -648,7 +648,7 @@ def send_one(selected, sig, runner_root, roots, job_coalition_value, rows=None,
 
 
 def send(targets, sig, runner_root, roots, job_coalition_value, logged,
-         classifier_kwargs=None):
+         classifier_kwargs=None, signalled=None):
     sent = 0
     for selected in targets.values():
         # Fresh path, start time and uid read immediately before every signal.
@@ -656,7 +656,66 @@ def send(targets, sig, runner_root, roots, job_coalition_value, logged,
                     job_coalition_value, logged=logged,
                     classifier_kwargs=classifier_kwargs):
             sent += 1
+            if signalled is not None:
+                signalled.setdefault(selected["pid"], []).append(sig.name)
     return sent
+
+
+# Paths a public ranked log may show. Any other path can name the box account
+# or a private directory, so the report shows only its file name.
+PUBLIC_PATH_PREFIXES = (
+    "/System/", "/Library/Apple/", "/usr/", "/bin/", "/sbin/", "/Applications/")
+
+
+def public_path(path):
+    if path is None:
+        return "<none>"
+    if path.startswith(PUBLIC_PATH_PREFIXES) and os.path.normpath(path) == path:
+        return path
+    return "<private>/" + os.path.basename(path)
+
+
+def not_system_agent_reason(proc, job_coalition_value, trust_cache):
+    """Why system_agent_passes() did not pass this candidate."""
+    if proc["ppid"] != 1:
+        return "parent is not launchd"
+    coalition = proc.get("coalition")
+    if coalition is None:
+        return "coalition unreadable"
+    if coalition == job_coalition_value:
+        return "in the job coalition"
+    path = proc["path"]
+    if path is None:
+        return "no executable path"
+    if not any(path.startswith(prefix) for prefix in SYSTEM_PREFIXES):
+        return "path outside " + ",".join(SYSTEM_PREFIXES)
+    if os.path.normpath(path) != path:
+        return "path not normal"
+    if interpreter(path):
+        return "interpreter or code host"
+    if path not in trust_cache:
+        trust_cache[path] = trusted_system_path(path)
+    if not trust_cache[path]:
+        return "path not in a sealed root-owned tree"
+    return "passed when checked again"
+
+
+def report_remaining(remaining, job_coalition_value, signalled, trust_cache):
+    # One line per process still a candidate at the deadline, so that a failed
+    # cleanup names what survived and why the guard did not exclude it.
+    for pid in sorted(remaining):
+        proc = remaining[pid]
+        kind = "orphan (ppid 1)" if proc["ppid"] == 1 else "in this runner's tree"
+        print(
+            f"{NAME}: kill: remaining pid={pid} ppid={proc['ppid']} "
+            f"path={public_path(proc['path'])} "
+            f"coalition={proc.get('coalition')} job_coalition={job_coalition_value} "
+            f"start={proc['start_sec']}.{proc['start_usec']:06d} "
+            f"candidate={kind} "
+            f"not_excluded={not_system_agent_reason(proc, job_coalition_value, trust_cache)} "
+            f"signalled={','.join(signalled.get(pid, [])) or 'none'}",
+            file=sys.stderr,
+        )
 
 
 def kill_mode(argv):
@@ -665,13 +724,14 @@ def kill_mode(argv):
     roots = staging_roots()
     logged = set()
     classifier_kwargs = {"trust_cache": {}}
+    signalled = {}
     rows = snapshot()
     first = kill_candidates(
         rows, job_start_value, runner_root, roots, job_coalition_value, logged,
         classifier_kwargs)
     term_count = send(
         first, signal.SIGTERM, runner_root, roots, job_coalition_value, logged,
-        classifier_kwargs)
+        classifier_kwargs, signalled)
     time.sleep(0.4)
 
     rows = snapshot()
@@ -681,7 +741,7 @@ def kill_mode(argv):
     new = {pid: proc for pid, proc in second.items() if pid not in first}
     term_count += send(
         new, signal.SIGTERM, runner_root, roots, job_coalition_value, logged,
-        classifier_kwargs)
+        classifier_kwargs, signalled)
     time.sleep(0.4)
 
     rows = snapshot()
@@ -690,7 +750,7 @@ def kill_mode(argv):
         classifier_kwargs)
     kill_count = send(
         survivors, signal.SIGKILL, runner_root, roots,
-        job_coalition_value, logged, classifier_kwargs)
+        job_coalition_value, logged, classifier_kwargs, signalled)
     deadline = time.monotonic() + 3.0
     while True:
         rows = snapshot()
@@ -703,6 +763,8 @@ def kill_mode(argv):
     print(
         f"{NAME}: kill: term={term_count} kill={kill_count} remain={len(remaining)}"
     )
+    report_remaining(
+        remaining, job_coalition_value, signalled, classifier_kwargs["trust_cache"])
     return 1 if remaining else 0
 
 
