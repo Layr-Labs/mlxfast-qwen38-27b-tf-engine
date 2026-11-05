@@ -78,6 +78,7 @@ const Key = struct {
     count: bool = false,
     wait: bool = false,
     tiles: u32 = 0,
+    tile_reuse: bool = false,
     parallel_sk2: bool = false,
     /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
     /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
@@ -523,7 +524,7 @@ pub const Kernels = struct {
     /// slots past list[0] (of `slots`) get the lowest finite bf16.
     pub fn quantTiles(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32) !void {
         if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        const t = try k.tileList(p, stride);
+        const t = try k.tileList(p, stride, false);
         try t.encodeTiles(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots);
     }
 
@@ -531,24 +532,36 @@ pub const Kernels = struct {
     /// the list), the threadgroups of an indirect launch; `slots` bounds the count and the room `y` has a row.
     pub fn quantTilesIndirect(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32, args: Ref) !void {
         if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
-        const t = try k.tileList(p, stride);
+        const t = try k.tileList(p, stride, false);
         try t.encodeTilesIndirect(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots, .{ .buf = args.buffer, .off = args.offset });
+    }
+
+    /// Indirect tile list with exact first-tile outputs computed earlier in this same round.
+    pub fn quantTilesReuseIndirect(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, list: Ref, y: Ref, rows: u32, slots: u32, stride: u32, args: Ref, first: Ref, values: Ref, first_stride: u32) !void {
+        if (rows == 0 or rows > 8) return error.BadCoreProjectionRows;
+        const t = try k.tileList(p, stride, true);
+        try t.encodeTilesReuseIndirect(e, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, p.index != null), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = list.buffer, .off = list.offset }, .{ .buf = y.buffer, .off = y.offset }, rows, slots, .{ .buf = args.buffer, .off = args.offset }, .{ .first = .{ .buf = first.buffer, .off = first.offset }, .values = .{ .buf = values.buffer, .off = values.offset }, .stride = first_stride });
+    }
+
+    /// Prepare the reuse variant independently of ordinary tile-list pipelines.
+    pub fn prepareTilesReuse(k: *Kernels, p: projection.Linear, stride: u32) !void {
+        _ = try k.tileList(p, stride, true);
     }
 
     /// Compiles at load the pipeline quantTiles of `p` at `stride` takes.
     pub fn prepareTiles(k: *Kernels, p: projection.Linear, stride: u32) !void {
-        _ = try k.tileList(p, stride);
+        _ = try k.tileList(p, stride, false);
     }
 
     /// The tile-list build of the decode-row pipeline `quant` of `p` takes for at most 8 rows (prepareDecode's key), so
     /// a listed tile's words are that launch's.
-    fn tileList(k: *Kernels, p: projection.Linear, stride: u32) !*lane.Projection {
+    fn tileList(k: *Kernels, p: projection.Linear, stride: u32, reuse: bool) !*lane.Projection {
         if (k.prompt or !ranged(p) or stride == 0 or stride % 32 != 0) return error.BadCoreProjectionRows;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .tiles = stride };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .tiles = stride, .tile_reuse = reuse };
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .output = .bf16, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .y_stride = stride, .tile_list = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .output = .bf16, .precompute_sums = true, .reg = true, .serial_sk2 = key.serialSk2(), .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .y_stride = stride, .tile_list = true, .tile_reuse = key.tile_reuse });
             k.joined(entry.value_ptr);
         }
         return entry.value_ptr;
@@ -951,7 +964,18 @@ fn bindAt(e: mtl.ComputeEncoder, r: Ref, index: usize) void {
     e.setBuffer(r.buffer, r.offset, index);
 }
 fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
-    inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        const n = @typeInfo(@TypeOf(refs)).@"struct".field_types.len;
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (refs, 0..) |r, i| {
+            buffers[i] = r.buffer;
+            offsets[i] = r.offset;
+        }
+        e.setBuffers(n, buffers, offsets, 0);
+    } else {
+        inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
+    }
 }
 
 /// Adjacent tiles a prompt-row reg SIMD group computes on one register copy of each activation group: two for the

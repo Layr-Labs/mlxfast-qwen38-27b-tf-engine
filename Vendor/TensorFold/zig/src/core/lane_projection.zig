@@ -218,6 +218,8 @@ pub const Layout = struct {
     /// Decoded rows over tiles a GPU list names (encodeTiles): threadgroup j computes the list's tile j and stores its 32
     /// columns at j * 32 of rows `y_stride` apart; threadgroups past the list's count store the lowest finite bf16 there.
     tile_list: bool = false,
+    /// Tile-list indirect launch may copy an already computed first tile from this round.
+    tile_reuse: bool = false,
     /// Rows8 reg launches on an 8-row tensor op (matmul2d M = 8) instead of the 16-row one, whose second eight rows rows8
     /// already leaves unread: half the tensor work a code. Its fragment layout is the toolchain's, so callers use such a
     /// build only once its words are shown equal to the 16-row build's (affine4_lane.Adapter).
@@ -231,6 +233,7 @@ pub const Layout = struct {
         if (l.y_stride) |s| if ((s < l.n and !l.tile_list) or s > std.math.maxInt(i32) / 16) return error.InvalidOutputStride;
         if (l.tile_list and (!l.reg or !l.rows8 or !l.reg_lean or l.swiglu or l.residual or l.count or l.prompt_sr or
             l.prompt_tn != 1 or l.ranges.len != 0 or l.groups != null or l.output != .bf16 or l.y_stride == null or l.y_stride.? % 32 != 0)) return error.InvalidSchedule;
+        if (l.tile_reuse and !l.tile_list) return error.InvalidSchedule;
         if (l.n == 0 or l.n % 16 != 0 or l.k == 0 or l.k % l.format.group != 0 or
             l.n > std.math.maxInt(i32) / 16 or l.k > std.math.maxInt(i32) / 16) return error.InvalidShape;
         if (l.sk == 0 or l.sk > 32 or (l.pf != 1 and l.pf != 2)) return error.InvalidSchedule;
@@ -357,6 +360,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
+    if (l.tile_reuse) try text.appendSlice(a, "#define TF_TILE_REUSE 1\n");
     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
@@ -476,6 +480,21 @@ fn overlap(a: []const u8, b: []const u8) bool {
 
 pub const Ref = struct { buf: mtl.Buffer, off: usize = 0 };
 
+/// Bind only consecutive buffer slots. Test facades without batching keep the same order.
+fn bindRefs(e: mtl.ComputeEncoder, comptime n: usize, refs: [n]Ref, first: usize) void {
+    if (@hasDecl(mtl.ComputeEncoder, "setBuffers")) {
+        var buffers: [n]mtl.Buffer = undefined;
+        var offsets: [n]usize = undefined;
+        inline for (0..n) |i| {
+            buffers[i] = refs[i].buf;
+            offsets[i] = refs[i].off;
+        }
+        e.setBuffers(n, buffers, offsets, first);
+    } else {
+        inline for (0..n) |i| e.setBuffer(refs[i].buf, refs[i].off, first + i);
+    }
+}
+
 pub const Projection = struct {
     pipe: mtl.Pipeline,
     n: usize,
@@ -507,6 +526,8 @@ pub const Projection = struct {
     wait: bool = false,
     /// Built with Layout.tile_list: encodeTiles only.
     tile_list: bool = false,
+    /// Built with Layout.tile_reuse: the indirect tile launch takes first-tile values.
+    tile_reuse: bool = false,
     /// Built with Layout.prompt_tn above 1: a lane stores its output words (and reads the residual's hidden words) four
     /// adjacent columns at a time, so those rows start four-word aligned.
     quads: bool = false,
@@ -531,7 +552,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .tile_reuse = l.tile_reuse, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -636,13 +657,9 @@ pub const Projection = struct {
         const hs_rows: usize = if (p.rows8) sums.stride else 16 * blocks;
         try checkRef(hs, ((p.n / 128 - 1) * @as(usize, sums.stride) + hs_rows) * 4, 4);
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
-        e.setBuffer(h.buf, h.off, 4);
-        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
-        e.setBuffer(hs.buf, hs.off, 6);
+        bindRefs(e, 3, .{ h, sums.ref, hs }, 4);
         if (counter) |c| e.setBuffer(c.buf, c.off, 7); // TF_GU_COUNT: the waiting down's word
         e.dispatchGroups(mtl.Size.of(p.n / 128, if (p.rows8) 1 else blocks, 1), mtl.Size.of(p.swiglu_threads, 1, 1));
     }
@@ -675,7 +692,7 @@ pub const Projection = struct {
     /// A tile-list projection (Layout.tile_list): `slots` threadgroups, threadgroup j computing tile list[1 + j] while j <
     /// list[0] (u32 words an earlier dispatch wrote, at most `slots` tiles) into columns [32 j, 32 j + 32) of `y`'s rows.
     pub fn encodeTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
-        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots);
+        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots, null);
         e.dispatchGroups(mtl.Size.of(slots, 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
     }
 
@@ -684,12 +701,19 @@ pub const Projection = struct {
     /// its own tiles. `y` must hold `slots` slots a row.
     pub fn encodeTilesIndirect(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32, args: Ref) !void {
         try checkRef(args, 12, 4);
-        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots);
+        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots, null);
         e.dispatchIndirect(args.buf, args.off, mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
     }
 
-    fn bindTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32) !void {
-        if (!p.tile_list) return error.InvalidSchedule;
+    /// The same indirect tile launch, copying a matching first tile's exact words instead of recomputing it.
+    pub fn encodeTilesReuseIndirect(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32, args: Ref, reuse: TileReuse) !void {
+        try checkRef(args, 12, 4);
+        try p.bindTiles(e, x, w, sb, sums, list, y, rows, slots, reuse);
+        e.dispatchIndirect(args.buf, args.off, mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+    }
+
+    fn bindTiles(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, list: Ref, y: Ref, rows: u32, slots: u32, reuse: ?TileReuse) !void {
+        if (!p.tile_list or p.tile_reuse != (reuse != null)) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         if (slots == 0 or @as(usize, slots) * 32 > p.y_stride) return error.InvalidSchedule;
         try checkRef(x, rows * p.k * 2, 2);
@@ -698,14 +722,21 @@ pub const Projection = struct {
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(list, (@as(usize, slots) + 1) * 4, 4);
         try checkRef(y, ((rows - 1) * p.y_stride + @as(usize, slots) * 32) * 2, 2);
+        if (reuse) |r| {
+            if (r.stride < rows * 32 or r.stride % 32 != 0) return error.InvalidSchedule;
+            try checkRef(r.first, (@as(usize, rows) + 1) * 4, 4);
+            try checkRef(r.values, ((@as(usize, rows) - 1) * r.stride + @as(usize, rows) * 32) * 2, 2);
+        }
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         e.setValue([2]i32{ @intCast(rows), @intCast(sums.stride) }, 3);
-        e.setBuffer(y.buf, y.off, 4);
-        e.setBuffer(sums.ref.buf, sums.ref.off, 5);
+        bindRefs(e, 2, .{ y, sums.ref }, 4);
         e.setBuffer(list.buf, list.off, 7);
+        if (reuse) |r| {
+            e.setBuffer(r.first.buf, r.first.off, 8);
+            e.setBuffer(r.values.buf, r.values.off, 9);
+            e.setValue(r.stride, 10);
+        }
     }
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
@@ -727,9 +758,7 @@ pub const Projection = struct {
             e.barrier();
         };
         e.setPipeline(p.pipe);
-        e.setBuffer(x.buf, x.off, 0);
-        e.setBuffer(w.buf, w.off, 1);
-        e.setBuffer(sb.buf, sb.off, 2);
+        bindRefs(e, 3, .{ x, w, sb }, 0);
         if (dims) |d| e.setBuffer(d.buf, d.off, 3) else e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
         e.setBuffer(y.buf, y.off, 4);
         if (given) |g| e.setBuffer(g.ref.buf, g.ref.off, 5) else if (p.sums_buffer) |buffer| e.setBuffer(buffer, 0, 5);
@@ -749,6 +778,8 @@ pub const reg_rows = 128;
 
 /// Group sums of a projection's input: XS[group * stride + row], fp32, each group's values added in order from zero.
 pub const Sums = struct { ref: Ref, stride: u32 };
+/// Per-round first tile list and its bf16 outputs, with output rows `stride` words apart.
+pub const TileReuse = struct { first: Ref, values: Ref, stride: u32 };
 
 test "rows8 is off by default, needs the reg kernel and only adds its define" {
     var l = Layout{ .n = 10240, .k = 5120, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .reg = true, .precompute_sums = true, .serial_sk2 = true };
