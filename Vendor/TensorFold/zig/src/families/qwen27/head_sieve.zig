@@ -82,8 +82,7 @@ pub const HeadSieve = struct {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(a);
         try text.print(a, "#define TF_SIEVE_SHAPED 1\n#define TF_N {d}\n#define TF_K {d}\n#define TF_TB {d}\n#define TF_SIEVE_KAPPA {d:.4}f\n", .{ head.n, head.k, head.batch, kappa });
-        if (head.index != null) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (head.index12) @import("core").lane_projection.sb_table12 else @import("core").lane_projection.sb_table)});
-        if (head.index != null and head.index12) try text.appendSlice(a, "#define TF_SBI12 1\n");
+        // The approximate scan reads exact packed pairs directly; exact tile launches keep the head index.
         try text.appendSlice(a, sources.head_sieve);
         const lib = try mtl.Library.fromSource(m.device, text.items, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -158,7 +157,7 @@ pub const HeadSieve = struct {
             cb.wait();
             if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 2-bit copy")) return error.HeadSieveGpuFailure;
         }
-        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
+        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, scan metadata pairs, exact metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
         return .{ .pack = made[0], .prep = made[1], .scan = made[2], .scan8 = scan8, .top = made[3], .select = made[4], .pick = made[5], .head = head, .tiles = tiles, .groups = groups, .blocks = blocks, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_hm8 = o_hm8, .o_bk = o_bk, .o_bk8 = o_bk8, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
     }
 
@@ -183,7 +182,7 @@ pub const HeadSieve = struct {
         const xs = quant.Sums{ .ref = f.get(.sums), .stride = sums_stride };
         const logits = f.get(.logits);
         if (logits.buffer.length() < @as(usize, rows) * s.head.n * 2) return error.BadSieveRows;
-        const meta: projection.Ref = if (s.head.index) |i| i else s.head.pairs;
+        const meta: projection.Ref = s.head.pairs;
         // 1: each group's sums of squares of the rows; the list and the block keys cleared
         e.setPipeline(s.prep);
         e.setBuffer(x.buffer, x.offset, 0);
