@@ -54,6 +54,11 @@ const warm_source =
 /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
 pub const Sums = struct { ref: Ref, stride: u32 };
 
+/// The switch is parsed once by Model.loadWith: any set value disables the local four-SG experiment.
+pub fn guParallelCutsEnabled(disable_value: ?[]const u8) bool {
+    return disable_value == null;
+}
+
 const Key = struct {
     kind: Kind,
     n: u32 = 0,
@@ -72,6 +77,7 @@ const Key = struct {
     prompt_sr: bool = false,
     batch: u32 = 1,
     swiglu: bool = false,
+    parallel_gu_cuts: bool = false,
     sbi: bool = false,
     sbi12: bool = false,
     resid: bool = false,
@@ -109,6 +115,50 @@ test "wide decode SK2 keeps row and phase boundaries distinct" {
     }
     try std.testing.expect(wideDecodeSk2(12288, 5120, 8, false));
     for ([_]u32{ 5120, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
+}
+
+fn testLinear(n: u32, k: u32, slices: u32, indexed: bool) projection.Linear {
+    return .{
+        .words = undefined,
+        .pairs = undefined,
+        .n = n,
+        .k = k,
+        .tile = 32,
+        .slices = slices,
+        .batch = 8,
+        .index = if (indexed) .{ .buffer = undefined } else null,
+    };
+}
+
+test "GU four-SG kill switch and counted selector are exact" {
+    try std.testing.expect(guParallelCutsEnabled(null));
+    try std.testing.expect(!guParallelCutsEnabled(""));
+    try std.testing.expect(!guParallelCutsEnabled("0"));
+
+    var kernels = Kernels{ .allocator = undefined, .device = undefined, .gu_parallel_cuts_enabled = true };
+    const gu = testLinear(34816, 5120, 2, true);
+    const down = testLinear(5120, 17408, 4, true);
+    var selected = Kernels.gateUpCountedKey(&kernels, gu, down, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selected.parallel_gu_cuts);
+    try std.testing.expect(selected.swiglu and selected.count and selected.rows8 and selected.sbi);
+
+    kernels.gu_parallel_cuts_enabled = false;
+    const baseline = Kernels.gateUpCountedKey(&kernels, gu, down, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!baseline.parallel_gu_cuts);
+    try std.testing.expect(!std.meta.eql(selected, baseline));
+    kernels.gu_parallel_cuts_enabled = true;
+    for (1..9) |rows| {
+        selected = Kernels.gateUpCountedKey(&kernels, gu, down, @intCast(rows)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(selected.parallel_gu_cuts);
+    }
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, gu, down, 0) == null);
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, gu, down, 9) == null);
+    kernels.prompt = true;
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, gu, down, 1) == null);
+    kernels.prompt = false;
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, testLinear(10240, 5120, 2, true), down, 1) == null);
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, testLinear(34816, 5120, 4, true), down, 1) == null);
+    try std.testing.expect(Kernels.gateUpCountedKey(&kernels, testLinear(34816, 5120, 2, false), down, 1) == null);
 }
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
@@ -163,6 +213,9 @@ pub const Kernels = struct {
     pair_twins: std.AutoHashMapUnmanaged([2]usize, bool) = .empty,
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
+    /// Cached once at model load; only gateUpCounted's exact indexed target shape can select the four-SG kernel.
+    gu_parallel_cuts_enabled: bool = false,
+    gu_parallel_cuts_encodes: std.atomic.Value(u64) = .init(0),
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
@@ -195,6 +248,8 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        const parallel_gu_encodes = k.gu_parallel_cuts_encodes.load(.monotonic);
+        if (parallel_gu_encodes != 0) std.log.info("qwen27: GU parallel-cut encoded launches={d}", .{parallel_gu_encodes});
         k.setResident(null);
         if (k.row_pipelines) |*pipelines| pipelines.deinit();
         if (k.simd) |*pipelines| pipelines.deinit();
@@ -214,6 +269,16 @@ pub const Kernels = struct {
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+    }
+
+    fn gateUpCountedKey(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) ?Key {
+        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
+        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
+        if (k.countedKey(down, rows, true) == null) return null;
+        var key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
+        if (!key.serialSk2()) return null;
+        key.parallel_gu_cuts = k.gu_parallel_cuts_enabled;
+        return key;
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -513,7 +578,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -858,11 +924,7 @@ pub const Kernels = struct {
     /// rows and their group sums are stored, when `down` takes the counted launch that waits on them in the same barrier
     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
-        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
-        if (k.countedKey(down, rows, true) == null) return null;
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
-        if (!key.serialSk2()) return null;
+        const key = gateUpCountedKey(k, p, down, rows) orelse return null;
         if (k.gu_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);
@@ -874,10 +936,11 @@ pub const Kernels = struct {
         const entry = try k.lanes.getOrPut(k.allocator, key);
         if (!entry.found_existing) {
             errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true });
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true, .parallel_gu_cuts = key.parallel_gu_cuts });
             k.joined(entry.value_ptr);
         }
         const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
+        if (key.parallel_gu_cuts) _ = k.gu_parallel_cuts_encodes.fetchAdd(1, .monotonic);
         try span.end();
         return n;
     }

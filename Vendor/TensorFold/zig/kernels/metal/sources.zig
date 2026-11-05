@@ -194,4 +194,5 @@ pub const drama3 = struct {
     pub const codec = @embedFile("drama3/codec.metal");
 };
 
-pub const core_lane_lockstep=@embedFile("core/lane_gu_lockstep.metal");
+pub const core_lane_lockstep = @embedFile("core/lane_gu_lockstep.metal");
+pub const core_lane_parallel_cuts = @embedFile("core/lane_gu_parallel_cuts.metal");

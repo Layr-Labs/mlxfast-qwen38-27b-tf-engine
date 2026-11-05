@@ -212,6 +212,8 @@ pub const Layout = struct {
     /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
     /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
     gu_count: bool = false,
+    /// Four-SG exact counted gate/up kernel: two tile members and two K cuts, selected only for the lockstep GU shape.
+    parallel_gu_cuts: bool = false,
     /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
     /// same barrier interval (encodeCountedAfter).
     wait: bool = false,
@@ -253,6 +255,7 @@ pub const Layout = struct {
         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
+        if (l.parallel_gu_cuts and !lockstepGu(l)) return error.InvalidSchedule;
         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
         const g = l.groupCut();
         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
@@ -319,12 +322,16 @@ pub const Layout = struct {
 };
 
 /// The complete decoded indexed GU schedule; every other layout keeps its original kernel.
-fn lockstepGu(l:Layout)bool{
-    return l.n==34816 and l.k==5120 and l.format.bits==4 and l.format.group==64 and
-        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk==2 and
-        l.indexed and !l.prompt_sr and l.prompt_tn==1 and l.tile_batch==8 and
-        l.pf==1 and l.precompute_sums and l.output==.bf16 and l.groups==null and
-        l.ranges.len==0 and l.y_stride==null and !l.residual;
+fn lockstepGu(l: Layout) bool {
+    return l.n == 34816 and l.k == 5120 and l.format.bits == 4 and l.format.group == 64 and
+        l.reg and l.rows8 and l.swiglu and l.reg_lean and l.serial_sk2 and l.sk == 2 and
+        l.indexed and !l.prompt_sr and l.prompt_tn == 1 and l.tile_batch == 8 and
+        l.pf == 1 and l.precompute_sums and l.output == .bf16 and l.groups == null and
+        l.ranges.len == 0 and l.y_stride == null and !l.residual;
+}
+
+fn parallelLockstepGu(l: Layout) bool {
+    return l.parallel_gu_cuts and lockstepGu(l);
 }
 
 pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
@@ -361,7 +368,11 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     if (l.indexed12) try text.appendSlice(a, "#define TF_SBI12 1\n");
     if (l.y_stride) |s| try text.print(a, "#define TF_YS {d}\n", .{s});
     try text.appendSlice(a, ks.core_lane_projection);
-    if(lockstepGu(l))try text.appendSlice(a,ks.core_lane_lockstep);
+    if (parallelLockstepGu(l)) {
+        try text.appendSlice(a, ks.core_lane_parallel_cuts);
+    } else if (lockstepGu(l)) {
+        try text.appendSlice(a, ks.core_lane_lockstep);
+    }
     return text.toOwnedSlice(a);
 }
 
@@ -520,10 +531,11 @@ pub const Projection = struct {
         defer a.free(adapted);
         const lib = try mtl.Library.fromSource(device, adapted, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const p = try mtl.Pipeline.init(device, lib, if(lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
+        const p = try mtl.Pipeline.init(device, lib, if (parallelLockstepGu(l)) "tf_lane_parallel_cuts" else if (lockstepGu(l)) "tf_lane_lockstep" else if (l.reg) "tf_lane_reg" else if (l.cooperative) "tf_lane_pair" else "tf_lane", false);
         errdefer p.deinit();
         const physical_sk: usize = if (l.serial_sk2) 1 else l.sk;
-        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
+        const swiglu_threads: usize = if (parallelLockstepGu(l)) 128 else if (l.prompt_tn == 2 or l.rows8) 64 else 128;
+        if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) swiglu_threads else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
         if (l.precompute_sums) {
@@ -531,7 +543,7 @@ pub const Projection = struct {
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = swiglu_threads, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -790,6 +802,45 @@ test "serial SK2 keeps logical split and is off by default" {
     try l.validate();
     l.sk = 2;
     l.reg = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "parallel GU cuts are opt-in and confined to the counted lockstep layout" {
+    var l = Layout{
+        .n = 34816,
+        .k = 5120,
+        .format = .{ .bits = 4, .group = 64 },
+        .sk = 2,
+        .reg = true,
+        .precompute_sums = true,
+        .serial_sk2 = true,
+        .rows8 = true,
+        .reg_lean = true,
+        .tile_batch = 8,
+        .swiglu = true,
+        .indexed = true,
+        .gu_count = true,
+    };
+    const original = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(original);
+    try std.testing.expect(std.mem.indexOf(u8, original, "tf_lane_lockstep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, original, "tf_lane_parallel_cuts") == null);
+
+    l.parallel_gu_cuts = true;
+    try l.validate();
+    const parallel = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(parallel);
+    try std.testing.expect(std.mem.indexOf(u8, parallel, "tf_lane_parallel_cuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parallel, "tf_lane_lockstep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, parallel, "threadgroup float partial[2*2*8*32]") != null);
+    try std.testing.expect(l.threadgroupBytes() <= 6 * 1024);
+
+    l.parallel_gu_cuts = false;
+    l.gu_count = false;
+    l.parallel_gu_cuts = true;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.gu_count = true;
+    l.sk = 4;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
 }
 
