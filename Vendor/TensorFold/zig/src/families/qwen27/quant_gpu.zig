@@ -5,7 +5,9 @@ const lane = @import("core").lane_projection;
 const row = @import("core").row_projection;
 const sources = @import("qwen_runtime_sources");
 const projection = @import("projection.zig");
+const gpu_weights = @import("gpu_weights.zig");
 const profile = @import("core").gpu_profile;
+const native4_pack = @import("core").native4_pack;
 pub const Ref = projection.Ref;
 /// Code MiB Kernels.warm reads ahead of a decoded out projection: about two thirds of its 15 MiB, as much as a star
 /// scan's or an attention prefix's idle bus time covers at the stream rate.
@@ -77,6 +79,8 @@ const Key = struct {
     resid: bool = false,
     count: bool = false,
     wait: bool = false,
+    native4: bool = false,
+    m8: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
     /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
@@ -94,6 +98,13 @@ const Key = struct {
     }
 };
 
+fn withNative4(key: Key) Key {
+    var result = key;
+    result.native4 = true;
+    result.m8 = true;
+    return result;
+}
+
 /// The larger live half-tiles favor parallel SK2 for the wide decode projections: fused gate/up (34816), GDN qkv (10240)
 /// and the attention query+gate (12288), whose 384 half-tiles sit between the other two.
 fn wideDecodeSk2(n: u32, input_width: u32, rows: u32, prompt: bool) bool {
@@ -109,6 +120,66 @@ test "wide decode SK2 keeps row and phase boundaries distinct" {
     }
     try std.testing.expect(wideDecodeSk2(12288, 5120, 8, false));
     for ([_]u32{ 5120, 248320 }) |n| try std.testing.expect(!wideDecodeSk2(n, 5120, 8, false));
+}
+
+fn native4TestLinear() projection.Linear {
+    return .{
+        .words = .{ .buffer = undefined },
+        .pairs = .{ .buffer = undefined },
+        .n = 5120,
+        .k = 17408,
+        .tile = 32,
+        .slices = 4,
+        .batch = 8,
+        .native4_words = .{ .buffer = undefined },
+        .native4_abi = .{ .buffer = undefined },
+        .native4_qualified = true,
+    };
+}
+
+test "native4 counted key is exact row mask and target only" {
+    var k = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_native4_required = true };
+    var p = native4TestLinear();
+    p.native4_row_mask = 0xFF;
+    for (1..9) |rows| {
+        const wait = try k.targetNative4CallKey(p, @intCast(rows));
+        try std.testing.expect(wait.native4 and wait.m8 and wait.wait and wait.count);
+        const count_key = k.countedKey(p, @intCast(rows), false) orelse return error.BadCoreProjectionRows;
+        try std.testing.expect(!count_key.native4);
+    }
+    p.native4_row_mask = 0x7F;
+    try std.testing.expectError(error.TargetNative4NotSelected, k.targetNative4CallKey(p, 8));
+    try std.testing.expectError(error.BadCoreProjectionRows, k.targetNative4CallKey(p, 9));
+    p.n = 34816;
+    try std.testing.expect(!(try k.targetNative4CallKey(p, 8)).native4);
+    k.target_native4_required = false;
+    p.n = 5120;
+    try std.testing.expect(!(try k.targetNative4CallKey(p, 8)).native4);
+}
+
+test "native4 blocks gate-up fallback before touching the encoder" {
+    var k = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_native4_required = true };
+    var down = native4TestLinear();
+    down.native4_row_mask = 0x7F;
+    const invalid_gate = projection.Linear{
+        .words = .{ .buffer = undefined },
+        .pairs = .{ .buffer = undefined },
+        .n = 128,
+        .k = 5120,
+        .tile = 32,
+        .slices = 1,
+    };
+    try std.testing.expectError(error.TargetNative4NotSelected, k.gateUpCounted(undefined, invalid_gate, down, undefined, undefined, undefined, undefined, 8));
+    down.native4_row_mask = 0xFF;
+    try std.testing.expectError(error.TargetNative4GateUpUnavailable, k.gateUpCounted(undefined, invalid_gate, down, undefined, undefined, undefined, undefined, 8));
+}
+
+test "native4 public counted entry guards unselected rows before touching encoder" {
+    var k = Kernels{ .allocator = std.testing.allocator, .device = undefined, .target_native4_required = true };
+    var down = native4TestLinear();
+    down.native4_row_mask = 0x7F;
+    try std.testing.expectError(error.TargetNative4NotSelected, k.quantCountedAfter(undefined, down, undefined, undefined, undefined, 8, 1));
+    try std.testing.expectError(error.TargetNative4WaitRequired, k.quantCounted(undefined, down, undefined, undefined, undefined, 8));
 }
 
 test "serial SK2 guard and cache keys separate every excluded projection" {
@@ -180,12 +251,25 @@ pub const Kernels = struct {
     warm_tiles_sink: ?mtl.Buffer = null,
     /// team-m5-08w: the 16-byte input norm failed to build on this chip (logged once): the record's kernel runs instead.
     input_words_failed: bool = false,
+    /// Canonical raw-u4 matrices and native lane configs borrowed by target DOWN linears; owned here.
+    native4_owned: std.ArrayList(mtl.Buffer) = .empty,
+    target_native4_required: bool = false,
+    target_native4_qualified: usize = 0,
+    target_native4_preflighted: usize = 0,
+    target_native4_rejected: usize = 0,
+    target_native4_calibration_failed: bool = false,
+    target_native4_probe_logged: bool = false,
+    target_native4_dispatches: u64 = 0,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
         var it = k.lanes.valueIterator();
         while (it.next()) |p| {
             if (k.residency) |f| mtl.resident.fields.apply(p, f, false);
             if (hook) |f| mtl.resident.fields.apply(p, f, true);
+        }
+        for (k.native4_owned.items) |buffer| {
+            if (k.residency) |f| f.leave(f.ctx, buffer);
+            if (hook) |f| f.join(f.ctx, buffer);
         }
         k.residency = hook;
     }
@@ -214,6 +298,34 @@ pub const Kernels = struct {
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+        for (k.native4_owned.items) |buffer| buffer.deinit();
+        k.native4_owned.deinit(k.allocator);
+        if (k.target_native4_required) std.log.info("qwen27: target-down native4 dispatches={d}", .{k.target_native4_dispatches});
+    }
+
+    /// Build an owned canonical raw-u4 sidecar for each actual target DOWN matrix after the promoted p.words have
+    /// reached lane.reg_layout. The checkpoint and original p.words are never modified.
+    pub fn prepareTargetNative4Weights(k: *Kernels, layers: []gpu_weights.Layer) !void {
+        for (layers) |*layer| {
+            const p = &layer.down;
+            if (!targetNative4Shape(p.*)) return error.Native4UnqualifiedDownShape;
+            if (p.native4_words != null or p.words.offset % 4 != 0) return error.Native4DuplicateSidecar;
+            const blocks = try std.math.mul(usize, @as(usize, p.n / 32), @as(usize, p.k / 64));
+            const word_count = try std.math.mul(usize, blocks, 256);
+            const end = try std.math.add(usize, p.words.offset / 4, word_count);
+            if (end > p.words.buffer.length() / 4) return error.Native4SourceBounds;
+            const source_words = p.words.buffer.slice(u32, p.words.buffer.length() / 4)[p.words.offset / 4 ..][0..word_count];
+            const canonical = try native4_pack.fromReg(k.allocator, source_words, p.n, p.k, p.batch);
+            defer k.allocator.free(canonical);
+            const buffer = try k.device.buffer(canonical.len * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            errdefer buffer.deinit();
+            @memcpy(buffer.contents()[0 .. canonical.len * 4], std.mem.sliceAsBytes(canonical));
+            k.native4_owned.append(k.allocator, buffer) catch |err| {
+                return err;
+            };
+            if (k.residency) |hook| hook.join(hook.ctx, buffer);
+            p.native4_words = .{ .buffer = buffer };
+        }
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -513,7 +625,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
@@ -701,9 +814,161 @@ pub const Kernels = struct {
     fn countedKey(k: *const Kernels, p: projection.Linear, rows: u32, wait: bool) ?Key {
         if (k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32 or rows == 0 or rows > 8) return null;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .sbi = p.index != null, .sbi12 = p.index != null and p.index12, .count = true, .wait = wait };
+        if (p.native4_qualified and p.native4_row_mask & (@as(u8, 1) << @as(u3, @intCast(rows - 1))) != 0) {
+            if (wait and targetNative4Shape(p) and p.native4_words != null and p.native4_abi != null) return withNative4(key);
+        }
         if (key.serialSk2() and wait) return null;
         if (!key.serialSk2() and p.slices < 2) return null;
         return key;
+    }
+
+    /// Canonical promoted M16 counted/count-wait path used as the identity and timing control arm.
+    fn countedProjection(k: *Kernels, p: projection.Linear, key: Key) !*lane.Projection {
+        if (key.native4) return error.InvalidCountedProjectionKey;
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = p.slices,
+                .precompute_sums = true,
+                .reg = true,
+                .tile_batch = p.batch,
+                .rows8 = true,
+                .reg_lean = true,
+                .indexed = p.index != null,
+                .indexed12 = p.index != null and p.index12,
+                .count = true,
+                .wait = key.wait,
+                .serial_sk2 = key.serialSk2(),
+            });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr;
+    }
+
+    fn targetNative4Shape(p: projection.Linear) bool {
+        return p.n == 5120 and p.k == 17408 and p.bits == 4 and p.group == 64 and p.tile == 32 and p.slices == 4 and p.batch == 8 and p.runs.len == 0 and p.raw == null;
+    }
+
+    fn targetNative4CallKey(k: *const Kernels, p: projection.Linear, rows: u32) !Key {
+        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        if (k.target_native4_required and !k.prompt and rows > 0 and rows <= 8 and targetNative4Shape(p) and !key.native4)
+            return error.TargetNative4NotSelected;
+        return key;
+    }
+
+    fn native4Projection(k: *Kernels, queue: mtl.Queue, p: projection.Linear, key: Key) !*lane.Projection {
+        if (!key.native4 or !targetNative4Shape(p) or p.native4_words == null) return error.InvalidNative4Projection;
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.initNative4(k.allocator, k.device, queue, .{
+                .n = p.n,
+                .k = p.k,
+                .format = .{ .bits = p.bits, .group = p.group },
+                .sk = p.slices,
+                .reg = true,
+                .tile_batch = p.batch,
+                .rows8 = true,
+                .m8 = true,
+                .reg_lean = true,
+                .indexed = p.index != null,
+                .indexed12 = p.index != null and p.index12,
+                .count = true,
+                .wait = true,
+                .native4 = true,
+            });
+            k.joined(entry.value_ptr);
+        }
+        if (entry.value_ptr.native4_abi == null) return error.Native4AbiUnavailable;
+        return entry.value_ptr;
+    }
+
+    fn targetNative4BaseKey(k: *const Kernels, p: projection.Linear) !Key {
+        if (!targetNative4Shape(p)) return error.InvalidNative4Shape;
+        return k.countedKey(p, 1, true) orelse error.Native4WaitKeyUnavailable;
+    }
+
+    /// Checks complete target DOWN cohorts for every row stratum before exposing the native projection.
+    /// Timing-policy decisions are recorded separately from the returned integrity-qualified row mask.
+    pub fn calibrateTargetNative4(k: *Kernels, queue: mtl.Queue, down: []projection.Linear) u8 {
+        const calibration = @import("native4_calibration.zig");
+        k.target_native4_calibration_failed = false;
+        if (down.len != calibration.matrices) {
+            k.target_native4_calibration_failed = true;
+            return 0;
+        }
+        var programs: [calibration.matrices]calibration.Program = undefined;
+        for (down, 0..) |*p, i| {
+            if (!targetNative4Shape(p.*) or p.native4_words == null) {
+                k.target_native4_rejected += 1;
+                k.target_native4_calibration_failed = true;
+                return 0;
+            }
+            const base_key = k.targetNative4BaseKey(p.*) catch {
+                k.target_native4_rejected += 1;
+                k.target_native4_calibration_failed = true;
+                return 0;
+            };
+            const candidate_key = withNative4(base_key);
+            const baseline = (k.countedProjection(p.*, base_key) catch {
+                k.target_native4_rejected += 1;
+                k.target_native4_calibration_failed = true;
+                return 0;
+            }).*;
+            const candidate = (k.native4Projection(queue, p.*, candidate_key) catch |err| {
+                if (!k.target_native4_probe_logged) {
+                    k.target_native4_probe_logged = true;
+                    std.log.warn("qwen27: target-down native4 ABI rejected for {d}x{d} Q4/G{d}: {s}", .{ p.n, p.k, p.group, @errorName(err) });
+                }
+                k.target_native4_rejected += 1;
+                k.target_native4_calibration_failed = true;
+                return 0;
+            }).*;
+            const native_words = p.native4_words.?;
+            const abi = candidate.native4_abi orelse {
+                k.target_native4_rejected += 1;
+                k.target_native4_calibration_failed = true;
+                return 0;
+            };
+            p.native4_abi = .{ .buffer = abi };
+            programs[i] = .{
+                .layer = i,
+                .baseline = baseline,
+                .candidate = candidate,
+                .words = .{ .buf = p.words.buffer, .off = p.words.offset },
+                .native_words = .{ .buf = native_words.buffer, .off = native_words.offset },
+                .metadata = metadata(p.*, p.index != null),
+            };
+            p.native4_qualified = true;
+            k.target_native4_preflighted += 1;
+        }
+
+        var row_mask: u8 = 0;
+        var identity_qualified = false;
+        for (1..9) |live_rows| {
+            const evidence = calibration.run(k.device, queue, &programs, @intCast(live_rows)) catch |err| {
+                k.target_native4_calibration_failed = true;
+                if (!k.target_native4_probe_logged) {
+                    k.target_native4_probe_logged = true;
+                    std.log.warn("qwen27: target-down native4 rows={d} refused ({s})", .{ live_rows, @errorName(err) });
+                }
+                continue;
+            };
+            if (!identity_qualified) {
+                k.target_native4_qualified = calibration.matrices;
+                identity_qualified = true;
+            }
+            const decision = evidence.decision;
+            std.log.info("qwen27: target-down native4 rows={d} qualified=true policy_pass={} relative={d:.6} saved={d:.9} positive={d} null={d:.6}", .{
+                live_rows, decision.use_m8, decision.median_relative_gain, decision.median_saving_seconds, decision.positive_pairs, decision.max_null_relative,
+            });
+            row_mask |= @as(u8, 1) << @as(u3, @intCast(live_rows - 1));
+        }
+        return row_mask;
     }
 
     /// Reads one word of every 128-byte line of the first warmBytes() of `p`'s code words (the stored layout, tile batches
@@ -808,6 +1073,7 @@ pub const Kernels = struct {
     }
 
     pub fn quantCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32) !?u32 {
+        if (k.target_native4_required and !k.prompt and rows > 0 and rows <= 8 and targetNative4Shape(p)) return error.TargetNative4WaitRequired;
         const key = k.countedKey(p, rows, false) orelse return null;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -832,7 +1098,7 @@ pub const Kernels = struct {
     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+        const key = try k.targetNative4CallKey(p, rows);
         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
         if (k.count_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -842,27 +1108,56 @@ pub const Kernels = struct {
         var span = profile.begin(k.profiler, input_encoder, .dense);
         span.shape = .{ .n = p.n, .k = p.k, .sk = p.slices, .bits = p.bits };
         errdefer span.cancel();
-        const entry = try k.lanes.getOrPut(k.allocator, key);
-        if (!entry.found_existing) {
-            errdefer _ = k.lanes.remove(key);
-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
-            k.joined(entry.value_ptr);
+        var tiles: usize = 0;
+        if (key.native4) {
+            const entry = k.lanes.getPtr(key) orelse return error.Native4PipelineUnavailable;
+            const w = p.native4_words orelse return error.Native4WeightsUnavailable;
+            const abi = p.native4_abi orelse return error.Native4AbiUnavailable;
+            try entry.encodeNative4CountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = w.buffer, .off = w.offset }, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for, .{ .buf = abi.buffer, .off = abi.offset });
+            tiles = entry.tile_count;
+            k.target_native4_dispatches += 1;
+        } else {
+            const entry = try k.lanes.getOrPut(k.allocator, key);
+            if (!entry.found_existing) {
+                errdefer _ = k.lanes.remove(key);
+                entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .indexed = key.sbi, .indexed12 = key.sbi12, .count = true, .wait = true });
+                k.joined(entry.value_ptr);
+            }
+            const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+            try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
+            tiles = entry.value_ptr.tile_count;
         }
-        const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
         try span.end();
-        return @intCast(entry.value_ptr.tile_count);
+        return @intCast(tiles);
     }
 
     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
     /// rows and their group sums are stored, when `down` takes the counted launch that waits on them in the same barrier
     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
     pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
-        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
-        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
-        if (k.countedKey(down, rows, true) == null) return null;
+        const required_target = k.target_native4_required and !k.prompt and rows > 0 and rows <= 8 and targetNative4Shape(down);
+        if (required_target) {
+            const required_key = k.countedKey(down, rows, true) orelse return error.TargetNative4GateUpUnavailable;
+            if (!required_key.native4) return error.TargetNative4NotSelected;
+        }
+        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) {
+            if (required_target) return error.TargetNative4GateUpUnavailable;
+            return null;
+        }
+        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) {
+            if (required_target) return error.TargetNative4GateUpUnavailable;
+            return null;
+        }
+        const down_key = k.countedKey(down, rows, true) orelse {
+            if (k.target_native4_required and !k.prompt and targetNative4Shape(down)) return error.TargetNative4GateUpUnavailable;
+            return null;
+        };
+        if (k.target_native4_required and !k.prompt and targetNative4Shape(down) and !down_key.native4) return error.TargetNative4NotSelected;
         const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
-        if (!key.serialSk2()) return null;
+        if (!key.serialSk2()) {
+            if (required_target) return error.TargetNative4GateUpUnavailable;
+            return null;
+        }
         if (k.gu_words == null) {
             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             @memset(b.contents()[0..8], 0);

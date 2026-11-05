@@ -23,6 +23,7 @@ pub const shared_attention = @import("src/core/shared_attention.zig");
 
 pub const affine4 = @import("src/core/affine4.zig");
 pub const affine4_lane = @import("src/core/affine4_lane.zig");
+pub const native4_pack = @import("src/core/native4_pack.zig");
 
 pub const tree_round = @import("tree_round");
 pub const tree_round_gpu = @import("tree_round_gpu");

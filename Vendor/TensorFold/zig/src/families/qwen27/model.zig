@@ -84,6 +84,26 @@ pub const Model = struct {
         errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        // The same default-on, fail-closed policy as other measured M8 work: never time an unqualified M16 fallback.
+        if (m.device.tensorUnits() and platform.c.getenv("TF_Q27_NATIVE4_DOWN_DISABLE") == null) {
+            m.kernels.target_native4_required = true;
+            try m.kernels.prepareTargetNative4Weights(m.weights.layers);
+            var down: [64]@import("projection.zig").Linear = undefined;
+            if (m.weights.layers.len != down.len) return error.TargetNative4QualificationFailed;
+            for (m.weights.layers, &down) |layer, *p| p.* = layer.down;
+            const row_mask = m.kernels.calibrateTargetNative4(m.queue, &down);
+            for (m.weights.layers, down) |*layer, p| {
+                layer.down.native4_qualified = p.native4_qualified;
+                layer.down.native4_abi = p.native4_abi;
+                layer.down.native4_row_mask = row_mask;
+            }
+            std.log.info("qwen27: target-down native4 ready qualified={d} rejected={d} row_mask={d}", .{ m.kernels.target_native4_qualified, m.kernels.target_native4_rejected, row_mask });
+            if (m.kernels.target_native4_qualified != down.len) return error.TargetNative4QualificationFailed;
+            if (row_mask != 0xFF) {
+                if (m.kernels.target_native4_calibration_failed) return error.TargetNative4CalibrationFailed;
+                return error.TargetNative4NoProfitableRows;
+            }
+        }
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.
