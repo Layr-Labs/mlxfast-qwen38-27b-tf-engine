@@ -160,6 +160,7 @@ Q27_PREFIX(14)
 Q27_PREFIX(15)
 Q27_PREFIX(16)
 template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+template [[host_name("q27_attn_prefix_quarter_2")]] kernel void q27_attn_prefix<2, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
 
 // One staged K or V block of a tail tile, 128 threads: this thread's slots kv[128 j] (j < 8) take rows q0 + STEP j of the
 // cache at `src` (the thread's column; rows D apart). Rows before P come from the cache through a pointer stepped STEP rows a
