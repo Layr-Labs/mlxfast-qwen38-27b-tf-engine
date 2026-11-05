@@ -18,8 +18,11 @@ pub const Graph = struct {
     hidden_projection: Tensor,
     predecessor: Tensor,
     successor: Tensor,
+    /// Exact immutable BF16 expansions for the host selector; never holds prompt state.
+    successor_f64: []f64 = &.{},
     embed: ck.Linear,
     pub fn deinit(g: *Graph) void {
+        g.gpa.free(g.successor_f64);
         g.gpa.free(g.layers);
         g.* = undefined;
     }
@@ -107,7 +110,10 @@ pub fn load(gpa: std.mem.Allocator, source: Inventory, c: Config, embed: ck.Line
         .attention_conv = .{ .projection = try layerTensor(src, i, "attention_conv.kernel_projection.weight", &.{ c.dynamicWidth(), c.hidden }), .base = try layerTensor(src, i, "attention_conv.base_kernel", &.{ 2, 2, c.hidden }) },
         .mlp_conv = .{ .projection = try layerTensor(src, i, "mlp_conv.kernel_projection.weight", &.{ c.dynamicWidth(), c.hidden }), .base = try layerTensor(src, i, "mlp_conv.base_kernel", &.{ 2, 2, c.hidden }) },
     };
-    return .{ .gpa = gpa, .config = c, .layers = layers, .fusion = try get(src, "fc.weight", &.{ c.hidden, c.tapWidth() }), .hidden_norm = try get(src, "hidden_norm.weight", &.{c.hidden}), .norm = try get(src, "norm.weight", &.{c.hidden}), .hidden_projection = try get(src, "candidate_selector.hidden_projection.weight", &.{ c.rank, c.hidden }), .predecessor = try get(src, "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank }), .successor = try get(src, "candidate_selector.successor_codebook", &.{ c.vocab, c.rank }), .embed = embed };
+    const successor = try get(src, "candidate_selector.successor_codebook", &.{ c.vocab, c.rank });
+    const expanded = try expandCodebook(gpa, successor);
+    errdefer gpa.free(expanded);
+    return .{ .gpa = gpa, .config = c, .layers = layers, .fusion = try get(src, "fc.weight", &.{ c.hidden, c.tapWidth() }), .hidden_norm = try get(src, "hidden_norm.weight", &.{c.hidden}), .norm = try get(src, "norm.weight", &.{c.hidden}), .hidden_projection = try get(src, "candidate_selector.hidden_projection.weight", &.{ c.rank, c.hidden }), .predecessor = try get(src, "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank }), .successor = successor, .successor_f64 = expanded, .embed = embed };
 }
 
 test "inventory is81exact names including unsuffixed BF16codebooks" {
@@ -120,4 +126,18 @@ test "inventory is81exact names including unsuffixed BF16codebooks" {
     list[0] = list[1];
     defer list[0] = previous;
     try std.testing.expectError(error.DraftTensorCoverage, inventory(a, list, .{}));
+}
+
+/// Decode only immutable checkpoint values, exactly as the selector's native reader.
+/// Finite checks move to load time; no prompt, candidate or probability is cached.
+fn expandCodebook(gpa: std.mem.Allocator, t: Tensor) ![]f64 {
+    const values = try gpa.alloc(f64, t.bytes.len / 2);
+    errdefer gpa.free(values);
+    for (values, 0..) |*value, i| {
+        const bits = std.mem.readInt(u16, t.bytes[i * 2 ..][0..2], .little);
+        const v: f32 = @bitCast(@as(u32, bits) << 16);
+        if (!std.math.isFinite(v)) return error.DraftCodebookFinite;
+        value.* = @as(f64, v);
+    }
+    return values;
 }

@@ -109,6 +109,28 @@ fn edgesOf(g: *const weights.Graph, terms: *const [max_rank]f64, tokens: []const
     const rank: usize = g.config.rank;
     if (tokens.len == 0) return;
     if (tokens.len > lanes or out.len < tokens.len) return error.DraftLatticeShape;
+    if (g.successor_f64.len != 0) {
+        // One vector lane per candidate, still one multiply and one add per rank.
+        // Expansion was exact and finite-checked when the immutable graph loaded.
+        var rows: [lanes][*]const f64 = undefined;
+        for (0..lanes) |k| {
+            const token = tokens[@min(k, tokens.len - 1)];
+            if (token >= g.config.vocab) return error.DraftCodebookShape;
+            const at = try std.math.mul(usize, token, rank);
+            if (at + rank > g.successor_f64.len) return error.DraftCodebookShape;
+            rows[k] = g.successor_f64[at..].ptr;
+        }
+        const Expanded = @Vector(lanes, f64);
+        var sums: Expanded = @splat(0);
+        for (0..rank) |r| {
+            var values: Expanded = undefined;
+            inline for (0..lanes) |k| values[k] = rows[k][r];
+            sums += @as(Expanded, @splat(terms[r])) * values;
+        }
+        const result: [lanes]f64 = sums;
+        @memcpy(out[0..tokens.len], result[0..tokens.len]);
+        return;
+    }
     const Sums = @Vector(lanes, f64);
     const Words = @Vector(lanes, u32);
     // rows a group of four candidates at a time, a lane past the last candidate on the last candidate's row; `groups`
@@ -163,7 +185,15 @@ pub fn warmAnchor(g: *const weights.Graph, anchor: u32) void {
 /// from there rather than waiting on each row in turn.
 pub fn warmCandidates(g: *const weights.Graph, lattice: op.Lattice) void {
     if (g.config.rank > max_rank) return;
-    for (lattice.candidates) |token| if (token < g.config.vocab) warmRow(g, g.successor, token);
+    for (lattice.candidates) |token| if (token < g.config.vocab) {
+        if (g.successor_f64.len != 0) {
+            const at = @as(usize, token) * g.config.rank;
+            if (at + g.config.rank > g.successor_f64.len) continue;
+            const values = g.successor_f64[at..][0..g.config.rank];
+            var i: usize = 0;
+            while (i < values.len) : (i += 16) @prefetch(values.ptr + i, .{ .locality = 3 });
+        } else warmRow(g, g.successor, token);
+    };
 }
 fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first: u64, parent_token: u32, parent: i32, depth: u32, cumulative: f64, frontier: *std.ArrayList(Node)) !void {
     @setFloatMode(.strict);
