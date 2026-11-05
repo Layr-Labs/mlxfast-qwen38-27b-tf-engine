@@ -170,7 +170,19 @@ pub const Attention = struct {
             const per = kvRows(p.shape);
             e.dispatchGroups(mtl.Size.of(p.shape.kv_heads, (rows + per - 1) / per, chunks), mtl.Size.of(kvThreads(p.shape), 1, 1));
         } else e.dispatchGroups(mtl.Size.of(p.shape.query_heads, rows, chunks), mtl.Size.of(32, 1, 1));
-        e.barrier();
+        if (@hasDecl(mtl.ComputeEncoder, "barrierBuffers")) {
+            // Include reads as well as writes: callers may use one arena buffer for
+            // different views, and a merge output can alias an earlier split input.
+            const args_buf = switch (args) {
+                .at => |r| r.buf,
+                .value => p.part,
+            };
+            const sums_buf = if (xs) |s| s.ref.buf else p.part;
+            e.barrierBuffers(&.{ p.part, q.buf, k.buf, v.buf, mask.buf, o.k.buf, o.v.buf, args_buf, out.buf, sums_buf });
+        } else {
+            // Host facades without the resource API retain their existing barrier.
+            e.barrier();
+        }
         e.setPipeline(if (xs != null) p.merge_xs else p.merge);
         e.setBuffer(p.part, 0, 0);
         bindArgs(e, args, 1);
