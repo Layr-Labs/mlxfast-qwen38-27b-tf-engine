@@ -223,6 +223,9 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
             if (x.every == 0 or i + 1 >= x.layers) return;
+            // a family's last periodic commit (commitsUntil, 0: none): past it the rest of the pass goes in one buffer
+            const until: usize = if (comptime @hasDecl(std.meta.Child(@TypeOf(x.fam)), "commitsUntil")) x.fam.commitsUntil() else 0;
+            if (until != 0 and i + 1 > until) return;
             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
             // host encodes the next chunk's layers
             if (i + 1 != x.first and (i + 1) % x.every != 0 and !(x.early and i < 3) and !(x.first == 0 and i == 0)) return;
@@ -251,6 +254,8 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
     for (lanes[0..n]) |l| l.cb.commit();
     // work the family queues behind the last chunk before the host waits on it (a round's keep)
     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
+    // a family that declares laneDue and laneDone takes each segment but the last as it ends, while the later ones run
+    const ended: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "laneDone")) endedLanes(fam, lanes[0..n]) else {};
     if (signalled) {
         const ev = poll_event.?;
         while (ev.value() < poll_value and lanes[0].cb.status() != .@"error") std.atomic.spinLoopHint();
@@ -262,6 +267,7 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
             unchecked[n_unchecked] = lanes[0].cb.retain();
             n_unchecked += 1;
             try queued;
+            try ended;
             return 0;
         }
     }
@@ -288,7 +294,22 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         gpu = if (n_done > 0) gpu + l.cb.gpuSeconds() else @max(gpu, l.cb.gpuSeconds());
     }
     try queued;
+    try ended;
     return gpu;
+}
+
+/// Every command buffer of the pass is committed. Segment k's last one is waited for, then the family's laneDone(k) runs,
+/// for each segment but the last in order while laneDue says so. Each wait returns: segment 0 waits on no event, and
+/// segment k only on segment k-1's signals, which its command buffers (committed, and waited for just before) carry. A
+/// segment that failed ends the walk; the pass's own waits report it.
+fn endedLanes(fam: anytype, lanes: []const Lane) !void {
+    if (lanes.len < 2) return;
+    for (lanes[0 .. lanes.len - 1], 0..) |l, k| {
+        if (!fam.laneDue(k)) return;
+        l.cb.wait();
+        if (l.cb.failure() != null) return;
+        try fam.laneDone(k);
+    }
 }
 
 test {
