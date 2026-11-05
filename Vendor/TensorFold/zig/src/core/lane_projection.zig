@@ -188,6 +188,8 @@ pub const Layout = struct {
     prompt_sr: bool = false,
     /// Reg launches of at most 8 rows (decoded rows): a lane's second row is padding and gets no accumulators.
     rows8: bool = false,
+    /// Raw Q4/g64 prompt projection with caller-provided global XS and 16-row grid-y blocks.
+    raw_prompt: bool = false,
     /// Reg SIMD groups prefetch only codes; metadata and row sums load in their own iteration (decode rows).
     reg_lean: bool = false,
     /// Reg codes of adjacent tiles interleave by group: u32[N/32/B][K/64][B][2][32 lanes][4]; a partial last batch keeps zero blocks.
@@ -225,6 +227,11 @@ pub const Layout = struct {
 
     pub fn validate(l: Layout) !void {
         try l.format.validate();
+        if (l.raw_prompt and (l.format.bits != 4 or l.format.group != 64 or l.reg or l.cooperative or l.sk != 2 or
+            !l.precompute_sums or l.output != .bf16 or l.serial_sk2 or l.prompt_sr or l.rows8 or l.reg_lean or
+            l.tile_batch != 1 or l.swiglu or l.indexed or l.indexed12 or l.y_stride != null or l.prompt_tn != 1 or
+            l.residual or l.count or l.gu_count or l.wait or l.tile_list or l.m8 or l.groups != null or l.ranges.len != 0))
+            return error.InvalidSchedule;
         if (l.cooperative and l.format.bits != 4) return error.UnsupportedCooperativeFormat;
         if (l.reg and (l.cooperative or (l.format.bits != 4 and !l.regTwo()) or l.format.group != 64 or !l.precompute_sums)) return error.UnsupportedRegFormat;
         if ((l.cooperative or l.reg) and l.n % 32 != 0) return error.InvalidShape;
@@ -344,6 +351,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
     try text.appendSlice(a, if (l.ranges.len == 0) "  return j;\n}\n" else "  return 0;\n}\n");
     try text.print(a, "#define TF_PRECOMPUTE_SUMS {d}\n", .{@intFromBool(l.precompute_sums)});
     if (l.reg) try text.appendSlice(a, "#define TF_REG 1\n");
+    if (l.raw_prompt) try text.appendSlice(a, "#define TF_RAW_PROMPT 1\n");
     if (l.serial_sk2) try text.appendSlice(a, "#define TF_SERIAL_SK2 1\n");
     if (l.prompt_sr) try text.appendSlice(a, "#define TF_PROMPT_SR 1\n");
     if (l.rows8) try text.appendSlice(a, "#define TF_ROWS8 1\n");
@@ -491,6 +499,7 @@ pub const Projection = struct {
     sums_buffer: ?mtl.Buffer = null,
     threads_per_slice: usize = 32,
     reg: bool = false,
+    raw_prompt: bool = false,
     /// Built with Layout.rows8: launches take at most 8 rows.
     rows8: bool = false,
     /// Built with Layout.swiglu: encodeSwiglu only.
@@ -526,12 +535,12 @@ pub const Projection = struct {
         if (p.simdWidth() != 32 or p.maxThreads() < (if (l.swiglu) @as(usize, if (l.prompt_tn == 2 or l.rows8) 64 else 128) else physical_sk * (if (l.cooperative) @as(usize, 64) else 32))) return error.UnsupportedPipelineShape;
         var sums_pipe: ?mtl.Pipeline = null;
         var sums_buffer: ?mtl.Buffer = null;
-        if (l.precompute_sums) {
+        if (l.precompute_sums and !l.raw_prompt) {
             sums_pipe = try mtl.Pipeline.init(device, lib, "tf_lane_sums", false);
             errdefer sums_pipe.?.deinit();
             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
         }
-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
+        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .raw_prompt = l.raw_prompt, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list, .quads = l.prompt_tn != 1 };
     }
 
     pub fn deinit(p: Projection) void {
@@ -542,6 +551,7 @@ pub const Projection = struct {
 
     /// Encodes one window; the caller owns buffers through GPU completion and orders later accesses.
     pub fn encode(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32) !void {
+        if (p.raw_prompt) return error.SumsNeedReg;
         if (p.residual) return error.InvalidSchedule;
         if (p.count) return error.InvalidSchedule;
         return p.encodeImpl(e, x, w, sb, null, y, rows, null, null, null);
@@ -555,7 +565,7 @@ pub const Projection = struct {
     /// encodeSums reading its [rows, stride] words at `dims` when given (an earlier dispatch wrote them: at most `rows`
     /// rows, the stride of `sums`): the launch is the one for `rows`, its arithmetic the one for the words' rows.
     pub fn encodeSumsAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, dims: ?Ref) !void {
-        if (!p.reg) return error.SumsNeedReg;
+        if (!p.reg and !p.raw_prompt) return error.SumsNeedReg;
         if (p.residual) return error.InvalidSchedule;
         if (rows == 0 or rows > reg_rows or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
@@ -710,7 +720,7 @@ pub const Projection = struct {
 
     fn encodeImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, given: ?Sums, y: Ref, rows: u32, hidden: ?Ref, counter: ?Ref, dims: ?Ref) !void {
         if (p.tile_list) return error.InvalidSchedule;
-        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg) reg_rows else 16)) return error.InvalidRows;
+        if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else if (p.reg or p.raw_prompt) reg_rows else 16)) return error.InvalidRows;
         const blocks = (rows + 15) / 16;
         const stride: u32 = if (given) |g| g.stride else 16 * blocks;
         try checkRef(x, rows * p.k * 2, 2);
@@ -739,7 +749,7 @@ pub const Projection = struct {
             e.setBuffer(y.buf, y.off, 7);
         }
         if (counter) |c| e.setBuffer(c.buf, c.off, 6); // TF_COUNT: the norm's wait word
-        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+        e.dispatchGroups(mtl.Size.of(p.tile_count, if (p.reg or p.raw_prompt) blocks else 1, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
         if (given == null and p.sums_buffer != null) e.barrier();
     }
 };
@@ -791,6 +801,29 @@ test "serial SK2 keeps logical split and is off by default" {
     l.sk = 2;
     l.reg = false;
     try std.testing.expectError(error.InvalidSchedule, l.validate());
+}
+
+test "raw prompt mode is explicit and constrained to precomputed Q4 g64 SK2" {
+    var l = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .raw_prompt = true };
+    try l.validate();
+    const raw = try source(std.testing.allocator, l);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "#define TF_RAW_PROMPT 1\n") != null);
+
+    l.sk = 1;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.sk = 2;
+    l.precompute_sums = false;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+    l.precompute_sums = true;
+    l.reg = true;
+    try std.testing.expectError(error.InvalidSchedule, l.validate());
+
+    const ordinary = Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true };
+    try ordinary.validate();
+    const plain = try source(std.testing.allocator, ordinary);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#define TF_RAW_PROMPT 1\n") == null);
 }
 
 test "a tile list takes decoded lean reg rows at a narrower whole-tile stride and only adds its define" {

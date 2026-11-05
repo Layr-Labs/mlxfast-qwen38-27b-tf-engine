@@ -187,6 +187,8 @@ pub const Stages = struct {
         }
         if (gu_wait) |n| {
             s.norm_wait = try m.kernels.quantCountedAfter(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows, n);
+        } else if (!s.compact and try m.kernels.rawDown(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows)) {
+            s.summed = false;
         } else if (!s.compact and try m.kernels.quantResid(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), s.hidden, s.residual, s.rows)) {
             s.summed = true;
         } else if (if (!s.compact) try m.kernels.quantCounted(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.output), s.rows) else null) |counted| {

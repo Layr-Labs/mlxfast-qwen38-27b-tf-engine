@@ -164,6 +164,9 @@ pub const Kernels = struct {
     /// Set around prompt chunks: prompt rows take projection.promptSplit, decoded rows the decode split.
     prompt: bool = false,
     lanes: std.AutoHashMapUnmanaged(Key, lane.Projection) = .empty,
+    raw_down_pipeline: ?lane.Projection = null,
+    raw_down_encodes: std.atomic.Value(u64) = .init(0),
+    raw_down_logged: std.atomic.Value(bool) = .init(false),
     cache: std.AutoHashMapUnmanaged(Key, mtl.Pipeline) = .empty,
     /// quantCounted's count word and normAfter's arrival word, zeroed when made and left zero by each waiting norm.
     count_words: ?mtl.Buffer = null,
@@ -182,6 +185,10 @@ pub const Kernels = struct {
     input_words_failed: bool = false,
 
     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
+        if (k.raw_down_pipeline) |*p| {
+            if (k.residency) |f| mtl.resident.fields.apply(p, f, false);
+            if (hook) |f| mtl.resident.fields.apply(p, f, true);
+        }
         var it = k.lanes.valueIterator();
         while (it.next()) |p| {
             if (k.residency) |f| mtl.resident.fields.apply(p, f, false);
@@ -205,6 +212,7 @@ pub const Kernels = struct {
         var lane_it = k.lanes.valueIterator();
         while (lane_it.next()) |p| p.deinit();
         k.lanes.deinit(k.allocator);
+        if (k.raw_down_pipeline) |*p| p.deinit();
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
@@ -348,6 +356,33 @@ pub const Kernels = struct {
             try entry.value_ptr.encodeSwiglu(span.encoder, xr, w, sb, xsr, hr, hsr, n);
         }
         try span.end();
+        return true;
+    }
+
+    /// Ordinary raw-Q4 lane math for prompt DOWN, on the producer's existing global group sums.
+    pub fn rawDown(k: *Kernels, encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, out: Ref, rows: u32) !bool {
+        if (!k.prompt or rows < 16 or rows > @import("gpu_frame.zig").max_rows or xs.stride < rows or p.runs.len != 0 or p.raw != null or p.tile != 32 or p.bits != 4 or p.group != 64 or p.n != 5120 or p.k != 17408) return false;
+        const raw = p.raw_prompt orelse return false;
+        if (k.raw_down_pipeline == null) {
+            k.raw_down_pipeline = try lane.Projection.init(k.allocator, k.device, .{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2, .precompute_sums = true, .raw_prompt = true });
+            k.joined(&k.raw_down_pipeline.?);
+        }
+        var span = profile.begin(k.profiler, encoder, .dense);
+        span.shape = .{ .n = p.n, .k = p.k, .sk = 2, .bits = 4 };
+        errdefer span.cancel();
+        var first: u32 = 0;
+        while (first < rows) : (first += lane.reg_rows) {
+            const count = @min(rows - first, lane.reg_rows);
+            try k.raw_down_pipeline.?.encodeSums(span.encoder,
+                .{ .buf = x.buffer, .off = x.offset + @as(usize, first) * p.k * 2 },
+                .{ .buf = raw.words.buffer, .off = raw.words.offset },
+                .{ .buf = raw.pairs.buffer, .off = raw.pairs.offset },
+                .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset + @as(usize, first) * 4 }, .stride = xs.stride },
+                .{ .buf = out.buffer, .off = out.offset + @as(usize, first) * p.n * 2 }, count);
+            _ = k.raw_down_encodes.fetchAdd(1, .monotonic);
+        }
+        try span.end();
+        if (!k.raw_down_logged.swap(true, .acq_rel)) std.log.info("qwen27: direct Q4 prompt DOWN path engaged", .{});
         return true;
     }
 

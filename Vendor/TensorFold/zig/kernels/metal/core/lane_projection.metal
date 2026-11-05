@@ -133,7 +133,11 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
 #endif
 
 #if TF_PRECOMPUTE_SUMS
+#if defined(TF_RAW_PROMPT)
+#define TF_SUM_VALUE(row, g) XS[(g) * stride + (row)]
+#else
 #define TF_SUM_VALUE(row, g) XS[(g) * 16 + (row)]
+#endif
 #else
 #define TF_SUM_VALUE(row, g) tf_lane_xsum(X, row, g, M)
 #endif
@@ -166,7 +170,11 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
     const device float* XS [[buffer(5)]],
 #endif
     uint sgi [[simdgroup_index_in_threadgroup]], uint lanei [[thread_index_in_simdgroup]],
+#if defined(TF_RAW_PROMPT)
+    uint2 tg [[threadgroup_position_in_grid]]) {
+#else
     uint tgx [[threadgroup_position_in_grid]]) {
+#endif
   const int lane = int(lanei), sg = int(sgi);
   const short qid = short(lane) >> 2;
   const short fm = (qid & 4) | ((short(lane) >> 1) & 3);
@@ -175,8 +183,18 @@ inline void tf_stage_codes(threadgroup uint* stage, thread const tf_raw& raw, in
 #else
   const short fn = ((qid & 2) | (short(lane) & 1)) * 4;
 #endif
+#if defined(TF_RAW_PROMPT)
+  const int row0 = int(tg.y) * 16;
+  const int M = min(mdims[0] - row0, 16);
+  const int stride = mdims[1];
+  const int tile = tf_tile(int(tg.x));
+  X += (size_t)row0 * TF_K;
+  Y += (size_t)row0 * TF_YS;
+  XS += row0;
+#else
   const int M = mdims[0];
   const int tile = tf_tile(int(tgx));
+#endif
   const int n0 = tile * NT;
   const int g_begin = TF_G0 + (sg * TF_GN) / TF_SK, g_end = TF_G0 + ((sg + 1) * TF_GN) / TF_SK;
   constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);

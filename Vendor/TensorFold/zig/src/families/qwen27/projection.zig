@@ -6,11 +6,27 @@ const row = @import("core").row_projection;
 const lane = @import("core").lane_projection;
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
+pub const RawPrompt = struct { words: Ref, pairs: Ref };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false, raw_prompt: ?RawPrompt = null };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
+
+/// A separate ordinary lane layout: canonical nibble codes and original, unfolded BF16 metadata.
+pub fn prepareRawPrompt(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), part: Triple) !RawPrompt {
+    if (part.bits != 4 or part.group != 64 or part.weight.rank != 2 or part.weight.shape[0] != 5120 or part.weight.shape[1] != 17408 / 8) return error.BadProjectionShape;
+    const layout = lane.Layout{ .n = 5120, .k = 17408, .format = .{ .bits = 4, .group = 64 }, .sk = 2 };
+    const words = try device.buffer(layout.weightWords() * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    errdefer words.deinit();
+    const pairs = try device.buffer(layout.metadataElements() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    errdefer pairs.deinit();
+    try lane.pack(layout, part.weight.host(u32), part.scales.host(u16), part.biases.host(u16), words.slice(u32, layout.weightWords()), pairs.slice(u16, layout.metadataElements()));
+    try owned.ensureUnusedCapacity(allocator, 2);
+    owned.appendAssumeCapacity(words);
+    owned.appendAssumeCapacity(pairs);
+    return .{ .words = .{ .buffer = words }, .pairs = .{ .buffer = pairs } };
+}
 
 pub fn split(n: usize, k: usize) !u32 {
     if (n == 0 or k == 0 or n % 4 != 0 or k % 64 != 0) return error.BadProjectionShape;
