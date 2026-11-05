@@ -370,7 +370,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
       if [[ "${MLXFAST_REQUIRE_METAL_TEST:-0}" == 1 ]]; then
         fail "trusted metal toolchain absent"
       fi
-      out="$(official_build --write "${WORK}/write" -- /usr/bin/true 2>&1 || true)"
+      # official_build execs, so the `|| true` must stay outside the
+      # substitution: inside it, it never runs and set -e ends the test.
+      out="$(official_build --write "${WORK}/write" -- /usr/bin/true 2>&1)" || true
       [[ "${out}" == 'sandboxed-build.sh: FAIL: xcrun-warm' \
         || "${out}" == 'sandboxed-build.sh: FAIL: toolchain-writable' ]] \
         || fail "missing Metal toolchain refusal changed: got '${out}', expected 'sandboxed-build.sh: FAIL: xcrun-warm' or 'sandboxed-build.sh: FAIL: toolchain-writable'"
