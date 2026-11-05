@@ -23,6 +23,28 @@ using namespace mpp::tensor_ops;
 #ifndef TF_SIEVE_M
 #define TF_SIEVE_M 16
 #endif
+#ifndef TF_SIEVE_LISTED
+#define TF_SIEVE_LISTED 0
+#endif
+#ifndef TF_SIEVE_BITS
+#define TF_SIEVE_BITS 1
+#endif
+#if TF_SIEVE_BITS == 2
+#define TF_SIEVE_SPAN 4.0f
+#define TF_SIEVE_MID 1.5f
+#define TF_SIEVE_VAR 1.25f
+#define TF_SIEVE_WORD uint4
+#else
+#define TF_SIEVE_SPAN 5.357f
+#define TF_SIEVE_MID 5.042f
+#define TF_SIEVE_WORD uint2
+#endif
+#ifndef TF_SIEVE_PAIR
+#define TF_SIEVE_PAIR 0
+#endif
+#ifndef TF_SIEVE_VAR
+#define TF_SIEVE_VAR 4.0f
+#endif
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
 // top's first pass: each block of TBLK tiles' highest best a a row, as tf_sieve_key's order (BK[block * 8 + row])
@@ -34,7 +56,9 @@ constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, g
 // its words 4-7 32 lanes on) into the 2-bit reg block of tile_batch 1 (lane_projection.halveReg's form): word j keeps
 // codes >> 2 of word j in bits 0-1 of each nibble and those of word j + 4 in bits 2-3, so the 2-bit kernel's two masks
 // give back each word's codes >> 2 in place. One thread a lane's uint4 of a block: tiles * KG * 32 threads.
-kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+// The 2-bit copy (code >> 2), the refine pass's: word j keeps codes >> 2 of word j in bits 0-1 of each nibble and those
+// of word j + 4 in bits 2-3.
+kernel void tf_head_sieve_pack2(const device uint4* W [[buffer(0)]], device uint4* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
   if (t >= uint(TILES * KG * 32)) return;
   const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
   const size_t wide = ((size_t)(tile / TF_TB) * KG + g) * TF_TB + tile % TF_TB;
@@ -42,16 +66,36 @@ kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint4
   W2[t] = ((w0 >> 2) & 0x33333333u) | (w1 & 0xCCCCCCCCu);
 }
 
+// s23: the 1-bit copy (code >> 3): a lane's uint2 of a block, word j's top bits in bit j of each nibble of .x (j < 4)
+// or bit j - 4 of .y, so the scan's mask (word >> j) & 0x11111111 gives back each word's code >> 3 in place.
+kernel void tf_head_sieve_pack(const device uint4* W [[buffer(0)]], device uint2* W2 [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+  if (t >= uint(TILES * KG * 32)) return;
+  const uint block = t / 32, lane = t % 32, tile = block / KG, g = block % KG;
+  const size_t wide = ((size_t)(tile / TF_TB) * KG + g) * TF_TB + tile % TF_TB;
+  const uint4 w0 = W[wide * 64 + lane], w1 = W[wide * 64 + 32 + lane];
+  uint x = 0u, y = 0u;
+  for (uint j = 0; j < 4; j++) {
+    x |= ((w0[j] >> 3) & 0x11111111u) << j;
+    y |= ((w1[j] >> 3) & 0x11111111u) << j;
+  }
+  W2[t] = uint2(x, y);
+}
+
 // Each group's sums of squares of the rows (XQ[g * 16 + row], zero past `rows`, the stride of the norm's sums for at
 // most 8 rows), each group's values added in order from zero; the candidate list, its dispatch words and the scan's
 // block keys cleared. max(KG * 16, BLOCKS * 8) threads.
 kernel void tf_head_sieve_prep(const device bfloat* X [[buffer(0)]], constant int& rows [[buffer(1)]], device float* XQ [[buffer(2)]],
-    device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], device uint* BK [[buffer(5)]], uint t [[thread_position_in_grid]]) {
+    device uint* list [[buffer(3)]], device uint* args [[buffer(4)]], device uint* BK [[buffer(5)]], device uint* list2 [[buffer(6)]],
+    device uint* args2 [[buffer(7)]], uint t [[thread_position_in_grid]]) {
   if (t == 0) {
     list[0] = 0;
     args[0] = 0;
     args[1] = 1;
     args[2] = 1;
+    list2[0] = 0;
+    args2[0] = 0;
+    args2[1] = 1;
+    args2[2] = 1;
   }
   if (t < uint(BLOCKS * 8)) BK[t] = 0;
   if (t >= uint(KG * 16)) return;
@@ -95,10 +139,16 @@ inline uint tf_sieve_key(float v) {
 // that best a (when finite) into its block's key BK[(tile / TBLK) * 8 + row] (atomic max of tf_sieve_key).
 // dims: rows, the sums' stride (16). Grid TILES threadgroups of 32.
 [[max_total_threads_per_threadgroup(32)]]
-[[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device uint4* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
+[[kernel]] void tf_head_sieve_scan(const device bfloat* X [[buffer(0)]], const device TF_SIEVE_WORD* W [[buffer(1)]], const device bfloat* SB [[buffer(2)]],
     constant int2& dims [[buffer(3)]], device float* HM [[buffer(4)]], const device float* XS [[buffer(5)]], const device float* XQ [[buffer(6)]],
-    device atomic_uint* BK [[buffer(7)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
-  const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, tile = int(tg), n0 = tile * NT;
+    device atomic_uint* BK [[buffer(7)]], const device uint* LIST [[buffer(8)]], uint lanei [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {
+#if TF_SIEVE_LISTED
+  // the refine pass: threadgroup i takes tier one's listed tile LIST[1 + i] (indirect dispatch of LIST[0] groups)
+  const int tile = int(LIST[1 + tg]);
+#else
+  const int tile = int(tg);
+#endif
+  const int lane = int(lanei), M = min(dims.x, 8), stride = dims.y, n0 = tile * NT;
   if (tile >= TILES || M <= 0) return;
   const int nb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1), mb = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   constexpr auto desc = matmul2d_descriptor(TF_SIEVE_M, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
@@ -118,7 +168,7 @@ inline uint tf_sieve_key(float v) {
   // the metadata (io), the row sums (xo, qo) and the rows' group columns (xv), the same words as the products
   // tile * KG * 32 + g * 32, g * TF_N, g * stride, g * 16 and g * GS index (all below 2^32 for the heads fits() takes)
   uint wo = uint(tile) * uint(KG * 32) + uint(lane);
-  uint4 nw = W[wo];
+  TF_SIEVE_WORD nw = W[wo];
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
@@ -136,6 +186,88 @@ inline uint tf_sieve_key(float v) {
 #endif
   uint xo = uint(mb), qo = uint(mb), xv = 0;
   const array<int32_t, 2> xstr = {1, TF_K};
+#if TF_SIEVE_PAIR && TF_SIEVE_BITS == 1
+  // s23: two groups a step, each into its own right input and destination, so two tensor ops are in flight; C takes
+  // group g's terms before group g + 1's, as the one-group loop adds them.
+  auto cbB = op.template get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto PB = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a0)>, metal::remove_addrspace_t<decltype(cbB)>, float>();
+  thread half2* b2B = (thread half2*)&cbB[0];
+  for (int g = 0; g < KG; g += 2) {
+    uint4 qa0, qa1, qb0, qb1;
+#if defined(TF_SBI12)
+    qa0 = tf_sieve_look12a(tab, ni); qa1 = tf_sieve_look12b(tab, ni);
+#elif defined(TF_SBI)
+    qa0 = uint4(tab[ni0.x], tab[ni0.y], tab[ni0.z], tab[ni0.w]); qa1 = uint4(tab[ni1.x], tab[ni1.y], tab[ni1.z], tab[ni1.w]);
+#else
+    qa0 = sbv[io]; qa1 = sbv[io + 4]; io += uint(TF_N / 4);
+#endif
+    const uint2 cwa = nw;
+    const float xa = XS[xo], xqa = XQ[qo];
+    xo += uint(stride); qo += 16u;
+    wo += 32u; nw = W[wo];
+#if defined(TF_SBI12)
+    io += uint(TF_N / 8); ni = ixs[io];
+    qb0 = tf_sieve_look12a(tab, ni); qb1 = tf_sieve_look12b(tab, ni);
+#elif defined(TF_SBI)
+    io += uint(TF_N / 4); ni0 = ixs[io]; ni1 = ixs[io + 4];
+    qb0 = uint4(tab[ni0.x], tab[ni0.y], tab[ni0.z], tab[ni0.w]); qb1 = uint4(tab[ni1.x], tab[ni1.y], tab[ni1.z], tab[ni1.w]);
+#else
+    qb0 = sbv[io]; qb1 = sbv[io + 4]; io += uint(TF_N / 4);
+#endif
+    const uint2 cwb = nw;
+    const float xb = XS[xo], xqb = XQ[qo];
+    xo += uint(stride); qo += 16u;
+    for (int w = 0; w < 8; w++) {
+      const uint wa = w < 4 ? ((cwa.x >> w) & 0x11111111u) : ((cwa.y >> (w - 4)) & 0x11111111u);
+      const uint wb = w < 4 ? ((cwb.x >> w) & 0x11111111u) : ((cwb.y >> (w - 4)) & 0x11111111u);
+      const int e = 16 * (w & 1) + 2 * (w >> 1);
+      b2[e] = as_type<half2>(wa & 0x000F000Fu);
+      b2[e + 1] = as_type<half2>((wa >> 4) & 0x000F000Fu);
+      b2[e + 8] = as_type<half2>((wa >> 8) & 0x000F000Fu);
+      b2[e + 9] = as_type<half2>((wa >> 12) & 0x000F000Fu);
+      b2B[e] = as_type<half2>(wb & 0x000F000Fu);
+      b2B[e + 1] = as_type<half2>((wb >> 4) & 0x000F000Fu);
+      b2B[e + 8] = as_type<half2>((wb >> 8) & 0x000F000Fu);
+      b2B[e + 9] = as_type<half2>((wb >> 12) & 0x000F000Fu);
+    }
+    {
+      const uint step = uint(g + 2 < KG);
+      wo += step * 32u;
+      nw = W[wo];
+#if defined(TF_SBI12)
+      io += step * uint(TF_N / 8);
+      ni = ixs[io];
+#elif defined(TF_SBI)
+      io += step * uint(TF_N / 4);
+      ni0 = ixs[io];
+      ni1 = ixs[io + 4];
+#endif
+    }
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> xA((device bfloat*)X + xv, dextents<int32_t, 2>(GS, M), xstr);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> xB((device bfloat*)X + xv + GS, dextents<int32_t, 2>(GS, M), xstr);
+    xv += uint(2 * GS);
+    op.run(xA, cb, P);
+    op.run(xB, cbB, PB);
+    for (int j = 0; j < 4; j++) {
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(qa0[j]), v1 = as_type<vec<bfloat, 2>>(qa1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+      const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
+      C[j] = fma(TF_SIEVE_SPAN * s0, P[j], fma(fma(TF_SIEVE_MID, t0, b0), xa, C[j]));
+      C[4 + j] = fma(TF_SIEVE_SPAN * s1, P[8 + j], fma(fma(TF_SIEVE_MID, t1, b1), xa, C[4 + j]));
+      V[j] = fma(t0 * t0, xqa, V[j]);
+      V[4 + j] = fma(t1 * t1, xqa, V[4 + j]);
+    }
+    for (int j = 0; j < 4; j++) {
+      const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(qb0[j]), v1 = as_type<vec<bfloat, 2>>(qb1[j]);
+      const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y);
+      const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
+      C[j] = fma(TF_SIEVE_SPAN * s0, PB[j], fma(fma(TF_SIEVE_MID, t0, b0), xb, C[j]));
+      C[4 + j] = fma(TF_SIEVE_SPAN * s1, PB[8 + j], fma(fma(TF_SIEVE_MID, t1, b1), xb, C[4 + j]));
+      V[j] = fma(t0 * t0, xqb, V[j]);
+      V[4 + j] = fma(t1 * t1, xqb, V[4 + j]);
+    }
+  }
+#else
   for (int g = 0; g < KG; g++) {
 #if defined(TF_SBI12)
     const uint4 q0 = tf_sieve_look12a(tab, ni), q1 = tf_sieve_look12b(tab, ni);
@@ -145,13 +277,17 @@ inline uint tf_sieve_key(float v) {
     const uint4 q0 = sbv[io], q1 = sbv[io + 4];
     io += uint(TF_N / 4);
 #endif
-    const uint4 cw = nw;
+    const TF_SIEVE_WORD cw = nw;
     const float x0 = XS[xo], xq = XQ[qo];
     xo += uint(stride);
     qo += 16u;
     for (int w = 0; w < 8; w++) {
       // codes >> 2 as fp16 subnormals (bits = code, value code * 2^-24); the scales carry the 2^24 back
+#if TF_SIEVE_BITS == 2
       const uint word = w < 4 ? (cw[w] & 0x33333333u) : ((cw[w - 4] >> 2) & 0x33333333u);
+#else
+      const uint word = w < 4 ? ((cw[0] >> w) & 0x11111111u) : ((cw[1] >> (w - 4)) & 0x11111111u);
+#endif
       const int e = 16 * (w & 1) + 2 * (w >> 1);
       b2[e] = as_type<half2>(word & 0x000F000Fu);
       b2[e + 1] = as_type<half2>((word >> 4) & 0x000F000Fu);
@@ -180,16 +316,18 @@ inline uint tf_sieve_key(float v) {
       const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); // scales stored times 2^24
       const float t0 = s0 * (1.0f / 16777216.0f), t1 = s1 * (1.0f / 16777216.0f);
       // code = 4 (code >> 2) + 1.5 + r: scale 4 s on the 2-bit product, bias b + 1.5 s on the row sum
-      C[j] = fma(4.0f * s0, P[j], fma(fma(1.5f, t0, b0), x0, C[j]));
-      C[4 + j] = fma(4.0f * s1, P[8 + j], fma(fma(1.5f, t1, b1), x0, C[4 + j]));
+      // s23 1-bit: code ~ TF_SIEVE_SPAN (code >> 3) + TF_SIEVE_MID (the head's code histogram's conditional means)
+      C[j] = fma(TF_SIEVE_SPAN * s0, P[j], fma(fma(TF_SIEVE_MID, t0, b0), x0, C[j]));
+      C[4 + j] = fma(TF_SIEVE_SPAN * s1, P[8 + j], fma(fma(TF_SIEVE_MID, t1, b1), x0, C[4 + j]));
       V[j] = fma(t0 * t0, xq, V[j]);
       V[4 + j] = fma(t1 * t1, xq, V[4 + j]);
     }
   }
+#endif
   // fmax drops a NaN operand: a row of NaN logits keeps -inf here, its first tile 0 and every tile listed
   float hi = -INFINITY, mid = -INFINITY;
   for (int i = 0; i < 8; i++) {
-    const float v = C[i], ks = TF_SIEVE_KAPPA * sqrt(1.25f * V[i]);
+    const float v = C[i], ks = TF_SIEVE_KAPPA * sqrt(TF_SIEVE_VAR * V[i]);
     hi = fmax(hi, v + ks + fma(fabs(v) + ks, SLACK_REL, SLACK_ABS));
     mid = fmax(mid, v);
   }
@@ -202,7 +340,9 @@ inline uint tf_sieve_key(float v) {
     HM[(size_t)tile * 16 + mb] = hi;
     HM[(size_t)tile * 16 + 8 + mb] = mid;
     // top never takes a tile whose best a is -inf, so neither does a block key
+#if !TF_SIEVE_LISTED
     if (mid > -INFINITY) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + mb, tf_sieve_key(mid), memory_order_relaxed);
+#endif
   }
 }
 
@@ -265,6 +405,44 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
   bool hit = false;
   if (t < uint(TILES))
     for (int r = 0; r < 8; r++) hit = hit || (r < rows && HM[(size_t)t * 16 + r] >= thr[r]);
+  const uint n = simd_sum(uint(hit)), at = simd_prefix_exclusive_sum(uint(hit));
+  uint base = 0;
+  if (lane == 0 && n != 0) {
+    base = atomic_fetch_add_explicit(list, n, memory_order_relaxed);
+    atomic_fetch_add_explicit(args, n, memory_order_relaxed);
+  }
+  base = simd_shuffle(base, 0);
+  if (hit) atomic_store_explicit(list + 1 + base + at, t, memory_order_relaxed);
+}
+
+// s23 refine: of tier one's listed tiles (LIST1), those whose 2-bit best a + k s + slack (HM2) reaches some row's
+// threshold (from Y1 and the refine pass's own best a of the first tile, which tier one always lists), and every row's first tile
+// whatever its bound, into list2 (its count also on the indirect dispatch's first word). Grid ceil(tiles / 256) of 256.
+kernel void tf_head_sieve_select2(const device float* HM [[buffer(0)]], const device ushort* Y1 [[buffer(1)]], const device uint* first [[buffer(2)]],
+    constant int& rows [[buffer(3)]], const device uint* LIST1 [[buffer(4)]], const device float* HM2 [[buffer(5)]],
+    device atomic_uint* list [[buffer(6)]], device atomic_uint* args [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint group [[threadgroup_position_in_grid]]) {
+  threadgroup float thr[8];
+  if (tid < 8) {
+    float e = -INFINITY;
+    if (int(tid) < rows) {
+      const device ushort* y = Y1 + tid * 256 + tid * 32;
+      for (int c = 0; c < 32; c++) {
+        const float v = as_type<float>(uint(y[c]) << 16);
+        if (v > e) e = v;
+      }
+      e = fmin(e, HM2[(size_t)first[1 + tid] * 16 + 8 + tid]);
+    }
+    thr[tid] = e;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint i = group * 256 + tid, n1 = min(LIST1[0], uint(TILES));
+  bool hit = false;
+  uint t = 0;
+  if (i < n1) {
+    t = LIST1[1 + i];
+    for (int r = 0; r < 8; r++) hit = hit || (r < rows && (HM2[(size_t)t * 16 + r] >= thr[r] || t == first[1 + r]));
+  }
   const uint n = simd_sum(uint(hit)), at = simd_prefix_exclusive_sum(uint(hit));
   uint base = 0;
   if (lane == 0 && n != 0) {

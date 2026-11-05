@@ -35,6 +35,14 @@ pub const HeadSieve = struct {
     top: mtl.Pipeline,
     select: mtl.Pipeline,
     pick: mtl.Pipeline,
+    /// s23 refine tier: the 2-bit copy's pack, the listed 2-bit scan and the refine select
+    pack2: mtl.Pipeline,
+    scan2: mtl.Pipeline,
+    select2: mtl.Pipeline,
+    words2: mtl.Buffer,
+    o_hm2: usize,
+    o_list2: usize,
+    o_args2: usize,
     /// The head the sieve stands for (Weights.head_decode): its words and metadata, which the exact launches read.
     head: projection.Linear,
     tiles: u32,
@@ -54,6 +62,7 @@ pub const HeadSieve = struct {
     o_y1: usize,
     o_list: usize,
     o_args: usize,
+    listed1: u64 = 0,
     rounds: u64 = 0,
     probe8: bool = false,
     checked8: bool = false,
@@ -109,6 +118,20 @@ pub const HeadSieve = struct {
                 scan8 = mtl.Pipeline.init(m.device, l8, "tf_head_sieve_scan", false) catch null;
             }
         }
+        const pack2 = try mtl.Pipeline.init(m.device, lib, "tf_head_sieve_pack2", false);
+        errdefer pack2.deinit();
+        const select2 = try mtl.Pipeline.init(m.device, lib, "tf_head_sieve_select2", false);
+        errdefer select2.deinit();
+        const scan2 = blk: {
+            var text2: std.ArrayList(u8) = .empty;
+            defer text2.deinit(a);
+            try text2.appendSlice(a, "#define TF_SIEVE_BITS 2\n#define TF_SIEVE_LISTED 1\n");
+            try text2.appendSlice(a, text.items);
+            const lib2 = try mtl.Library.fromSource(m.device, text2.items, mtl.CompileOptions.mlx());
+            defer lib2.deinit();
+            break :blk try mtl.Pipeline.init(m.device, lib2, "tf_head_sieve_scan", false);
+        };
+        errdefer scan2.deinit();
         if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
@@ -131,9 +154,17 @@ pub const HeadSieve = struct {
         const o_y1 = take(&at, rows_max * first_stride * 2);
         const o_list = take(&at, (1 + @as(usize, tiles)) * 4);
         const o_args = take(&at, 4 * 4);
-        const words = try m.device.buffer(@as(usize, tiles) * groups * 512, options);
+        const o_hm2 = take(&at, @as(usize, tiles) * 16 * 4);
+        const o_list2 = take(&at, (1 + @as(usize, tiles)) * 4);
+        const o_args2 = take(&at, 4 * 4);
+        const words = try m.device.buffer(@as(usize, tiles) * groups * 256, options);
         owned.append(a, words) catch |err| {
             words.deinit();
+            return err;
+        };
+        const words2 = try m.device.buffer(@as(usize, tiles) * groups * 512, options);
+        owned.append(a, words2) catch |err| {
+            words2.deinit();
             return err;
         };
         const scratch = try m.device.buffer(at, options);
@@ -143,6 +174,7 @@ pub const HeadSieve = struct {
         };
         if (residency) |f| {
             f.join(f.ctx, words);
+            f.join(f.ctx, words2);
             f.join(f.ctx, scratch);
         }
         // the 2-bit copy, once: a thread a lane's uint4 of a block
@@ -153,18 +185,22 @@ pub const HeadSieve = struct {
             e.setBuffer(head.words.buffer, head.words.offset, 0);
             e.setBuffer(words, 0, 1);
             e.dispatchThreads(mtl.Size.of(@as(usize, tiles) * groups * 32, 1, 1), mtl.Size.of(256, 1, 1));
+            e.setPipeline(pack2);
+            e.setBuffer(head.words.buffer, head.words.offset, 0);
+            e.setBuffer(words2, 0, 1);
+            e.dispatchThreads(mtl.Size.of(@as(usize, tiles) * groups * 32, 1, 1), mtl.Size.of(256, 1, 1));
             e.end();
             cb.commit();
             cb.wait();
             if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 2-bit copy")) return error.HeadSieveGpuFailure;
         }
-        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
-        return .{ .pack = made[0], .prep = made[1], .scan = made[2], .scan8 = scan8, .top = made[3], .select = made[4], .pick = made[5], .head = head, .tiles = tiles, .groups = groups, .blocks = blocks, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_hm8 = o_hm8, .o_bk = o_bk, .o_bk8 = o_bk8, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
+        std.log.info("qwen27: head sieve: kappa {d:.2}, 1-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 256 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
+        return .{ .pack = made[0], .prep = made[1], .scan = made[2], .scan8 = scan8, .top = made[3], .select = made[4], .pick = made[5], .pack2 = pack2, .scan2 = scan2, .select2 = select2, .words2 = words2, .o_hm2 = o_hm2, .o_list2 = o_list2, .o_args2 = o_args2, .head = head, .tiles = tiles, .groups = groups, .blocks = blocks, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_hm8 = o_hm8, .o_bk = o_bk, .o_bk8 = o_bk8, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
     }
 
     /// The pipelines; the buffers go with the runner's `owned`.
     pub fn deinit(s: *HeadSieve) void {
-        for ([_]mtl.Pipeline{ s.pack, s.prep, s.scan, s.top, s.select, s.pick }) |p| p.deinit();
+        for ([_]mtl.Pipeline{ s.pack, s.prep, s.scan, s.top, s.select, s.pick, s.pack2, s.scan2, s.select2 }) |p| p.deinit();
         if (s.scan8) |p| p.deinit();
     }
 
@@ -192,6 +228,8 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_list, 3);
         e.setBuffer(s.scratch, s.o_args, 4);
         e.setBuffer(s.scratch, s.o_bk, 5);
+        e.setBuffer(s.scratch, s.o_list2, 6);
+        e.setBuffer(s.scratch, s.o_args2, 7);
         e.dispatchThreads(mtl.Size.of(@max(@as(usize, s.groups) * sums_stride, @as(usize, s.blocks) * rows_max), 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
         // 2: every tile's best a + k s and best a, a row each, through the 2-bit copy. The 8-row scan is used once it
@@ -207,6 +245,7 @@ pub const HeadSieve = struct {
             e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
             e.setBuffer(s.scratch, s.o_xq, 6);
             e.setBuffer(s.scratch, s.o_bk, 7);
+            e.setBuffer(s.scratch, s.o_list, 8);
             e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
         } else {
             e.setPipeline(s.scan);
@@ -218,6 +257,7 @@ pub const HeadSieve = struct {
             e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
             e.setBuffer(s.scratch, s.o_xq, 6);
             e.setBuffer(s.scratch, s.o_bk, 7);
+            e.setBuffer(s.scratch, s.o_list, 8);
             e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
             if (!s.checked8 and s.scan8 != null and !s.probe8) {
                 e.setPipeline(s.scan8.?);
@@ -229,6 +269,7 @@ pub const HeadSieve = struct {
                 e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
                 e.setBuffer(s.scratch, s.o_xq, 6);
                 e.setBuffer(s.scratch, s.o_bk8, 7);
+                e.setBuffer(s.scratch, s.o_list, 8);
                 e.dispatchGroups(mtl.Size.of(s.tiles, 1, 1), mtl.Size.of(32, 1, 1));
                 s.probe8 = true;
             }
@@ -259,15 +300,40 @@ pub const HeadSieve = struct {
         e.setBuffer(s.scratch, s.o_args, 5);
         e.dispatchGroups(mtl.Size.of((s.tiles + 255) / 256, 1, 1), mtl.Size.of(256, 1, 1));
         e.barrier();
+        // s23 refine: tier one's listed tiles through the 2-bit copy (one SIMD group a listed tile, indirect), then
+        // those whose 2-bit bound reaches a row's threshold, and every row's first tile, into list2
+        e.setPipeline(s.scan2);
+        e.setBuffer(x.buffer, x.offset, 0);
+        e.setBuffer(s.words2, 0, 1);
+        e.setBuffer(meta.buffer, meta.offset, 2);
+        e.setValue([2]i32{ @intCast(rows), sums_stride }, 3);
+        e.setBuffer(s.scratch, s.o_hm2, 4);
+        e.setBuffer(xs.ref.buffer, xs.ref.offset, 5);
+        e.setBuffer(s.scratch, s.o_xq, 6);
+        e.setBuffer(s.scratch, s.o_bk, 7);
+        e.setBuffer(s.scratch, s.o_list, 8);
+        e.dispatchIndirect(s.scratch, s.o_args, mtl.Size.of(32, 1, 1));
+        e.barrier();
+        e.setPipeline(s.select2);
+        e.setBuffer(s.scratch, s.o_hm, 0);
+        e.setBuffer(s.scratch, s.o_y1, 1);
+        e.setBuffer(s.scratch, s.o_first, 2);
+        e.setValue(@as(i32, @intCast(rows)), 3);
+        e.setBuffer(s.scratch, s.o_list, 4);
+        e.setBuffer(s.scratch, s.o_hm2, 5);
+        e.setBuffer(s.scratch, s.o_list2, 6);
+        e.setBuffer(s.scratch, s.o_args2, 7);
+        e.dispatchGroups(mtl.Size.of((s.tiles + 255) / 256, 1, 1), mtl.Size.of(256, 1, 1));
+        e.barrier();
         // 6: the listed tiles exactly, as many threadgroups as tiles listed, rows the vocabulary apart in the logits buffer;
         // beside it, the listed tiles' lines requested at once, as in 4
-        m.kernels.warmTiles(e, s.head, s.ref(s.o_list), s.tiles) catch {};
-        try m.kernels.quantTilesIndirect(e, s.head, x, xs, s.ref(s.o_list), logits, rows, s.tiles, s.head.n, s.ref(s.o_args));
+        m.kernels.warmTiles(e, s.head, s.ref(s.o_list2), s.tiles) catch {};
+        try m.kernels.quantTilesIndirect(e, s.head, x, xs, s.ref(s.o_list2), logits, rows, s.tiles, s.head.n, s.ref(s.o_args2));
         e.barrier();
         // 7: each row's token from those words
         e.setPipeline(s.pick);
         e.setBuffer(logits.buffer, logits.offset, 0);
-        e.setBuffer(s.scratch, s.o_list, 1);
+        e.setBuffer(s.scratch, s.o_list2, 1);
         e.setBuffer(picks, 0, 2);
         e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(1024, 1, 1));
     }
@@ -288,12 +354,13 @@ pub const HeadSieve = struct {
             s.probe8 = false;
             std.log.info("qwen27: head sieve: 8-row scan {s} (bit-identical fragment: {s})", .{ if (same) "on" else "off", if (same) "yes" else "no" });
         }
-        const n = s.scratch.slice(u32, s.o_list / 4 + 1)[s.o_list / 4];
+        s.listed1 += s.scratch.slice(u32, s.o_list / 4 + 1)[s.o_list / 4];
+        const n = s.scratch.slice(u32, s.o_list2 / 4 + 1)[s.o_list2 / 4];
         s.rounds += 1;
         s.listed += n;
         s.listed_max = @max(s.listed_max, n);
         if (s.rounds != s.next_log) return;
         s.next_log *= 2;
-        std.log.info("qwen27: head sieve: rounds={d} listed tiles avg={d} max={d} of {d}", .{ s.rounds, s.listed / s.rounds, s.listed_max, s.tiles });
+        std.log.info("qwen27: head sieve: rounds={d} tier-1 listed avg={d}, listed tiles avg={d} max={d} of {d}", .{ s.rounds, s.listed1 / s.rounds, s.listed / s.rounds, s.listed_max, s.tiles });
     }
 };
