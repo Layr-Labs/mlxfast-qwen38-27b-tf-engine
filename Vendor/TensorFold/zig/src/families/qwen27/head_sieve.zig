@@ -131,7 +131,7 @@ pub const HeadSieve = struct {
         const o_y1 = take(&at, rows_max * first_stride * 2);
         const o_list = take(&at, (1 + @as(usize, tiles)) * 4);
         const o_args = take(&at, 4 * 4);
-        const words = try m.device.buffer(@as(usize, tiles) * groups * 512, options);
+        const words = try m.device.buffer(@as(usize, tiles) * groups * 256, options);
         owned.append(a, words) catch |err| {
             words.deinit();
             return err;
@@ -158,7 +158,7 @@ pub const HeadSieve = struct {
             cb.wait();
             if (@import("decode_round.zig").gpuFailed(cb, "the head sieve's 2-bit copy")) return error.HeadSieveGpuFailure;
         }
-        std.log.info("qwen27: head sieve: kappa {d:.2}, 2-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 512 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
+        std.log.info("qwen27: head sieve: kappa {d:.2}, 1-bit copy {d} MiB, metadata {s}", .{ kappa, @as(usize, tiles) * groups * 256 >> 20, if (head.index == null) "pairs" else if (head.index12) "12-bit indices" else "16-bit indices" });
         return .{ .pack = made[0], .prep = made[1], .scan = made[2], .scan8 = scan8, .top = made[3], .select = made[4], .pick = made[5], .head = head, .tiles = tiles, .groups = groups, .blocks = blocks, .kappa = kappa, .words = words, .scratch = scratch, .o_xq = o_xq, .o_hm = o_hm, .o_hm8 = o_hm8, .o_bk = o_bk, .o_bk8 = o_bk8, .o_first = o_first, .o_y1 = o_y1, .o_list = o_list, .o_args = o_args };
     }
 
