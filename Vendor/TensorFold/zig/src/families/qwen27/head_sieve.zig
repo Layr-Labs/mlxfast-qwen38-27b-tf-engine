@@ -26,7 +26,7 @@ pub const HeadSieve = struct {
     const first_stride = rows_max * 32;
     const sums_stride = 16; // quant.padded(rows) for rows_max rows at most
     /// Tiles a block key covers (head_sieve.metal's TBLK): the scan keeps each block's highest best a a row for top.
-    const block_tiles = 256;
+    const block_tiles = 128;
 
     pack: mtl.Pipeline,
     prep: mtl.Pipeline,

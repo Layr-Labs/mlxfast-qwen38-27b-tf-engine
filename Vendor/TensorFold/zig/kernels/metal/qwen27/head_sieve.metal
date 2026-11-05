@@ -26,7 +26,7 @@ using namespace mpp::tensor_ops;
 
 constant constexpr int NT = 32, GS = 64, KG = TF_K / GS, TILES = TF_N / NT;
 // top's first pass: each block of TBLK tiles' highest best a a row, as tf_sieve_key's order (BK[block * 8 + row])
-constant constexpr int TBLK = 256, BLOCKS = (TILES + TBLK - 1) / TBLK;
+constant constexpr int TBLK = 128, BLOCKS = (TILES + TBLK - 1) / TBLK;
 constant constexpr float SLACK_REL = 1.0f / 128.0f; // a bf16 logit's spacing at most, relative to its size
 constant constexpr float SLACK_ABS = 1e-2f;         // the f32 sums' rounding, generously
 
