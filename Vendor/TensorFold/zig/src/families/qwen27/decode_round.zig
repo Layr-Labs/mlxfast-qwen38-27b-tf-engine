@@ -6,6 +6,10 @@ const Frame = @import("gpu_frame.zig").Frame;
 const forward = @import("forward.zig");
 /// Layers a verify encodes before committing them, so the GPU starts while the CPU encodes the rest.
 const commit_every = 8;
+/// Decoded rows (a verify's, a serial step's) commit periodically only up to this layer count: their host encodes a
+/// layer several times faster than the GPU runs it, so once 8 layers are on the GPU the host encodes the other 56 and
+/// the tail before the GPU runs out, and they go in one command buffer with no boundary for the GPU to cross.
+const decoded_commit_until = 8;
 /// Layers a verify encodes before its first commit, 0 for the first layer's mixer alone: the GPU (kept busy by the draft
 /// bridge) starts after the embedding and the first layer's norm and mixer are encoded, and the host encodes that layer's
 /// MLP and the next chunk's layers while the GPU runs them.
@@ -78,7 +82,15 @@ pub const Runner = struct {
     /// then cleared: work its caller left pending (Generation: the last round's keep), so planning and encoding overlap
     /// it.
     settle: ?forward.Hook = null,
+    /// Set by its caller around one prompt pass: as each segment but the last of a staggered pass ends on the GPU, `due`
+    /// then `run` with the absolute row its rows end at (segments.runCommittingEarly's laneDone).
+    rows_done: ?RowsDone = null,
     current_gdn: ?*const GdnPlan = null,
+    /// The next verify's first command buffer, committed ahead (commitFirst); its verify (verifyImpl) encodes the rest.
+    first: ?First = null,
+    /// While commitFirst encodes: the plan metadata its GDN mixer reads.
+    first_metadata: ?@import("gdn_pool_gpu.zig").Metadata = null,
+    first_dims: ?@import("projection.zig").Ref = null,
     current_attention: ?*const attn.Plan = null,
     /// A verify's attention plan, made by its first attention layer (planAttention) rather than before its first commit.
     attention_due: ?struct { plan: *attn.Plan, made: *bool } = null,
@@ -273,9 +285,100 @@ pub const Runner = struct {
         return r.verifyImpl(round, head, true);
     }
 
+    /// What a first command buffer committed ahead (commitFirst) leaves its verify: the buffer (checked once the pass ran),
+    /// the slot and start its rows follow, the rows it ran, the GDN replay it took and what its mixer left in
+    /// Frame.mixer_sums.
+    pub const First = struct { cb: mtl.CommandBuffer, start: u32, rows: u32, deferred: ?abi.Deferred, mixer_sums: bool };
+    /// Rows every first command buffer committed ahead runs: as many as any depth-one tree of the drafter's 2-row block.
+    pub const first_rows = 8;
+
+    /// The next verify's first command buffer, committed now behind `fences` (the drafter frame that picks its tree, the
+    /// last round's keep), before the host knows the tree: the lead, the embedding of `first_rows` rows from `ids` (the
+    /// tree's tokens, written on the GPU, its anchor in the rows past them), the first layer's norm reading `dims`
+    /// ([first_rows, stride]) and that layer's GDN mixer on a depth-one star of those rows, its plan's metadata in
+    /// `metadata`. Each launch is the one a verify of first_rows rows encodes, and each row's words depend only on its own
+    /// row and on row 0 (its parent), so the rows a tree of fewer rows takes are the words a verify of that tree writes.
+    /// The tree's verify then encodes from the first layer's MLP on (verifyImpl). False: nothing committed (the caller's
+    /// verify encodes all of it).
+    pub fn commitFirst(r: *Runner, ids: @import("projection.zig").Ref, dims: @import("projection.zig").Ref, meta: @import("gdn_pool_gpu.zig").Metadata, fences: []const mtl.objc.Id, lead: forward.Tail) !bool {
+        // a slot whose first rows' window ends inside the context, nothing in flight, no clear or image rows due
+        if (r.first != null or r.failed or r.active != null or r.ready == 0 or r.words[0] == .dirty or r.images != null or r.model.ane != null or r.offsets[0] == 0 or r.capacity - r.offsets[0] < first_rows) return false;
+        if (r.model.weights.layers.len == 0) return false;
+        // the first layer's mixer is GDN (its projections read `dims`, not the frame's [rows, stride] words)
+        switch (r.model.weights.layers[0].mixer) {
+            .linear => {},
+            .attention => return false,
+        }
+        const placeholder: [first_rows]u32 = @splat(0);
+        var star: [first_rows]i32 = @splat(0);
+        star[0] = -1;
+        // planning that fails commits nothing: the verify then encodes all of it
+        var round = Round.init(r.allocator, &.{.{ .slot = 0, .start = r.offsets[0], .capacity = r.capacity, .ids = &placeholder, .parents = &star }}, @intCast(r.model.config.conv_kernel), r.slots, @intCast(r.model.config.vocab)) catch return false;
+        defer round.deinit();
+        var paths = [_][]const u32{&.{}};
+        var recurrent = round.recurrent(r.params(first_rows) catch return false, &paths) catch return false;
+        defer recurrent.deinit();
+        if (!r.gdn.starPlan(recurrent)) return false;
+        r.writes();
+        // the tree's verify is a depth-one round's, whose keep stashes its GDN rows (Generation.runRound's defer_gdn)
+        const was = r.defer_gdn;
+        r.defer_gdn = true;
+        const deferred = r.deferGdn(&round, recurrent, false);
+        r.defer_gdn = was;
+        const taken = try deferred;
+        try r.gdn.prepare(r.model.device, recurrent, false);
+        try meta.upload(recurrent);
+        r.current_gdn = &recurrent;
+        r.first_metadata = meta;
+        r.first_dims = dims;
+        r.deferred = taken;
+        r.accepted_chain = false;
+        defer {
+            r.current_gdn = null;
+            r.first_metadata = null;
+            r.first_dims = null;
+            r.deferred = null;
+        }
+        var stages = forward.Stages{ .model = r.model, .rows = first_rows, .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward }, .lead = lead, .first_ids = ids, .first_dims = dims };
+        r.model.frame.mixer_sums = false;
+        const cb = (try @import("core").segments.commitFirst(r.model.queue, .concurrent, fences, .{ .ptr = &stages, .encode = encodeFirst })) orelse return false;
+        // a write-back lands every pending row (as verifyImpl does): the keep stashes this round's from the first
+        if (taken) |d| if (d.persist != 0) {
+            r.gdn.pending.rows = 0;
+            r.gdn.pending.rounds = 0;
+        };
+        r.first = .{ .cb = cb, .start = r.offsets[0], .rows = first_rows, .deferred = taken, .mixer_sums = r.model.frame.mixer_sums };
+        r.model.frame.mixer_sums = false;
+        return true;
+    }
+    fn encodeFirst(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+        const stages: *forward.Stages = @ptrCast(@alignCast(ptr));
+        var lane = @import("core").segments.Lane{ .k = 0, .cb = undefined, .enc = e, .fence = undefined };
+        try stages.begin(&lane);
+        try stages.pre(&lane, 0);
+        try stages.mixer(&lane, 0);
+    }
+    /// A first command buffer committed ahead whose verify never ran: waited for, and the runner fails (its first layer's
+    /// GDN replay may have landed without the other layers').
+    pub fn dropFirst(r: *Runner) void {
+        const f = r.first orelse return;
+        r.first = null;
+        f.cb.wait();
+        f.cb.release();
+        r.failed = true;
+    }
+
     fn verifyImpl(r: *Runner, round: *const Round, head: forward.Head, accepted: bool) !void {
         r.writes(); // its GDN layers, a deferred replay it lands first and the keep it commits behind it
         if (r.failed or r.active != null or round.ids.len > r.model.frame.capacity) return error.RoundNotReady;
+        // a first command buffer committed ahead ran this verify's first layer for a star of first_rows rows from the same
+        // slot and start: this tree is such a star of at most those rows
+        const ahead = r.first;
+        errdefer r.dropFirst();
+        if (ahead) |f| {
+            if (accepted or round.windows.len != 1 or round.slots[0] != 0 or round.windows[0].start != f.start or round.ids.len > f.rows) return error.BadFirstRound;
+            for (round.windows[0].parents, 0..) |parent, row| if (parent != @as(i32, if (row == 0) -1 else 0)) return error.BadFirstRound;
+        }
         // a sieved verify writes picks, not logits: only a full head's rows (or the sieve's own token) stand for row 0
         const sieved = r.head_sieve and head == .all and round.ids.len <= HeadSieve.rows_max and r.sieve != null;
         if (r.head_sieve and !sieved) return error.RoundNotReady;
@@ -301,7 +404,7 @@ pub const Runner = struct {
             if (!accepted or !r.model.kernels.prompt or r.capture_taps) return error.BadPromptMarks;
             try m.check(recurrent);
         }
-        const deferred = try r.deferGdn(round, recurrent, accepted);
+        const deferred = if (ahead) |f| f.deferred else try r.deferGdn(round, recurrent, accepted);
         // a verify's attention plan is made, checked against the scratch and goes up there at its first attention layer,
         // its first reader (planAttention), after the first commit; an accepted pass's is made here
         var attention_plan: attn.Plan = undefined;
@@ -338,10 +441,11 @@ pub const Runner = struct {
         r.terminal_head = if (terminal_rows) head else .all;
         defer r.terminal_head = .all;
         var clears = Clears{ .r = r, .slots = round.slots };
-        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images };
+        var stages = forward.Stages{ .terminal_rows = terminal_rows, .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .sieve = sieved, .tail = r.tail, .lead = r.lead, .clear = clears.due(), .after = r.after, .settle = .{ .ptr = r, .run = settleRound }, .images = placed.images, .after_first = ahead != null, .first_sums = if (ahead) |f| f.mixer_sums else false };
         r.deferred = deferred;
-        // a write-back lands every pending row: the keep stashes this round's from the first
-        if (deferred) |d| if (d.persist != 0) {
+        // a write-back lands every pending row: the keep stashes this round's from the first (a first command buffer
+        // committed ahead reset them as it took the replay)
+        if (ahead == null) if (deferred) |d| if (d.persist != 0) {
             r.gdn.pending.rows = 0;
             r.gdn.pending.rounds = 0;
         };
@@ -349,11 +453,24 @@ pub const Runner = struct {
         if (!accepted and r.after != null) r.active = fingerprint(round);
         // a prompt-sized pass encodes a layer in milliseconds: its GPU starts on the first mixer and is fed layer by layer
         const early = round.ids.len > 16;
+        if (!early) stages.commit_until = decoded_commit_until;
         r.last_gpu_seconds = @import("core").segments.runCommittingEarly(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, first_commit, commit_every, early) catch |err| {
             r.failed = true;
             r.active = null;
             return err;
         };
+        // the pass ran behind its first command buffer's fence: that buffer is checked with the pass's own
+        if (ahead) |f| {
+            r.first = null;
+            if (!@import("core").segments.addUnchecked(f.cb)) {
+                defer f.cb.release();
+                if (gpuFailed(f.cb, "a verify's first command buffer")) {
+                    r.failed = true;
+                    r.active = null;
+                    return error.RoundGpuFailure;
+                }
+            }
+        }
         if (r.model.ane) |share| share.drain() catch |err| {
             r.failed = true;
             return err;
@@ -471,7 +588,8 @@ pub const Runner = struct {
         var due: [max]bool = @splat(true);
         var segments: [max]Segment = undefined;
         var stages: [max]forward.Stages = undefined;
-        var family = Stagger{};
+        var family = Stagger{ .rows_done = r.rows_done };
+        for (0..parts) |k| family.ends[k] = start + firsts[k + 1];
         // the slot's clear, if due, runs in the first segment's lane ahead of its embedding: every later segment's first
         // read of the slot's words (its first mixer) waits for the first's first mixer, behind it
         var clears = Clears{ .r = r, .slots = round.slots[0..1] };
@@ -815,7 +933,7 @@ pub const Runner = struct {
 
     fn gdnForward(ptr: *anyopaque, e: mtl.ComputeEncoder, block: usize, weights: wts.Gdn, frame: *Frame, rows: u32) !void {
         const r: *Runner = @ptrCast(@alignCast(ptr));
-        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain };
+        var hook = GdnHook{ .pool = &r.gdn, .quant = &r.model.kernels, .glue = r.model.glue, .plan = r.current_gdn orelse return error.RoundNotReady, .linear_index = r.linear_index, .accepted_chain = r.accepted_chain, .deferred = r.deferred, .uploaded = !r.accepted_chain, .metadata = r.first_metadata, .dims = r.first_dims };
         try GdnHook.forward(&hook, e, block, weights, frame, rows);
     }
 
@@ -1028,9 +1146,24 @@ const Segment = struct {
 };
 
 /// A staggered prompt pass's segments as one family for core/segments.zig: each hook goes to its lane's stages.
+/// Runner.rows_done.
+pub const RowsDone = struct { ptr: *anyopaque, due: *const fn (*anyopaque, u32) bool, run: *const fn (*anyopaque, u32) anyerror!void };
+
 const Stagger = struct {
     stages: [@import("core").segments.MAX]*forward.Stages = undefined,
+    rows_done: ?RowsDone = null,
+    /// Each segment's end row, absolute.
+    ends: [@import("core").segments.MAX]u32 = undefined,
     const Lane = @import("core").segments.Lane;
+
+    pub fn laneDue(p: *Stagger, k: usize) bool {
+        const h = p.rows_done orelse return false;
+        return h.due(h.ptr, p.ends[k]);
+    }
+    pub fn laneDone(p: *Stagger, k: usize) !void {
+        const h = p.rows_done orelse return;
+        return h.run(h.ptr, p.ends[k]);
+    }
 
     pub fn begin(p: *Stagger, lane: *Lane) !void {
         return p.stages[lane.k].begin(lane);
@@ -1089,3 +1222,5 @@ fn fingerprint(round: *const Round) [32]u8 {
     hash.final(&out);
     return out;
 }
+// Commit cadence, in one place: a verify commits after its first layer's mixer, after that layer's MLP and every
+// commit_every layers; a staggered prompt segment after its first mixer, its first three layers and every commit_every. (1002)
