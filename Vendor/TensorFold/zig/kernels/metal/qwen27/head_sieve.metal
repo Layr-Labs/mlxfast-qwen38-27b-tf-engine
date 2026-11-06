@@ -246,20 +246,20 @@ inline uint tf_sieve_key(float v) {
 // Grid TILES / 256 threadgroups of 256.
 kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const device ushort* Y1 [[buffer(1)]], const device uint* first [[buffer(2)]],
     constant int& rows [[buffer(3)]], device atomic_uint* list [[buffer(4)]], device atomic_uint* args [[buffer(5)]],
-    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint group [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  // One 32-lane SIMD group computes each row's exact first-tile maximum.
+  // The host verifies the selector's SIMD width and 256-thread geometry.
   threadgroup float thr[8];
-  if (tid < 8) {
-    float e = -INFINITY;
-    if (int(tid) < rows) {
-      const device ushort* y = Y1 + tid * 256 + tid * 32;
-      for (int c = 0; c < 32; c++) {
-        const float v = as_type<float>(uint(y[c]) << 16);
-        if (v > e) e = v;
-      }
-      e = fmin(e, HM[(size_t)first[1 + tid] * 16 + 8 + tid]);
-    }
-    thr[tid] = e;
+  float e = -INFINITY;
+  if (int(sg) < rows) {
+    const device ushort* y = Y1 + sg * 256 + sg * 32;
+    const float v = as_type<float>(uint(y[lane]) << 16);
+    // The original strict comparison ignores NaN and -infinity.
+    e = simd_max(v > -INFINITY ? v : -INFINITY);
+    if (lane == 0) e = fmin(e, HM[(size_t)first[1 + sg] * 16 + 8 + sg]);
   }
+  if (lane == 0) thr[sg] = e;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint t = group * 256 + tid;
   bool hit = false;

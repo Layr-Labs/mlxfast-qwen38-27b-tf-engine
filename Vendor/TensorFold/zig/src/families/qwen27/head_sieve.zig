@@ -109,7 +109,7 @@ pub const HeadSieve = struct {
                 scan8 = mtl.Pipeline.init(m.device, l8, "tf_head_sieve_scan", false) catch null;
             }
         }
-        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[4].simdWidth() != 32 or made[4].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
         try m.kernels.prepareTiles(head, head.n);
