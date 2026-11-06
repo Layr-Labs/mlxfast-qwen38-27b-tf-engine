@@ -56,6 +56,10 @@ test {
     _ = @import("rope_test.zig");
     _ = state;
     _ = projection;
+    _ = @import("native_down.zig");
+    _ = @import("native_down_abi.zig");
+    _ = @import("native_down_startup_policy.zig");
+    _ = @import("native_down_startup.zig");
     _ = model;
     _ = round_plan;
     _ = attention;

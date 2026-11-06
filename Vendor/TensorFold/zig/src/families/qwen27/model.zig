@@ -78,12 +78,25 @@ pub const Model = struct {
         errdefer m.checkpoint.deinit();
         const files = try core.checkpoint_host.shardFiles(a, io, dir);
         defer core.checkpoint_host.freeShardFiles(a, files);
-        // projections stay in the files until load repacks them: the weights live once, in their lane layouts
+        // Base projections stay in the files until load repacks them; enabled native Down adds one canonical sidecar.
         for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
-        m.weights = try wts.load(a, m.device, &m.checkpoint, c, &ws);
-        errdefer m.weights.deinit();
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits() };
         errdefer m.kernels.deinit();
+        // Cache preparation at load; an enabled target request must adopt native routing before Frame.
+        const native_policy = @import("native_down.zig");
+        const native_text = if (platform.c.getenv("TF_Q27_NATIVE_DOWN")) |v| std.mem.span(v) else null;
+        m.kernels.native_down_mode = native_policy.requestedMode(native_text, platform.c.getenv("TF_Q27_NATIVE_DOWN_DISABLE") != null, m.device.tensorUnits(), m.widths_tag == 0);
+        const native_requested = m.kernels.native_down_mode;
+        const native_enabled = m.kernels.native_down_mode != .off;
+        if (native_enabled) {
+            if (!@import("native_down_startup_policy.zig").budgetFits(m.device.allocated(), m.device.maxWorkingSet(), native_policy.all64_sidecar_bytes + @import("native_down_startup.zig").scratch_bytes)) return error.NativeDownBudget;
+            try m.kernels.prepareNativeDown(m.queue);
+        }
+        m.weights = try wts.loadWithOptions(a, m.device, &m.checkpoint, c, &ws, .{ .native_down = native_enabled });
+        errdefer m.weights.deinit();
+        try m.kernels.qualifyNativeDown(m.queue, m.weights.layers, m.widths_tag == 0);
+        native_policy.finishAdmission(&m.kernels, &m.weights);
+        try native_policy.requireRequestedAdmission(native_requested, m.kernels.native_down_mode);
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         // Serving defers automatic widening until its context and streams are known; explicit widths stay exact.

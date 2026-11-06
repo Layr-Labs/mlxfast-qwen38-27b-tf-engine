@@ -1,5 +1,7 @@
 //! Runtime specialization preserves the original M5 group arithmetic and GPU-resident argument buffers.
 const std = @import("std");
+const native_down = @import("native_down.zig");
+const native_abi = @import("native_down_abi.zig");
 const mtl = @import("metal");
 const lane = @import("core").lane_projection;
 const row = @import("core").row_projection;
@@ -171,6 +173,15 @@ pub const Kernels = struct {
     gu_words: ?mtl.Buffer = null,
     /// warm's read-only line touch and the word it could store (it never does), made on first use.
     warm_pipe: ?mtl.Pipeline = null,
+    native_down_pipe: ?mtl.Pipeline = null,
+    native_down_abi: ?mtl.Buffer = null,
+    native_down_mode: native_down.Mode = .off,
+    native_down_status: @import("native_down_startup_policy.zig").Status = .off,
+    native_down_startup_cohorts: u16 = 0,
+    /// CPU-only diagnostics, inspectable outside a phase; never used to select work.
+    native_down_calls: u64 = 0,
+    native_down_dispatches: u64 = 0,
+
     warm_sink: ?mtl.Buffer = null,
     /// Code bytes warm reads ahead of a decoded out projection (warm_mb MiB), set on first use.
     warm_bytes: ?usize = null,
@@ -187,6 +198,7 @@ pub const Kernels = struct {
             if (k.residency) |f| mtl.resident.fields.apply(p, f, false);
             if (hook) |f| mtl.resident.fields.apply(p, f, true);
         }
+        if (k.native_down_abi) |b| native_abi.follow(b, k.residency, hook);
         k.residency = hook;
     }
 
@@ -208,12 +220,99 @@ pub const Kernels = struct {
         if (k.count_words) |b| b.deinit();
         if (k.gu_words) |b| b.deinit();
         if (k.warm_pipe) |p| p.deinit();
+        if (k.native_down_pipe) |p| p.deinit();
+        if (k.native_down_abi) |b| b.deinit();
         if (k.warm_sink) |b| b.deinit();
         if (k.warm_tiles_pipe) |p| p.deinit();
         if (k.warm_tiles_sink) |b| b.deinit();
         var it = k.cache.valueIterator();
         while (it.next()) |p| p.deinit();
         k.cache.deinit(k.allocator);
+    }
+
+    /// Eager model-load preparation only: no first-use compile or GPU repack in a prompt phase.
+    pub fn prepareNativeDown(k: *Kernels, queue: mtl.Queue) !void {
+        if (k.native_down_pipe != null or !k.device.tensorUnits()) return;
+        k.native_down_status = .unavailable;
+        const text = "#define TF_NATIVE_DOWN_M16_BOTHCOOP_NORMALHALF_PROTOTYPE 1\n" ++ sources.native_down_m16_bothcoop_normalhalf;
+        const library = try mtl.Library.fromSource(k.device, text, mtl.CompileOptions.mlx());
+        defer library.deinit();
+        const pipe = try mtl.Pipeline.init(k.device, library, "tf_native_down_m16_bothcoop_normalhalf_prototype", false);
+        errdefer pipe.deinit();
+        if (pipe.simdWidth() != 32 or pipe.maxThreads() < 64) return error.UnsupportedPipelineShape;
+        const abi = try k.device.buffer(native_abi.storage_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        errdefer abi.deinit();
+        try native_abi.initialize(abi.slice(u32, native_abi.storage_words));
+        // Query has no input/parameter/output access. Separate small guarded
+        // bindings at offset zero do not require allocating I8 weights first.
+        var dummy: [6]mtl.Buffer = undefined;
+        var ready: usize = 0;
+        defer for (dummy[0..ready]) |buffer| buffer.deinit();
+        for (&dummy) |*buffer| {
+            buffer.* = try k.device.buffer(64, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            @memset(buffer.contents()[0..64], 0xA5);
+            ready += 1;
+        }
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(pipe);
+        for (dummy, 0..) |buffer, binding| e.setBuffer(buffer, 0, @intCast(binding));
+        const params = native_down.promptParams(0, 0);
+        e.setValue(params, 6);
+        e.setBuffer(abi, native_abi.offset_bytes, 11);
+        e.dispatchGroups(mtl.Size.of(1, 1, 1), mtl.Size.of(64, 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.status() != .completed) return error.NativeDownGpu;
+        for (dummy) |buffer| for (buffer.contents()[0..64]) |v| if (v != 0xA5) return error.NativeDownGuard;
+        try native_abi.activate(abi.slice(u32, native_abi.storage_words));
+        k.native_down_abi = abi;
+        k.native_down_pipe = pipe;
+        k.native_down_status = .off;
+    }
+
+    pub fn dropNativeDown(k: *Kernels) void {
+        if (k.native_down_abi) |b| {
+            native_abi.follow(b, k.residency, null);
+            b.deinit();
+            k.native_down_abi = null;
+        }
+        if (k.native_down_pipe) |p| p.deinit();
+        k.native_down_pipe = null;
+    }
+
+    fn nativeRefFits(ref: Ref, bytes: usize) bool {
+        return ref.offset <= ref.buffer.length() and bytes <= ref.buffer.length() - ref.offset;
+    }
+
+    pub fn encodeNativeStartup(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, hidden: Ref, residual: Ref, rows: u32) !u64 {
+        const words = p.native_down orelse return error.NativeDownShape;
+        const pairs = p.native_down_pairs orelse return error.NativeDownShape;
+        if (!@import("native_down_startup.zig").refsDistinct(p)) return error.NativeDownShape;
+        const pipe = k.native_down_pipe orelse return error.NativeDownShape;
+        const abi = k.native_down_abi orelse return error.NativeDownAbi;
+        if (!native_down.route(true, k.device.tensorUnits(), rows, p.n, p.k, p.bits, p.group, p.tile, p.runs.len, p.raw != null) or rows > @import("gpu_frame.zig").max_rows) return error.NativeDownShape;
+        if (xs.stride < rows or !nativeRefFits(words, native_down.bytes) or !nativeRefFits(pairs, native_down.metadata_bytes) or !nativeRefFits(x, @as(usize, rows) * p.k * 2) or !nativeRefFits(xs.ref, (@as(usize, p.k / 64 - 1) * xs.stride + rows) * 4) or !nativeRefFits(hidden, @as(usize, rows) * p.n * 2) or !nativeRefFits(residual, @as(usize, rows) * p.n * 2)) return error.NativeDownShape;
+        var dispatches: u64 = 0;
+        var first: u32 = 0;
+        while (first < rows) : (first += lane.reg_rows) {
+            const chunk = native_down.chunk(first, rows);
+            e.setPipeline(pipe);
+            e.setBuffer(x.buffer, x.offset + chunk.x, 0);
+            e.setBuffer(words.buffer, words.offset, 1);
+            e.setBuffer(pairs.buffer, pairs.offset, 2);
+            e.setBuffer(xs.ref.buffer, xs.ref.offset + chunk.sums, 3);
+            e.setBuffer(hidden.buffer, hidden.offset + chunk.y, 4);
+            e.setBuffer(residual.buffer, residual.offset + chunk.y, 5);
+            e.setValue(native_down.promptParams(chunk.rows, xs.stride), 6);
+            e.setBuffer(abi, native_abi.offset_bytes, 11);
+            e.dispatchGroups(mtl.Size.of(80, (chunk.rows + 15) / 16, 1), mtl.Size.of(64, 1, 1));
+            dispatches += 1;
+        }
+        return dispatches;
     }
 
     fn get(k: *Kernels, key: Key) !mtl.Pipeline {
@@ -351,10 +450,75 @@ pub const Kernels = struct {
         return true;
     }
 
+    fn originalPromptDownLane(k: *Kernels, p: projection.Linear) !lane.Projection {
+        const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = sk, .bits = p.bits, .group = p.group, .lean = true, .batch = p.batch, .prompt_sr = true, .resid = true };
+        const tn = promptTiles(key, p.n, 0);
+        if (tn != 2 or sk != 2 or key.serialSk2()) return error.NativeDownShape;
+        const entry = try k.lanes.getOrPut(k.allocator, key);
+        if (!entry.found_existing) {
+            errdefer _ = k.lanes.remove(key);
+            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = sk, .precompute_sums = true, .reg = true, .prompt_sr = true, .tile_batch = key.batch, .reg_lean = true, .prompt_tn = tn, .residual = true });
+            k.joined(entry.value_ptr);
+        }
+        return entry.value_ptr.*;
+    }
+
+    /// Optional model-load admission; successful finalization separately requires every runtime hit.
+    pub fn qualifyNativeDown(k: *Kernels, queue: mtl.Queue, layers: anytype, target: bool) !void {
+        if (k.native_down_mode == .off) return;
+        k.native_down_startup_cohorts = 0;
+        const decision = k.nativeQualification(queue, layers, target) catch |err| {
+            k.native_down_status = switch (err) {
+                error.NativeDownIdentity => .identity,
+                error.NativeDownGuard, error.NativeDownNonfinite => .guard,
+                error.NativeDownSums => .sums,
+                error.NativeDownGpu => .gpu,
+                error.NativeDownTime => .time,
+                error.NativeDownBudget => .budget,
+                error.NativeDownShape => .shape,
+                else => .unavailable,
+            };
+            k.dropNativeDown();
+            if (k.native_down_mode == .required) return err;
+            return;
+        };
+        k.native_down_status = decision.status;
+        if (!decision.native) {
+            k.dropNativeDown();
+        }
+        try @import("native_down_startup_policy.zig").requireDecision(k.native_down_mode, decision);
+    }
+
+    fn nativeQualification(k: *Kernels, queue: mtl.Queue, layers: anytype, target: bool) !@import("native_down_startup_policy.zig").Decision {
+        if (k.native_down_pipe == null or k.native_down_abi == null or !target or !k.device.tensorUnits() or layers.len != 64) return error.NativeDownShape;
+        const calibration = @import("native_down_startup.zig");
+        var matrices: [64]projection.Linear = undefined;
+        for (layers, &matrices) |layer, *p| {
+            p.* = layer.down;
+            if (!calibration.eligible(p.*)) return error.NativeDownShape;
+        }
+        const baseline = try k.originalPromptDownLane(matrices[0]);
+        return calibration.run(k, queue, baseline, &matrices, &k.native_down_startup_cohorts, k.native_down_mode);
+    }
+
     /// Prompt rows of a two-tile 5120-wide output projection with the residual add in its store: `residual` gets `hidden`
     /// + the output rows, each word as q27_norm_xs forms it, and no output rows are written; the norm after it then reads
     /// `residual` alone. False (nothing encoded) where the launch has no two-tile prompt form: decoded rows among them.
     pub fn quantResid(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, hidden: Ref, residual: Ref, rows: u32) !bool {
+        if (k.prompt and rows > 0 and native_down.mustRun(k.native_down_mode, k.device.tensorUnits(), p.n, p.k)) {
+            const eligible = xs != null and rows <= @import("gpu_frame.zig").max_rows and native_down.route(k.native_down_pipe != null and p.native_down != null and p.native_down_pairs != null, k.device.tensorUnits(), rows, p.n, p.k, p.bits, p.group, p.tile, p.runs.len, p.raw != null) and (projection.promptSplit(p.n, p.k) orelse p.slices) == 2;
+            try native_down.requireRoute(k.native_down_mode, k.device.tensorUnits(), p.n, p.k, true, eligible);
+            var native_span = profile.begin(k.profiler, input_encoder, .dense);
+            native_span.shape = .{ .n = p.n, .k = p.k, .sk = 2, .bits = p.bits };
+            errdefer native_span.cancel();
+            const dispatches = try k.encodeNativeStartup(native_span.encoder, p, x, xs.?, hidden, residual, rows);
+            try native_down.requireRoute(k.native_down_mode, k.device.tensorUnits(), p.n, p.k, true, dispatches > 0);
+            k.native_down_dispatches +|= dispatches;
+            k.native_down_calls +|= 1;
+            try native_span.end();
+            return true;
+        }
         if (!k.prompt or p.runs.len > 0 or p.raw != null or p.bits != 4 or p.group != 64 or p.tile != 32) return false;
         if (rows == 0 or rows > @import("gpu_frame.zig").max_rows) return false;
         const sk = projection.promptSplit(p.n, p.k) orelse p.slices;
@@ -513,7 +677,8 @@ pub const Kernels = struct {
             .tile_batch = key.batch,
             .rows8 = key.rows8,
             .reg_lean = key.lean,
-            .indexed = key.sbi, .indexed12 = key.sbi12,
+            .indexed = key.sbi,
+            .indexed12 = key.sbi12,
         });
         k.joined(entry.value_ptr);
     }
