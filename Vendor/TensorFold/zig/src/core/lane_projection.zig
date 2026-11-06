@@ -580,19 +580,11 @@ pub const Projection = struct {
     /// A counting projection (Layout.count): encodeSums whose threadgroups each add one to `counter` (a u32 word the
     /// waiting norm leaves zero) once their stores are past a device-scope fence; tile_count of them a launch.
     pub fn encodeCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref) !void {
-        return p.encodeCountedAt(e, x, w, sb, sums, y, rows, counter, null);
-    }
-
-    /// encodeCounted reading its [rows, stride] words at `dims` when given (encodeSumsAt's: an earlier dispatch wrote them,
-    /// at least one and at most `rows` rows): the launch is the one for `rows`, so every one of its tile_count
-    /// threadgroups still counts itself once.
-    pub fn encodeCountedAt(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, y: Ref, rows: u32, counter: Ref, dims: ?Ref) !void {
         if (!p.count or p.wait) return error.InvalidSchedule;
         if (rows == 0 or rows > 8 or sums.stride < rows) return error.InvalidRows;
         try checkRef(sums.ref, ((p.group_count - 1) * @as(usize, sums.stride) + rows) * 4, 4);
         try checkRef(counter, 8, 4);
-        if (dims) |d| try checkRef(d, 8, 4);
-        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, dims);
+        return p.encodeImpl(e, x, w, sb, sums, y, rows, null, counter, null);
     }
 
     /// encodeCounted whose threadgroups first wait until `waited` (two u32 words: the producer's count, and the arrivals
