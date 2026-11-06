@@ -94,7 +94,7 @@ pub const HeadSieve = struct {
             made[count] = try mtl.Pipeline.init(m.device, lib, name, false);
             count += 1;
         }
-        // the scan runs a SIMD group a tile; top runs a 256-thread threadgroup (a SIMD group a row), pick 1024 threads
+        // the scan runs a SIMD group a tile; top runs a 256-thread threadgroup (a SIMD group a row), pick 256 threads
         // the 8-row scan is a second library: a toolchain that rejects the descriptor leaves it null and the sieve stays
         // on the 16-row scan
         var scan8: ?mtl.Pipeline = null;
@@ -109,7 +109,7 @@ pub const HeadSieve = struct {
                 scan8 = mtl.Pipeline.init(m.device, l8, "tf_head_sieve_scan", false) catch null;
             }
         }
-        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 1024) return error.UnsupportedPipelineShape;
+        if (made[2].simdWidth() != 32 or made[3].maxThreads() < 256 or made[5].maxThreads() < 256) return error.UnsupportedPipelineShape;
         // the exact launches' pipelines (the first tiles' rows, then the listed tiles' rows at the vocabulary's stride)
         try m.kernels.prepareTiles(head, first_stride);
         try m.kernels.prepareTiles(head, head.n);
@@ -269,7 +269,7 @@ pub const HeadSieve = struct {
         e.setBuffer(logits.buffer, logits.offset, 0);
         e.setBuffer(s.scratch, s.o_list, 1);
         e.setBuffer(picks, 0, 2);
-        e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(1024, 1, 1));
+        e.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(256, 1, 1));
     }
 
     /// After a sieved round's command buffer ran: the tiles it listed, logged at rounds 1, 2, 4, ...
