@@ -27,6 +27,10 @@ pub const Weights = struct {
     owned: std.ArrayList(mtl.Buffer) = .empty,
     runs: std.ArrayList([]projection.Run) = .empty,
 
+    pub fn releaseNativeGU(w: *Weights) void {
+        @import("native_gu.zig").releaseOwned(w.layers, &w.owned);
+    }
+
     pub fn deinit(w: *Weights) void {
         for (w.owned.items) |b| b.deinit();
         w.owned.deinit(w.allocator);
@@ -69,6 +73,7 @@ const Builder = struct {
     stage: *cp.Stage,
     runs: *std.ArrayList([]projection.Run),
     widths: *const widths.Widths,
+    native_gu: bool = false,
 
     fn get(b: Builder, suffix: []const u8) !Tensor {
         const name = try std.mem.concat(b.allocator, u8, &.{ b.prefix, suffix });
@@ -132,7 +137,7 @@ const Builder = struct {
         for (parts, 0..) |p, i| ws[i] = .{ .bits = p.bits, .group = @intCast(p.group) };
         var buf: [3][2]usize = undefined;
         const list = widths.runs(ws[0..parts.len], &buf);
-        if (list.len == 1) return projection.prepareForced(b.device, b.allocator, b.owned, parts, 32, forced);
+        if (list.len == 1) return projection.prepareForcedWithOptions(b.device, b.allocator, b.owned, parts, 32, forced, .{ .native_gu = b.native_gu });
         const runs = try b.allocator.alloc(projection.Run, list.len);
         b.runs.append(b.allocator, runs) catch |err| {
             b.allocator.free(runs);
@@ -140,7 +145,7 @@ const Builder = struct {
         };
         var first: u32 = 0;
         for (list, runs) |r, *run| {
-            run.* = .{ .linear = try projection.prepareForced(b.device, b.allocator, b.owned, parts[r[0]..][0..r[1]], 32, forced), .first = first };
+            run.* = .{ .linear = try projection.prepareForcedWithOptions(b.device, b.allocator, b.owned, parts[r[0]..][0..r[1]], 32, forced, .{ .native_gu = b.native_gu }), .first = first };
             first += run.linear.n;
         }
         var fused = runs[0].linear;
@@ -195,6 +200,11 @@ fn checked(t: Tensor, dtype: cp.DType, shape: []const usize) !Tensor {
 
 /// The graph from `checkpoint`, whose `repacked` tensors stay in their files: each Linear is staged, repacked, dropped.
 pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const cp.Checkpoint, c: Config, ws: *const widths.Widths) !Weights {
+    return loadWithOptions(allocator, device, checkpoint, c, ws, .{});
+}
+
+pub const LoadOptions = struct { native_gu: bool = false };
+pub fn loadWithOptions(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const cp.Checkpoint, c: Config, ws: *const widths.Widths, options: LoadOptions) !Weights {
     const prefix: []const u8 = if (checkpoint.has("language_model.model.embed_tokens.weight")) "language_model." else if (checkpoint.has("model.embed_tokens.weight")) "" else return error.MissingTextNamespace;
     if (checkpoint.has("language_model.model.embed_tokens.weight") and checkpoint.has("model.embed_tokens.weight")) return error.AmbiguousTextNamespace;
     var owned: std.ArrayList(mtl.Buffer) = .empty;
@@ -211,7 +221,7 @@ pub fn load(allocator: std.mem.Allocator, device: mtl.Device, checkpoint: *const
     errdefer allocator.free(layers);
     var stage = cp.Stage{ .device = device };
     defer stage.deinit();
-    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws };
+    const b = Builder{ .allocator = allocator, .device = device, .checkpoint = checkpoint, .prefix = prefix, .owned = &owned, .stage = &stage, .runs = &runs, .widths = ws, .native_gu = options.native_gu };
     for (layers, 0..) |*l, i| l.* = try b.layer(c, i);
     const embed = try b.quant("model.embed_tokens", c.vocab, c.hidden, ws.embed);
     const norm = try b.tensor("model.norm.weight", .bf16, &.{c.hidden});
