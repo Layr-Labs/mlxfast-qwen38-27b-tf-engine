@@ -787,6 +787,52 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       } \
 }
 #endif
+#ifndef TF_GU_EXPLICIT_LITERAL
+#define TF_GU_EXPLICIT_LITERAL 1
+#endif
+#if defined(TF_SWIGLU) && TF_GU_EXPLICIT_LITERAL
+#define TF_GU_LITERAL_ACC(t, a, b, c, d) { \
+  const vec<bfloat, 2> v0 = as_type<vec<bfloat, 2>>(q0[a]), v1 = as_type<vec<bfloat, 2>>(q1[a]); \
+  const float s0 = float(v0.x), b0 = float(v0.y), s1 = float(v1.x), b1 = float(v1.y); \
+  C[t][a] = fma(s0, P[a], fma(b0, x0, C[t][a])); \
+  C[t][b] = fma(s0, P[b], fma(b0, x1, C[t][b])); \
+  C[t][c] = fma(s1, P[c], fma(b1, x0, C[t][c])); \
+  C[t][d] = fma(s1, P[d], fma(b1, x1, C[t][d])); }
+#define TF_GU_LITERAL_STORE(t, i) { \
+  const int m = mb + 8 * (((i) >> 2) & 1); \
+  gu16[((2 * ks + (t)) * 16 + m) * 32 + nb + 16 * ((i) >> 3) + ((i) & 3)] = static_cast<bfloat>(C[t][i]); }
+#undef TF_TN_TILE
+#define TF_TN_TILE(t) { \
+      const uint4 q0 = sp[0], q1 = sp[4]; \
+      sp += (t) + 1 < TN ? NT / 4 : (TF_N - (TN - 1) * NT) / 4; \
+      const uint4 cur0=nw0,cur1=nw1; \
+      thread half2* b2=(thread half2*)&cbl[0]; \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w]:cur1[2*(w-2)]; const int e=2*w; \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      TF_STREAM_EARLY(t) \
+      opm.run(xl0,cbl,P); \
+      TF_UNROLL \
+      for(int w=0;w<4;w++){ \
+        const uint word=w<2?cur0[2*w+1]:cur1[2*(w-2)+1]; const int e=2*w; \
+        b2[e]=as_type<half2>(word&0x000f000fu); \
+        b2[e+1]=as_type<half2>((word>>4)&0x000f000fu); \
+        b2[e+8]=as_type<half2>((word>>8)&0x000f000fu); \
+        b2[e+9]=as_type<half2>((word>>12)&0x000f000fu); \
+      } \
+      TF_STREAM_LATE(t) \
+      opa.run(xl1,cbl,P); \
+      TF_GU_LITERAL_ACC(t, 0, 4, 8, 12); \
+      TF_GU_LITERAL_ACC(t, 1, 5, 9, 13); \
+      TF_GU_LITERAL_ACC(t, 2, 6, 10, 14); \
+      TF_GU_LITERAL_ACC(t, 3, 7, 11, 15); \
+}
+#endif
 // TF_RESID (prompt rows of the 5120-wide output projections): instead of the output rows, the kernel stores the residual
 // stream's next rows, H + the output, as the norm after it would have formed them.
 // TF_SWIGLU (prompt rows of the fused gate/up, TN 2, one K split): SIMD group 0 computes gate tiles 2x and 2x + 1, SIMD
@@ -854,11 +900,22 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   uint4 nw0 = 0, nw1 = 0;
   if (first < last) { nw0 = cp[0]; nw1 = cp[32]; }
   float C[TN][16];
+#if defined(TF_SWIGLU) && TF_GU_EXPLICIT_LITERAL
+  C[0][0]=0.0f; C[0][1]=0.0f; C[0][2]=0.0f; C[0][3]=0.0f;
+  C[0][4]=0.0f; C[0][5]=0.0f; C[0][6]=0.0f; C[0][7]=0.0f;
+  C[0][8]=0.0f; C[0][9]=0.0f; C[0][10]=0.0f; C[0][11]=0.0f;
+  C[0][12]=0.0f; C[0][13]=0.0f; C[0][14]=0.0f; C[0][15]=0.0f;
+  C[1][0]=0.0f; C[1][1]=0.0f; C[1][2]=0.0f; C[1][3]=0.0f;
+  C[1][4]=0.0f; C[1][5]=0.0f; C[1][6]=0.0f; C[1][7]=0.0f;
+  C[1][8]=0.0f; C[1][9]=0.0f; C[1][10]=0.0f; C[1][11]=0.0f;
+  C[1][12]=0.0f; C[1][13]=0.0f; C[1][14]=0.0f; C[1][15]=0.0f;
+#else
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
     for (int i = 0; i < 16; i++) C[t][i] = 0.0f;
   }
+#endif
   const device float* xp = XS + first * stride + mb;
   const device bfloat* xv = X + (size_t)first * GS;
   const array<int32_t, 2> xstr = {1, TF_K};
@@ -882,6 +939,16 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
   threadgroup float hb16[16 * 64];
+#if TF_GU_EXPLICIT_LITERAL
+  TF_GU_LITERAL_STORE(0, 0); TF_GU_LITERAL_STORE(0, 1); TF_GU_LITERAL_STORE(0, 2); TF_GU_LITERAL_STORE(0, 3);
+  TF_GU_LITERAL_STORE(0, 4); TF_GU_LITERAL_STORE(0, 5); TF_GU_LITERAL_STORE(0, 6); TF_GU_LITERAL_STORE(0, 7);
+  TF_GU_LITERAL_STORE(0, 8); TF_GU_LITERAL_STORE(0, 9); TF_GU_LITERAL_STORE(0, 10); TF_GU_LITERAL_STORE(0, 11);
+  TF_GU_LITERAL_STORE(0, 12); TF_GU_LITERAL_STORE(0, 13); TF_GU_LITERAL_STORE(0, 14); TF_GU_LITERAL_STORE(0, 15);
+  TF_GU_LITERAL_STORE(1, 0); TF_GU_LITERAL_STORE(1, 1); TF_GU_LITERAL_STORE(1, 2); TF_GU_LITERAL_STORE(1, 3);
+  TF_GU_LITERAL_STORE(1, 4); TF_GU_LITERAL_STORE(1, 5); TF_GU_LITERAL_STORE(1, 6); TF_GU_LITERAL_STORE(1, 7);
+  TF_GU_LITERAL_STORE(1, 8); TF_GU_LITERAL_STORE(1, 9); TF_GU_LITERAL_STORE(1, 10); TF_GU_LITERAL_STORE(1, 11);
+  TF_GU_LITERAL_STORE(1, 12); TF_GU_LITERAL_STORE(1, 13); TF_GU_LITERAL_STORE(1, 14); TF_GU_LITERAL_STORE(1, 15);
+#else
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
@@ -890,6 +957,7 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
       gu16[((2 * ks + t) * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[t][i]);
     }
   }
+#endif
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int t16 = ks * 32 + lane;
   for (int at = t16; at < 16 * 64; at += 64) {
