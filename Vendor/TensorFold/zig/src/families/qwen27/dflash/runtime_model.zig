@@ -64,6 +64,9 @@ pub const Model = struct {
         errdefer model.backend.deinit();
         model.graph = try loadGraph(a, &model.backend);
         errdefer model.graph.deinit();
+        // the selector's codebooks for tf_draft_select (runtime_callbacks.selectTree): a draft whose codebooks no
+        // checkpoint buffer holds leaves every tree to the host
+        model.backend.codebooks = if (model.backend.weight(model.graph.predecessor)) |p| (if (model.backend.weight(model.graph.successor)) |s| .{ p, s } else |_| null) else |_| null;
         if (mode == .prepared_q4_reference) try model.backend.prepare();
         model.checkpoint.closeFiles();
         model.pending = try target.device.buffer(@as(usize, c.window) * c.tapWidth() * 2, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
@@ -123,6 +126,31 @@ pub const Model = struct {
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
         }
     }
+    /// Whether absorbAhead takes a fresh prompt's committed taps up to `end` of its `total` now: nothing in the ring counted
+    /// yet, the session empty or ahead-absorbed from row 0, nothing open, the prepared q4 path, the prompt inside one window
+    /// and one flush pass, and each 128-row launch of this append, of the one left for the first round and of the single
+    /// append they replace over 16 rows (the prompt loop, Adapter.encode), so every row takes the kernel it took.
+    pub fn canAbsorbAhead(m: *const Model, end: u64, total: u64) bool {
+        const b = &m.backend;
+        const s = m.session.context;
+        if (b.failed or b.frame.active or b.transaction != null or b.staged != null or b.batch.len != 0 or m.early != null or m.preparation.mode != .prepared_q4_reference) return false;
+        if (m.committed_end != 0 or s.begin != 0 or (s.end == 0) == m.session.ready or end <= s.end or end >= total or total > flush_rows or total >= m.graph.config.window) return false;
+        const step = @import("core").lane_projection.reg_rows;
+        for ([_]u64{ end - s.end, total - end, total }) |rows| if (rows % step != 0 and rows % step <= 16) return false;
+        return true;
+    }
+    /// The prompt's taps [session end, end) into the session (flush's absorb: one frame and its wait) before the ring
+    /// counts them: the caller's pass has stored them on the GPU (a staggered pass's ended segments, its laneDone).
+    pub fn absorbAhead(m: *Model, end: u64, total: u64) !void {
+        if (!m.canAbsorbAhead(end, total)) return error.BadDraftContext;
+        const first = m.session.context.end;
+        const rows: u32 = @intCast(end - first);
+        var positions: [flush_rows]u64 = undefined;
+        for (positions[0..rows], 0..) |*position, i| position.* = first + i;
+        const stride = @as(usize, m.graph.config.tapWidth()) * 2;
+        const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, @intCast(first)) * stride }, rows, m.graph.config.tapWidth());
+        try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = end });
+    }
     /// Whether prepareNext encodes a 2-row block (a depth-one round's) now: the drafter has every committed tap, nothing
     /// open, and either count of new taps leaves the frame's launches as they are (runtime_context.sameForEither).
     pub fn canPrepare(m: *const Model, block: u32) bool {
@@ -168,7 +196,7 @@ pub const Model = struct {
         m.committed_end += rows;
     }
     /// The early frame's tree, drafted from `pending`: its words must be the ones the host decoded from the verify.
-    fn completeNext(m: *Model, pending: u32, options: selector.Options) !selector.Tree {
+    fn completeNext(m: *Model, pending: u32, options: selector.Options, gpu_tree: bool) !selector.Tree {
         const x = m.early.?;
         if (x.rows == null) {
             try m.drainNext();
@@ -177,15 +205,49 @@ pub const Model = struct {
         m.early = null;
         // the anchor's codebook row heads for the caches while the frame runs, its candidates' rows once the lattice names
         // them (while the host checks what the frame admitted): hints only, the selector reads every word as before
-        selector.warmAnchor(&m.graph, pending);
+        if (!gpu_tree) selector.warmAnchor(&m.graph, pending);
         var lattice = try execution.completeBlock(m.backend.ops(), &m.graph, x.block);
         defer lattice.deinit();
-        selector.warmCandidates(&m.graph, lattice);
+        if (!gpu_tree) selector.warmCandidates(&m.graph, lattice);
         if (!m.admitted(x, pending)) {
             m.backend.failed = true;
             return error.DraftFrameMismatch;
         }
+        if (gpu_tree) return m.readGpuTree(pending, lattice) catch |err| {
+            m.backend.failed = true;
+            return err;
+        };
         return selector.propose(m.allocator, &m.graph, lattice, pending, try std.math.add(u64, m.session.context.end, 1), options);
+    }
+    /// Token/parent-only proposal for Generation after it committed the GPU tree's first verify buffer.
+    /// Scores are intentionally unavailable: this call is used only by greedy depth-one verification.
+    pub fn completeGpuNext(m: *Model, pending: u32, policy: selector.Policy) !selector.Tree {
+        const callbacks = @import("runtime_callbacks.zig");
+        if (m.early == null or m.backend.failed or m.backend.select_pipe == null or m.backend.codebooks == null or
+            m.early.?.block.head.logits.rows != 1 or
+            (policy.max_depth orelse 0) != 1 or policy.nodes != callbacks.select_nodes or
+            policy.children != callbacks.select_nodes or policy.floor != callbacks.select_floor or
+            try policy.block(m.tree_block) != 2 or pending >= m.graph.config.vocab) return error.BadDraftOptions;
+        return m.completeNext(pending, .{ .nodes = @intCast(policy.nodes), .children = policy.children, .floor = policy.floor }, true);
+    }
+    fn readGpuTree(m: *Model, pending: u32, lattice: op.Lattice) !selector.Tree {
+        const words = m.backend.proposal.slice(u32, 18);
+        if (words[0] != 0 or words[1] < 2 or words[1] > 8 or words[2] != pending or words[10] != std.math.maxInt(u32) or
+            lattice.topk == 0 or lattice.candidates.len < lattice.topk) return error.DraftFrameMismatch;
+        const count: usize = words[1] - 1;
+        const candidates = lattice.candidates[0..lattice.topk];
+        for (0..count) |i| {
+            const token = words[3 + i];
+            if (token >= m.graph.config.vocab or words[11 + i] != 0 or std.mem.indexOfScalar(u32, candidates, token) == null or
+                std.mem.indexOfScalar(u32, words[3..][0..i], token) != null) return error.DraftFrameMismatch;
+        }
+        // The first buffer may run eight rows; its unused rows must be the anchor placeholders.
+        for (count + 1..8) |row| if (words[2 + row] != pending or words[10 + row] != std.math.maxInt(u32)) return error.DraftFrameMismatch;
+        const tokens = try m.allocator.dupe(u32, words[3..][0..count]);
+        errdefer m.allocator.free(tokens);
+        const parents = try m.allocator.alloc(i32, count);
+        @memset(parents, -1);
+        return .{ .gpa = m.allocator, .tokens = tokens, .parents = parents, .scores = &.{} };
     }
     /// Whether proposePolicy drafts `policy`'s tree from the early frame (completeNext), as it decides it.
     pub fn draftsNext(m: *const Model, pending: u32, policy: selector.Policy) bool {
@@ -309,7 +371,7 @@ pub const Model = struct {
         const nodes: u32 = @intCast(policy.nodes);
         // the frame prepareNext committed behind the last verify: its tree, or (another block) only the taps it admitted
         if (m.early != null) {
-            if (block == 2 and pending < m.graph.config.vocab) return m.completeNext(pending, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+            if (block == 2 and pending < m.graph.config.vocab) return m.completeNext(pending, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor }, false);
             try m.drainNext();
         }
         if (m.backend.failed or m.backend.frame.active or m.backend.transaction != null or pending >= m.graph.config.vocab) return error.BadDraftOptions;
@@ -318,9 +380,13 @@ pub const Model = struct {
         const window = m.graph.config.window;
         const behind = m.committed_end - m.session.context.end;
         const slot: u32 = @intCast(m.session.context.end % window);
-        if (m.session.ready and behind > 0 and behind <= 128 and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
+        // the taps the session lacks and the block that reads them in one frame: a fresh session's whole prompt too (the
+        // seed's catch-up, up to flush_rows rows), so the GPU runs the block right behind the append instead of idling
+        // while the host waits for a flush frame and encodes the block's own
+        const fresh_start = !m.session.ready and m.session.context.end == m.session.context.begin;
+        if ((m.session.ready or fresh_start) and behind > 0 and behind <= flush_rows and slot + behind <= window and m.session.context.end >= m.committed_end -| (@as(u64, window) - 1)) {
             const rows: u32 = @intCast(behind);
-            var positions: [128]u64 = undefined;
+            var positions: [flush_rows]u64 = undefined;
             for (positions[0..rows], 0..) |*position, i| position.* = m.session.context.end + i;
             const stride = @as(usize, m.graph.config.tapWidth()) * 2;
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());

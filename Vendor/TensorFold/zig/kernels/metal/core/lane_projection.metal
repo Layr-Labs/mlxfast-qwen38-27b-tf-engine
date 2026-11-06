@@ -619,7 +619,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows: 16 a block. Each tile's words round to bf16 as the unfused store does; SwiGLU reads them as the
   // activation kernel reads the gate/up rows, and each 64-column group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // Pad the FP32 row stride while preserving the ordered 64-word sum.
+  threadgroup float hb16[16 * 65];
   for (int i = 0; i < 16; i++) {
     const int m = mb + 8 * ((i >> 2) & 1);
     gu16[(ks * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
@@ -632,12 +633,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    hb16[m * 65 + c] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 65 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -881,7 +882,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // Pad the FP32 row stride while preserving the ordered 64-word sum.
+  threadgroup float hb16[16 * 65];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
@@ -898,12 +900,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    hb16[m * 65 + c] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 65 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else
