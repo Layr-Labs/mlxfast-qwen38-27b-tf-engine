@@ -408,11 +408,12 @@ fn rescored(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, adapter
     return .{ .logits = y, .token_ids = map };
 }
 fn lattice(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Config) !op.Lattice {
-    const picks = try latticeBegin(ptr, epoch, h, c);
+    const picks = try latticeBegin(ptr, epoch, h, projected, c);
     return latticeEnd(ptr, epoch, h, picks, projected, c);
 }
 /// The head's top-k, then the frame committed with the bridge behind it, without a wait: its picks (latticeEnd reads them).
-fn latticeBegin(ptr: *anyopaque, epoch: u64, h: op.Head, c: Config) !op.View {
+/// An early frame's depth-one block also writes the next round's tree behind its top-k (selectTree).
+fn latticeBegin(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Config) !op.View {
     const b = backend(ptr);
     _ = try b.encoder(epoch);
     // deferred taps (Ops.context_defer): every layer wrote their keys and values (rope_append)
@@ -422,12 +423,41 @@ fn latticeBegin(ptr: *anyopaque, epoch: u64, h: op.Head, c: Config) !op.View {
     const out = try b.frame.ref(output);
     b.access(b.frame.encoder, &.{try b.span(h.logits)}, &.{ try b.span(output), Span.whole(b.topk.part) });
     try b.topk.encode(b.frame.encoder, .{ .buf = logits.buf, .off = logits.off }, .{ .buf = out.buf, .off = out.off }, .{ .rows = h.logits.rows, .vocab = h.logits.width, .k = c.topk, .stride = h.logits.stride });
+    if (b.early != null and h.logits.rows == 1) try selectTree(b, h, output, projected, c);
     b.frame.commitLast(b.frame.bridge != null) catch |err| {
         b.failed = true;
         return err;
     };
     return output;
 }
+/// tf_draft_select behind the top-k of a depth-one block: the tree selector.propose makes from this lattice row (seven
+/// siblings at most, the policy's floor), from the anchor the frame's lead picked, into Backend.proposal.
+fn selectTree(b: *Backend, h: op.Head, picks: op.View, projected: op.View, c: Config) !void {
+    const books = b.codebooks orelse return;
+    const pipe = b.select_pipe orelse return;
+    const e = b.frame.encoder;
+    const anchor = b.roundArg("ids");
+    const map: ?@import("runtime_backend.zig").Ref = if (h.token_ids) |ids| try b.frame.ref(ids) else null;
+    // the top-k row, the projected row, the lead's anchor word and the token map are this frame's writes
+    var reads: [4]Span = .{ try b.span(picks), try b.span(projected), Span.of(anchor, 4), undefined };
+    if (h.token_ids) |ids| reads[3] = try b.span(ids);
+    b.access(e, reads[0 .. 3 + @as(usize, @intFromBool(map != null))], &.{Span.whole(b.proposal)});
+    const pr = try b.frame.ref(picks);
+    const xr = try b.frame.ref(projected);
+    e.setPipeline(pipe);
+    e.setBuffer(pr.buf, pr.off, 0);
+    if (map) |m| e.setBuffer(m.buf, m.off, 1) else e.setBuffer(pr.buf, pr.off, 1);
+    e.setBuffer(xr.buf, xr.off, 2);
+    e.setBuffer(anchor.buf, anchor.off, 3);
+    e.setBuffer(books[0].buf, books[0].off, 4);
+    e.setBuffer(books[1].buf, books[1].off, 5);
+    e.setBuffer(b.proposal, 0, 6);
+    e.setValue(@import("runtime_backend.zig").SelectParams{ .vocab = c.vocab, .topk = c.topk, .rank = c.rank, .nodes = select_nodes, .children = select_nodes, .mapped = @intFromBool(map != null), .map_width = if (h.token_ids) |ids| ids.width else 0, .floor = @bitCast(@as(f64, select_floor)), .edge = @bitCast((@import("selector.zig").Options{}).edge), .tau = @bitCast((@import("selector.zig").Options{}).tau) }, 7);
+    e.dispatchGroups(@import("metal").Size.of(1, 1, 1), @import("metal").Size.of(512, 1, 1));
+}
+/// The tree tf_draft_select makes: the bench's depth-one policy (width and children 7, floor 0.018).
+pub const select_nodes = 7;
+pub const select_floor = 0.018;
 /// latticeBegin's frame once the GPU reached its end: the lattice.
 fn latticeEnd(ptr: *anyopaque, epoch: u64, h: op.Head, picks: op.View, projected: op.View, c: Config) !op.Lattice {
     const b = backend(ptr);
