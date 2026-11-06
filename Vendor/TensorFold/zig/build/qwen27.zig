@@ -26,6 +26,8 @@ pub fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, metal: *st
         _ = files.addCopyFile(b.path(b.fmt("zig/kernels/metal/qwen27/{s}.metal", .{part})), b.fmt("{s}.metal", .{part}));
         index = b.fmt("{s}pub const {s} = @embedFile(\"{s}.metal\");\n", .{ index, part, part });
     }
+    _ = files.addCopyFile(b.path("zig/kernels/metal/core/native_gu_m16_direct_u4_k64_prototype.metal"), "native_gu_m16_direct_u4_k64.metal");
+    index = b.fmt("{s}pub const native_gu_m16_direct_u4_k64 = @embedFile(\"native_gu_m16_direct_u4_k64.metal\");\n", .{index});
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/deltanet.metal"), "gdn.metal");
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/deltanet_slots.metal"), "gdn_slots.metal");
     const bf16_topk = b.createModule(.{ .root_source_file = b.path("zig/src/core/bf16_topk.zig"), .target = target, .optimize = .ReleaseSafe });

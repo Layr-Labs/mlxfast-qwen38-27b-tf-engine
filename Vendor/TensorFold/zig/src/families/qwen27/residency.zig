@@ -146,6 +146,7 @@ pub fn hold(h: anytype, io: std.Io) !void {
         var buffers: ShareBuffers = undefined;
         try list.appendSlice(h.gpa, try shareBuffers(share, &buffers));
     }
+    if (h.model.kernels.native_gu_abi) |abi| try list.append(h.gpa, abi);
     var projections = h.model.kernels.lanes.valueIterator();
     while (projections.next()) |projection| try fields.append(h.gpa, &list, projection);
     try appendRunner(&h.runner, h.gpa, &list);
