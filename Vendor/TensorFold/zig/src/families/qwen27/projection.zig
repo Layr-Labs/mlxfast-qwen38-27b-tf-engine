@@ -4,10 +4,11 @@ const mtl = @import("metal");
 const checkpoint = @import("core").checkpoint_metal;
 const row = @import("core").row_projection;
 const lane = @import("core").lane_projection;
+const native_gu = @import("native_gu.zig");
 
 pub const Ref = struct { buffer: mtl.Buffer, offset: usize = 0 };
 /// A device matrix (`index`: decoded rows' indexed copy of `pairs`, lane_projection.indexed_layout); `runs` non-empty means fused members of different widths, each its own product into these rows.
-pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false };
+pub const Linear = struct { words: Ref, pairs: Ref, n: u32, k: u32, tile: u32, slices: u32, raw: ?row.Weights = null, bits: u8 = 4, group: u32 = 64, runs: []const Run = &.{}, batch: u32 = 1, index: ?Ref = null, index12: bool = false, native_gu: ?Ref = null, native_gu_pairs: ?Ref = null };
 /// One product inside a mixed fused matrix, writing output columns [first, first + linear.n).
 pub const Run = struct { linear: Linear, first: u32 };
 pub const Triple = struct { weight: checkpoint.Tensor, scales: checkpoint.Tensor, biases: checkpoint.Tensor, bits: u8 = 4, group: u32 = 64 };
@@ -52,6 +53,11 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
 
 /// The same matrix with `forced` adjacent tiles interleaved instead of `tileBatch`'s count.
 pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32) !Linear {
+    return prepareForcedWithOptions(device, allocator, owned, parts, tile, forced, .{});
+}
+
+pub const Options = struct { native_gu: bool = false };
+pub fn prepareForcedWithOptions(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, tile: u32, forced: ?u32, options: Options) !Linear {
     if (tile != 32 or parts.len == 0) return error.BadProjectionShape;
     const bits = parts[0].bits;
     const group = parts[0].group;
@@ -100,13 +106,52 @@ pub fn prepareForced(device: mtl.Device, allocator: std.mem.Allocator, owned: *s
         };
         base += rows;
     }
+    const native = prepareNativeGU(device, allocator, owned, parts, n, k, options.native_gu);
     const indexed = try lane.indexMetadata(device, allocator, pair, n, k);
     if (indexed) |x| owned.append(allocator, x.buffer) catch |err| {
         x.buffer.deinit();
         return err;
     };
     const index: ?Ref = if (indexed) |x| .{ .buffer = x.buffer } else null;
-    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false };
+    return .{ .words = .{ .buffer = w }, .pairs = .{ .buffer = sb }, .n = @intCast(n), .k = @intCast(k), .tile = tile, .slices = slices, .batch = @intCast(batch), .index = index, .index12 = if (indexed) |x| x.twelve else false, .native_gu = if (native) |x| x.words else null, .native_gu_pairs = if (native) |x| x.pairs else null };
+}
+
+/// Pack while Stage's original checkpoint rows are live. The global owned list alone frees the sidecar.
+const NativeBuffers = struct { words: Ref, pairs: Ref };
+fn prepareNativeGU(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), parts: []const Triple, n: usize, k: usize, requested: bool) ?NativeBuffers {
+    const halves = parts.len == 2 and parts[0].weight.shape[0] == n / 2 and parts[1].weight.shape[0] == n / 2;
+    if (!native_gu.admit(requested, device.tensorUnits(), n, k, parts[0].bits, parts[0].group, halves)) return null;
+    owned.ensureUnusedCapacity(allocator, 2) catch return null;
+    const buffer = device.buffer(native_gu.bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) catch |err| {
+        std.log.warn("qwen27: optional native prompt GU allocation unavailable ({s}); original projection retained", .{@errorName(err)});
+        return null;
+    };
+    const metadata = device.buffer(native_gu.metadata_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) catch {
+        buffer.deinit();
+        return null;
+    };
+    var transferred = false;
+    defer if (!transferred) {
+        buffer.deinit();
+        metadata.deinit();
+    };
+    const rows = [_]native_gu.Part{
+        .{ .words = parts[0].weight.host(u32), .rows = parts[0].weight.shape[0] },
+        .{ .words = parts[1].weight.host(u32), .rows = parts[1].weight.shape[0] },
+    };
+    native_gu.pack(buffer.contents()[0..native_gu.bytes], &rows, n, k) catch |err| {
+        std.log.warn("qwen27: optional native prompt GU packing unavailable ({s}); original projection retained", .{@errorName(err)});
+        return null;
+    };
+    const metadata_parts = [_]native_gu.MetadataPart{
+        .{ .scales = parts[0].scales.host(u16), .biases = parts[0].biases.host(u16), .rows = parts[0].weight.shape[0] },
+        .{ .scales = parts[1].scales.host(u16), .biases = parts[1].biases.host(u16), .rows = parts[1].weight.shape[0] },
+    };
+    native_gu.packMetadata(metadata.slice(u16, native_gu.metadata_bytes / 2), &metadata_parts, n, k) catch return null;
+    owned.appendAssumeCapacity(buffer);
+    owned.appendAssumeCapacity(metadata);
+    transferred = true;
+    return .{ .words = .{ .buffer = buffer }, .pairs = .{ .buffer = metadata } };
 }
 
 test "stacked gate-up keeps the member K split rather than recomputing it from stacked width" {
