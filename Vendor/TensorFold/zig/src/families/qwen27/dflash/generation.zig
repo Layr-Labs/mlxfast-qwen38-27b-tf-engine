@@ -16,6 +16,9 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
+/// The policy tf_draft_select applies (runtime_callbacks.selectTree).
+const select_nodes = @import("runtime_callbacks.zig").select_nodes;
+const select_floor = @import("runtime_callbacks.zig").select_floor;
 const precise_below: f32 = 0.95;
 /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
 fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
@@ -46,6 +49,8 @@ pub const Generation = struct {
     /// settle sees the keep's work done tens of microseconds before its completion is reported, which comes only behind
     /// the drafter frame's, committed before it (settleKeep).
     keep_event: ?mtl.SharedEvent = null,
+    /// Updated at the end of each keep's encoder: a verify's first command buffer committed ahead waits on it.
+    keep_fence: ?mtl.objc.Id = null,
     keep_value: u64 = 0,
     keep_signal: u64 = 0,
     /// A keep whose work settleKeep saw done before its completion was reported: checked once the verify behind it ran,
@@ -57,6 +62,10 @@ pub const Generation = struct {
     /// Moving share of rounds a sibling landed in (each round's weight `accept_step`): below `precise_below` the frames
     /// draft on the q4 copies of the linears drafted below 4 bits, which miss fewer siblings where they are missed.
     accept_share: f32 = 1,
+    /// The drafter scratch's refill (Frame.refill) while a prefill's pass runs: joined before the drafter's first frame.
+    refill: ?std.Thread = null,
+    /// The rows of the prompt chunk in flight, for aheadDue.
+    ahead_total: u64 = 0,
     pub fn init(a: std.mem.Allocator, runner: *Runner, draft: *Draft) !Generation {
         if (runner.model != draft.backend.target or runner.model.config.hidden != draft.graph.config.hidden or runner.model.config.layers != draft.graph.config.target_layers) return error.TargetBinding;
         runner.capture_taps = true;
@@ -88,6 +97,7 @@ pub const Generation = struct {
             cb.release();
         }
         if (g.keep_event) |ev| ev.deinit();
+        if (g.keep_fence) |f| mtl.objc.release(f);
         g.commit.deinit();
         if (g.picked) |f| f.deinit();
         g.matcher.deinit();
@@ -152,8 +162,26 @@ pub const Generation = struct {
         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
         const direct = g.tapsInto(ids.len);
         defer g.runner.taps.into = null;
+        // the taps land in the ring's slots: each segment but the last of a staggered pass gives its rows' taps to the
+        // drafter as it ends on the GPU, while the later segments still run (Model.absorbAhead); only a chunk that is the
+        // whole prompt (the last, with nothing committed before it), so `ahead_total` is the prompt's rows
+        g.ahead_total = ids.len;
+        if (direct and last) g.runner.rows_done = .{ .ptr = g, .due = aheadDue, .run = aheadRun };
+        defer g.runner.rows_done = null;
         try (TargetSession.Session{ .runner = g.runner }).promptChunk(ids, last);
         try g.absorbChunk(ids.len, direct);
+    }
+    fn aheadDue(ptr: *anyopaque, end: u32) bool {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        return g.keep == null and g.draft.canAbsorbAhead(end, g.ahead_total);
+    }
+    fn aheadRun(ptr: *anyopaque, end: u32) anyerror!void {
+        const g: *Generation = @ptrCast(@alignCast(ptr));
+        if (g.refill) |t| { // the scratch the frame takes, made beside the pass
+            t.join();
+            g.refill = null;
+        }
+        try g.draft.absorbAhead(end, g.ahead_total);
     }
     /// `promptChunk` with decoded rows' arithmetic (an earlier reply's tokens).
     pub fn decodeChunk(g: *Generation, ids: []const u32, last: bool) !void {
@@ -171,6 +199,14 @@ pub const Generation = struct {
         g.draft.backend.precise = false;
         std.debug.assert(g.keep == null);
         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
+        // the drafter's scratch, freed at the last phase close, is made again on a helper thread while the GPU runs this
+        // pass (Frame.refill): the catch-up frame behind it then waits on no allocation. Nothing here touches the frame.
+        const frame = &g.draft.backend.frame;
+        g.refill = if (frame.refillDue()) std.Thread.spawn(.{}, @TypeOf(frame.*).refill, .{frame}) catch null else null;
+        defer if (g.refill) |t| {
+            t.join();
+            g.refill = null;
+        };
         var first: usize = 0;
         while (first < ids.len) {
             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
@@ -236,6 +272,10 @@ pub const Generation = struct {
         held: bool = false,
         /// The rows' picks come from the runner's head sieve (the forward wrote no logits): no head row to keep.
         sieve: bool = false,
+        /// The next round's verify commits its first command buffer behind the early frame (Generation.commitFirst): no
+        /// bridge spin behind the frame, which would hold that buffer back until the spin ends (a buffer committed
+        /// behind one that has not started starts only once that one ends).
+        first_next: bool = false,
         fn encode(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
             const p: *Picks = @ptrCast(@alignCast(ptr));
             const g = p.g;
@@ -268,6 +308,10 @@ pub const Generation = struct {
             const g = p.g;
             // the last round's keep ended before this verify's first commit (settle): never two keeps pending
             if (g.keep != null) try g.finishKeep();
+            // Submit the independent draft frame before encoding target-state maintenance,
+            // so its GPU work can overlap the host's keep planning and dispatch encoding.
+            // Preserve a prepare failure until the keep is encoded and committed below.
+            const prepared: anyerror!bool = if (p.early) g.draft.prepareNext(.{ .ptr = p, .encode = lead }, 2) else false;
             const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
             const keep_cb = g.runner.model.queue.commandBuffer();
             const k = keep_cb.compute(.concurrent);
@@ -275,6 +319,8 @@ pub const Generation = struct {
             var kept = false;
             errdefer if (!kept) k.end();
             try g.runner.keepDevice(p.round, k, g.commit, result);
+            if (g.keep_fence == null) g.keep_fence = mtl.objc.msg(?mtl.objc.Id, g.runner.model.device.id, "newFence", .{});
+            if (g.keep_fence) |f| mtl.objc.msg(void, k.id, "updateFence:", .{f});
             k.end();
             kept = true;
             // its event behind its last command, for the next verify's settle (settleKeep)
@@ -288,12 +334,12 @@ pub const Generation = struct {
             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
             if (p.early) {
-                const prepared = g.draft.prepareNext(.{ .ptr = p, .encode = lead }, 2) catch |err| {
+                const ready = prepared catch |err| {
                     keep_cb.commit();
                     g.keep = keep_cb.retain();
                     return err;
                 };
-                if (prepared) {
+                if (ready) {
                     g.keep = keep_cb.retain();
                     p.held = true;
                     return;
@@ -308,7 +354,7 @@ pub const Generation = struct {
             if (!p.held) return;
             p.held = false;
             p.g.keep.?.commit();
-            p.g.draft.bridgeNext();
+            if (!p.first_next) p.g.draft.bridgeNext();
         }
         /// First in the next round's frame: once the picks are in, the RoundArgs of the count they admitted.
         fn lead(ptr: *anyopaque, e: mtl.ComputeEncoder, blocks: @import("runtime_backend.zig").Ref) anyerror!void {
@@ -340,7 +386,7 @@ pub const Generation = struct {
     /// The verify with its picks encoded behind the head and its keep committed behind them: the host waits once. `early`:
     /// the kept taps go to the drafter's ring, and the next round's frame is committed behind the verify, the keep once
     /// the verify ran.
-    fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32, early: bool) !@import("core").tree_round.Decoded {
+    fn verifyAccept(g: *Generation, round: *const Round, ids: []const u32, parents: []const i32, budget: u32, eos: []const u32, early: bool, first_next: bool) !@import("core").tree_round.Decoded {
         if (g.picked == null) g.picked = try @import("core").segments.Fence.init(g.runner.model.device);
         // the picks rewrite the matcher's result, which a pending keep still reads, and the verify's metadata uploads
         // and launches rewrite what it reads: a pending keep ends right before the verify's first GPU work (settle)
@@ -348,7 +394,7 @@ pub const Generation = struct {
         defer g.runner.settle = null;
         // a greedy verify of at most the sieve's rows picks through it; wider ones (copies past the tree) take the full head
         const sieve = g.runner.sieve != null and ids.len <= @import("../head_sieve.zig").HeadSieve.rows_max;
-        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .early = early, .sieve = sieve };
+        var picks = Picks{ .g = g, .ids = ids, .parents = parents, .budget = budget, .eos = eos, .round = round, .early = early, .sieve = sieve, .first_next = early and first_next };
         g.runner.tail = .{ .ptr = &picks, .encode = Picks.encode };
         defer g.runner.tail = null;
         g.runner.head_sieve = sieve;
@@ -425,12 +471,19 @@ pub const Generation = struct {
         offered_policy.nodes = offered;
         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
         if (g.proposer != null) try g.draft.drainNext();
-        // a tree drafted from the early frame waits for it: what waits on nothing it makes goes first (ahead)
-        if (g.proposer == null and g.draft.draftsNext(pending, offered_policy)) try g.ahead();
+        // a tree drafted from the early frame waits for it: what waits on nothing it makes goes first (ahead), and when
+        // the frame picks the tree on the GPU (tf_draft_select: this policy's tree) its verify's first command buffer
+        // goes to the queue now, behind the frame
+        const selected = (policy.max_depth orelse 0) == 1 and offered == select_nodes and policy.children == select_nodes and policy.floor == select_floor and extend == null and extra == 0 and eos.len == 0;
+        if (g.proposer == null and g.draft.draftsNext(pending, offered_policy)) try g.ahead(selected);
         // a first command buffer made ahead that this round's verify did not take goes to the queue with its stop
         errdefer @import("core").segments.flushFirst();
-        var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.proposePolicy(pending, offered_policy);
+        // one committed ahead that this round's verify did not take is waited for, and the runner fails
+        errdefer g.runner.dropFirst();
+        // Only this path has already queued a verify using the GPU proposal; the normal public proposer still returns scores.
+        var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else if (g.runner.first != null) try g.draft.completeGpuNext(pending, offered_policy) else try g.draft.proposePolicy(pending, offered_policy);
         defer tree.deinit();
+        if (g.runner.first != null) try g.sameTree(pending, tree);
         try offered_policy.checkTree(tree.parents);
         const drafted = try tree.verifyParents(g.allocator);
         defer g.allocator.free(drafted);
@@ -469,7 +522,7 @@ pub const Generation = struct {
         // a depth-one round's keep (keepDevice, behind the verify) stashes its GDN rows for the next verifies' star scans
         g.runner.defer_gdn = (policy.max_depth orelse 0) == 1;
         defer g.runner.defer_gdn = false;
-        const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos, early);
+        const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos, early, selected and g.proposer == null and g.draft.backend.select_pipe != null and g.draft.backend.codebooks != null);
         // a depth-bounded round that takes its whole budget stops at its length with the bonus emitted: that pick is the
         // next round's pending token, as a bonus stop's is, so the next round need not take it from the logits again
         g.pending = accepted.pending orelse accepted.bonus;
@@ -490,7 +543,9 @@ pub const Generation = struct {
     /// runs: the last verify's command buffers checked (segments.checkUnchecked, else this verify's first host work),
     /// and this verify's first command buffer and encoder made with the bridge's stop encoded first in it, as the
     /// verify's lead would encode it (Frame.endBridge; the lead then finds the bridge stopped and encodes nothing).
-    fn ahead(g: *Generation) !void {
+    /// `selected`: the round's tree is the one the frame's tf_draft_select picks, and its verify's first command buffer is
+    /// committed here (commitFirst) when the runner can take one.
+    fn ahead(g: *Generation, selected: bool) !void {
         @import("core").segments.checkUnchecked() catch |err| {
             g.runner.failed = true;
             g.draft.drainNext() catch {};
@@ -499,7 +554,40 @@ pub const Generation = struct {
         };
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        // a frame whose bridge spin the last round left due (Picks.first_next) gets it now when no first buffer goes ahead
+        defer if (g.runner.first == null) g.draft.bridgeNext();
+        if (selected and try g.commitFirst()) return;
         @import("core").segments.prepareFirst(g.runner.model.queue, .concurrent, .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge });
+    }
+    /// The verify's first command buffer (Runner.commitFirst) behind the early frame's end, which writes the tree's ids
+    /// beside the ids of the rows past it, and behind the last round's keep, whose words its first layer reads and
+    /// rewrites. The bridge's stop goes first, as the verify's lead. False: nothing committed.
+    fn commitFirst(g: *Generation) !bool {
+        const b = &g.draft.backend;
+        // the frame's last encoder updates its fence (Frame.commitLast, bridged): the first buffer's encoder waits on it
+        if (b.select_pipe == null or b.codebooks == null or !b.frame.committed or b.frame.completed or b.frame.bridge == null) return false;
+        var fences: [2]mtl.objc.Id = undefined;
+        fences[0] = b.frame.fence orelse return false;
+        var n: usize = 1;
+        if (g.keep != null) {
+            fences[1] = g.keep_fence orelse return false;
+            n = 2;
+        }
+        const H = @import("runtime_backend.zig").Handoff;
+        return g.runner.commitFirst(.{ .buffer = b.proposal, .offset = H.ids }, .{ .buffer = b.proposal, .offset = H.dims }, H.metadata(b.proposal), fences[0..n], .{ .ptr = &b.frame, .encode = @import("runtime_frame.zig").Frame.endBridge });
+    }
+    /// A tree whose verify's first command buffer was committed ahead is the one the frame picked on the GPU: its rows
+    /// ran there.
+    fn sameTree(g: *Generation, pending: u32, tree: @import("selector.zig").Tree) !void {
+        const words = g.draft.backend.proposal.slice(u32, 10);
+        var same = words[0] == 0 and words[1] == tree.tokens.len + 1 and words[2] == pending and tree.tokens.len < 8;
+        if (same) for (tree.tokens, tree.parents, 3..) |token, parent, at| {
+            same = same and parent == -1 and words[at] == token;
+        };
+        if (!same) {
+            g.draft.backend.failed = true;
+            return error.DraftFrameMismatch;
+        }
     }
     fn runImpl(g: *Generation, count: usize, force_length: bool, nodes: usize, eos_override: ?[]const u32, already_delivered: bool) !Result {
         g.pending = null;
@@ -532,7 +620,7 @@ pub const Generation = struct {
             var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
             defer round.deinit();
             try g.finishKeep();
-            const accepted = try g.verifyAccept(&round, ids, parents, @intCast(count - tokens.items.len), eos, false);
+            const accepted = try g.verifyAccept(&round, ids, parents, @intCast(count - tokens.items.len), eos, false, false);
             rounds += 1;
             verified += ids.len;
             min_rows = if (min_rows == 0) @intCast(ids.len) else @min(min_rows, @as(u32, @intCast(ids.len)));
