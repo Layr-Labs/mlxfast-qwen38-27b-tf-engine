@@ -1,3 +1,21 @@
+#ifndef TF_LOCKSTEP_EXPLICIT_LITERAL
+#define TF_LOCKSTEP_EXPLICIT_LITERAL 1
+#endif
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+#define TF_LS_APPLY16(F) \
+ F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) \
+ F(8) F(9) F(10) F(11) F(12) F(13) F(14) F(15)
+#define TF_LS_ZERO(i) G[i]=0.0f;U[i]=0.0f;
+#define TF_LS_COPY(i) if(TF_LIVE(i)){G0[i]=G[i];U0[i]=U[i];}
+#define TF_LS_MERGE(i) if(TF_LIVE(i)){G[i]=G0[i]+G[i];U[i]=U0[i]+U[i];}
+#define TF_LS_ACC(j,h) { \
+ const vec<bfloat,2> v0=as_type<vec<bfloat,2>>(q0[j]),v1=as_type<vec<bfloat,2>>(q1[j]); \
+ const float s0=float(v0.x),b0=float(v0.y),s1=float(v1.x),b1=float(v1.y); \
+ if(turn==0){G[j]=fma(s0,P[j],fma(b0,x0,G[j]));G[h]=fma(s1,P[h],fma(b1,x0,G[h]));} \
+ else{U[j]=fma(s0,P[j],fma(b0,x0,U[j]));U[h]=fma(s1,P[h],fma(b1,x0,U[h]));} }
+#define TF_LS_PUBLISH(i) if(TF_LIVE(i)){const int c=16*((i)>>3)+((i)&3); \
+ const float gf=float(bfloat(G[i]));const bfloat h=bfloat(gf/(1.0f+metal::exp(-gf))*float(bfloat(U[i])));yr[c]=h;hr[c]=h;}
+#endif
 // K64 lockstep G/U scheduler for the guarded decoded indexed GU path. Same two SGs, original split chains and register activation.
 [[max_total_threads_per_threadgroup(64)]]
 kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],
@@ -27,7 +45,11 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
  float G[16],U[16],G0[16],U0[16];
  for(int split=0;split<2;split++){
   const int first=split*40,last=first+40;
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+  TF_LS_APPLY16(TF_LS_ZERO)
+#else
   for(int i=0;i<16;i++){G[i]=0.0f;U[i]=0.0f;}
+#endif
   const device uint4* gp=gw+(size_t)first*TF_TB*64;
   const device uint4* up=uw+(size_t)first*TF_TB*64;
   uint4 nw0=gp[0],nw1=gp[32];
@@ -69,22 +91,38 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
 #endif
     }
     op.run(x,cb,P);
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+    TF_LS_ACC(0,8);TF_LS_ACC(1,9);TF_LS_ACC(2,10);TF_LS_ACC(3,11);
+#else
     for(int j=0;j<4;j++){
      const vec<bfloat,2> v0=as_type<vec<bfloat,2>>(q0[j]),v1=as_type<vec<bfloat,2>>(q1[j]);
      const float s0=float(v0.x),b0=float(v0.y),s1=float(v1.x),b1=float(v1.y);
      if(turn==0){G[j]=fma(s0,P[j],fma(b0,x0,G[j]));G[8+j]=fma(s1,P[8+j],fma(b1,x0,G[8+j]));}
      else{U[j]=fma(s0,P[j],fma(b0,x0,U[j]));U[8+j]=fma(s1,P[8+j],fma(b1,x0,U[8+j]));}
     }
+#endif
    }
   }
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+  if(split==0){TF_LS_APPLY16(TF_LS_COPY)}
+#else
   if(split==0)for(int i=0;i<16;i++)if(TF_LIVE(i)){G0[i]=G[i];U0[i]=U[i];}
+#endif
  }
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+ TF_LS_APPLY16(TF_LS_MERGE)
+#else
  for(int i=0;i<16;i++)if(TF_LIVE(i)){G[i]=G0[i]+G[i];U[i]=U0[i]+U[i];}
+#endif
 
  // Literal original two-SG register-local SwiGLU/HS epilogue; only C is named U.
  threadgroup bfloat hb[8*64];
  if(mb<M){const int c0=ks*32+nb;device bfloat* yr=Y+(size_t)mb*(TF_N/2)+int(tg.x)*64+c0;threadgroup bfloat* hr=hb+mb*64+c0;
+#if defined(TF_SWIGLU) && TF_LOCKSTEP_EXPLICIT_LITERAL
+  TF_LS_APPLY16(TF_LS_PUBLISH)
+#else
   for(int i=0;i<16;i++){if(!TF_LIVE(i))continue;const int c=16*(i>>3)+(i&3);const float gf=float(bfloat(G[i]));const bfloat h=bfloat(gf/(1.0f+metal::exp(-gf))*float(bfloat(U[i])));yr[c]=h;hr[c]=h;}
+#endif
  }
  threadgroup_barrier(mem_flags::mem_threadgroup);
  const int t=ks*32+lane;
