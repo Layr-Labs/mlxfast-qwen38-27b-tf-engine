@@ -146,11 +146,15 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   if (kt < kend && kt < kstop) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
   if (!live) return;
   const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
-  _Pragma("clang loop unroll(full)")
-  for (int j = 0; j < 8; j++) {
-    device float* dst = PO + (base + fm) * PD + h * PH + j * 16 + fn;
-    *(device float4*)dst = float4(r.O[j][0], r.O[j][1], r.O[j][2], r.O[j][3]);
-    *(device float4*)(dst + 8 * PD) = float4(r.O[j][4], r.O[j][5], r.O[j][6], r.O[j][7]);
+  // Empty key ranges retain PM=-infinity below; the merge skips them before reading PO.
+  // Their output vectors have no reader, so only publish the empty-range metadata.
+  if (kbeg < kstop) {
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < 8; j++) {
+      device float* dst = PO + (base + fm) * PD + h * PH + j * 16 + fn;
+      *(device float4*)dst = float4(r.O[j][0], r.O[j][1], r.O[j][2], r.O[j][3]);
+      *(device float4*)(dst + 8 * PD) = float4(r.O[j][4], r.O[j][5], r.O[j][6], r.O[j][7]);
+    }
   }
   if (h == 0 && (lane & 9) == 0) {
     PM[base + fm] = r.m0; PL[base + fm] = r.l0;
