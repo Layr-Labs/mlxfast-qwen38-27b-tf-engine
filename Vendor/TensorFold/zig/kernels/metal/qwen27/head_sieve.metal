@@ -277,17 +277,17 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
 
 // Each row's token from the listed tiles' exact words (Y: the tile-list launch's, slot j's 32 columns at 32 j of rows
 // TF_N apart, slot j holding tile list[1 + j]): the highest finite value, ties to the lowest id, and the nonfinite
-// mask (1 NaN, 2 +inf, 4 -inf) of the words read, as tf_round_bf16_argmax picks a full row. A threadgroup of 1024 a row.
-[[max_total_threads_per_threadgroup(1024)]]
+// mask (1 NaN, 2 +inf, 4 -inf) of the words read, as tf_round_bf16_argmax picks a full row. A threadgroup of 256 a row.
+[[max_total_threads_per_threadgroup(256)]]
 [[kernel]] void tf_head_sieve_pick(const device ushort* Y [[buffer(0)]], const device uint* list [[buffer(1)]], device uint2* picks [[buffer(2)]],
     uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float bv[32];
-  threadgroup uint bi[32], bm[32];
+  threadgroup float bv[8];
+  threadgroup uint bi[8], bm[8];
   const uint cells = min(list[0], uint(TILES)) * 32;
   float best = -INFINITY;
   uint id = 0xffffffffu, mask = 0;
-  for (uint cell = tid; cell < cells; cell += 1024) {
+  for (uint cell = tid; cell < cells; cell += 256) {
     const float value = as_type<float>(uint(Y[(size_t)row * TF_N + cell]) << 16);
     const uint token = list[1 + cell / 32] * 32 + cell % 32;
     if (!isfinite(value)) mask |= isnan(value) ? 1u : value > 0 ? 2u : 4u;
@@ -308,14 +308,14 @@ kernel void tf_head_sieve_select(const device float* HM [[buffer(0)]], const dev
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // the 32 SIMD groups' bests by SIMD group 0: a group's best is finite exactly when its id is valid (else -inf and no
+  // the eight SIMD groups' bests by SIMD group 0: a group's best is finite exactly when its id is valid (else -inf and no
   // id), so the highest valid value and the lowest id holding it are those of a pass over the groups in order
   if (sg == 0) {
-    const uint ti = bi[lane];
+    const uint ti = lane < 8 ? bi[lane] : 0xffffffffu;
     const float tv = ti != 0xffffffffu ? bv[lane] : -INFINITY;
     const float m = simd_max(tv);
     const uint t = simd_min(ti != 0xffffffffu && tv == m ? ti : 0xffffffffu);
-    const uint k = simd_or(bm[lane]);
+    const uint k = simd_or(lane < 8 ? bm[lane] : 0u);
     if (lane == 0) picks[row] = uint2(k != 0 ? 0xffffffffu : t, k);
   }
 }

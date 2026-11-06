@@ -420,11 +420,13 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
-  uint3 ni = ixs[(size_t)TF_G0 * (TF_N / 8)];
+  const device packed_uint3* ip = ixs + (size_t)TF_G0 * (TF_N / 8);
+  uint3 ni = ip[0];
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
-  uint2 ni0 = ixs[(size_t)TF_G0 * (TF_N / 4)], ni1 = ixs[(size_t)TF_G0 * (TF_N / 4) + 4];
+  const device uint2* ip = ixs + (size_t)TF_G0 * (TF_N / 4);
+  uint2 ni0 = ip[0], ni1 = ip[4];
 #endif
   const device uint4* wp = wl + (size_t)TF_G0 * TF_TB * TF_RW;
 #endif
@@ -465,13 +467,15 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #if defined(TF_SBI12)
   const device uint* tab = (const device uint*)SB;
   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
+  const device packed_uint3* ip = ixs + (size_t)first * (TF_N / 8);
   uint3 ni = 0;
-  if (first < last) ni = ixs[(size_t)first * (TF_N / 8)];
+  if (first < last) ni = ip[0];
 #elif defined(TF_SBI)
   const device uint* tab = (const device uint*)SB;
   const device uint2* ixs = (const device uint2*)(tab + TF_SBI) + (n0 + nb) / 4;
+  const device uint2* ip = ixs + (size_t)first * (TF_N / 4);
   uint2 ni0 = 0, ni1 = 0;
-  if (first < last) { ni0 = ixs[(size_t)first * (TF_N / 4)]; ni1 = ixs[(size_t)first * (TF_N / 4) + 4]; }
+  if (first < last) { ni0 = ip[0]; ni1 = ip[4]; }
 #endif
   const device uint4* wp = wl + (size_t)first * TF_TB * TF_RW;
 #endif
@@ -532,9 +536,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
 #else
     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
 #if defined(TF_SBI12)
-    ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
+    ip += g + 1 < end ? TF_N / 8 : 0;
+    ni = ip[0];
 #elif defined(TF_SBI)
-    { const size_t gi = (size_t)min(g + 1, end - 1) * (TF_N / 4); ni0 = ixs[gi]; ni1 = ixs[gi + 4]; }
+    ip += g + 1 < end ? TF_N / 4 : 0;
+    ni0 = ip[0];
+    ni1 = ip[4];
 #endif
 #endif
 #else
@@ -581,12 +588,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   }
   for (int i = 0; i < 16; i++) C[i] = C0[i];
 #if defined(TF_PROMPT_SR) && !defined(TF_SWIGLU)
-#ifndef TF_TGPAD
-#define TF_TGPAD 8192
+#ifndef TF_TGPAD1
+#define TF_TGPAD1 0
 #endif
-#if TF_TGPAD > 0
-  // the parallel prompt launches' threadgroup-memory reserve (TF_TGPAD) for the serial ones too; the use never runs
-  threadgroup float tgpad1[TF_TGPAD / 4];
+#if TF_TGPAD1 > 0
+  // the parallel prompt launches' threadgroup-memory reserve for the serial ones too; the use never runs (0: none)
+  threadgroup float tgpad1[TF_TGPAD1 / 4];
   if (mdims[0] == -12345) { tgpad1[lane] = C[0]; threadgroup_barrier(mem_flags::mem_threadgroup); C[0] = tgpad1[lane ^ 1]; }
 #endif
 #endif
@@ -619,7 +626,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // prompt rows: 16 a block. Each tile's words round to bf16 as the unfused store does; SwiGLU reads them as the
   // activation kernel reads the gate/up rows, and each 64-column group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // Pad the FP32 row stride while preserving the ordered 64-word sum.
+  threadgroup float hb16[16 * 65];
   for (int i = 0; i < 16; i++) {
     const int m = mb + 8 * ((i >> 2) & 1);
     gu16[(ks * 16 + m) * 32 + nb + 16 * (i >> 3) + (i & 3)] = static_cast<bfloat>(C[i]);
@@ -632,12 +640,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    hb16[m * 65 + c] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 65 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #elif defined(TF_SWIGLU)
@@ -881,7 +889,8 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
   // bf16 as the unfused store does; SwiGLU reads them as the activation kernel reads the gate/up rows, and each 64-column
   // group's sum adds its values in order from zero.
   threadgroup bfloat gu16[4 * 16 * 32];
-  threadgroup float hb16[16 * 64];
+  // Pad the FP32 row stride while preserving the ordered 64-word sum.
+  threadgroup float hb16[16 * 65];
   TF_UNROLL
   for (int t = 0; t < TN; t++) {
     TF_UNROLL
@@ -898,12 +907,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
     const float gf = float(gu16[((c >> 5) * 16 + m) * 32 + (c & 31)]);
     const bfloat h = bfloat(gf / (1.0f + metal::exp(-gf)) * float(gu16[((2 + (c >> 5)) * 16 + m) * 32 + (c & 31)]));
     Y[(size_t)m * (TF_N / 2) + int(tg.x) * 64 + c] = h;
-    hb16[at] = float(h);
+    hb16[m * 65 + c] = float(h);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t16 < M) {
     float acc = 0.0f;
-    for (int i = 0; i < 64; i++) acc += hb16[t16 * 64 + i];
+    for (int i = 0; i < 64; i++) acc += hb16[t16 * 65 + i];
     HS[int(tg.x) * stride + t16] = acc;
   }
 #else

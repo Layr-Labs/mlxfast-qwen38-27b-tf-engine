@@ -83,9 +83,16 @@ Q27_SPECIALIZE
   ss = simd_sum(ss);
   if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  float total = 0.0f;
-  for (int i = 0; i < TPG / 32; i++) total += red[i];
-  const float inv = metal::rsqrt(total / float(K) + eps[0]);
+  // All lanes normalize with the same row factor. Keep the existing ordered
+  // sum, but let one lane per SIMD group read the shared partials and compute
+  // the factor, then broadcast its exact float bits to the other lanes.
+  float group_inv = 0.0f;
+  if (thread_index_in_simdgroup == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < TPG / 32; i++) total += red[i];
+    group_inv = metal::rsqrt(total / float(K) + eps[0]);
+  }
+  const float inv = simd_shuffle(group_inv, ushort(0));
   float xv[E];
   bfloat4 x4[E / 4];
   for (int i = 0; i < E; i++) {
