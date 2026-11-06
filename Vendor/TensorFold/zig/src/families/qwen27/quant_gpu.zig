@@ -16,8 +16,10 @@ const warm_source =
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\kernel void tf_q27_warm(const device uint* W [[buffer(0)]], const device uint* M [[buffer(1)]],
-    \\    constant uint2& lines [[buffer(2)]], device uint* sink [[buffer(3)]],
-    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
+    \\    constant uint2& lines [[buffer(2)]], device atomic_uint* sink [[buffer(3)]],
+    \\    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]],
+    \\    uint sl [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    \\    uint sgs [[simdgroups_per_threadgroup]], uint tg [[threadgroup_position_in_grid]]) {
     \\  uint acc = 0;
     \\  for (uint j = i; j < lines.x; j += 4u * n) {
     \\    const uint a = W[(size_t)j * 32u];
@@ -27,7 +29,8 @@ const warm_source =
     \\    acc ^= a ^ b ^ c ^ d;
     \\  }
     \\  for (uint j = i; j < lines.y; j += n) acc ^= M[(size_t)j * 32u];
-    \\  if (acc == 0x9E3779B9u && i == 0xFFFFFFFFu) sink[0] = acc; // never true: the loads stay, nothing is stored
+    \\  acc = simd_sum(acc);
+    \\  if (sl == 0) atomic_store_explicit(sink + tg * sgs + sg, acc, memory_order_relaxed);
     \\}
     \\// One word of every 128-byte line a tile-list launch reads of the tiles a GPU list names (its count, then the tiles):
     \\// each listed tile's code block of every K group, its metadata block of every K group (its first and last word: the
@@ -79,8 +82,10 @@ const Key = struct {
     wait: bool = false,
     tiles: u32 = 0,
     parallel_sk2: bool = false,
-    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8): one SIMD group a tile runs the eight K chains
-    /// in turn (lane_projection.Layout.serial_sk2) instead of eight SIMD groups a threadgroup.
+    /// Prompt rows of the attention k|v projection (2048 x 5120, K split 8) and of the GDN z|b|a projection (6240 x 5120,
+    /// K split 4), whose b and a tiles' one-tile launch (gdn_hook) takes it: one SIMD group a tile runs the K chains in
+    /// turn (lane_projection.Layout.serial_sk2) instead of a SIMD group a chain in one threadgroup. Two-tile launches (z's)
+    /// keep their parallel K splits.
     serial: bool = false,
 
     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
@@ -169,7 +174,7 @@ pub const Kernels = struct {
     count_words: ?mtl.Buffer = null,
     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
     gu_words: ?mtl.Buffer = null,
-    /// warm's read-only line touch and the word it could store (it never does), made on first use.
+    /// warm's line touch and private atomic checksum sink, made on first use.
     warm_pipe: ?mtl.Pipeline = null,
     warm_sink: ?mtl.Buffer = null,
     /// Code bytes warm reads ahead of a decoded out projection (warm_mb MiB), set on first use.
@@ -457,7 +462,7 @@ pub const Kernels = struct {
         const reg = p.bits == 4 and p.group == 64;
         if (!reg and (skip > 0 or cut[1] > 0 or range[1] > 0)) return error.BadCoreProjectionRows;
         // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.n == 2048 and p.k == 5120 and sk == 8 };
+        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .range = range, .bits = p.bits, .group = p.group, .rows8 = reg and !k.prompt and rows <= 8, .lean = reg, .batch = if (reg) p.batch else 1, .prompt_sr = reg and k.prompt, .sbi = reg and !k.prompt and p.index != null, .sbi12 = reg and !k.prompt and p.index != null and p.index12, .parallel_sk2 = reg and sk == 2 and skip == 0 and cut[0] == 0 and cut[1] == 0 and range[1] == 0 and wideDecodeSk2(p.n, p.k, rows, k.prompt), .serial = reg and k.prompt and p.k == 5120 and ((p.n == 2048 and sk == 8) or (p.n == 6240 and sk == 4)) };
         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
         const half = p.n / 64;
         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
@@ -710,7 +715,7 @@ pub const Kernels = struct {
     /// and padding included) and of all its decoded metadata (the indexed table and indices, else the pairs), with no
     /// barrier. Encoded inside a latency-bound barrier interval (a star scan, an attention prefix), it moves those lines
     /// from DRAM into the system cache while the memory bus is idle, just before the decoded launch of `p` reads them.
-    /// It writes nothing anything reads, so it adds no hazard and changes no word.
+    /// Only its private sink is written; relaxed atomics permit overlapping warm dispatches without races.
     pub fn warm(k: *Kernels, e: mtl.ComputeEncoder, p: projection.Linear) !void {
         return k.warmPrefix(e, p, k.warmBytes());
     }
@@ -739,7 +744,8 @@ pub const Kernels = struct {
             defer library.deinit();
             const pipe = try mtl.Pipeline.init(k.device, library, "tf_q27_warm", false);
             errdefer pipe.deinit();
-            k.warm_sink = try k.device.buffer(16, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            // At most one sink word per dispatched thread, conservatively covering every SIMD width.
+            k.warm_sink = try k.device.buffer(warm_groups * 256 * @sizeOf(u32), mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
             k.warm_pipe = pipe;
         }
         const lines = [2]u32{ @intCast(take / 128), @intCast(meta_take / 128) };
