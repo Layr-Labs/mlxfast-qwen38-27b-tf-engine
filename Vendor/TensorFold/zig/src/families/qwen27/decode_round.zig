@@ -1089,3 +1089,4 @@ fn fingerprint(round: *const Round) [32]u8 {
     hash.final(&out);
     return out;
 }
+// redraw 1003 of terrapinelf's d27d4abd
