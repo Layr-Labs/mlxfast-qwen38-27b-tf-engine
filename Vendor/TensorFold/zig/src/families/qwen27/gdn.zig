@@ -165,6 +165,18 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// prepareRows for a prompt chain's rows on `chain` (tf_delta_gdn_pre_chain): 32 rows a group of 128.
+    pub fn prepareChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 31) / 32 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
     /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
     /// so any other shape is refused rather than run unsynchronised.
@@ -337,7 +349,7 @@ pub const Round = struct {
         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
         e.barrier();
     }
-    /// gate for a prompt chain on `rows16` (tf_delta_gdn_post_rows16: post_rows' words and group sums, 16 rows a group of
+    /// gate for a prompt chain on `rows16` (tf_delta_gdn_post_rows16: post_rows' words and group sums, 32 rows a group of
     /// 128); shapes post_rows does not take keep `gate`.
     pub fn gatePrompt(r: Round, e: metal.ComputeEncoder, rows16: metal.Pipeline, post_rows: metal.Pipeline) void {
         if (!r.gateRows()) return r.gate(e, post_rows);
@@ -353,7 +365,7 @@ pub const Round = struct {
             r.b.output.bind(e, 5); // never read: a zero stride writes no sums
             e.setValue(@as(u32, 0), 6);
         }
-        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 15) / 16 }, .{ .width = 128 });
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 31) / 32 }, .{ .width = 128 });
         e.barrier();
     }
     pub fn commitConv(r: Round, e: metal.ComputeEncoder) void {
