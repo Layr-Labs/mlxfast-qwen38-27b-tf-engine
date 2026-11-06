@@ -202,7 +202,14 @@ inline uint tf_sieve_key(float v) {
     HM[(size_t)tile * 16 + mb] = hi;
     HM[(size_t)tile * 16 + 8 + mb] = mid;
     // top never takes a tile whose best a is -inf, so neither does a block key
-    if (mid > -INFINITY) atomic_fetch_max_explicit(BK + (tile / TBLK) * 8 + mb, tf_sieve_key(mid), memory_order_relaxed);
+    if (mid > -INFINITY) {
+      device atomic_uint* key = BK + (tile / TBLK) * 8 + mb;
+      const uint value = tf_sieve_key(mid);
+      // The key only increases during this scan. A stale smaller read can add an unnecessary atomic max,
+      // but a value already dominated by an observed key cannot change the final maximum.
+      if (value > atomic_load_explicit(key, memory_order_relaxed))
+        atomic_fetch_max_explicit(key, value, memory_order_relaxed);
+    }
   }
 }
 
