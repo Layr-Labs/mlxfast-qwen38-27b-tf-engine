@@ -31,13 +31,15 @@ pub const Session = struct {
         s.context = next;
         s.ready = true;
     }
-    /// absorb and treeBlock in one drafter frame.
+    /// absorb and treeBlock in one drafter frame; a session that has absorbed nothing yet (an empty context) takes its
+    /// first taps here as absorb would.
     pub fn absorbTreeBlock(s: *Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, batch: Batch, pending: u32, block: u32, options: selector.Options) !selector.Tree {
-        if (!std.meta.eql(s.config, graph.config) or !s.ready) return error.BadDraftContext;
+        if (!std.meta.eql(s.config, graph.config) or (!s.ready and s.context.end != s.context.begin)) return error.BadDraftContext;
         const next = try s.admit(batch);
         var lattice = try execution.appendBlock(ops, graph, preparation, s.context, batch.values, batch.positions, next, pending, block);
         defer lattice.deinit();
         s.context = next;
+        s.ready = true;
         return selector.propose(gpa, graph, lattice, pending, try std.math.add(u64, next.end, 1), options);
     }
     /// absorbTreeBlock's frame, committed before the round that admits `batch`'s taps (at most) is read; the caller completes
