@@ -61,27 +61,41 @@ kernel void q27_attn_scatter(device const bfloat* K [[buffer(0)]], device const 
 }
 struct Q27KeepLayer { device Q27CachePtrs* caches; device const int* meta; device const Q27KeepRow* map; };
 struct Q27KeepLayers { uint kept, lane; };
+// Eight BF16 words per thread. Keep arbitrary head strides legal through a raw-word fallback.
+static inline void q27_keep_copy8(device bfloat* dst, device const bfloat* src, bool aligned) {
+  if (aligned) {
+    *(device uint4*)dst = *(device const uint4*)src;
+  } else {
+    device ushort* d = (device ushort*)dst;
+    device const ushort* s = (device const ushort*)src;
+    for (uint i = 0; i < 8; ++i) d[i] = s[i];
+  }
+}
 kernel void q27_attn_gather_layers(constant Q27KeepLayer* layers [[buffer(0)]], device bfloat* lanes [[buffer(1)]],
     constant Q27KeepLayers& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
   const uint layer = at.z / a.kept, z = at.z - layer * a.kept;
-  if (at.x >= 256 || at.y >= 4) return;
+  if (at.x >= 32 || at.y >= 4) return;
   const Q27KeepLayer l = layers[layer];
   const Q27KeepRow r = l.map[z]; if (r.stream == 0xffffffffu) return; const uint base = 8 + r.stream * 12, source = uint(l.meta[base + 4]) + r.source;
-  const ulong destination = (ulong(r.row) * 4 + at.y) * 256 + at.x;
+  const ulong destination = (ulong(r.row) * 4 + at.y) * 256 + at.x * 8;
   device bfloat* K = lanes + ulong(2 * layer) * a.lane;
   device bfloat* V = lanes + ulong(2 * layer + 1) * a.lane;
-  K[destination] = l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + source * 256 + at.x];
-  V[destination] = l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + source * 256 + at.x];
+  const ulong ks = ulong(at.y) * uint(l.meta[base + 7]), vs = ulong(at.y) * uint(l.meta[base + 8]);
+  const bool aligned = ((ulong(a.lane) | ks | vs) & 7ul) == 0ul;
+  q27_keep_copy8(K + destination, l.caches[r.stream].keys + ks + source * 256 + at.x * 8, aligned);
+  q27_keep_copy8(V + destination, l.caches[r.stream].values + vs + source * 256 + at.x * 8, aligned);
 }
 kernel void q27_attn_scatter_layers(constant Q27KeepLayer* layers [[buffer(0)]], device const bfloat* lanes [[buffer(1)]],
     constant Q27KeepLayers& a [[buffer(2)]], uint3 at [[thread_position_in_grid]]) {
   const uint layer = at.z / a.kept, z = at.z - layer * a.kept;
-  if (at.x >= 256 || at.y >= 4) return;
+  if (at.x >= 32 || at.y >= 4) return;
   const Q27KeepLayer l = layers[layer];
   const Q27KeepRow r = l.map[z]; if (r.stream == 0xffffffffu) return; const uint base = 8 + r.stream * 12, destination = uint(l.meta[base + 4]) + r.destination;
-  const ulong source = (ulong(r.row) * 4 + at.y) * 256 + at.x;
+  const ulong source = (ulong(r.row) * 4 + at.y) * 256 + at.x * 8;
   device const bfloat* K = lanes + ulong(2 * layer) * a.lane;
   device const bfloat* V = lanes + ulong(2 * layer + 1) * a.lane;
-  l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + destination * 256 + at.x] = K[source];
-  l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + destination * 256 + at.x] = V[source];
+  const ulong ks = ulong(at.y) * uint(l.meta[base + 7]), vs = ulong(at.y) * uint(l.meta[base + 8]);
+  const bool aligned = ((ulong(a.lane) | ks | vs) & 7ul) == 0ul;
+  q27_keep_copy8(l.caches[r.stream].keys + ks + destination * 256 + at.x * 8, K + source, aligned);
+  q27_keep_copy8(l.caches[r.stream].values + vs + destination * 256 + at.x * 8, V + source, aligned);
 }
