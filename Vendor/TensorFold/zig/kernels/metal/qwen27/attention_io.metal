@@ -85,3 +85,23 @@ kernel void q27_attn_scatter_layers(constant Q27KeepLayer* layers [[buffer(0)]],
   l.caches[r.stream].keys[ulong(at.y) * uint(l.meta[base + 7]) + destination * 256 + at.x] = K[source];
   l.caches[r.stream].values[ulong(at.y) * uint(l.meta[base + 8]) + destination * 256 + at.x] = V[source];
 }
+
+// Only the validated single-stream map from tf_round_keep_metadata: source indices increase,
+// destination i <= source[i]. Each thread owns one column through all rows, so an earlier
+// destination cannot overwrite a later source. Arbitrary keep maps still gather then scatter.
+kernel void q27_attn_compact_device_layers(constant Q27KeepLayer* layers [[buffer(0)]],
+    constant uint& kept [[buffer(1)]], uint3 at [[thread_position_in_grid]]) {
+  if (at.x >= 256 || at.y >= 4) return;
+  const Q27KeepLayer l = layers[at.z];
+  for (uint i = 0; i < kept; ++i) {
+    const Q27KeepRow r = l.map[i];
+    if (r.stream == 0xffffffffu) continue;
+    const uint base = 8 + r.stream * 12, start = uint(l.meta[base + 4]);
+    const ulong source = ulong(start + r.source) * 256 + at.x;
+    const ulong destination = ulong(start + r.destination) * 256 + at.x;
+    device ushort* keys = (device ushort*)l.caches[r.stream].keys + ulong(at.y) * uint(l.meta[base + 7]);
+    device ushort* values = (device ushort*)l.caches[r.stream].values + ulong(at.y) * uint(l.meta[base + 8]);
+    keys[destination] = keys[source];
+    values[destination] = values[source];
+  }
+}
