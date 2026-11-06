@@ -164,7 +164,7 @@ inline void tf_split_key(thread float (&q)[TF_D / 32], thread float (&out)[TF_D 
 // and mask bytes load first, then each unmasked key's arithmetic in key order, tf_split_key's on the same bfloat words,
 // into the same partials; rows past args.rows load and barrier but write nothing.
 #define TF_SPLIT_ROWS (TF_G >= 16 ? 1 : 16 / TF_G)
-#define TF_STAGE 16
+#define TF_STAGE (TF_D <= 128 ? 32 : 16) // cap K/V staging at the existing 16 KiB maximum
 // One staged key: tf_split_key's arithmetic on its K and V words already in registers.
 inline void tf_split_staged(thread float (&q)[TF_D / 32], thread float (&out)[TF_D / 32], thread float& maximum,
     thread float& total, thread const float (&k)[TF_D / 32], thread const float (&v)[TF_D / 32], float scale) {
