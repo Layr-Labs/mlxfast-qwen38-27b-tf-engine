@@ -2,6 +2,7 @@
 const std = @import("std");
 const q = @import("decode_round.zig");
 const Round = @import("round_plan.zig").Round;
+const native_gu = @import("native_gu.zig");
 
 pub const Session = struct {
     runner: *q.Runner,
@@ -9,6 +10,7 @@ pub const Session = struct {
     slot: u32 = 0, // the runner slot whose stream this feeds
     pub fn prefill(s: Session, ids: []const u32, chunk: usize) !void {
         if (ids.len == 0 or chunk == 0 or chunk > s.runner.model.frame.capacity or ids.len > s.runner.capacity - s.runner.offsets[s.slot]) return error.BadPrompt;
+        const native_before = s.runner.model.kernels.native_gu_calls;
         s.runner.model.kernels.prompt = true;
         defer s.runner.model.kernels.prompt = false;
         var first: usize = 0;
@@ -17,12 +19,15 @@ pub const Session = struct {
             try s.feed(ids[first..end], if (end == ids.len) .last else .none);
             first = end;
         }
+        try native_gu.requireEngaged(s.runner.model.kernels.native_gu_mode, ids.len > 0, native_before, s.runner.model.kernels.native_gu_calls);
     }
     pub fn promptChunk(s: Session, ids: []const u32, last: bool) !void {
         if (ids.len == 0 or ids.len > s.runner.model.frame.capacity) return error.BadPrompt;
+        const native_before = s.runner.model.kernels.native_gu_calls;
         s.runner.model.kernels.prompt = true;
         defer s.runner.model.kernels.prompt = false;
         try s.feed(ids, if (last) .last else .none);
+        try native_gu.requireEngaged(s.runner.model.kernels.native_gu_mode, ids.len > 0, native_before, s.runner.model.kernels.native_gu_calls);
     }
 
     /// Prompt rows with decoded rows' arithmetic (an earlier reply's tokens): the bits decoding them gave.
