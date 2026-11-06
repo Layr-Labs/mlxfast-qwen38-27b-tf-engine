@@ -34,8 +34,42 @@ CI uses offline tests and JSON validation. The `macos-security` job in
 27. `tools/test-yukon-run.sh` checks ranked and local Yukon routing.
 28. `tools/test-zig-bin.sh` checks Zig `0.17.0` selection and refusal.
 
-The `lint` job on `ubuntu-latest` runs shell syntax, JSON, manifest, editable
-archive size, workflow egress, and actionlint checks. It does not run the
-`tools/test-*.sh` loop.
+The `lint` job on Linux (`ubuntu-latest`, or a Darkbloom Linux Sandbox) runs
+shell syntax, JSON, manifest, editable archive size, workflow egress, and
+actionlint checks. It does not run the `tools/test-*.sh` loop.
 
 The tests do not use the network, a GPU, or model weights.
+
+## Runner routing
+
+`.github/workflows/darkbloom-route.yml` chooses where each CI job runs: a
+Darkbloom Sandbox when the Darkbloom plane grants one, otherwise the job's
+GitHub-hosted fallback. The route job runs on GitHub-hosted `ubuntu-24.04`
+with no token permissions and no checkout. Each routed job runs on
+`fromJSON(needs.route.outputs.routes)['<lane>']`. The lane is the job name.
+
+| Lane | Darkbloom profile | Fallback |
+|---|---|---|
+| `lint` | `linux_arm64` | `ubuntu-latest` |
+
+`macos-security` is not routed. It always runs on GitHub-hosted `macos-15`.
+On a self-hosted runner, the Seatbelt scripts take the ranked Mac's official
+path (`RUNNER_ENVIRONMENT=self-hosted`), so the job cannot run as plain CI
+there.
+
+Routing is off unless the repository variable `DARKBLOOM_ROUTING` is exactly
+`on`. While it is off, and for pull requests from forks, every job keeps its
+fallback and the route job sends no request. When it is on, the route job
+sends one `POST /v1/ci/routes` to `DARKBLOOM_SANDBOX_URL` (default
+`https://api-sandbox.darkbloom.dev`). The request names only the repository,
+the run ID, the run attempt and the lanes. It holds no credential. Errors,
+timeouts and malformed replies keep the fallback. The plane never fails the
+route job.
+
+Darkbloom Linux Sandboxes are ARM64; the `ubuntu-latest` fallback is x64. The
+`lint` job picks the actionlint and ShellCheck assets that match the runner.
+The decision is fixed for the run: **Re-run failed jobs** reuses it. To move a
+run back to GitHub-hosted runners, turn routing off and use **Re-run all
+jobs**.
+
+The ranked pipeline, `.github/workflows/benchmark.yml`, is not routed.

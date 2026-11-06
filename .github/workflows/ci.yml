@@ -13,9 +13,21 @@ permissions:
   contents: read
 
 jobs:
+  # Chooses a Darkbloom Sandbox or the GitHub-hosted fallback for each job
+  # below (docs/ci-coverage.md, "Runner routing"). Routing is off unless the
+  # repository variable DARKBLOOM_ROUTING is exactly `on`. The route job never
+  # fails the run.
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        lint linux_arm64 ubuntu-latest
+
   lint:
     name: Hosted security and syntax
-    runs-on: ubuntu-latest
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['lint'] }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -26,17 +38,52 @@ jobs:
       - name: No credential or unapproved artifact egress
         run: tools/ci-workflow-egress-scan.sh
 
+      # The GitHub-hosted image has ShellCheck 0.9.0 and the Darkbloom image has
+      # none. Install the same pinned 0.9.0 on both, so that actionlint checks
+      # run blocks the same way on both. The release has no checksums file; the
+      # two digests are of the release assets.
+      - name: ShellCheck for actionlint
+        env:
+          SHELLCHECK_VERSION: 0.9.0
+          SHELLCHECK_SHA256_X86_64: 700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f
+          SHELLCHECK_SHA256_AARCH64: 179c579ef3481317d130adebede74a34dbbc2df961a70916dd4039ebf0735fae
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; sha256="${SHELLCHECK_SHA256_X86_64}" ;;
+            aarch64) arch=aarch64; sha256="${SHELLCHECK_SHA256_AARCH64}" ;;
+            *) echo "::error::no pinned ShellCheck for $(uname -m)" >&2; exit 1 ;;
+          esac
+          workdir="${RUNNER_TEMP}/shellcheck"
+          mkdir -p "${workdir}"
+          tarball="${workdir}/shellcheck.tar.xz"
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${arch}.tar.xz"
+          curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
+          printf '%s  %s\n' "${sha256}" "${tarball}" | sha256sum --check --status
+          tar -xJf "${tarball}" -C "${workdir}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          chmod +x "${workdir}/shellcheck"
+          "${workdir}/shellcheck" --version
+          echo "${workdir}" >> "${GITHUB_PATH}"
+
+      # Linux amd64 on GitHub-hosted runners, linux arm64 on Darkbloom. Both
+      # digests are from actionlint_1.7.12_checksums.txt.
       - name: actionlint
         env:
           ACTIONLINT_VERSION: 1.7.12
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_SHA256_AMD64: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_SHA256_ARM64: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
         run: |
           set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sha256="${ACTIONLINT_SHA256_AMD64}" ;;
+            aarch64) arch=arm64; sha256="${ACTIONLINT_SHA256_ARM64}" ;;
+            *) echo "::error::no pinned actionlint for $(uname -m)" >&2; exit 1 ;;
+          esac
           workdir="$(mktemp -d)"
           tarball="${workdir}/actionlint.tar.gz"
-          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"
           curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
-          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tarball}" | sha256sum --check --status
+          printf '%s  %s\n' "${sha256}" "${tarball}" | sha256sum --check --status
           tar -xzf "${tarball}" -C "${workdir}" actionlint
           chmod +x "${workdir}/actionlint"
           "${workdir}/actionlint" -color
@@ -66,6 +113,8 @@ jobs:
 
   macos-security:
     name: macOS Seatbelt and offline tests
+    # Not routed. On any self-hosted runner, the Seatbelt scripts take the
+    # ranked Mac's official path, so this job stays on GitHub-hosted macOS.
     needs: lint
     runs-on: macos-15
     timeout-minutes: 30
