@@ -165,6 +165,18 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// prepareRows for a prompt chain's rows on `chain` (tf_delta_gdn_pre_chain): 64 rows a group of 128.
+    pub fn prepareChain(r: Round, e: metal.ComputeEncoder, chain: metal.Pipeline) void {
+        if (r.p.rows == 0 or r.p.dk != 128 or r.p.dv != 128 or r.p.taps != 4) return r.prepare(e);
+        inline for (.{ r.b.qkv, r.b.history, r.b.query, r.b.key, r.b.value }) |s| if (s.offset % 8 != 0) return r.prepare(e); // bfloat4 rows
+        e.setPipeline(chain);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing }, 10);
+        e.dispatchGroups(.{ .width = 1, .height = 2 * r.p.nk + r.p.nv, .depth = (r.p.rows + 63) / 64 }, .{ .width = 128, .height = 1, .depth = 1 });
+        e.barrier();
+    }
+
     /// prepareRows in the barrier interval of the counted decoded projections it reads (no barrier before it): each group
     /// waits until `counter`'s first word reaches `wait` (Kernels.quantCounted). Only the tf_delta_gdn_pre_rows path waits,
     /// so any other shape is refused rather than run unsynchronised.
